@@ -40,10 +40,15 @@ hz = 50
 # called healthy. Raise it in step with `control.hz`.
 min_achieved_hz = 45.0
 
-# How many periods may pass with no tick at all before the loop counts as stalled. This is
-# what turns a wedged control thread into an honest "unhealthy" instead of a socket that
+# How many periods may pass with no tick at all before the loop counts as WEDGED. This is
+# what turns a hung control thread into an honest "unhealthy" instead of a socket that
 # keeps answering "healthy" on the strength of one tick it managed an hour ago.
-stall_periods = 3
+#
+# It detects a dead loop, not a slow one — min_achieved_hz above owns degradation. Keep the
+# two apart. This was originally 3 (60 ms at 50 Hz), which ordinary scheduler jitter on a
+# busy board exceeds routinely; a health check that trips on jitter rolls back good
+# releases. 25 periods is 500 ms: a loop silent that long is genuinely gone.
+stall_periods = 25
 
 # Consecutive failed bus reads tolerated. One dropped transaction is ordinary on a serial
 # bus; a run of them means the bus is gone, and a robot that cannot read its own joints is
