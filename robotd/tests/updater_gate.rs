@@ -78,6 +78,31 @@ impl Robotd {
         }
         panic!("robotd never answered on {}", self.socket.display());
     }
+
+    /// Wait until the control loop has actually started.
+    ///
+    /// Separate from [`Self::wait_until_answering`] because the socket comes up *before*
+    /// the first tick, and deliberately so: IPC has to answer even when the loop is broken,
+    /// which is the entire reason health is computed from published atomics rather than by
+    /// asking the loop. So there is a real window where a running `robotd` correctly
+    /// reports `control loop has not completed a cycle yet`.
+    ///
+    /// The updater handles that window by polling within its health-gate budget. A test
+    /// that asserts on the first answer instead races the thread scheduler — it passes on
+    /// an idle laptop and fails under a parallel `cargo test` on a loaded machine.
+    async fn wait_until_healthy(&self) {
+        let client = SocketRobotClient::new(self.socket.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last = Health::Unreachable;
+        while Instant::now() < deadline {
+            last = client.health(Duration::from_millis(500)).await;
+            if matches!(last, Health::Healthy) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("robotd never became healthy; last answer was {last:?}");
+    }
 }
 
 impl Drop for Robotd {
@@ -193,13 +218,18 @@ async fn apply_latest(engine: &mut Engine) -> Result<ApplyResult, updater::Error
 #[tokio::test]
 async fn real_robotd_answers_every_method_the_engine_calls() {
     let fx = Fixture::new();
-    let _robotd = Robotd::spawn(fx.socket(), &[]).await;
+    let robotd = Robotd::spawn(fx.socket(), &[]).await;
+    robotd.wait_until_healthy().await;
     let client = SocketRobotClient::new(fx.socket());
     let t = Duration::from_secs(2);
 
+    // Report the verdict, not just that it was wrong: `robot.health` carries a reason
+    // precisely so a failure names its cause, and swallowing it here means every future
+    // regression in this test starts with a debugging session.
+    let health = client.health(t).await;
     assert!(
-        matches!(client.health(t).await, Health::Healthy),
-        "a running robotd must report healthy"
+        matches!(health, Health::Healthy),
+        "a running robotd must report healthy, got {health:?}"
     );
     // `Yes` specifically, not `permits_restart()`: that also returns true for
     // `Unreachable`, so it would pass even if the wire were completely broken.

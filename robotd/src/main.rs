@@ -686,18 +686,57 @@ mod tests {
     /// the updater's auto-rollback actually gates on.
     #[test]
     fn a_stalled_loop_reports_unhealthy() {
-        let s = state();
+        // A short window so the test does not sleep for the real 500 ms default. Two
+        // periods at 50 Hz is 40 ms.
+        let mut params = Params::default();
+        params.health.stall_periods = 2;
+        let s = RobotState::new(&params, false, false);
+
         s.ticks.store(1, Ordering::Relaxed);
         // Last tick stamped at time zero while `started` keeps advancing — the shape of a
-        // loop that stopped. Three periods at 50 Hz is 60 ms.
+        // loop that stopped.
         s.last_tick_us.store(0, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(70));
+        std::thread::sleep(Duration::from_millis(60));
 
         let health = s.health();
         assert!(!health.healthy);
         assert!(
             health.reason.as_deref().unwrap().contains("stalled"),
             "{:?}",
+            health.reason
+        );
+    }
+
+    /// **Regression.** The stall check must not fire on ordinary scheduler jitter.
+    ///
+    /// It was originally three periods — 60 ms at 50 Hz — which a loaded machine exceeds
+    /// routinely. That failed the gate test outright, and on a board it would report a
+    /// perfectly good release unhealthy and roll it back: exactly the false positive the
+    /// health gate exists not to produce. Stall detects a *wedged* loop; `min_achieved_hz`
+    /// owns degradation, and conflating them makes both worse.
+    #[test]
+    fn a_late_tick_is_not_a_stalled_loop() {
+        let s = state();
+        let params = Params::default();
+        s.ticks.store(100, Ordering::Relaxed);
+
+        // 100 ms late: five whole periods, far past anything the old threshold tolerated,
+        // and still nowhere near a loop that has died.
+        let late_by = Duration::from_millis(100);
+        assert!(
+            late_by.as_micros() as u64 > params.period().as_micros() as u64 * 3,
+            "the jitter under test must exceed the old three-period threshold"
+        );
+        let now_us = s.started.elapsed().as_micros() as u64;
+        s.last_tick_us.store(
+            now_us.saturating_sub(late_by.as_micros() as u64),
+            Ordering::Relaxed,
+        );
+
+        let health = s.health();
+        assert!(
+            health.healthy,
+            "a merely late loop must stay healthy, got {:?}",
             health.reason
         );
     }

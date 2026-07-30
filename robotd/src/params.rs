@@ -45,7 +45,13 @@ pub struct Health {
     /// updater's auto-rollback mean something. A loop running at 60% of target is alive,
     /// answers every request, and is badly broken.
     pub min_achieved_hz: f64,
-    /// How many periods may pass with no tick before the loop counts as stalled.
+    /// How many periods may pass with no tick before the loop counts as **wedged**.
+    ///
+    /// This detects a dead loop, not a slow one — `min_achieved_hz` owns degradation. Keep
+    /// the two apart: set this near the period and it fires on ordinary scheduler jitter,
+    /// which on a loaded board would report a perfectly good release unhealthy and roll it
+    /// back. A loop that has not ticked in half a second is genuinely gone; one that
+    /// ticked 80 ms late is just late.
     pub stall_periods: u32,
     /// Consecutive bus read failures tolerated before reporting unhealthy. One dropped
     /// transaction is ordinary; a run of them means the bus is gone.
@@ -72,7 +78,10 @@ impl Default for Health {
             // 90% of the default rate. Generous enough not to trip on a slow tick, tight
             // enough that a loop losing every tenth cycle is not called healthy.
             min_achieved_hz: 45.0,
-            stall_periods: 3,
+            // 500 ms at the default rate. Deliberately far from the period: three periods
+            // is 60 ms, which ordinary scheduler jitter exceeds on a busy machine, and a
+            // health check that trips on jitter rolls back good releases.
+            stall_periods: 25,
             max_consecutive_errors: 10,
         }
     }
@@ -177,7 +186,32 @@ mod tests {
         let p = Params::load(&path, true).unwrap();
         assert_eq!(p.bus.port, "/dev/ttyUSB0");
         assert_eq!(p.control.hz, 50);
-        assert_eq!(p.health.stall_periods, 3);
+        assert_eq!(p.health.stall_periods, 25);
+    }
+
+    /// The shipped example must agree with the built-in defaults, or the file documents a
+    /// robot that does not exist — and an operator reading it would draw wrong conclusions
+    /// about what their board is actually doing.
+    #[test]
+    fn the_shipped_example_matches_the_defaults() {
+        let shipped = include_str!("../../deploy/robotd.toml");
+        let from_file: Params = toml::from_str(shipped).expect("deploy/robotd.toml must parse");
+        let built_in = Params::default();
+
+        assert_eq!(from_file.bus.port, built_in.bus.port);
+        assert_eq!(from_file.control.hz, built_in.control.hz);
+        assert_eq!(
+            from_file.health.min_achieved_hz,
+            built_in.health.min_achieved_hz
+        );
+        assert_eq!(
+            from_file.health.stall_periods,
+            built_in.health.stall_periods
+        );
+        assert_eq!(
+            from_file.health.max_consecutive_errors,
+            built_in.health.max_consecutive_errors
+        );
     }
 
     /// A typo in a key must fail loudly. Silently ignoring `min_acheived_hz` would leave
