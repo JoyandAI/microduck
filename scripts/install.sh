@@ -60,7 +60,11 @@ REF="${DUCK_REF:-main}"
 TOKEN="${DUCK_TOKEN:-}"
 
 RAW="https://raw.githubusercontent.com/${REPO}/${REF}"
-BOOTSTRAP_URL="https://github.com/${REPO}/releases/latest/download/updaterd-bootstrap-aarch64"
+BOOTSTRAP_ASSET="updaterd-bootstrap-aarch64"
+
+# Set by `resolve_bootstrap_asset`. A global rather than a `$(...)` result so a failure can
+# `die` in the caller's shell instead of exiting a subshell and returning an empty string.
+BOOTSTRAP_URL=""
 
 CONFIG_DIR=/etc/robot
 KEYS_DIR="${CONFIG_DIR}/trusted_keys"
@@ -84,6 +88,20 @@ fetch() {
         curl -fsSL -H "Authorization: Bearer ${TOKEN}" -o "$2" "$1"
     else
         curl -fsSL -o "$2" "$1"
+    fi
+}
+
+# As `fetch`, but asking the release API for bytes rather than metadata.
+#
+# Without `Accept: application/octet-stream` that endpoint answers with the asset's JSON
+# description, which downloads perfectly and is not a binary.
+fetch_asset() {
+    # $1 url, $2 destination
+    if [ -n "$TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/octet-stream" -o "$2" "$1"
+    else
+        curl -fsSL -H "Accept: application/octet-stream" -o "$2" "$1"
     fi
 }
 
@@ -193,6 +211,52 @@ install_config() {
 # above, so there is one statement of where keys live, where state lives and which channel
 # this robot tracks — rather than a copy of those values here that could disagree with the
 # one the daemon reads a minute later.
+# Find the bootstrap asset's API download URL on the latest stable release.
+#
+# **Not** `releases/latest/download/<asset>`. On a private repository that browser URL
+# returns 404 with or without a token — see `docs/updater-design.md` §6.1 — which is exactly
+# how this failed the first time it was run against a real board. The engine already
+# re-resolves its own download URLs through the release API (`resolve_download` in
+# `source/github.rs`); this script was the one place that had not caught up, because until a
+# release was promoted there was nothing here to exercise.
+resolve_bootstrap_asset() {
+    api="https://api.github.com/repos/${REPO}/releases/latest"
+    json="$(mktemp)"
+
+    if ! fetch "$api" "$json"; then
+        rm -f "$json"
+        die "cannot read ${api}
+  A stable, non-prerelease release must exist. If only staging releases have been
+  published, promote one first:  gh workflow run promote --field version=X.Y.Z"
+    fi
+
+    # Parsed with grep rather than jq: this script runs before anything is installed, and
+    # requiring a JSON parser on a freshly flashed board, in order to bootstrap the thing
+    # that installs software, would be the wrong way round.
+    #
+    # Whitespace is stripped *first*. The API pretty-prints, so `tr '{'` alone leaves the
+    # original newlines in place and grep still matches line by line — the line naming the
+    # asset does not carry its id, and the search silently finds nothing. Compacting makes
+    # one line per JSON object, and an asset's `id` and `name` both precede its nested
+    # `uploader` object, so the line naming the asset carries its id too.
+    id="$(
+        tr -d ' \n' < "$json" \
+        | tr '{' '\n' \
+        | grep "\"name\":\"${BOOTSTRAP_ASSET}\"" \
+        | grep -o '"id":[0-9][0-9]*' \
+        | grep -o '[0-9][0-9]*' \
+        | head -1
+    )"
+    rm -f "$json"
+
+    if [ -z "$id" ]; then
+        die "the latest release has no asset named ${BOOTSTRAP_ASSET}.
+  A promoted release must carry it — release.yml attaches it, promote.yml copies it across."
+    fi
+
+    BOOTSTRAP_URL="https://api.github.com/repos/${REPO}/releases/assets/${id}"
+}
+
 bootstrap_first_release() {
     if [ -L "${INSTALL_DIR}/current" ]; then
         say "a release is already live ($(readlink "${INSTALL_DIR}/current")); skipping the bootstrap"
@@ -204,10 +268,9 @@ bootstrap_first_release() {
     trap "rm -rf '$tmp'" EXIT INT TERM
 
     say "fetching the bootstrap updaterd"
-    if ! fetch "$BOOTSTRAP_URL" "${tmp}/updaterd"; then
-        die "cannot fetch ${BOOTSTRAP_URL}
-  A stable release must exist and carry the updaterd-bootstrap-aarch64 asset. If only
-  staging releases have been published, promote one first."
+    resolve_bootstrap_asset
+    if ! fetch_asset "$BOOTSTRAP_URL" "${tmp}/updaterd"; then
+        die "cannot fetch ${BOOTSTRAP_URL}"
     fi
     chmod +x "${tmp}/updaterd"
 
