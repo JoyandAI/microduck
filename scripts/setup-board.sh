@@ -235,10 +235,13 @@ EOF
     say "board ready — install the daemon next"
     cat <<'EOF'
 
-  curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh -o /tmp/install.sh
-  sudo sh /tmp/install.sh
+  URL=https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh
+  curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" "$URL" -o /tmp/install.sh
+  sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/install.sh
 
-  On a private repository, pass a token:  sudo DUCK_TOKEN=ghp_... sh /tmp/install.sh
+  While the repository is private, both halves need the token: raw.githubusercontent.com
+  404s without it, and sudo does not pass the variable through on its own. Once the
+  repository is public, drop the header and the prefix.
 EOF
 }
 

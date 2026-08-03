@@ -260,6 +260,17 @@ resolve_bootstrap_asset() {
 bootstrap_first_release() {
     if [ -L "${INSTALL_DIR}/current" ]; then
         say "a release is already live ($(readlink "${INSTALL_DIR}/current")); skipping the bootstrap"
+        # This script provisions a bare board; it is not how an installed board updates. Say
+        # so, because everything after this point still prints reassuring green output and it
+        # is entirely reasonable to read that as "now on the latest release".
+        cat <<'EOF'
+
+  This script only bootstraps a board with no release on it, so the daemon version below
+  will not change. To update an installed board:
+
+    sudo robotctl update apply daemon
+
+EOF
         return 0
     fi
 
@@ -475,6 +486,14 @@ install_token_dropin() {
         printf '[Service]\nEnvironment=GITHUB_TOKEN=%s\n' "$TOKEN" > "${dir}/token.conf"
     )
     systemctl daemon-reload
+    # `daemon-reload` re-reads unit files; it does not restart anything. Without this the
+    # drop-in exists on disk and the *running* updaterd still has no GITHUB_TOKEN, so every
+    # later check 404s against a private repo — silently, on a timer, forever. The units are
+    # started before this function runs, so this was not a corner case: it was every board.
+    #
+    # `try-restart`, not `restart`: if updaterd is not running, starting it is
+    # `install_units`' job and doing it here would hide a failure there.
+    systemctl try-restart updaterd.service || warn "could not restart updaterd"
     say "wrote ${dir}/token.conf (mode 600) so updaterd can fetch updates"
     warn "that file holds a GitHub token in plaintext. Fine on a developer's board, not on a
   robot you ship. It is why artifact hosting is still open — docs/updater-design.md §6.1."

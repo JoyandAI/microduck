@@ -137,9 +137,10 @@ struct RobotState {
     achieved_hz: AtomicU64,
     /// Consecutive failed bus reads. Reset by any success.
     consecutive_errors: AtomicU32,
-    /// Failed attempts to read the startup pose. Non-zero means the loop is still waiting
-    /// for the bus to answer and has never commanded anything.
-    startup_read_failures: AtomicU32,
+    /// Failed attempts to bring the bus up — opening it, verifying its registers, or
+    /// reading the startup pose. Non-zero means the loop is still waiting for a robot to
+    /// answer and has never commanded anything.
+    startup_bus_failures: AtomicU32,
     shutdown: AtomicBool,
 
     period_us: u64,
@@ -159,7 +160,7 @@ impl RobotState {
             last_tick_us: AtomicU64::new(0),
             achieved_hz: AtomicU64::new(0),
             consecutive_errors: AtomicU32::new(0),
-            startup_read_failures: AtomicU32::new(0),
+            startup_bus_failures: AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
             min_achieved_hz: params.health.min_achieved_hz,
@@ -192,12 +193,12 @@ impl RobotState {
             // Distinguish "starting" from "cannot see a robot". Both mean no ticks, but only
             // one of them is going to resolve on its own, and the update system quotes this
             // string as the reason it rolled a release back — so it has to name the cause.
-            let waiting = self.startup_read_failures.load(Ordering::Relaxed);
+            let waiting = self.startup_bus_failures.load(Ordering::Relaxed);
             if waiting > 0 {
                 // Degraded, not unhealthy: an unpowered bench board must not roll back every
                 // release shipped to it. The bus not answering is the same before and after.
                 return degraded(format!(
-                    "no answer from the motor bus after {waiting} attempts; \
+                    "no robot on the motor bus after {waiting} attempts; \
                      is servo power on and the bus wired?"
                 ));
             }
@@ -409,19 +410,69 @@ fn spawn_control_thread(
                 return;
             }
 
-            if let Some(io) = open_bus(&port) {
-                runtime.block_on(control_loop(io, state, period));
-            }
+            // Waiting, not one shot. `open_bus` verifies motor registers, which means it
+            // talks to the servos — so on an unpowered board it fails and this used to fall
+            // straight off the end of the thread. No control loop was ever created, and
+            // because nothing had been *attempted* the health reason was the bland "control
+            // loop has not completed a cycle yet", forever, whatever happened to the robot
+            // afterwards. Retrying the read alone was not enough: execution never got there.
+            runtime.block_on(async move {
+                if let Some(io) = open_bus_waiting(&port, &state).await {
+                    control_loop(io, state, period).await;
+                }
+            });
         })
+}
+
+/// The real bus on the board; a fake elsewhere, so `open_bus_waiting` has one signature.
+#[cfg(target_os = "linux")]
+type BusIo = duck_control::bus::DynamixelIo;
+#[cfg(not(target_os = "linux"))]
+type BusIo = FakeIo;
+
+/// Open and verify the bus, waiting for a robot to answer.
+///
+/// Same reasoning as [`adopt_startup_pose`], one step earlier: an unpowered board cannot
+/// pass `check_registers`, and that is a condition someone fixes by flipping a switch, not
+/// one to abandon the control loop over.
+///
+/// Returns `None` only if shutdown is requested while waiting.
+async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
+    let mut attempt = 0u32;
+
+    while !state.shutdown.load(Ordering::Relaxed) {
+        // Logging lives in `open_bus`, which is chatty by design on the first attempt and
+        // quiet thereafter — a board waiting overnight must not fill the journal.
+        if let Some(io) = open_bus(port, attempt) {
+            state.startup_bus_failures.store(0, Ordering::Relaxed);
+            return Some(io);
+        }
+        attempt += 1;
+        // Published before sleeping, so `robot.health` can name the cause immediately.
+        state.startup_bus_failures.store(attempt, Ordering::Relaxed);
+
+        // Nothing to retry on a platform that has no bus at all.
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
+    }
+
+    None
 }
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(port: &str) -> Option<duck_control::bus::DynamixelIo> {
+fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
+    // First attempt and every thirtieth — about one line per 30 s while waiting.
+    let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
+
     let mut io = match duck_control::bus::DynamixelIo::open(port) {
         Ok(io) => io,
         Err(e) => {
-            tracing::error!(error = %e, port, "cannot open the bus");
+            if loud {
+                tracing::error!(error = %e, port, attempt, "cannot open the bus; waiting");
+            }
             return None;
         }
     };
@@ -429,7 +480,13 @@ fn open_bus(port: &str) -> Option<duck_control::bus::DynamixelIo> {
         Ok(0) => tracing::info!("motor registers already correct"),
         Ok(n) => tracing::warn!(corrected = n, "motor registers corrected"),
         Err(e) => {
-            tracing::error!(error = %e, "motor register check failed");
+            if loud {
+                tracing::error!(
+                    error = %e,
+                    attempt,
+                    "motor register check failed; waiting, is servo power on?"
+                );
+            }
             return None;
         }
     }
@@ -437,7 +494,7 @@ fn open_bus(port: &str) -> Option<duck_control::bus::DynamixelIo> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_port: &str) -> Option<FakeIo> {
+fn open_bus(_port: &str, _attempt: u32) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -476,7 +533,7 @@ async fn adopt_startup_pose<T: RobotIo>(
     while !state.shutdown.load(Ordering::Relaxed) {
         match io.read() {
             Ok(sensors) => {
-                state.startup_read_failures.store(0, Ordering::Relaxed);
+                state.startup_bus_failures.store(0, Ordering::Relaxed);
                 tracing::warn!(
                     joints = NUM_JOINTS,
                     hz = 1.0 / period.as_secs_f64(),
@@ -488,9 +545,7 @@ async fn adopt_startup_pose<T: RobotIo>(
                 attempt += 1;
                 // Published before sleeping, so `robot.health` can name the cause on the
                 // very first failure rather than after the first log line.
-                state
-                    .startup_read_failures
-                    .store(attempt, Ordering::Relaxed);
+                state.startup_bus_failures.store(attempt, Ordering::Relaxed);
                 if attempt == 1 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY) {
                     tracing::warn!(
                         error = %e,
@@ -1028,7 +1083,7 @@ mod tests {
     #[test]
     fn health_names_the_bus_while_waiting_for_it() {
         let s = RobotState::new(&Params::default(), false, false);
-        s.startup_read_failures.store(4, Ordering::Relaxed);
+        s.startup_bus_failures.store(4, Ordering::Relaxed);
 
         let health = s.health();
         assert!(!health.healthy);
@@ -1039,13 +1094,47 @@ mod tests {
         );
     }
 
+    /// **The regression.** A bus that cannot be *opened* — or whose register check fails,
+    /// which is what an unpowered board does — used to fall off the end of the control
+    /// thread. No loop was created and nothing had been recorded, so health fell back to
+    /// "control loop has not completed a cycle yet" for the life of the process: the one
+    /// message that says nothing about the cause. Retrying the first *read* did not help,
+    /// because execution never reached it.
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_that_cannot_be_opened_is_reported_rather_than_abandoned() {
+        let s = Arc::new(RobotState::new(&Params::default(), false, false));
+        let waiter_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            open_bus_waiting("/dev/definitely-not-a-bus", &waiter_state)
+                .await
+                .is_none()
+        });
+
+        // Bounded, so a regression fails rather than hanging CI.
+        for _ in 0..10_000 {
+            if s.startup_bus_failures.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            s.startup_bus_failures.load(Ordering::Relaxed) > 0,
+            "an unopenable bus must be recorded, or health cannot explain the silence"
+        );
+        // Which is exactly what health needs to name it and to pass the update gate.
+        assert!(s.health().degraded);
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        assert!(handle.await.unwrap(), "must give up only on shutdown");
+    }
+
     /// A silent bus must be *degraded*, not unhealthy: it reports the same before and after
     /// a swap, so rolling a release back cannot fix it and only wastes an update. An
     /// unpowered bench board is the case that has to keep updating.
     #[test]
     fn a_silent_bus_is_degraded_rather_than_unhealthy() {
         let s = RobotState::new(&Params::default(), false, false);
-        s.startup_read_failures.store(4, Ordering::Relaxed);
+        s.startup_bus_failures.store(4, Ordering::Relaxed);
 
         let health = s.health();
         assert!(!health.healthy);
@@ -1093,12 +1182,12 @@ mod tests {
 
         // Let it fail at least once, so shutdown lands mid-wait rather than before the start.
         for _ in 0..10_000 {
-            if s.startup_read_failures.load(Ordering::Relaxed) > 0 {
+            if s.startup_bus_failures.load(Ordering::Relaxed) > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        assert!(s.startup_read_failures.load(Ordering::Relaxed) > 0);
+        assert!(s.startup_bus_failures.load(Ordering::Relaxed) > 0);
 
         s.shutdown.store(true, Ordering::Relaxed);
         handle
