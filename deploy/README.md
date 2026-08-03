@@ -29,6 +29,20 @@ curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/ma
 sudo sh /tmp/setup-board.sh
 ```
 
+The first run copies itself to `/usr/local/sbin/robot-setup-board`, so after the reboot it
+asks for there is still something to run:
+
+```bash
+sudo reboot
+```
+
+```bash
+sudo /usr/local/sbin/robot-setup-board
+```
+
+`/tmp` is cleared on reboot, and a script whose whole job is *change boot config, reboot,
+confirm* should not delete itself in the middle of that.
+
 It ends with a status block — motor bus, ONNX Runtime, clock — so "is this board ready" is a
 question you can ask on its own, not only as a side effect of installing something.
 

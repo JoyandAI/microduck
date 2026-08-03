@@ -10,8 +10,12 @@
 # needs one, it says so and stops, and running it again afterwards continues.
 #
 #   sudo sh setup-board.sh
-#   sudo reboot            # only if it asks
-#   sudo sh setup-board.sh # confirms, then points at install.sh
+#   sudo reboot                     # only if it asks
+#   sudo /usr/local/sbin/robot-setup-board
+#
+# The first run copies itself to that path. /tmp does not survive a reboot, and a script
+# whose whole job is "change boot config, reboot, confirm" that then deletes itself across
+# the reboot is a bad joke to play on whoever is holding the board.
 #
 # Radxa Zero 3W on Armbian. Nothing here is specific to a robot revision.
 set -eu
@@ -25,16 +29,46 @@ MOTOR_PORT="${MOTOR_PORT:-/dev/ttyS2}"
 
 ENV_TXT=/boot/armbianEnv.txt
 
+# Where this script puts itself so it is still around after the reboot it asks for.
+SELF=/usr/local/sbin/robot-setup-board
+
 # Only what `robotd` needs. The prototype also enables i2c-gpio-pihat, aic3104-pihat and a
 # camera overlay; none apply here — our IMU rides the Dynamixel bus rather than I²C, and
 # `robotd` owns no camera or audio.
 REQUIRED_OVERLAY=uart2-m0
 
 needs_reboot=0
+# Whether we managed to leave a persistent copy, which decides what the reboot advice says.
+persisted=0
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Leave a copy somewhere that survives a reboot.
+#
+# Not possible when piped (`curl | sh`), because then there is no file to copy — `$0` is the
+# shell. That is fine; the reboot message adapts.
+persist_self() {
+    case "$0" in
+        sh|-sh|bash|-bash|/dev/fd/*|/proc/self/fd/*) return 0 ;;
+    esac
+    [ -f "$0" ] || return 0
+
+    # Already running from the installed copy: nothing to do, and copying a file onto
+    # itself would truncate it.
+    if [ "$(readlink -f "$0" 2>/dev/null)" = "$(readlink -f "$SELF" 2>/dev/null)" ]; then
+        persisted=1
+        return 0
+    fi
+
+    if install -m 0755 "$0" "$SELF" 2>/dev/null; then
+        persisted=1
+    else
+        warn "could not copy this script to ${SELF}; you will need to fetch it again after
+  the reboot."
+    fi
+}
 
 check_environment() {
     [ "$(id -u)" = 0 ] || die "run as root (sudo sh setup-board.sh)"
@@ -182,9 +216,15 @@ report() {
 
     if [ "$needs_reboot" = 1 ]; then
         say "reboot required, then run this again"
+        echo
+        echo "  sudo reboot"
+        if [ "$persisted" = 1 ]; then
+            echo "  sudo ${SELF}"
+        else
+            echo "  # then fetch and run this script again — it was not copied anywhere"
+            echo "  # persistent, so /tmp will have cleared it"
+        fi
         cat <<'EOF'
-
-  sudo reboot
 
   Boot configuration changed. Nothing else can be confirmed until the overlay is live, and
   this script is idempotent — running it again after the reboot picks up where it stopped.
@@ -204,6 +244,7 @@ EOF
 
 main() {
     check_environment
+    persist_self
     configure_overlay
     install_onnxruntime
     report
