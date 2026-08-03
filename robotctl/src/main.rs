@@ -413,8 +413,16 @@ fn run_health(robot_socket: &Path, json: bool) -> Result<(), Failure> {
     } else if health.healthy {
         println!("healthy");
     } else {
+        // "degraded" reads as what it is: this release is fine, this board cannot move.
+        // Still a non-zero exit — `install.sh` and anyone else scripting this should hear
+        // about an unpowered robot rather than see a silent success.
         println!(
-            "unhealthy: {}",
+            "{}: {}",
+            if health.degraded {
+                "degraded"
+            } else {
+                "unhealthy"
+            },
             health.reason.as_deref().unwrap_or("no reason given")
         );
     }

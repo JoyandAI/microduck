@@ -410,7 +410,9 @@ verify_install() {
         :
     else
         warn "robotd is up but not healthy. That is the honest answer, not necessarily a
-  failed install — a board with no motor bus reports exactly this. Look at:
+  failed install — a bench board reports exactly this until its servos are powered, and
+  the reason above says which. robotd keeps retrying, so powering the servos brings it up
+  without reinstalling or restarting anything. Look at:
     journalctl -u robotd -b --no-pager"
     fi
 }
