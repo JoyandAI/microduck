@@ -391,6 +391,43 @@ create_group() {
     if ! getent group robot >/dev/null; then
         die "the robot group could not be created; updaterd.service will not start without it"
     fi
+
+    add_operator_to_group
+}
+
+# Put the person doing the install in the `robot` group.
+#
+# The socket is mode 0660, root:robot, and `Group=robot` in the unit is load-bearing for
+# exactly this reason: group membership is how a non-root client reaches robotd. But the group
+# was only ever created, never populated — so on every board provisioned so far, no
+# unprivileged user could talk to the robot at all:
+#
+#   $ robotctl health
+#   error: cannot reach robotd at /run/robotd.sock: Permission denied (os error 13)
+#
+# which reads like a crashed daemon rather than a missing group.
+#
+# Read-only access, not a privilege grant: mutations are refused to non-root peers regardless
+# of group, so this permits asking and not commanding.
+add_operator_to_group() {
+    # The human who ran sudo, not `whoami` — that is root, which is already able to connect
+    # and would make this a silent no-op.
+    operator="${SUDO_USER:-}"
+    if [ -z "$operator" ] || [ "$operator" = root ]; then
+        return 0
+    fi
+
+    if id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx robot; then
+        return 0
+    fi
+
+    if usermod -aG robot "$operator"; then
+        say "added ${operator} to the robot group"
+        warn "${operator} must log out and back in before that takes effect. Until then,
+  read-only commands need sudo:  sudo robotctl health"
+    else
+        warn "could not add ${operator} to the robot group; robotctl will need sudo"
+    fi
 }
 
 # The units live inside the release, so this can only run after the release is installed.
