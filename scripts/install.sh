@@ -396,6 +396,23 @@ verify_install() {
     # support report. Non-fatal: a daemon that is active but not yet answering is a timing
     # artefact, not a failed install.
     robotctl version || warn "robotctl could not reach the daemons yet"
+
+    # And ask whether it is actually *working*, which `is-active` cannot tell you.
+    #
+    # robotd stays active with no motor bus: it logs the failure, keeps serving its socket,
+    # and reports unhealthy. Before this, a board with no servos wired produced a completely
+    # green install of a daemon that could not see a robot.
+    #
+    # Non-fatal on purpose. A bench board with no motors attached is a legitimate state — it
+    # is the right thing to test the update system against — so this reports rather than
+    # refuses. The exit code is swallowed deliberately.
+    if robotctl health; then
+        :
+    else
+        warn "robotd is up but not healthy. That is the honest answer, not necessarily a
+  failed install — a board with no motor bus reports exactly this. Look at:
+    journalctl -u robotd -b --no-pager"
+    fi
 }
 
 report() {
