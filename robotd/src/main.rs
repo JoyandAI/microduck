@@ -173,6 +173,13 @@ impl RobotState {
     fn health(&self) -> proto::HealthResult {
         let unhealthy = |reason: String| proto::HealthResult {
             healthy: false,
+            degraded: false,
+            reason: Some(reason),
+        };
+        // Not healthy, but not the release's fault either — see `HealthResult::degraded`.
+        let degraded = |reason: String| proto::HealthResult {
+            healthy: false,
+            degraded: true,
             reason: Some(reason),
         };
 
@@ -187,7 +194,9 @@ impl RobotState {
             // string as the reason it rolled a release back — so it has to name the cause.
             let waiting = self.startup_read_failures.load(Ordering::Relaxed);
             if waiting > 0 {
-                return unhealthy(format!(
+                // Degraded, not unhealthy: an unpowered bench board must not roll back every
+                // release shipped to it. The bus not answering is the same before and after.
+                return degraded(format!(
                     "no answer from the motor bus after {waiting} attempts; \
                      is servo power on and the bus wired?"
                 ));
@@ -219,6 +228,7 @@ impl RobotState {
 
         proto::HealthResult {
             healthy: true,
+            degraded: false,
             reason: None,
         }
     }
@@ -1027,6 +1037,36 @@ mod tests {
             reason.contains("motor bus") && reason.contains("servo power"),
             "unactionable reason: {reason}"
         );
+    }
+
+    /// A silent bus must be *degraded*, not unhealthy: it reports the same before and after
+    /// a swap, so rolling a release back cannot fix it and only wastes an update. An
+    /// unpowered bench board is the case that has to keep updating.
+    #[test]
+    fn a_silent_bus_is_degraded_rather_than_unhealthy() {
+        let s = RobotState::new(&Params::default(), false, false);
+        s.startup_read_failures.store(4, Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(!health.healthy);
+        assert!(
+            health.degraded,
+            "an unpowered board would roll back releases"
+        );
+    }
+
+    /// The other unhealthy states *are* evidence about the release, so they must not be
+    /// degraded — otherwise auto-rollback stops working for the cases it exists for.
+    #[test]
+    fn a_broken_control_loop_is_not_degraded() {
+        let s = RobotState::new(&Params::default(), false, false);
+        s.ticks.store(1, Ordering::Relaxed);
+        s.consecutive_errors
+            .store(s.max_consecutive_errors, Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(!health.healthy);
+        assert!(!health.degraded, "this must still roll back");
     }
 
     /// Before any read is attempted there is nothing to blame, so the plain starting-up
