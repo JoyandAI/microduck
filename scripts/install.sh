@@ -275,7 +275,13 @@ bootstrap_first_release() {
     chmod +x "${tmp}/updaterd"
 
     say "installing the first release (verifying signatures)"
-    "${tmp}/updaterd" install --config "${CONFIG_DIR}/updater.toml"
+    # GITHUB_TOKEN, not DUCK_TOKEN: the engine reads that name, and it needs one for the
+    # same reason this script does — a private repo's API answers 404 to an unauthenticated
+    # caller. Exported only for this command, deliberately: nothing is written to disk, so
+    # the installed `updaterd` still has no credential and still cannot fetch a *later*
+    # update until someone adds the systemd drop-in by hand. That asymmetry is the point —
+    # provisioning is a person at a keyboard, an unattended update is not.
+    GITHUB_TOKEN="$TOKEN" "${tmp}/updaterd" install --config "${CONFIG_DIR}/updater.toml"
 
     if [ ! -L "${INSTALL_DIR}/current" ]; then
         die "the install reported success but nothing is live"
