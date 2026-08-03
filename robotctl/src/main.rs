@@ -708,10 +708,48 @@ impl Failure {
 }
 
 /// Progress goes to stderr so `--json` output on stdout stays pipeable.
+///
+/// The engine emits progress once per network chunk — around 250 notifications for a 3.6 MB
+/// artifact — and printing a line for each buried the phases that actually matter in a
+/// screenful of `Downloading N%`. On a terminal this now rewrites a single line; when
+/// redirected, where `\r` is useless, it prints one line per decile instead.
 fn report_progress(progress: &proto::Progress) {
-    match progress.percent {
-        Some(percent) => eprintln!("  {:?} {percent}%", progress.phase),
-        None => eprintln!("  {:?}", progress.phase),
+    use std::io::{IsTerminal, Write};
+
+    // `Some` also means "a bare `\r` line is open and owes a newline".
+    static LAST: std::sync::Mutex<Option<(proto::Phase, u8)>> = std::sync::Mutex::new(None);
+
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let tty = std::io::stderr().is_terminal();
+
+    let Some(percent) = progress.percent else {
+        // A phase with no percentage. Close any open counter line first, or it gets
+        // overwritten and the download appears to stop partway.
+        if tty && last.is_some() {
+            eprintln!();
+        }
+        *last = None;
+        eprintln!("  {:?}", progress.phase);
+        return;
+    };
+
+    if tty {
+        eprint!("\r  {:?} {percent}%", progress.phase);
+        if percent >= 100 {
+            eprintln!();
+            *last = None;
+        } else {
+            *last = Some((progress.phase, 0));
+        }
+        let _ = std::io::stderr().flush();
+        return;
+    }
+
+    // 100 in its own bucket, so a finished download says so rather than stopping at 90.
+    let decile = if percent >= 100 { 10 } else { percent / 10 };
+    if *last != Some((progress.phase, decile)) {
+        *last = Some((progress.phase, decile));
+        eprintln!("  {:?} {percent}%", progress.phase);
     }
 }
 
