@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "duck-control"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rustypot",
  "serde",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "duck-ipc-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "semver",
  "serde",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "robotctl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "robotd"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "duck-control",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "minisign",
  "semver",
@@ -2319,7 +2319,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -2645,7 +2645,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "minisign",
