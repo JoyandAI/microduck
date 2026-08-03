@@ -137,6 +137,9 @@ struct RobotState {
     achieved_hz: AtomicU64,
     /// Consecutive failed bus reads. Reset by any success.
     consecutive_errors: AtomicU32,
+    /// Failed attempts to read the startup pose. Non-zero means the loop is still waiting
+    /// for the bus to answer and has never commanded anything.
+    startup_read_failures: AtomicU32,
     shutdown: AtomicBool,
 
     period_us: u64,
@@ -156,6 +159,7 @@ impl RobotState {
             last_tick_us: AtomicU64::new(0),
             achieved_hz: AtomicU64::new(0),
             consecutive_errors: AtomicU32::new(0),
+            startup_read_failures: AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
             min_achieved_hz: params.health.min_achieved_hz,
@@ -178,6 +182,16 @@ impl RobotState {
 
         // "Starting" is not "started". The gate polls, so it will see the transition.
         if self.ticks.load(Ordering::Relaxed) == 0 {
+            // Distinguish "starting" from "cannot see a robot". Both mean no ticks, but only
+            // one of them is going to resolve on its own, and the update system quotes this
+            // string as the reason it rolled a release back — so it has to name the cause.
+            let waiting = self.startup_read_failures.load(Ordering::Relaxed);
+            if waiting > 0 {
+                return unhealthy(format!(
+                    "no answer from the motor bus after {waiting} attempts; \
+                     is servo power on and the bus wired?"
+                ));
+            }
             return unhealthy("control loop has not completed a cycle yet".into());
         }
 
@@ -418,28 +432,79 @@ fn open_bus(_port: &str) -> Option<FakeIo> {
     None
 }
 
+/// How long to wait between attempts to read the startup pose.
+///
+/// A second, not a control period: the read itself already carries a 30 ms bus timeout, and
+/// a board waiting for someone to switch servo power on is not in a hurry. Fast enough that
+/// powering the robot brings it up while your hand is still on the switch.
+const STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Log one waiting line, then one every this many attempts — about one per 30 s.
+const STARTUP_READ_LOG_EVERY: u32 = 30;
+
+/// Adopt the pose the robot is already in, waiting for the bus to answer.
+///
+/// Never move on start: the servos hold their last commanded goal while this process is
+/// dead, so a restart mid-update leaves a standing robot standing, with no gap. That
+/// requires a successful read, so there is nothing to command until one lands.
+///
+/// This used to be a single read that logged and returned on failure — which killed the
+/// control thread for the life of the process. `robotd` stayed up and kept answering the
+/// socket, so a board booted before its servos were powered was permanently inert: powering
+/// them changed nothing and only `systemctl restart robotd` helped, with no hint anywhere
+/// that a restart was what was needed. Retrying makes the ordinary order of operations —
+/// power the board, then power the servos — just work.
+///
+/// Returns `None` only if shutdown is requested while waiting.
+async fn adopt_startup_pose<T: RobotIo>(
+    io: &mut T,
+    state: &RobotState,
+    period: Duration,
+) -> Option<JointTargets> {
+    let mut attempt = 0u32;
+
+    while !state.shutdown.load(Ordering::Relaxed) {
+        match io.read() {
+            Ok(sensors) => {
+                state.startup_read_failures.store(0, Ordering::Relaxed);
+                tracing::warn!(
+                    joints = NUM_JOINTS,
+                    hz = 1.0 / period.as_secs_f64(),
+                    "holding the pose found at startup"
+                );
+                return Some(JointTargets::new(sensors.positions));
+            }
+            Err(e) => {
+                attempt += 1;
+                // Published before sleeping, so `robot.health` can name the cause on the
+                // very first failure rather than after the first log line.
+                state
+                    .startup_read_failures
+                    .store(attempt, Ordering::Relaxed);
+                if attempt == 1 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY) {
+                    tracing::warn!(
+                        error = %e,
+                        attempt,
+                        "no answer from the motor bus; waiting, not commanding anything"
+                    );
+                }
+                tokio::time::sleep(STARTUP_RETRY_INTERVAL).await;
+            }
+        }
+    }
+
+    None
+}
+
 /// The tick.
 ///
 /// Slice 1 reads, publishes, and writes back the pose adopted at startup. The sensor sample
 /// is read every tick even though nothing consumes it yet — it is what makes the bus load,
 /// and therefore the timing, representative of what slice 2 will do.
 async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Duration) {
-    // Adopt the pose the robot is already in. Never move on start: the servos hold their
-    // last commanded goal while this process is dead, so a restart mid-update leaves a
-    // standing robot standing, with no gap.
-    let targets = match io.read() {
-        Ok(sensors) => JointTargets::new(sensors.positions),
-        Err(e) => {
-            tracing::error!(error = %e, "first bus read failed; not commanding anything");
-            return;
-        }
+    let Some(targets) = adopt_startup_pose(&mut io, &state, period).await else {
+        return;
     };
-    tracing::warn!(
-        joints = NUM_JOINTS,
-        hz = 1.0 / period.as_secs_f64(),
-        "holding the pose found at startup"
-    );
-
     let mut ticker = tokio::time::interval(period);
     // `Skip`, not `Burst` and not `Delay`.
     //
@@ -901,6 +966,108 @@ mod tests {
         assert_eq!(
             written.positions, resting,
             "the loop moved the robot instead of holding where it found it"
+        );
+    }
+
+    /// **The regression.** A board powered on before its servos gets no answer from the bus.
+    /// That used to kill the control thread outright — `robotd` stayed up, kept serving the
+    /// socket, and never ticked again no matter what happened to the robot afterwards. Only
+    /// `systemctl restart robotd` recovered it, and nothing said so.
+    ///
+    /// So: fail the first few reads, then answer, and require the loop to be running.
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_waits_for_the_bus_rather_than_giving_up() {
+        let mut resting = DEFAULT_POSITION;
+        resting[0] = 0.42;
+        // Three failures is arbitrary; one is enough to have broken the old code.
+        let io = FakeIo::at(resting).failing_reads(3).frozen();
+
+        let s = Arc::new(RobotState::new(&Params::default(), false, false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe(&mut io, loop_state, Duration::from_millis(2)).await;
+            tx.send(io.last_written).unwrap();
+        });
+
+        // Bounded, so a regression fails the test instead of hanging CI forever.
+        for _ in 0..10_000 {
+            if s.ticks.load(Ordering::Relaxed) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            s.ticks.load(Ordering::Relaxed) >= 3,
+            "the loop never started ticking; it gave up on the bus instead of waiting"
+        );
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        // And it still adopted the pose it found rather than the home pose — waiting must
+        // not cost the startup invariant.
+        let written = rx.recv().unwrap().expect("the loop must command something");
+        assert_eq!(written.positions, resting);
+    }
+
+    /// While waiting, health must say *why*. The update system quotes this string as the
+    /// reason it rolled a release back, and "control loop has not completed a cycle yet"
+    /// describes a robot that is about to start, not one that cannot see its servos.
+    #[test]
+    fn health_names_the_bus_while_waiting_for_it() {
+        let s = RobotState::new(&Params::default(), false, false);
+        s.startup_read_failures.store(4, Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(!health.healthy);
+        let reason = health.reason.unwrap();
+        assert!(
+            reason.contains("motor bus") && reason.contains("servo power"),
+            "unactionable reason: {reason}"
+        );
+    }
+
+    /// Before any read is attempted there is nothing to blame, so the plain starting-up
+    /// message is still the honest one.
+    #[test]
+    fn health_says_merely_starting_before_the_first_read_fails() {
+        let s = RobotState::new(&Params::default(), false, false);
+        let reason = s.health().reason.unwrap();
+        assert!(reason.contains("not completed a cycle"), "{reason}");
+    }
+
+    /// A robot whose bus never answers must still shut down promptly. Waiting forever is
+    /// correct; ignoring `systemctl stop` while doing it is not.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_for_the_bus_still_honours_shutdown() {
+        let io = FakeIo::at(DEFAULT_POSITION).failing_reads(u32::MAX);
+
+        let s = Arc::new(RobotState::new(&Params::default(), false, false));
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe(&mut io, loop_state, Duration::from_millis(2)).await;
+        });
+
+        // Let it fail at least once, so shutdown lands mid-wait rather than before the start.
+        for _ in 0..10_000 {
+            if s.startup_read_failures.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(s.startup_read_failures.load(Ordering::Relaxed) > 0);
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle
+            .await
+            .expect("the loop must exit when asked, even with no bus");
+        assert_eq!(
+            s.ticks.load(Ordering::Relaxed),
+            0,
+            "nothing should have been commanded without a successful read"
         );
     }
 
