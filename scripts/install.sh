@@ -396,6 +396,23 @@ verify_install() {
     # support report. Non-fatal: a daemon that is active but not yet answering is a timing
     # artefact, not a failed install.
     robotctl version || warn "robotctl could not reach the daemons yet"
+
+    # And ask whether it is actually *working*, which `is-active` cannot tell you.
+    #
+    # robotd stays active with no motor bus: it logs the failure, keeps serving its socket,
+    # and reports unhealthy. Before this, a board with no servos wired produced a completely
+    # green install of a daemon that could not see a robot.
+    #
+    # Non-fatal on purpose. A bench board with no motors attached is a legitimate state — it
+    # is the right thing to test the update system against — so this reports rather than
+    # refuses. The exit code is swallowed deliberately.
+    if robotctl health; then
+        :
+    else
+        warn "robotd is up but not healthy. That is the honest answer, not necessarily a
+  failed install — a board with no motor bus reports exactly this. Look at:
+    journalctl -u robotd -b --no-pager"
+    fi
 }
 
 report() {
@@ -413,13 +430,63 @@ waiting to be asked. Ordinary releases wait for a client.
 EOF
 }
 
+
+# The motor bus, checked but never configured here.
+#
+# Board bring-up is `setup-board.sh`'s job — device-tree overlays need a reboot and belong to
+# the board, not to a daemon release. But installing a robot daemon onto a board with no bus
+# is worth saying out loud: the install will succeed, `robotd` will start, fail to open the
+# bus, and report unhealthy. That is honest behaviour, and an easy thing to stare past.
+MOTOR_PORT="${MOTOR_PORT:-/dev/ttyS2}"
+
+check_board() {
+    if [ -e "$MOTOR_PORT" ]; then
+        return 0
+    fi
+    warn "${MOTOR_PORT} does not exist, so robotd will have no motor bus.
+  Run scripts/setup-board.sh (then reboot) to enable it. Installing anyway: the update
+  system is worth testing on a board whose bus is not wired yet, and robotd reports itself
+  unhealthy rather than pretending."
+}
+
+# Let `updaterd` fetch updates on a *developer's* board.
+#
+# Only when a token was supplied, and never on a customer robot: those install from a public
+# artifact repository and pass no token, so they never reach this path. A fleet-wide
+# credential baked into an image is one that leaks and cannot be rotated without reflashing —
+# the failure the tiered signing keys exist to avoid (deploy/README.md).
+#
+# Without this, `updaterd` is installed, running, and unable to fetch a single update — which
+# is most of what it is for.
+install_token_dropin() {
+    if [ -z "$TOKEN" ]; then
+        say "no token supplied; updaterd will not be able to fetch updates"
+        return 0
+    fi
+
+    dir=/etc/systemd/system/updaterd.service.d
+    mkdir -p "$dir"
+    # Restrictive umask before the write, not chmod after: a drop-in is world-readable by
+    # default, and this one holds a credential from the moment it exists.
+    (
+        umask 077
+        printf '[Service]\nEnvironment=GITHUB_TOKEN=%s\n' "$TOKEN" > "${dir}/token.conf"
+    )
+    systemctl daemon-reload
+    say "wrote ${dir}/token.conf (mode 600) so updaterd can fetch updates"
+    warn "that file holds a GitHub token in plaintext. Fine on a developer's board, not on a
+  robot you ship. It is why artifact hosting is still open — docs/updater-design.md §6.1."
+}
+
 main() {
     check_environment
+    check_board
     wait_for_clock
     install_config
     bootstrap_first_release
     create_group
     install_units
+    install_token_dropin
     verify_install
     report
 }
