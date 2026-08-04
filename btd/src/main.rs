@@ -30,6 +30,13 @@ struct Args {
     #[arg(long, default_value = duck_ipc_proto::socket::CONFIG)]
     config_socket: PathBuf,
 
+    /// Serve without requiring a paired, encrypted link.
+    ///
+    /// Bench use only. Without pairing, anyone in radio range can write requests — including
+    /// `net.connect`, which carries a wifi passphrase.
+    #[arg(long)]
+    insecure_no_pairing: bool,
+
     /// Name to advertise. Defaults to the hostname.
     ///
     /// This is what someone sees in a phone's Bluetooth list. It becomes `system.setName`'s
@@ -88,13 +95,13 @@ async fn main() -> ExitCode {
     };
     let name = args.name.unwrap_or_else(hostname);
 
-    run(sockets, name).await
+    run(sockets, name, !args.insecure_no_pairing).await
 }
 
 #[cfg(target_os = "linux")]
-async fn run(sockets: Sockets, name: String) -> ExitCode {
+async fn run(sockets: Sockets, name: String, require_pairing: bool) -> ExitCode {
     tokio::select! {
-        result = btd::bluez::serve(sockets, name) => match result {
+        result = btd::bluez::serve(sockets, name, require_pairing) => match result {
             // `serve` only returns when BlueZ closes the control stream, which means the
             // adapter went away. Exiting non-zero lets systemd restart us into the retry loop
             // rather than leaving a daemon that is advertising nothing.
@@ -119,7 +126,7 @@ async fn run(sockets: Sockets, name: String) -> ExitCode {
 /// The crate still builds and tests here, which is the point: `cargo test` on a laptop is the
 /// onboarding path, and only the radio is Linux-only.
 #[cfg(not(target_os = "linux"))]
-async fn run(_sockets: Sockets, _name: String) -> ExitCode {
+async fn run(_sockets: Sockets, _name: String, _require_pairing: bool) -> ExitCode {
     tracing::error!(
         "btd needs BlueZ, which is Linux-only. This binary exists here so the crate builds \
          and its tests run; it cannot serve BLE on this platform."

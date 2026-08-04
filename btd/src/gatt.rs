@@ -8,29 +8,37 @@
 //! Random v4 UUIDs rather than anything derived: they are ours, and they must not change once an
 //! app has shipped against them. Written out in full so that grepping for a value finds this
 //! comment.
+//!
+//! ## One characteristic, both directions
+//!
+//! A client **writes** requests to [`RPC_UUID`] and **subscribes** to the same characteristic for
+//! responses. Two characteristics — a write one and a notify one — is the more conventional
+//! shape, and this was written that way first. It is worse here for a specific reason: BlueZ
+//! reports a write and a subscription as separate events, so with two characteristics a robot has
+//! to pair the write half of one with the notify half of the other by device address, guessing at
+//! the association. With one characteristic both events belong to it by construction, and a
+//! connection is a genuine duplex stream.
+//!
+//! A characteristic with both `write` and `notify` is ordinary BLE. The cost is that it reads
+//! slightly oddly in a generic browser like nRF Connect, where the same row is both.
 
 /// The robot's service. What a client scans for.
 pub const SERVICE_UUID: uuid::Uuid = uuid::uuid!("6f5d2a10-3b47-4c8e-9a1f-2d7e8c4b6019");
 
-/// Central → robot. NDJSON request bytes, chunked, written here.
-pub const REQUEST_UUID: uuid::Uuid = uuid::uuid!("6f5d2a11-3b47-4c8e-9a1f-2d7e8c4b6019");
-
-/// Robot → central. NDJSON response and notification bytes, chunked, notified here.
-pub const RESPONSE_UUID: uuid::Uuid = uuid::uuid!("6f5d2a12-3b47-4c8e-9a1f-2d7e8c4b6019");
+/// The RPC pipe: write NDJSON request bytes here, subscribe here for the answers.
+///
+/// Chunked in both directions, delimited by the newline that already separates NDJSON messages —
+/// see [`crate::framing`], which is the module both the robot and `btctl` use.
+pub const RPC_UUID: uuid::Uuid = uuid::uuid!("6f5d2a11-3b47-4c8e-9a1f-2d7e8c4b6019");
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Distinct, and stable forever once an app ships against them. A copy-paste making two of
-    /// them equal would present one characteristic and hang a client waiting for the other.
+    /// The service and the characteristic must differ, and both are frozen once an app ships
+    /// against them.
     #[test]
     fn the_uuids_are_distinct() {
-        let all = [SERVICE_UUID, REQUEST_UUID, RESPONSE_UUID];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a, b);
-            }
-        }
+        assert_ne!(SERVICE_UUID, RPC_UUID);
     }
 }

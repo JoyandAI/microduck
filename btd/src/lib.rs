@@ -5,8 +5,9 @@
 //! service would depend on `btd`, and an SDK would absurdly have to go through Bluetooth to
 //! set a robot's name.
 //!
-//! So the design is a pipe. A GATT service with two characteristics — write `request`, notify
-//! `response` — carries **the same NDJSON JSON-RPC lines as every other transport**, and `btd`
+//! So the design is a pipe. A GATT service with one characteristic — written to for requests,
+//! subscribed to for answers — carries **the same NDJSON JSON-RPC lines as every other
+//! transport** (see [`gatt`] for why one and not two), and `btd`
 //! reassembles them, checks the method against [`route`]'s table, forwards them verbatim to
 //! the owning service's unix socket, and chunks the replies back. Adding a method to the
 //! protocol needs no change here beyond one line in that table.
@@ -31,6 +32,7 @@ pub mod bluez;
 pub mod framing;
 pub mod gatt;
 pub mod link;
+pub mod pairing;
 pub mod route;
 pub mod session;
 pub mod upstream;

@@ -115,6 +115,10 @@ pub mod method {
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
     pub const SYSTEM_REBOOT: &str = "system.reboot";
+    /// The Bluetooth pairing PIN. Never reachable over Bluetooth itself.
+    pub const SYSTEM_PAIRING_PIN: &str = "system.pairingPin";
+    /// Set the Bluetooth pairing PIN.
+    pub const SYSTEM_SET_PAIRING_PIN: &str = "system.setPairingPin";
 }
 
 /// JSON-RPC error codes.
@@ -203,6 +207,13 @@ pub enum Call {
     SystemInfo,
     SystemSetName(SetNameParams),
     SystemReboot,
+    /// Read the pairing PIN.
+    ///
+    /// Exists so `btd` can answer a BLE passkey request without owning config. It must never be
+    /// routed to BLE — a PIN an unpaired peer can read authorises nothing — and `btd`'s routing
+    /// table has a test saying so.
+    SystemPairingPin,
+    SystemSetPairingPin(SetPairingPinParams),
 }
 
 impl Call {
@@ -231,6 +242,8 @@ impl Call {
             Call::SystemInfo => method::SYSTEM_INFO,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
+            Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
+            Call::SystemSetPairingPin(_) => method::SYSTEM_SET_PAIRING_PIN,
         }
     }
 
@@ -252,6 +265,7 @@ impl Call {
                 | Call::NetForget(_)
                 | Call::SystemSetName(_)
                 | Call::SystemReboot
+                | Call::SystemSetPairingPin(_)
         )
     }
 
@@ -289,6 +303,7 @@ impl Call {
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
             Call::SystemSetName(p) => encode(p),
+            Call::SystemSetPairingPin(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -298,7 +313,8 @@ impl Call {
             | Call::NetStatus
             | Call::NetScan
             | Call::SystemInfo
-            | Call::SystemReboot => Value::Object(serde_json::Map::new()),
+            | Call::SystemReboot
+            | Call::SystemPairingPin => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -336,6 +352,8 @@ impl Call {
             method::SYSTEM_INFO => Call::SystemInfo,
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
+            method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
+            method::SYSTEM_SET_PAIRING_PIN => Call::SystemSetPairingPin(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -613,6 +631,16 @@ pub struct NetForgetParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetNameParams {
     pub name: String,
+}
+
+/// Set the Bluetooth pairing PIN.
+///
+/// A **string, not an integer**, because leading zeros are significant: the default is `000000`,
+/// and a `u32` would store that as 0 and display it as "0". The robot and the phone must agree
+/// on six characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetPairingPinParams {
+    pub pin: String,
 }
 
 // ── results ──────────────────────────────────────────────────────────────────
@@ -931,6 +959,19 @@ pub struct SetNameResult {
     pub name: String,
 }
 
+/// Answer to [`Call::SystemPairingPin`] and [`Call::SystemSetPairingPin`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingPinResult {
+    /// Six digits, leading zeros included.
+    pub pin: String,
+    /// True while the robot is still on the factory PIN.
+    ///
+    /// Worth a field rather than leaving callers to compare against a constant: a default PIN
+    /// authorises nothing, because everyone in radio range knows it, and every client should be
+    /// able to say so without hardcoding the value.
+    pub is_default: bool,
+}
+
 /// Answer to [`Call::SystemReboot`].
 ///
 /// The reboot is *scheduled*, not immediate, and the delay is what makes this answerable at
@@ -1053,6 +1094,8 @@ mod tests {
             Call::SystemInfo,
             Call::SystemSetName(SetNameParams { name: "duck-01".into() }),
             Call::SystemReboot,
+            Call::SystemPairingPin,
+            Call::SystemSetPairingPin(SetPairingPinParams { pin: "042042".into() }),
         ]
     }
 
@@ -1155,6 +1198,7 @@ mod tests {
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,
                 method::SYSTEM_REBOOT,
+                method::SYSTEM_SET_PAIRING_PIN,
             ]
         );
     }

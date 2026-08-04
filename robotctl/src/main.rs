@@ -73,15 +73,19 @@ struct Cli {
 
     /// Path to the robotd socket. Only used by `version`, which asks each daemon what it
     /// is running.
-    #[arg(long, global = true, default_value = "/run/robotd.sock")]
+    #[arg(long, global = true, default_value = proto::socket::ROBOT)]
     robot_socket: PathBuf,
+
+    /// Path to the configd socket — wifi and the robot's identity.
+    #[arg(long, global = true, default_value = proto::socket::CONFIG)]
+    config_socket: PathBuf,
 
     #[command(subcommand)]
     namespace: Namespace,
 }
 
-/// Only `update` exists today, plus `version`. The namespace layer is here so adding
-/// `robotctl motors` later is additive rather than a restructure.
+/// One namespace per owning service, so adding `robotctl motors` later is additive rather
+/// than a restructure.
 #[derive(Subcommand, Debug)]
 enum Namespace {
     /// Update and release management.
@@ -108,6 +112,92 @@ enum Namespace {
     /// Distinct from `--version`, which reports only this binary. This asks every daemon.
     Version {
         /// Machine-readable output, for support bundles and scripts.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Wifi. Served by `configd`, which drives NetworkManager.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Net {
+        #[command(subcommand)]
+        command: NetCommand,
+    },
+
+    /// The robot's name, identity and power.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    System {
+        #[command(subcommand)]
+        command: SystemCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NetCommand {
+    /// SSID, signal and addresses. Changes nothing.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Networks in range, strongest first. Changes nothing.
+    Scan {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Join a network and store it, so the robot rejoins by itself afterwards.
+    Connect {
+        ssid: String,
+        /// Passphrase. Omit for an open network.
+        ///
+        /// Prefer `--psk-stdin` on a shared machine: an argument is visible in `ps` for the
+        /// lifetime of the command, and this one is a credential.
+        #[arg(long, conflicts_with = "psk_stdin")]
+        psk: Option<String>,
+        /// Read the passphrase from stdin instead, so it never reaches the process list.
+        #[arg(long)]
+        psk_stdin: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forget a stored network.
+    Forget {
+        ssid: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SystemCommand {
+    /// Name, serial and uptime. Changes nothing.
+    Info {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename the robot. This is the name a phone sees over Bluetooth.
+    SetName {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the Bluetooth pairing PIN.
+    ///
+    /// Deliberately reachable here and NOT over Bluetooth: a PIN readable by an unpaired peer
+    /// would authorise nothing at all.
+    Pin {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the Bluetooth pairing PIN. Six digits.
+    SetPin {
+        pin: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reboot, cleanly, through systemd.
+    Reboot {
+        /// Reboot without asking.
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         json: bool,
     },
@@ -707,6 +797,256 @@ impl Failure {
     }
 }
 
+// ── configd: net.* and system.* ──────────────────────────────────────────────
+
+/// A response becomes its result, or the failure the daemon reported.
+///
+/// The `update` path inlines this because it also has to print progress; these calls have none,
+/// so they share one line.
+fn result_of(response: proto::Response) -> Result<serde_json::Value, Failure> {
+    if let Some(error) = response.error {
+        return Err(Failure::from_rpc(error));
+    }
+    Ok(response.result.unwrap_or(serde_json::Value::Null))
+}
+
+/// Ask `configd` one question and print the answer.
+///
+/// Every one of these is a single call with no progress stream, so they share one shape:
+/// connect, handshake, call, render. The rendering is deliberately not `Debug` output — a
+/// human running `robotctl net status` wants two lines, and `--json` is there for everything
+/// else.
+fn run_net(socket: &Path, command: NetCommand) -> Result<(), Failure> {
+    let mut client = Client::connect_to("configd", socket)?;
+    client.hello()?;
+
+    let (call, json) = match &command {
+        NetCommand::Status { json } => (proto::Call::NetStatus, *json),
+        NetCommand::Scan { json } => (proto::Call::NetScan, *json),
+        NetCommand::Forget { ssid, json } => (
+            proto::Call::NetForget(proto::NetForgetParams { ssid: ssid.clone() }),
+            *json,
+        ),
+        NetCommand::Connect { ssid, psk, psk_stdin, json } => {
+            let psk = if *psk_stdin { Some(read_secret()?) } else { psk.clone() };
+            (
+                proto::Call::NetConnect(proto::NetConnectParams { ssid: ssid.clone(), psk }),
+                *json,
+            )
+        }
+    };
+
+    let result = result_of(client.call(&call)?)?;
+    if json {
+        println!("{}", compact(&result));
+        return Ok(());
+    }
+
+    match command {
+        NetCommand::Status { .. } => println!("{}", render_net_status(&result)?),
+        NetCommand::Scan { .. } => println!("{}", render_scan(&result)?),
+        NetCommand::Connect { .. } => return report_connect(&result),
+        NetCommand::Forget { ssid, .. } => {
+            let forgotten: proto::ForgetResult = decode(&result)?;
+            if forgotten.removed {
+                println!("forgot {ssid}");
+            } else {
+                // Not an error: a client asking twice should not be told it failed.
+                println!("{ssid} was not stored");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
+    // Asked before connecting, so a robot is not disturbed by a command the operator then
+    // aborts.
+    if let SystemCommand::Reboot { yes: false, .. } = &command {
+        return Err(Failure::new(
+            exit::USAGE,
+            "this reboots the robot. Re-run with --yes if that is what you want.".to_owned(),
+        ));
+    }
+
+    let mut client = Client::connect_to("configd", socket)?;
+    client.hello()?;
+
+    let (call, json) = match &command {
+        SystemCommand::Info { json } => (proto::Call::SystemInfo, *json),
+        SystemCommand::SetName { name, json } => (
+            proto::Call::SystemSetName(proto::SetNameParams { name: name.clone() }),
+            *json,
+        ),
+        SystemCommand::Pin { json } => (proto::Call::SystemPairingPin, *json),
+        SystemCommand::SetPin { pin, json } => (
+            proto::Call::SystemSetPairingPin(proto::SetPairingPinParams { pin: pin.clone() }),
+            *json,
+        ),
+        SystemCommand::Reboot { json, .. } => (proto::Call::SystemReboot, *json),
+    };
+
+    let result = result_of(client.call(&call)?)?;
+    if json {
+        println!("{}", compact(&result));
+        return Ok(());
+    }
+
+    match command {
+        SystemCommand::Info { .. } => {
+            let info: proto::SystemInfoResult = decode(&result)?;
+            println!("name    {}", info.name);
+            println!("serial  {}", info.serial.as_deref().unwrap_or("not provisioned"));
+            println!("uptime  {}", format_uptime(info.uptime_seconds));
+        }
+        SystemCommand::SetName { .. } => {
+            let renamed: proto::SetNameResult = decode(&result)?;
+            // The stored name, not what was asked for: trimming and truncation mean they can
+            // differ, and showing the request would disagree with the robot.
+            println!("name    {}", renamed.name);
+            println!("Bluetooth advertises the new name after:  systemctl restart btd");
+        }
+        SystemCommand::Pin { .. } | SystemCommand::SetPin { .. } => {
+            let pin: proto::PairingPinResult = decode(&result)?;
+            println!("pairing PIN  {}", pin.pin);
+            if pin.is_default {
+                println!(
+                    "This is the factory default, so it authorises nothing — anyone in range \n\
+                     knows it. Set a per-robot PIN:  sudo robotctl system set-pin <6 digits>"
+                );
+            }
+        }
+        SystemCommand::Reboot { .. } => {
+            let reboot: proto::RebootResult = decode(&result)?;
+            println!("rebooting in {}s", reboot.in_seconds);
+        }
+    }
+    Ok(())
+}
+
+fn render_net_status(result: &serde_json::Value) -> Result<String, Failure> {
+    use std::fmt::Write;
+    let status: proto::NetStatusResult = decode(result)?;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "state   {:?}", status.state);
+    if let Some(ssid) = &status.ssid {
+        let signal = status.signal.map(|s| format!("  ({s}%)")).unwrap_or_default();
+        let _ = writeln!(out, "ssid    {ssid}{signal}");
+    }
+    if let Some(ip4) = &status.ip4 {
+        let _ = writeln!(out, "ipv4    {ip4}");
+    }
+    if let Some(ip6) = &status.ip6 {
+        let _ = writeln!(out, "ipv6    {ip6}");
+    }
+    if let Some(iface) = &status.iface {
+        let mac = status.mac.as_deref().unwrap_or("unknown");
+        let _ = writeln!(out, "iface   {iface}  {mac}");
+    }
+
+    // The one state worth explaining, because it is a provisioning mistake rather than a
+    // network problem and the fix is a different script entirely.
+    if status.state == proto::NetState::Unavailable {
+        let _ = write!(
+            out,
+            "\nNetworkManager manages no wifi device. If this board still runs netplan, \n\
+             run scripts/migrate-network.sh first."
+        );
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+fn render_scan(result: &serde_json::Value) -> Result<String, Failure> {
+    use std::fmt::Write;
+    let scan: proto::NetScanResult = decode(result)?;
+
+    if scan.networks.is_empty() {
+        return Ok("no networks in range".to_owned());
+    }
+    let mut out = String::new();
+    for network in &scan.networks {
+        let saved = if network.saved { " (saved)" } else { "" };
+        let _ = writeln!(
+            out,
+            "{:>3}%  {:<12} {}{}",
+            network.signal,
+            format!("{:?}", network.security),
+            network.ssid,
+            saved
+        );
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+/// A join is a successful call that may report a failed outcome, and the difference matters:
+/// the exit status has to distinguish "the robot refused" from "the robot could not be asked",
+/// and a wrong passphrase is the case a script most wants to detect.
+fn report_connect(result: &serde_json::Value) -> Result<(), Failure> {
+    match decode::<proto::ConnectResult>(result)? {
+        proto::ConnectResult::Connected { ssid, ip4 } => {
+            println!("connected to {ssid}");
+            if let Some(ip4) = ip4 {
+                println!("ipv4      {ip4}");
+            } else {
+                // Associated but no address yet: DHCP is still running, and saying so is better
+                // than printing nothing where an address should be.
+                println!("ipv4      pending (DHCP)");
+            }
+            Ok(())
+        }
+        proto::ConnectResult::Failed { reason, detail } => {
+            let advice = match reason {
+                proto::ConnectFailure::BadKey => "the passphrase was rejected",
+                proto::ConnectFailure::NotFound => "that network is not in range",
+                proto::ConnectFailure::Timeout => "it associated but never finished; try again",
+                proto::ConnectFailure::Unsupported => "this network needs something we cannot do",
+                proto::ConnectFailure::Other => "the join failed",
+            };
+            let detail = detail.map(|d| format!(" ({d})")).unwrap_or_default();
+            Err(Failure::new(exit::REFUSED, format!("{advice}{detail}")))
+        }
+    }
+}
+
+/// Read a passphrase from stdin, so it never appears in the process list.
+fn read_secret() -> Result<String, Failure> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| Failure::new(exit::USAGE, format!("cannot read the passphrase: {e}")))?;
+    // Only the trailing newline is stripped: a passphrase may legitimately end in a space, and
+    // trimming one would produce a wrong-password failure nobody could explain.
+    Ok(line.trim_end_matches(['\n', '\r']).to_owned())
+}
+
+fn format_uptime(seconds: u64) -> String {
+    let (days, hours, minutes) = (seconds / 86400, (seconds % 86400) / 3600, (seconds % 3600) / 60);
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+/// Decode a result, naming the disagreement rather than reporting a serde error.
+///
+/// A shape mismatch here means `robotctl` and the daemon were built from different revisions,
+/// which the `hello` handshake is meant to catch — so if it happens, saying so is far more use
+/// than "missing field `state`".
+fn decode<T: for<'de> serde::Deserialize<'de>>(value: &serde_json::Value) -> Result<T, Failure> {
+    serde_json::from_value(value.clone()).map_err(|e| {
+        Failure::new(
+            exit::FAILED,
+            format!("cannot read the daemon's answer ({e}). Are robotctl and configd the same build?"),
+        )
+    })
+}
+
 /// Progress goes to stderr so `--json` output on stdout stays pipeable.
 ///
 /// The engine emits progress once per network chunk — around 250 notifications for a 3.6 MB
@@ -790,6 +1130,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Version { json } => {
             return run_version(&cli.socket, &cli.robot_socket, json);
+        }
+        Namespace::Net { command } => {
+            return run_net(&cli.config_socket, command);
+        }
+        Namespace::System { command } => {
+            return run_system(&cli.config_socket, command);
         }
         Namespace::Update { command } => command,
     };

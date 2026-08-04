@@ -80,6 +80,11 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // Unlike `resetToGolden` it discards nothing.
         SystemReboot => Some(Upstream::Config),
 
+        // The pairing PIN, and the one refusal in this file that is load-bearing rather than
+        // conservative: a PIN readable by an unpaired peer authorises nothing at all. `btd`
+        // reads it over the unix socket to answer BlueZ's passkey request, and BLE never can.
+        SystemPairingPin | SystemSetPairingPin(_) => None,
+
         // ── refused ─────────────────────────────────────────────────────────
 
         // Operator surgery. Choosing which installed release runs, or pinning one, is a
@@ -153,6 +158,22 @@ mod tests {
                 proto::method::SYSTEM_SET_NAME,
                 proto::method::SYSTEM_REBOOT,
             ]
+        );
+    }
+
+    /// The PIN must never be readable or writable over the radio.
+    ///
+    /// This is the one refusal here that is not merely cautious: pairing is what authorises a
+    /// BLE client at all (§4.2), and a passkey an unpaired peer could ask for — or worse,
+    /// overwrite — would make the whole mechanism theatre. `btd` gets it over the unix socket.
+    #[test]
+    fn the_pairing_pin_is_not_reachable_over_ble() {
+        assert_eq!(upstream_for(&proto::Call::SystemPairingPin), None);
+        assert_eq!(
+            upstream_for(&proto::Call::SystemSetPairingPin(proto::SetPairingPinParams {
+                pin: "000000".into()
+            })),
+            None
         );
     }
 
@@ -253,6 +274,8 @@ mod tests {
             proto::Call::SystemInfo,
             proto::Call::SystemSetName(proto::SetNameParams { name: "duck".into() }),
             proto::Call::SystemReboot,
+            proto::Call::SystemPairingPin,
+            proto::Call::SystemSetPairingPin(proto::SetPairingPinParams { pin: "000000".into() }),
         ]
     }
 }

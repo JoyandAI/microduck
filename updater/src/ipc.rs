@@ -618,7 +618,9 @@ impl Server {
             | Call::NetForget(_)
             | Call::SystemInfo
             | Call::SystemSetName(_)
-            | Call::SystemReboot => Response::err(
+            | Call::SystemReboot
+            | Call::SystemPairingPin
+            | Call::SystemSetPairingPin(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,

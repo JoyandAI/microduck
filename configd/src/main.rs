@@ -342,6 +342,31 @@ async fn dispatch(
                 proto::Error::new(proto::code::INVALID_PARAMS, e.to_string()),
             ),
         },
+        proto::Call::SystemPairingPin => {
+            let pin = service.store.name_and_pin_result();
+            proto::Response::ok(Some(id), &pin)
+        }
+        proto::Call::SystemSetPairingPin(params) => {
+            // The PIN itself is not logged. It is not much of a secret — a default one is
+            // printed in this repo — but a per-robot one is meant to be, and a journal is the
+            // wrong place for it.
+            match service.store.set_pairing_pin(&params.pin) {
+                Ok(pin) => {
+                    tracing::info!("pairing PIN changed");
+                    proto::Response::ok(
+                        Some(id),
+                        &proto::PairingPinResult {
+                            is_default: pin == configd::store::DEFAULT_PIN,
+                            pin,
+                        },
+                    )
+                }
+                Err(e) => proto::Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::INVALID_PARAMS, e.to_string()),
+                ),
+            }
+        }
         proto::Call::SystemReboot => {
             power::schedule();
             proto::Response::ok(

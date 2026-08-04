@@ -25,10 +25,31 @@ use serde::{Deserialize, Serialize};
 /// returning what was stored is the honest version.
 pub const MAX_NAME: usize = 24;
 
+/// The factory pairing PIN.
+///
+/// A known default rather than a random per-board value, deliberately, and it is the weakest
+/// link here: everyone in radio range knows it, so it proves physical presence and nothing more.
+/// It exists so the *process* is in place — the agent, the storage, the six-digit contract — and
+/// so a robot is provisionable out of the box. A per-device PIN printed under the robot is
+/// provisioning's job (`updater-design.md` §5.7), and `is_default` on the result exists so every
+/// client can say out loud that this one is not a secret.
+pub const DEFAULT_PIN: &str = "000000";
+
+/// How many digits a PIN has.
+///
+/// **Six, not five.** Bluetooth's passkey entry is defined as a six-digit value, 000000–999999
+/// (Core spec, LE Secure Connections), and BlueZ hands it to an agent as exactly that. Five
+/// digits would have to be padded to six somewhere, and the two sides would then disagree about
+/// whether the PIN is "12345" or "012345" — which is a support call nobody can diagnose. Six is
+/// the format the radio already speaks.
+pub const PIN_DIGITS: usize = 6;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pairing_pin: Option<String>,
 }
 
 pub struct Store {
@@ -76,6 +97,37 @@ impl Store {
         config.name = Some(name.clone());
         self.write(&config)?;
         Ok(name)
+    }
+
+    /// The pairing PIN, or the factory default.
+    pub fn pairing_pin(&self) -> String {
+        self.read()
+            .ok()
+            .and_then(|config| config.pairing_pin)
+            .unwrap_or_else(|| DEFAULT_PIN.to_owned())
+    }
+
+    /// Store a PIN. Six digits, leading zeros kept.
+    pub fn set_pairing_pin(&self, requested: &str) -> std::io::Result<String> {
+        let pin = requested.trim();
+        if pin.len() != PIN_DIGITS || !pin.chars().all(|c| c.is_ascii_digit()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("a pairing PIN is exactly {PIN_DIGITS} digits, 000000 to 999999"),
+            ));
+        }
+
+        let mut config = self.read().unwrap_or_default();
+        config.pairing_pin = Some(pin.to_owned());
+        self.write(&config)?;
+        Ok(pin.to_owned())
+    }
+
+    /// The PIN as a protocol result, so the `is_default` judgement lives with the constant it
+    /// compares against rather than in every caller.
+    pub fn name_and_pin_result(&self) -> duck_ipc_proto::PairingPinResult {
+        let pin = self.pairing_pin();
+        duck_ipc_proto::PairingPinResult { is_default: pin == DEFAULT_PIN, pin }
     }
 
     fn read(&self) -> std::io::Result<Config> {
@@ -202,6 +254,53 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         // And nothing was written, so the previous name stands.
         assert_eq!(store(dir.path()).name(), "radxa-zero3");
+    }
+
+    /// An unprovisioned robot is pairable with the factory PIN rather than not pairable at all.
+    #[test]
+    fn a_missing_pin_is_the_factory_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(store(dir.path()).pairing_pin(), DEFAULT_PIN);
+    }
+
+    /// Leading zeros are the whole reason this is a string. Storing "012345" as a number and
+    /// rendering it back would give "12345", and the phone would be told the wrong PIN.
+    #[test]
+    fn a_pin_keeps_its_leading_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        assert_eq!(store.set_pairing_pin("012345").unwrap(), "012345");
+        assert_eq!(store.pairing_pin(), "012345");
+    }
+
+    /// Anything the radio cannot express is refused, rather than silently padded or truncated
+    /// into a PIN the two sides disagree about.
+    #[test]
+    fn a_pin_must_be_exactly_six_digits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        for bad in ["12345", "1234567", "", "12 456", "abcdef", "12345٦"] {
+            assert_eq!(
+                store.set_pairing_pin(bad).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput,
+                "accepted {bad:?}"
+            );
+        }
+        // And nothing was stored, so the default still stands.
+        assert_eq!(store.pairing_pin(), DEFAULT_PIN);
+    }
+
+    /// The name and the PIN share one file, so writing one must not lose the other.
+    #[test]
+    fn a_name_and_a_pin_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.set_name("Ducky").unwrap();
+        store.set_pairing_pin("424242").unwrap();
+        assert_eq!(store.name(), "Ducky");
+        assert_eq!(store.pairing_pin(), "424242");
+        store.set_name("Other").unwrap();
+        assert_eq!(store.pairing_pin(), "424242", "the PIN was lost by a rename");
     }
 
     /// No temp or lock file left behind that a later read could mistake for the config.

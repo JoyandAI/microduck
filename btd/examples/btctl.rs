@@ -25,7 +25,7 @@
 
 use std::time::Duration;
 
-use btd::gatt::{REQUEST_UUID, RESPONSE_UUID, SERVICE_UUID};
+use btd::gatt::{RPC_UUID, SERVICE_UUID};
 use btd::framing::{self, Reassembler};
 use btleplug::api::{
     Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
@@ -236,17 +236,20 @@ fn characteristics(
     let all = peripheral.characteristics();
     let find = |uuid| all.iter().find(|c| c.uuid == uuid).cloned();
 
-    let request = find(REQUEST_UUID)
-        .ok_or("the robot has no request characteristic; is this the right service?")?;
-    let response = find(RESPONSE_UUID).ok_or("the robot has no response characteristic")?;
+    let rpc = find(RPC_UUID)
+        .ok_or("the robot has no RPC characteristic; is this the right service?")?;
 
-    if !request.properties.intersects(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE) {
-        return Err("the request characteristic is not writable".into());
+    // One characteristic carries both directions, so it must be able to do both. Checking rather
+    // than assuming turns a confusing silence — a write that lands nowhere — into a message
+    // naming which half is missing.
+    if !rpc.properties.intersects(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE) {
+        return Err("the RPC characteristic is not writable".into());
     }
-    if !response.properties.contains(CharPropFlags::NOTIFY) {
-        return Err("the response characteristic cannot notify".into());
+    if !rpc.properties.contains(CharPropFlags::NOTIFY) {
+        return Err("the RPC characteristic cannot notify".into());
     }
-    Ok((request, response))
+    // Cloned rather than borrowed twice: btleplug takes a &Characteristic for each operation.
+    Ok((rpc.clone(), rpc))
 }
 
 /// One command becomes one JSON-RPC line, plus how long to wait for it.

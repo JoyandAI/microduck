@@ -10,6 +10,11 @@
 //! The IO model reports `device_address()` on both halves, so a connection is a real duplex
 //! stream and several centrals cost nothing extra.
 //!
+//! One characteristic carries both directions, for the reason in [`crate::gatt`]: BlueZ reports a
+//! write and a subscription as separate events, and with two characteristics they would have to be
+//! matched across them by address rather than belonging to the same characteristic by
+//! construction.
+//!
 //! **Untested against hardware.** It type-checks for aarch64 and has never met a real central.
 //! Treat what follows as intent until someone connects a phone.
 
@@ -17,6 +22,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bluer::adv::Advertisement;
+use bluer::agent::{Agent, ReqError};
 // The reader and writer live on `gatt` rather than `gatt::local`: they are the same socket
 // halves the client side uses, so bluer shares them between both roles.
 use bluer::gatt::local::{
@@ -28,8 +34,9 @@ use bluer::gatt::{CharacteristicReader, CharacteristicWriter};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::gatt::{REQUEST_UUID, RESPONSE_UUID, SERVICE_UUID};
+use crate::gatt::{RPC_UUID, SERVICE_UUID};
 use crate::link::{Link, QUEUE};
+use crate::pairing;
 use crate::session;
 use crate::upstream::Sockets;
 
@@ -51,7 +58,11 @@ struct Half {
 }
 
 /// Wait for an adapter, then advertise and serve until cancelled.
-pub async fn serve(sockets: Sockets, name: String) -> bluer::Result<()> {
+///
+/// `require_pairing` controls whether writing a request needs an authenticated, encrypted link.
+/// It defaults on, because §7 requires it for anything carrying wifi credentials and
+/// `net.connect` now does. The opt-out exists for bench work against a client that cannot pair.
+pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> bluer::Result<()> {
     let bt = bluer::Session::new().await?;
 
     let adapter = loop {
@@ -65,10 +76,53 @@ pub async fn serve(sockets: Sockets, name: String) -> bluer::Result<()> {
     };
     adapter.set_powered(true).await?;
 
+    // Pairable only matters while we advertise, and the board reports `Pairable: no` by default.
+    // A pairing *window* — opened by a physical button rather than left open — is the obvious
+    // next step and needs a button that does not exist yet.
+    if require_pairing {
+        adapter.set_pairable(true).await?;
+    }
+
+    // The agent answers BlueZ's passkey request with the PIN configd holds. Registered before
+    // advertising, or a phone quick off the mark could reach pairing before there is anything to
+    // answer it.
+    let _agent = if require_pairing {
+        let config_socket = sockets.config.clone();
+        Some(
+            bt.register_agent(Agent {
+                request_default: true,
+                request_passkey: Some(Box::new(move |request| {
+                    let config_socket = config_socket.clone();
+                    Box::pin(async move {
+                        tracing::info!(peer = %request.device, "pairing requested");
+                        match pairing::pin(&config_socket).await {
+                            Ok(passkey) => Ok(passkey),
+                            Err(e) => {
+                                // Refusing is the only safe answer. Falling back to a default
+                                // would let anyone pair whenever configd was briefly unreachable.
+                                tracing::warn!(error = %e, "cannot read the pairing PIN; refusing to pair");
+                                Err(ReqError::Rejected)
+                            }
+                        }
+                    })
+                })),
+                ..Default::default()
+            })
+            .await?,
+        )
+    } else {
+        tracing::warn!(
+            "pairing NOT required: any device in range can write requests, including wifi \
+             credentials. Bench use only."
+        );
+        None
+    };
+
     tracing::warn!(
         adapter = adapter.name(),
         address = %adapter.address().await?,
         service = %SERVICE_UUID,
+        pairing = require_pairing,
         "serving BLE"
     );
 
@@ -89,20 +143,18 @@ pub async fn serve(sockets: Sockets, name: String) -> bluer::Result<()> {
             uuid: SERVICE_UUID,
             primary: true,
             characteristics: vec![Characteristic {
-                uuid: REQUEST_UUID,
+                uuid: RPC_UUID,
                 write: Some(CharacteristicWrite {
                     write: true,
                     // Write-without-response too: a chunked request does not need an ATT
                     // acknowledgement per chunk, and requiring one roughly halves throughput on
                     // the slowest link in the system.
                     write_without_response: true,
-                    // Encryption is NOT required yet, and that is a gap rather than a decision.
-                    // §7 says the characteristic carrying wifi credentials must be paired and
-                    // encrypted, and `encrypt_authenticated_write` is the flag — but setting it
-                    // without a pairing story (a button-held window, or a secret printed under
-                    // the robot) yields a robot nobody can provision. It goes on in the same
-                    // change that decides how a phone may bond, and before `net.connect` is
-                    // routed.
+                    // §7: anything carrying wifi credentials must be paired and encrypted, and
+                    // `net.connect` does. `encrypt_authenticated_write` demands a bond made with
+                    // passkey entry rather than just-works, which is what makes the PIN mean
+                    // something — see `crate::pairing` for what it does and does not prove.
+                    encrypt_authenticated_write: require_pairing,
                     method: CharacteristicWriteMethod::Io,
                     ..Default::default()
                 }),
