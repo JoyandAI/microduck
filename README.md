@@ -229,10 +229,18 @@ sudo robotctl update pin daemon          # unpin
 
 Three things that are easy to get wrong.
 
-**`rollback` needs a predecessor on that board.** A freshly provisioned board has exactly one
-release — the bootstrap install has nothing before it — so there is nothing to roll back to,
-and auto-rollback cannot protect its first update either. That is a property of the board, not
-a fault: it takes one successful update before rollback means anything.
+**`rollback` needs a predecessor, but an update creates one.** A freshly provisioned board has
+exactly one release, so `rollback` right then has nothing older to go to and says so. Auto-
+rollback is *not* affected: applying a release unpacks it alongside the current one and only
+then moves `current`, so by the time the health gate runs there are two, and the release you
+came from is the target. `rollback_target` picks the highest installed version below `current`
+that the journal has not already recorded as bad — so a board with one release is fully
+protected from the moment it takes its first update.
+
+The one genuinely unprotected install is the bootstrap itself, which has nothing before it by
+definition. `golden` would cover that, and it is deliberately unset until 1.0.0 exists — so
+`reset-to-golden` reports honestly that none is configured rather than doing something
+surprising.
 
 **`version` shows the live release per component, not the release store.** It will never list
 two versions, however many are unpacked under `/opt/robot/daemon/releases/`. Ask the store
