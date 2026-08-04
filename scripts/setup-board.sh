@@ -44,6 +44,15 @@ ENV_TXT=/boot/armbianEnv.txt
 # Where this script puts itself so it is still around after the reboot it asks for.
 SELF=/usr/local/sbin/robot-setup-board
 
+# Wifi migration lives in its own script — see `check_network` for why. Named here so the
+# advice this prints and the thing it points at cannot drift apart.
+MIGRATE=migrate-network.sh
+# Where that script leaves itself once run, which is what to point at after a reboot: by then
+# the copy in /tmp is gone, and telling someone to run a file that no longer exists is worse
+# than telling them nothing.
+MIGRATE_SELF=/usr/local/sbin/robot-migrate-network
+NET_CHECK_UNIT=/etc/systemd/system/robot-net-check.service
+
 # Only what `robotd` needs. The prototype also enables i2c-gpio-pihat, aic3104-pihat and a
 # camera overlay; none apply here — our IMU rides the Dynamixel bus rather than I²C, and
 # `robotd` owns no camera or audio.
@@ -210,6 +219,49 @@ install_onnxruntime() {
     rm -rf "$tmp"
 }
 
+# Which stack owns wifi — checked, never changed.
+#
+# The netplan -> NetworkManager migration lives in `migrate-network.sh` and not here, for two
+# reasons that are not about file size. It has a different *lifetime*: it exists only because
+# Armbian's stock image ships netplan, and the day we build an image with NM already in it the
+# whole thing is deleted, while overlays and ONNX are needed forever. And it has a different
+# *risk*: it is the one step that can make a headless board unreachable, so it belongs behind
+# an explicit decision rather than inside bring-up you can re-run whenever.
+#
+# What this does check matters because `configd` drives NetworkManager over D-Bus: a board
+# still on netplan answers every `net.*` call with "no such device", which is a confusing
+# failure to meet later rather than named here.
+check_network() {
+    # Prefer the persisted copy when it exists: after the reboot the migration asks for, the
+    # one in /tmp is gone.
+    if [ -x "$MIGRATE_SELF" ]; then
+        migrate_cmd="sudo ${MIGRATE_SELF}"
+    else
+        migrate_cmd="sudo sh ${MIGRATE}"
+    fi
+
+    if ! command -v nmcli >/dev/null 2>&1; then
+        warn "wifi is still netplan's, so configd cannot manage it. Migrate first:
+    ${migrate_cmd}
+  Then reboot and re-run this. Everything else here is done regardless."
+        return 0
+    fi
+
+    case "$(nmcli -t -f DEVICE,STATE device status 2>/dev/null | sed -n 's/^wlan0://p')" in
+        ''|unmanaged)
+            warn "NetworkManager is installed but wlan0 is not its, so the migration is
+  incomplete. Finish it with:  ${migrate_cmd}"
+            ;;
+    esac
+
+    # A backstop left armed reboots the board on any later boot where wifi is merely slow. It
+    # is `migrate-network.sh`'s to retire, so say so rather than reaching into its state.
+    if [ -f "$NET_CHECK_UNIT" ]; then
+        warn "the wifi cutover backstop is still armed. Re-run  ${migrate_cmd}  to retire it,
+  or any later boot where wifi comes up slowly will revert this board to netplan."
+    fi
+}
+
 # Take the login console off the motor UART.
 #
 # UART2 is the RK3566 debug console, so Armbian runs `serial-getty@ttyS2` on it by default.
@@ -311,6 +363,24 @@ report() {
         printf '  %-22s %s\n' "ONNX Runtime" "ABSENT — robotd cannot load a policy"
     fi
 
+    if ! command -v nmcli >/dev/null 2>&1; then
+        printf '  %-22s %s\n' "wifi" "NetworkManager ABSENT — still netplan"
+    else
+        wifi_state="$(nmcli -t -f DEVICE,STATE device status 2>/dev/null | sed -n 's/^wlan0://p')"
+        case "$wifi_state" in
+            '')          printf '  %-22s %s\n' "wifi" "no wlan0" ;;
+            unmanaged)   printf '  %-22s %s\n' "wifi" "NOT NetworkManager's — still netplan" ;;
+            connected)   printf '  %-22s %s\n' "wifi" "NetworkManager, connected" ;;
+            *)           printf '  %-22s %s\n' "wifi" "NetworkManager, ${wifi_state}" ;;
+        esac
+    fi
+
+    if [ "$(systemctl is-enabled systemd-networkd-wait-online.service 2>/dev/null)" = masked ]; then
+        printf '  %-22s %s\n' "networkd wait-online" "masked"
+    elif command -v nmcli >/dev/null 2>&1; then
+        printf '  %-22s %s\n' "networkd wait-online" "NOT masked — expect a boot stall"
+    fi
+
     # A board with no battery-backed RTC reading 1970 fails TLS certificate validation, and
     # that surfaces as an opaque handshake error several steps into an install.
     if command -v timedatectl >/dev/null 2>&1; then
@@ -358,6 +428,7 @@ main() {
     check_environment
     persist_self
     configure_overlay
+    check_network
     free_motor_port
     install_onnxruntime
     report
