@@ -91,6 +91,23 @@ enum Namespace {
         command: UpdateCommand,
     },
 
+    /// Watch what the robot is doing, live.
+    ///
+    /// This is the one window into the control loop. It shows what a client asked for
+    /// alongside what was actually applied and why they differ — safety clamps things
+    /// constantly, and "the stick is forward and the robot is still" is unreadable without
+    /// the reason next to it.
+    Monitor {
+        /// Frames per second. The robot decimates server-side, so asking for less genuinely
+        /// costs it less.
+        #[arg(long, default_value_t = 10)]
+        hz: u32,
+
+        /// One JSON object per line, for piping somewhere.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// The full state of this robot: hardware and software.
     ///
     /// Hardware from `robotd` — the verdict the update system's health gate turns on, the loop
@@ -438,6 +455,91 @@ impl HealthReport {
 
 /// Report the full state of the robot: control loop, bus, IMU, battery, motor temperature,
 /// and the software running and installed.
+///
+/// Stream `robot.state` until interrupted.
+///
+/// Reads notifications rather than waiting for a terminal response, so it never "finishes"
+/// — Ctrl-C is the exit. A closed socket ends it too, which is what happens when `robotd`
+/// restarts during an update, and is worth seeing rather than hanging through.
+fn run_monitor(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", robot_socket)?;
+    let call = proto::Call::RobotSubscribe(proto::SubscribeParams {
+        hz: (hz > 0).then_some(hz),
+    });
+    client.send(&proto::Request::call(proto::Id::Number(1), &call))?;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = client
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| Failure::new(exit::UNREACHABLE, format!("stream ended: {e}")))?;
+        if read == 0 {
+            // robotd went away — a restart mid-update looks exactly like this, so say so
+            // rather than exiting silently as though the user had asked to stop.
+            return Err(Failure::new(
+                exit::UNREACHABLE,
+                "robotd closed the connection".to_owned(),
+            ));
+        }
+
+        let Ok(request) = serde_json::from_str::<proto::Request>(&line) else {
+            continue;
+        };
+        let Some(state) = request.as_state() else {
+            // The subscribe acknowledgement, or anything else this client does not model.
+            continue;
+        };
+
+        if json {
+            println!("{}", line.trim_end());
+            continue;
+        }
+
+        let limits = if state.movement.limited_by.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", state.movement.limited_by.join(","))
+        };
+        // Gravity and gain sit next to the fall verdict on purpose: `fallen` is derived from
+        // the first and overrides the second, and reading the verdict without its input made
+        // "the robot is down" indistinguishable from "the IMU frame is wrong".
+        println!(
+            "{:8.2}  {:>5}  {:5.1}Hz miss={:<4} {}  g[{:+.2} {:+.2} {:+.2}] kp={:<4} \
+             req[{:+.2} {:+.2} {:+.2}] app[{:+.2} {:+.2} {:+.2}]{}",
+            state.t,
+            state.policy,
+            state.control_loop.hz,
+            state.control_loop.missed,
+            if state.safety.fallen {
+                "FALLEN"
+            } else {
+                "ok    "
+            },
+            state.safety.gravity[0],
+            state.safety.gravity[1],
+            state.safety.gravity[2],
+            state
+                .safety
+                .gain
+                .map_or_else(|| "-".to_owned(), |g| g.to_string()),
+            state.movement.requested[0],
+            state.movement.requested[1],
+            state.movement.requested[2],
+            state.movement.applied[0],
+            state.movement.applied[1],
+            state.movement.applied[2],
+            limits,
+        );
+    }
+}
+
+/// Ask `robotd` whether it is healthy.
+/// Deliberately does **not** use the ordinary `Client::connect(..)?` + `hello()?` path.
+/// That exits non-zero when `updaterd` is unreachable, which is precisely the situation
+/// where someone is running this command. Every failure here becomes a line in the report
+/// instead.
 ///
 /// Both halves, in one command, because the question "what is wrong with this robot" does not
 /// divide along that line — a robot that reverted a release an hour ago and a robot whose
@@ -1078,6 +1180,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Version { json } => {
             return run_version(&cli.socket, &cli.robot_socket, json);
+        }
+        Namespace::Monitor { hz, json } => {
+            return run_monitor(&cli.robot_socket, hz, json);
         }
         // Pure codegen: no socket, no daemon, no root. It must keep working on a robot
         // where nothing is running, since that is where an operator most wants to type

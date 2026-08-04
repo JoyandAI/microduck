@@ -259,6 +259,15 @@ impl RobotIo for DynamixelIo {
             .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
     }
 
+    fn set_gain(&mut self, kp: u16) -> Result<()> {
+        for &id in &JOINT_IDS {
+            self.controller
+                .write_position_p_gain(id, kp)
+                .map_err(|e| IoError::Bus(format!("position_p_gain {kp} on {id}: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Supply voltage and case temperatures, in one `sync_read` over registers 144–146.
     ///
     /// Voltage is averaged because all 15 servos sit on one pack: a single reading is the

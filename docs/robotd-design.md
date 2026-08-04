@@ -71,6 +71,53 @@ transition, without that being a rewrite.
 
 (`padd` is a placeholder name.)
 
+### 3.1 The shape of it
+
+Who talks to `robotd`, and over what:
+
+```text
+   ┌──────────┐   robot.move / robot.head      ┌─────────────────────┐
+   │  padd    │───(notifications, 50 Hz)──────►│                     │
+   │ gamepad  │   robot.stop / robot.enable    │                     │
+   └──────────┘───(requests, answered)────────►│                     │
+                                               │   /run/robotd.sock  │
+   ┌──────────┐   robot.subscribe              │   JSON-RPC 2.0      │
+   │ robotctl │──────────────────────────────► │   NDJSON            │
+   │ monitor  │◄──robot.state (decimated)──────│                     │
+   └──────────┘                                │                     │
+                                               │                     │
+   ┌──────────┐   robot.health                 │                     │
+   │ updaterd │──robot.safeToRestart──────────►│                     │
+   │          │  robot.modelApi                └──────────┬──────────┘
+   └──────────┘                                           │
+        │                                                 │
+        │ on_apply: systemctl restart robotd              │
+        └─────────────────────────────────────────────────┘
+
+   ┌ not built ─────────────────────────────────┐
+   │  mediad — WebRTC + JSON-RPC relay          │  phone, browser and LLM
+   │  btd    — BLE, a subset of the same API    │  clients arrive through here
+   └────────────────────────────────────────────┘
+```
+
+Every one of those speaks the same two vocabularies — intents in, state out — so `mediad`
+will **relay** frames rather than translate them (§5.5, §5.6).
+
+And the crate boundary, which is the same boundary:
+
+```text
+  duck-ipc-proto   the wire types — serde only; no tokio, no http, no crypto
+        │
+  duck-control     model · bus · IMU · RobotIo · obs · policy · safety
+        │          everything between reading the bus and writing it
+        │          no tokio, no sockets, no systemd
+        ▼
+  robotd           the process: socket, JSON-RPC, systemd, health reporting
+```
+
+`safety` holds the `RobotIo`, so the policy, the controller and every client can *propose*
+targets and none of them can send one. That is the borrow checker, not a convention.
+
 ## 4. Slice 1 — hold the pose
 
 A daemon that drives the real bus at the real rate and tells the truth about itself. No
@@ -230,11 +277,27 @@ ground pick, ball kick and sit. So there is exactly one layout:
 Joints exclude the mouth throughout; actions map back into 15 motor slots with index 9 left
 at zero. The 51/54D legacy, 49D wheeled and 85D tracking layouts go away with the variants.
 
-⚠ **How the 13 command floats are filled is unresolved — see §11.2 before implementing this.**
-Slice 2 intends to send zeros for the 6 body slots (there is no `pose` intent yet), but
-whether all-zero is the nominal-pose encoding these policies were trained against is not
-known, nor is whether head offsets still apply on top of policy output under this layout.
-The other 48 floats are unambiguous.
+The command block, which was the only part in doubt, is now settled — read out of the
+prototype's `control_step` rather than guessed:
+
+```text
+48..51   vx, vy, vyaw
+51..55   neck_pitch, head_pitch, head_yaw, head_roll
+55..57   body x, y      — hardcoded zero, unbound in training
+57..60   body z, roll, pitch
+60       body yaw       — hardcoded zero, unbound in training
+```
+
+Three things about it are individually plausible and wrong:
+
+1. **All-zero body is the nominal encoding**, not a placeholder — x, y and yaw are literally
+   hardcoded zero as "unbound", and z/roll/pitch are zero unless body-pose mode is active.
+2. **Head targets ride in the command and are not added on top of the policy output.** The
+   prototype does both in different modes and gates the post-hoc addition behind
+   `if !new_cmd_obs`, commented "head\_offsets are a COMMAND fed via the obs vector instead —
+   don't double-add it here". Doing both bends the head twice.
+3. **The body block is ordered `z, roll, pitch`** — not `z, pitch, roll`. Swapping the last
+   two tilts the robot sideways when asked to lean forward.
 
 ### 5.3 The policy stays shaped like Antoine's
 
@@ -246,10 +309,33 @@ Policy files come from a path in the params file, defaulting into the release di
 a normal update carries the policy, and a dev points the path at their own `.onnx` and
 iterates without cutting a release.
 
-Two hot-path fixes worth doing while the code is being moved, both cheap: pre-bind the ONNX
-input/output tensors, since the current path does `to_vec()` on the observation and again on
-the output, allocating several times per inference; and run one warm-up inference before the
-loop starts, because the first is always an outlier.
+Everything is validated at **load**, not at inference: observation width, action count, and
+whether ONNX Runtime is present at all. A warm-up inference runs before the loop starts,
+which both pays the first-call cost off the hot path — where it would look identical to a
+missed deadline — and proves the dylib resolved.
+
+**`ort` panics when ONNX Runtime is missing.** It `expect`s inside `setup_api`, on a lazy
+path reachable from any API call, so it cannot be caught as an error. Left alone that killed
+the control thread: no tick ever landed and health reported "the loop has not completed a
+cycle" forever, so the daemon looked wedged rather than naming the cause — worse than the
+crashloop this design rejected. `policy::ensure_runtime` therefore probes for the dylib with
+the same loader and search rule `ort` uses, before `ort` is touched, so a missing library
+becomes an ordinary error.
+
+**`policy.enabled` separates "no policy wanted" from "policy broken."** The first is healthy
+and is the right configuration for bench updater testing; the second is unhealthy so the
+updater rolls the release back. Collapsing them would either make a bench robot look broken
+or let an unusable bundle pass the gate. `robotd --no-policy` sets it, and the gate tests use
+it, since neither CI nor a laptop has ONNX Runtime installed.
+
+ONNX Runtime is a **board prerequisite**, installed by `scripts/install.sh`, not shipped in
+the release. It changes far less often than the daemon, and ~20 MB in every artifact would
+enlarge every update for nothing. The trade is that a board missing it installs and starts
+fine and then cannot walk — which is why health reports the searched path.
+
+Not done, and deliberately: pre-binding the ONNX input/output tensors. The current path
+allocates a 61-float vector per inference, which is ~244 bytes at 50 Hz. Worth measuring on
+the board before optimising.
 
 **Carried over from the runtime because it works** — head and leg low-pass filters, action
 scale, voltage-adaptive scaling, the standing-transition gain change. These are tunables
@@ -336,6 +422,18 @@ ports on 9874/9875 and the web hub's `/state.json`. Adding a field today means e
 places that can silently disagree; here it means one struct, and older clients ignore what
 they do not know.
 
+**Built.** `robot.subscribe` turns a connection into a stream; the loop publishes into a
+bounded broadcast and never waits on a subscriber, so a slow client gets a gap rather than
+applying backpressure — the rule the updater already uses for progress. Decimation is
+server-side and per-subscriber, so a 10 Hz dashboard genuinely costs the robot less than a
+50 Hz digital twin.
+
+Two details that are easy to get wrong. **Nothing is assembled when nobody is subscribed** —
+which is the normal state of a robot — because building a frame allocates on the thread that
+should not be visiting the allocator without reason. And the limit names are **spelled out
+for the wire** rather than derived from the Rust enum, so renaming a variant cannot silently
+break a client branching on `limited_by`.
+
 ### 5.7 The gamepad is a client
 
 `padd` reads `gilrs` and sends intents over `robotd`'s socket. Its own crate, so a gamepad
@@ -354,8 +452,86 @@ time that can happen.
 
 ### 5.9 Done when
 
-It walks on a board, driven by `padd` through the intent API; an update applied with
-`robotctl` restarts it cleanly with the gate passing; and `--unhealthy` still rolls back.
+It walks on a board, driven through the intent API; an update applied with `robotctl`
+restarts it cleanly with the gate passing; and `--unhealthy` still rolls back.
+
+**Built, not yet run on hardware.** Nothing in slice 2 has met a robot: no policy has been
+loaded on a board, no observation has reached a real ONNX Runtime, and the fall and deadman
+paths have only been exercised against `FakeIo`. The tests establish that the logic is
+self-consistent — not that the robot walks. Note also that `padd` cannot run on the board
+yet (§11.4), so the first hardware driving will be from a laptop over a forwarded socket.
+
+### 5.10 The tick, end to end
+
+Where the data goes, once per period:
+
+```text
+  Dynamixel bus
+       │  one sync_read: IMU board + 15 servos, one transaction
+       ▼
+   Sensors ──────────┬──────────────────────► safety.observe ──► fallen? (debounced)
+   joints, IMU       │
+                     ▼
+              Observation::build  ◄──── Command ◄── gate(deadman) ◄── intent snapshot
+                     │              (twist, head, body = nominal)
+                     │  [f32; 61]
+                     ▼
+              Policy::infer ──── walk | stand, chosen on |twist|
+                     │
+                     │  [f32; 14]   — mouth excluded
+                     ▼
+              home_pose + scale × action ──► low-pass (off by default)
+                     │
+                     │  [f64; 15] proposed targets
+                     ▼
+        ╔═══════════════════════════════════════════╗
+        ║  safety.apply   ← owns the only RobotIo    ║
+        ║  · refuse non-finite                       ║
+        ║  · clamp to actuator range                 ║
+        ║  · fallen → hold pose, soft gain           ║
+        ╚═══════════════════════════════════════════╝
+                     │  sync_write goal positions
+                     ▼
+              Dynamixel bus
+```
+
+And the decisions around it, which the dataflow above does not show:
+
+```text
+  startup
+    ├─ Safety::new(io)          safety takes the RobotIo; nothing else can write again
+    ├─ read() → hold = the pose the robot is already in     ── never move on start
+    └─ policy
+         disabled ─────────────► controller = None                    healthy
+         loaded   ─────────────► controller = Some
+         failed   ─────────────► controller = None + policy_error   unhealthy
+
+  each tick
+    read ─┬─ ok  ─► clear the consecutive-error count
+          └─ err ─► count++, sensors = None   (the tick still runs)
+
+    observe → fallen?
+
+    driving = enabled ∧ policy loaded ∧ ¬fallen ∧ sensors this tick
+
+    edges ─┬─ started driving ──► controller.reset()
+           │                      else a stale last action, or a filter anchored to
+           │                      where the robot was a minute ago, shows up as a lurch
+           └─ stopped driving ──► hold = current pose, captured once
+                                  re-reading each tick would sag under gravity
+
+    driving ─┬─ yes ─► step() → targets, gain, "walk" | "stand"
+             └─ no  ─► targets = hold, default gain, "held"
+
+    safety.apply(targets, hold, gain)
+
+    publish ─┬─ atomics            always      → robot.health, safeToRestart
+             └─ state frame        only if subscribed   → robot.state
+```
+
+The four conditions on `driving` are each load-bearing. `sensors this tick` is the
+non-obvious one: a read that failed leaves nothing to build an observation from, and
+inventing one would feed the policy a robot that does not exist.
 
 ## 6. The robot model
 
@@ -372,6 +548,29 @@ Intents and params are published by IPC threads and read by the loop as a single
 load. Nothing can apply backpressure to the loop and no request enters it synchronously.
 Telemetry goes out through a bounded broadcast where a slow subscriber gets a gap, never
 backpressure — the pattern the updater's IPC layer already uses and documents.
+
+```text
+   IPC tasks (tokio, multi-thread)        control thread (own runtime, 50 Hz)
+   ═══════════════════════════════        ═══════════════════════════════════
+
+     robot.move  ──► ┌────────────┐
+     robot.head  ──► │intent slots│ ──atomic load, once per tick──►  read
+                     │ twist│head │
+                     └────────────┘
+                     ArcSwap, stamped
+
+     robot.health ◄── ┌──────────┐ ◄────────── publish ───────────  atomics
+     safeToRestart    │ atomics  │              ticks, hz, missed,
+                      └──────────┘              fallen, moving
+
+     robot.state  ◄── ┌──────────┐ ◄─── send, only if subscribed ──  frame
+                      │broadcast │
+                      └──────────┘
+                      bounded, drop-on-lag
+```
+
+**No channel runs the other way.** Health is *published*, never asked for, which is what
+lets a wedged loop report itself unhealthy instead of hanging the caller.
 
 ### 7.2 Params
 
@@ -442,15 +641,25 @@ per-device IMU calibration.
 
 1. **Control rate on the Radxa.** 50 Hz is inherited from a Pi Zero 2W. Measurable now
    that boards exist.
-2. ⚠ **The 61D command encoding is not settled, and it blocks slice 2 being correct.**
-   Two unknowns (§5.2): whether an all-zero body command is the nominal-pose encoding these
-   policies expect, and whether head offsets are still applied on top of policy output under
-   the 61D layout or only through the command slots — the runtime does both in different
-   places and marks one path "legacy". Nobody currently knows. Getting either wrong produces
-   a robot that walks badly for reasons that look like a timing problem, so this needs
-   settling against the training env (`microduck_brain`) rather than guessed from the
-   runtime's behaviour.
-3. **Golden vectors** need an export from `microduck_brain`. This is the highest-value test
-   in the plan and the only item here that depends on another repo.
+2. ~~**The 61D command encoding is not settled**~~ — **resolved** (§5.2), by reading
+   `control_step` rather than by asking. All three sub-questions are answered and pinned by
+   tests. This turned out not to need `microduck_brain` at all.
+3. **Golden vectors** would still be worth having from `microduck_brain` — as a regression
+   check against the training env rather than as the source of truth they were going to be.
+   No longer a prerequisite for slice 2.
+4. ~~**`padd` does not reach the board**~~ — **decided**: install libudev. `gilrs` pulls
+   `libudev-sys` unconditionally on Linux, so CI and the board cross-build now install it,
+   and `padd` ships in the release. The alternative was a pure-Rust evdev backend, rejected
+   because `gilrs`'s value is its SDL controller database — without it each pad needs a
+   hand-written mapping, and the same Xbox controller reports different codes over USB and
+   Bluetooth. **Note the standing cost:** the same expense recurs for the next C dependency
+   that has to reach the board, so prefer pure-Rust crates elsewhere on that path.
+   *Unverified on macOS:* the cross-build needs an aarch64 sysroot, which a Mac cannot
+   provide, so `cargo board --bins` fails locally there — build the shipped set with
+   `-p updater -p robotd -p robotctl`, or build on Linux.
+5. **Per-joint limits do not exist.** Safety clamps to the *actuator's* travel, which catches
+   `NaN`, a bad action scale and a garbage tensor — it will not stop a joint being driven
+   somewhere mechanically unwise. The real limits are in the alpha MJCF (31 KB), not vendored
+   here. A limit that looked anatomical but was not would imply protection nobody has.
 4. **Where the alpha MJCF lives** if a sim/real agreement test is ever wanted — 31 KB of
    XML, 19 MB of meshes, currently in the runtime's `scripts/alpha_assets/`.

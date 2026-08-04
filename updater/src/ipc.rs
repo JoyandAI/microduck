@@ -601,7 +601,12 @@ impl Server {
             Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive => Response::err(
+            | Call::RobotRemoteSessionActive
+            | Call::RobotMove(_)
+            | Call::RobotHead(_)
+            | Call::RobotStop
+            | Call::RobotEnable(_)
+            | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,

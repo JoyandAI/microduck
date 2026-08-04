@@ -11,6 +11,11 @@ This repo is the daemons plus the update system. Start with
 [`docs/architecture.md`](docs/architecture.md) for how the services fit together, and
 [`docs/roadmap.md`](docs/roadmap.md) for what exists today versus what is designed.
 
+For the control side specifically, [`docs/robotd-design.md`](docs/robotd-design.md) §3.1 is
+the fastest way in — who talks to `robotd` and where the crate boundary sits — with the
+per-tick dataflow in §5.10 and the thread-to-thread channels in §7.1. Those three diagrams
+are the part that is hardest to reconstruct from prose.
+
 ## Getting started
 
 Needs Rust **1.89+** (stable) and nothing else. macOS and Linux both work for development;
@@ -20,7 +25,7 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-317 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+350 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
 The fastest way to actually *see* the update engine work is the playground, which drives
 the real engine — real signatures, real atomic swaps, real rollback — against a fake remote
@@ -56,8 +61,9 @@ to watch the boot counter undo a release that never confirmed healthy.
 
 | | |
 |---|---|
-| `robotd` | motor control, kinematics, gait model, **safety authority**. Currently holds the pose it starts in: a real 50 Hz loop on the Dynamixel bus, plus the four `robot.*` methods the updater needs. Walking arrives in slice 2 ([`docs/robotd-design.md`](docs/robotd-design.md)). |
-| `duck-control` | the control core — robot model, bus, sensing. A library, not a service: no tokio, no sockets, no systemd. |
+| `robotd` | motor control, gait policy, **safety authority**. A real 50 Hz loop driving walk/stand through a safety layer that holds the only write handle, plus intents and the four `robot.*` methods the updater needs. **Never run on a robot** ([`docs/robotd-design.md`](docs/robotd-design.md)). |
+| `duck-control` | the control core — robot model, bus, sensing, observations, ONNX policy, safety. A library, not a service: no tokio, no sockets, no systemd. |
+| `padd` | a gamepad, as an ordinary intent client. No privileged access; it sends what the app and SDK will send. |
 | `updaterd` | the update engine. Resident, and deliberately independent of `robotd` — it is the recovery path, so it must work when the robot does not. |
 | `mediad` | camera, audio, WebRTC gateway. **Not built yet.** |
 | `btd` | BLE: wifi provisioning, naming, update trigger from the phone. **Not built yet.** |
@@ -68,7 +74,8 @@ never inherit the update engine's http/tar/crypto tree.
 
 ```
 duck-ipc-proto/ the wire contract
-duck-control/   the control core: robot model · Dynamixel bus · IMU · the RobotIo seam
+duck-control/   the control core: model · bus · IMU · observations · policy · safety
+padd/           gamepad → intents — an ordinary socket client, no privileged access
 updater/        engine + updaterd
 robotd/         control daemon
 robotctl/       the local CLI
@@ -136,6 +143,15 @@ directory the process was launched from, at `warn`, so it survives any log level
 
 ```bash
 journalctl -u robotd -b
+```
+
+Logs say what happened; `monitor` says what is happening. It shows what a client asked for
+next to what was actually applied, and names the reason when they differ — safety clamps
+things constantly, and "the stick is forward and the robot is still" is unreadable without
+that:
+
+```bash
+robotctl monitor
 ```
 
 The update history is separate from the journal on purpose — `fsync`ed per entry under
@@ -335,9 +351,12 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
 - **Open:** artifact hosting. This repo is private, and a robot without a token cannot
   download from it (§6.1). Dev boards have tokens; the fleet will need a public
   artifact-only repository or an object store. Blocks hardware bring-up, not development.
-- **`robotd` holds a pose.** A real 50 Hz loop on the Dynamixel bus, and `robot.health`
-  now means *the loop is meeting its deadline* rather than *it ticked once* — which is what
-  makes the updater's auto-rollback gate on something real. Walking is slice 2.
+- **`robotd` walks — in principle.** A real 50 Hz loop, one 61-D observation builder, the
+  walk/stand policy pair, and a safety layer holding the only write handle. `robot.health`
+  means *the loop is meeting its deadline and the policy loaded*, which is what makes
+  auto-rollback gate on something real. **None of it has met a robot**: the tests prove the
+  logic is self-consistent, not that it walks. Needs ONNX Runtime on the board, which
+  `install.sh` now installs.
 - **Not started:** `mediad`, `btd`, the phone app, the SDK, safety authority.
 - **Runs on aarch64 Linux, emulated.** `scripts/board-test.sh` runs in CI: it
   cross-compiles for the board and executes 13 checks — rollback, tampered-artifact

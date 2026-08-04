@@ -78,6 +78,43 @@ pub mod method {
     pub const ROBOT_MODEL_API: &str = "robot.modelApi";
     /// Is a telepresence session live?
     pub const ROBOT_SESSION_ACTIVE: &str = "robot.remoteSessionActive";
+
+    // ── intents ──────────────────────────────────────────────────────────────
+    //
+    // What a client asks the robot to *do*, as opposed to what `updaterd` asks it about.
+    // Clients send intents, never joint commands: `robotd` stays authoritative on what is
+    // executable (`architecture.md` §6).
+    //
+    // Two kinds, and JSON-RPC's two message families map onto them exactly:
+    //
+    //   * **Continuous** — `move`, `head`. Sent as *notifications* (no `id`, no reply),
+    //     20–50 Hz, last-writer-wins, expiring. No response traffic at rate, and when they
+    //     later travel over WebRTC they belong on the unreliable channel, because a
+    //     retransmitted 80 ms-old stick position is worse than useless (`architecture.md`
+    //     §5.2). The message family already says which channel it wants.
+    //   * **Discrete** — `stop`, `enable`. Sent as *requests*, answered, because the caller
+    //     needs to know whether it was accepted and why not.
+
+    /// Velocity twist. Continuous; send as a notification.
+    pub const ROBOT_MOVE: &str = "robot.move";
+    /// Head joint targets. Continuous; send as a notification.
+    pub const ROBOT_HEAD: &str = "robot.head";
+    /// Stop moving — zero the velocity. Not "go limp".
+    pub const ROBOT_STOP: &str = "robot.stop";
+    /// Turn policy execution on or off.
+    pub const ROBOT_ENABLE: &str = "robot.enable";
+
+    /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
+    pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
+    /// Server → client. Never carries an `id`.
+    ///
+    /// One stream for every consumer — `robotctl monitor`, a digital-twin viewer, later the
+    /// app through `mediad`. It replaces the prototype's five bespoke channels: a 180-byte
+    /// binary frame on 9870, JPEG on 9871, a UDP command socket on 9872, maploc on
+    /// 9874/9875, and the web hub's `/state.json`. Adding a field there meant editing four
+    /// places that could silently disagree; here it is one struct, and older clients ignore
+    /// what they do not recognise.
+    pub const ROBOT_STATE: &str = "robot.state";
 }
 
 /// JSON-RPC error codes.
@@ -155,6 +192,15 @@ pub enum Call {
     RobotHealth,
     RobotModelApi,
     RobotRemoteSessionActive,
+
+    // ── intents ──────────────────────────────────────────────────────────────
+    /// Continuous. Send as a notification.
+    RobotMove(MoveParams),
+    /// Continuous. Send as a notification.
+    RobotHead(HeadParams),
+    RobotStop,
+    RobotEnable(EnableParams),
+    RobotSubscribe(SubscribeParams),
 }
 
 impl Call {
@@ -176,6 +222,11 @@ impl Call {
             Call::RobotHealth => method::ROBOT_HEALTH,
             Call::RobotModelApi => method::ROBOT_MODEL_API,
             Call::RobotRemoteSessionActive => method::ROBOT_SESSION_ACTIVE,
+            Call::RobotMove(_) => method::ROBOT_MOVE,
+            Call::RobotHead(_) => method::ROBOT_HEAD,
+            Call::RobotStop => method::ROBOT_STOP,
+            Call::RobotEnable(_) => method::ROBOT_ENABLE,
+            Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
         }
     }
 
@@ -225,12 +276,17 @@ impl Call {
             Call::Select(p) => encode(p),
             Call::Pin(p) => encode(p),
             Call::Log(p) => encode(p),
+            Call::RobotMove(p) => encode(p),
+            Call::RobotHead(p) => encode(p),
+            Call::RobotEnable(p) => encode(p),
+            Call::RobotSubscribe(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive => Value::Object(serde_json::Map::new()),
+            | Call::RobotRemoteSessionActive
+            | Call::RobotStop => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -261,6 +317,11 @@ impl Call {
             method::ROBOT_HEALTH => Call::RobotHealth,
             method::ROBOT_MODEL_API => Call::RobotModelApi,
             method::ROBOT_SESSION_ACTIVE => Call::RobotRemoteSessionActive,
+            method::ROBOT_MOVE => Call::RobotMove(decode(params)?),
+            method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
+            method::ROBOT_STOP => Call::RobotStop,
+            method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
+            method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -298,6 +359,39 @@ impl Request {
             method: call.method().to_owned(),
             params: Some(call.params()),
         }
+    }
+
+    /// A call sent as a notification: no `id`, so no response is expected.
+    ///
+    /// This is how continuous intents travel. At 50 Hz a reply per message would be pure
+    /// overhead, and there is nothing useful to say about a velocity that is superseded
+    /// 20 ms later. Discrete intents use [`Self::call`] instead, because "refused, and here
+    /// is why" is an answer the caller needs.
+    pub fn notify(call: &Call) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: call.method().to_owned(),
+            params: Some(call.params()),
+        }
+    }
+
+    /// A robot-state notification: no `id`, so no response is expected.
+    pub fn notify_state(state: &RobotState) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::ROBOT_STATE.to_owned(),
+            params: Some(serde_json::to_value(state).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a robot-state notification back.
+    pub fn as_state(&self) -> Option<RobotState> {
+        if self.method != method::ROBOT_STATE {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
     }
 
     /// A progress notification: no `id`, so no response is expected.
@@ -441,6 +535,63 @@ pub struct HelloParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentParams {
     pub component: ComponentId,
+}
+
+// ── intent parameters ────────────────────────────────────────────────────────
+//
+// **Units and frame, stated once so no consumer has to rediscover them.** Everything is
+// radians and radians per second, in the robot's trunk frame, right-handed: `x` forward,
+// `y` left, `z` up. Positive `vyaw` turns left.
+//
+// This paragraph is load-bearing. The prototype accumulated
+// `--laser-track-yaw-sign`, `--laser-track-pitch-sign`, `--laser-fk-pitch-sign`,
+// `--laser-fk-neck-sign` and `--imu-z-rotation-deg` precisely because the convention was
+// never written down, so every new consumer determined it empirically and disagreed.
+// Fixing it in the protocol deletes that entire category of flag.
+
+/// Velocity twist. Continuous intent — see [`method::ROBOT_MOVE`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MoveParams {
+    /// Forward, m/s.
+    pub vx: f64,
+    /// Left, m/s.
+    pub vy: f64,
+    /// Yaw rate, rad/s, positive turns left.
+    pub vyaw: f64,
+}
+
+/// Head joint targets, radians. Continuous intent — see [`method::ROBOT_HEAD`].
+///
+/// Joint-space rather than a gaze direction. Both forms are wanted eventually and both will
+/// be exposed; this is the one the gamepad and calibration produce, and it is what the
+/// policy's observation actually carries, so it is the one that exists first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeadParams {
+    pub neck_pitch: f64,
+    pub head_pitch: f64,
+    pub head_yaw: f64,
+    pub head_roll: f64,
+}
+
+/// How often a subscriber wants [`method::ROBOT_STATE`].
+///
+/// Decimation is per-subscriber and happens server-side, so a dashboard asking for 10 Hz
+/// costs the robot a tenth of what a digital twin asking for 50 Hz does — and neither can
+/// slow the control loop, which publishes into a bounded buffer and never waits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubscribeParams {
+    /// Absent means every tick.
+    pub hz: Option<u32>,
+}
+
+/// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnableParams {
+    pub on: bool,
 }
 
 /// What an apply should move to.
@@ -785,6 +936,99 @@ pub struct Battery {
     pub percent: f64,
 }
 
+/// Answer to a discrete intent — [`Call::RobotStop`], [`Call::RobotEnable`].
+///
+/// `accepted: false` is a normal outcome, not an error: safety may refuse to enable a
+/// policy on a fallen robot, and the caller needs to know *why* rather than receiving a
+/// JSON-RPC error that reads as "something broke".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentResult {
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl IntentResult {
+    pub fn accepted() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// What the robot is doing, pushed as [`method::ROBOT_STATE`].
+///
+/// **It reports what was refused, not just what happened.** Safety clamps things
+/// constantly, and a client watching the robot ignore its command with no explanation
+/// cannot tell a bug from a limit. That is why `applied` and `limited_by` exist beside
+/// `requested` rather than the stream carrying only outcomes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RobotState {
+    /// Seconds since the daemon started. Monotonic: it is for correlating samples, not for
+    /// telling the time.
+    pub t: f64,
+    #[serde(rename = "move")]
+    pub movement: MoveState,
+    pub head: [f64; 4],
+    /// Which policy drove this tick: `walk`, `stand`, or `held` when none did.
+    pub policy: String,
+    pub safety: SafetyState,
+    #[serde(rename = "loop")]
+    pub control_loop: LoopState,
+    /// Measured joint angles, radians, in the model's joint order.
+    pub joints: Vec<f64>,
+    /// What was commanded, so a viewer can show tracking error rather than guessing at it.
+    pub targets: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoveState {
+    pub requested: [f64; 3],
+    pub applied: [f64; 3],
+    /// Empty when the command went through untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limited_by: Vec<String>,
+}
+
+// `Eq` is gone with the arrival of a float: gravity is a measurement, and exact equality on
+// one is not a comparison anybody should be offered.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SafetyState {
+    pub fallen: bool,
+    /// Gains have been dropped so the robot yields.
+    pub limp: bool,
+    /// Projected gravity in the trunk frame, the input `fallen` is decided from. Upright is
+    /// about `[0, 0, -1]`.
+    ///
+    /// Reported because the verdict alone is not diagnosable: "the robot is down" and "the
+    /// IMU is mounted differently than this build assumes" produce an identical `fallen`, and
+    /// telling them apart otherwise means stopping the daemon and reaching for another tool.
+    #[serde(default)]
+    pub gravity: [f64; 3],
+    /// Position P gain last written to the servos, or `None` before the first write.
+    ///
+    /// What the robot is actually running at, not what was asked for: safety overrides the
+    /// requested gain when it decides the robot has fallen, and that override was invisible.
+    #[serde(default)]
+    pub gain: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoopState {
+    /// Achieved rate over the last window. Zero until the first window closes.
+    pub hz: f64,
+    /// Ticks whose work overran the period, cumulative.
+    pub missed: u64,
+}
+
 /// Answer to [`Call::RobotModelApi`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelApiResult {
@@ -901,7 +1145,34 @@ mod tests {
             Call::RobotHealth,
             Call::RobotModelApi,
             Call::RobotRemoteSessionActive,
+            Call::RobotMove(MoveParams {
+                vx: 0.2,
+                vy: -0.1,
+                vyaw: 0.4,
+            }),
+            Call::RobotHead(HeadParams {
+                neck_pitch: 0.35,
+                head_pitch: -0.1,
+                head_yaw: 0.2,
+                head_roll: 0.0,
+            }),
+            Call::RobotStop,
+            Call::RobotEnable(EnableParams { on: true }),
+            Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
         ]
+    }
+
+    /// `every_call` is a hand-written list, so a new variant is silently untested unless
+    /// someone remembers to add it. Pin the count: adding a `Call` without extending the
+    /// list fails here, which is the only thing standing between a new method and it never
+    /// being round-tripped at all.
+    #[test]
+    fn every_call_covers_every_variant() {
+        assert_eq!(
+            every_call().len(),
+            20,
+            "a Call variant was added or removed — update every_call() and this count"
+        );
     }
 
     /// Every call must survive the wire unchanged.
@@ -1094,6 +1365,58 @@ mod tests {
         };
         let line = serde_json::to_string(&sick).unwrap();
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), sick);
+    }
+
+    /// `move` and `loop` are Rust keywords, so the fields are renamed on the wire. A typo
+    /// in either rename is invisible in Rust and breaks every consumer, so pin the JSON.
+    #[test]
+    fn robot_state_uses_the_documented_field_names() {
+        let state = RobotState {
+            t: 1.5,
+            movement: MoveState {
+                requested: [0.4, 0.0, 0.0],
+                applied: [0.15, 0.0, 0.0],
+                limited_by: vec!["deadman".into()],
+            },
+            head: [0.0; 4],
+            policy: "walk".into(),
+            safety: SafetyState {
+                fallen: false,
+                limp: false,
+                gravity: [0.0, 0.0, -1.0],
+                gain: Some(200),
+            },
+            control_loop: LoopState {
+                hz: 49.8,
+                missed: 0,
+            },
+            joints: vec![0.0; 15],
+            targets: vec![0.0; 15],
+        };
+
+        let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();
+        assert!(line.contains(r#""method":"robot.state""#), "{line}");
+        assert!(line.contains(r#""move":"#), "{line}");
+        assert!(line.contains(r#""loop":"#), "{line}");
+        assert!(!line.contains("movement"), "{line}");
+        assert!(!line.contains("control_loop"), "{line}");
+
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert!(back.is_notification(), "state carries no id");
+        assert_eq!(back.as_state().unwrap(), state);
+    }
+
+    /// An unlimited command must not carry an empty array — a consumer checking
+    /// truthiness on `limited_by` should see the field absent, not present-and-empty.
+    #[test]
+    fn an_unlimited_command_omits_limited_by() {
+        let movement = MoveState {
+            requested: [0.0; 3],
+            applied: [0.0; 3],
+            limited_by: Vec::new(),
+        };
+        let line = serde_json::to_string(&movement).unwrap();
+        assert!(!line.contains("limited_by"), "{line}");
     }
 
     /// `degraded` must default to false, so an older `robotd` that never sends the field

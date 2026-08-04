@@ -95,6 +95,14 @@ pub trait RobotIo {
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
+    /// Set the position P gain on every joint.
+    ///
+    /// Here rather than in the bus layer alone because it is what makes "go limp" mean
+    /// something. Refusing to command a fallen robot only freezes it in the pose it fell
+    /// in; dropping the gain lets it yield. The prototype does the same, at kP 50 against
+    /// a running value of 200.
+    fn set_gain(&mut self, kp: u16) -> Result<()>;
+
     /// Supply voltage and case temperatures, in one extra transaction.
     ///
     /// Not part of [`Sensors`], and not on the tick's critical path: these registers sit at
@@ -135,6 +143,11 @@ pub struct FakeIo {
     pub last_written: Option<JointTargets>,
     pub reads: usize,
     pub writes: usize,
+    /// Last gain commanded, so a test can tell "went limp" from "stopped commanding".
+    pub last_gain: Option<u16>,
+    /// Whether the orientation filter reports converged. False models the first seconds after
+    /// startup, when projected gravity is not yet a measurement.
+    pub imu_ready: bool,
     /// What [`RobotIo::slow_sensors`] reports. Mid-pack and hand-warm by default so `--fake`
     /// shows a plausible robot; set it to exercise a flat pack or a cooking servo. `None`
     /// fails the read, which is what a robot with no bus does.
@@ -158,6 +171,8 @@ impl FakeIo {
             last_written: None,
             reads: 0,
             writes: 0,
+            last_gain: None,
+            imu_ready: true,
             slow: Some(SlowSensors {
                 volts: 7.4,
                 temps_c: [32.0; NUM_JOINTS],
@@ -217,6 +232,15 @@ impl RobotIo for FakeIo {
             self.sensors.positions = targets.positions;
         }
         Ok(())
+    }
+
+    fn set_gain(&mut self, kp: u16) -> Result<()> {
+        self.last_gain = Some(kp);
+        Ok(())
+    }
+
+    fn imu_ready(&self) -> bool {
+        self.imu_ready
     }
 
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
