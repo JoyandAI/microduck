@@ -40,13 +40,18 @@ struct Args {
     #[arg(long, default_value = DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
 
-    /// uids permitted to make changes. Read-only calls are never gated.
+    /// Users permitted to make changes, by name. Read-only calls are never gated.
+    ///
+    /// Names rather than numbers, because `systemd-sysusers` allocates uids dynamically: a
+    /// numeric uid in a shipped unit file is right on the board it was written for and wrong
+    /// on the next one. Unresolvable names are a warning rather than a fatal error, so a
+    /// robot missing an optional user still serves everything read-only.
     #[arg(long, value_delimiter = ',')]
-    allow_uid: Vec<u32>,
+    allow_user: Vec<String>,
 
-    /// gids permitted to make changes.
+    /// Groups permitted to make changes, by name.
     #[arg(long, value_delimiter = ',')]
-    allow_gid: Vec<u32>,
+    allow_group: Vec<String>,
 
     /// Serve an in-memory wifi stack instead of NetworkManager.
     ///
@@ -90,6 +95,38 @@ impl PeerPolicy {
             self.owner_uid
         ))
     }
+}
+
+/// A user name to a uid.
+///
+/// `SO_PEERCRED` reports a numeric uid, so a name has to become a number somewhere. Doing it
+/// here, once at startup, means a unit file can name `btd` and stay correct on a board where
+/// sysusers allocated a different number.
+fn resolve_uid(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // Safety: `getpwnam` takes a NUL-terminated string and returns a pointer into a static
+    // buffer or null. Read immediately and nothing is retained.
+    let entry = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if entry.is_null() {
+        tracing::warn!(user = name, "no such user; it cannot change this robot's configuration");
+        return None;
+    }
+    let uid = unsafe { (*entry).pw_uid };
+    tracing::info!(user = name, uid, "may change configuration");
+    Some(uid)
+}
+
+fn resolve_gid(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // Safety: as above, for the group database.
+    let entry = unsafe { libc::getgrnam(cname.as_ptr()) };
+    if entry.is_null() {
+        tracing::warn!(group = name, "no such group; it cannot change this robot's configuration");
+        return None;
+    }
+    let gid = unsafe { (*entry).gr_gid };
+    tracing::info!(group = name, gid, "may change configuration");
+    Some(gid)
 }
 
 struct Service {
@@ -145,8 +182,8 @@ async fn main() -> ExitCode {
         store: Store::new(args.state_dir.join("config.json"), hostname()),
         policy: PeerPolicy {
             owner_uid: unsafe { libc::getuid() },
-            allow_uids: args.allow_uid,
-            allow_gids: args.allow_gid,
+            allow_uids: args.allow_user.iter().filter_map(|name| resolve_uid(name)).collect(),
+            allow_gids: args.allow_group.iter().filter_map(|name| resolve_gid(name)).collect(),
         },
     });
 

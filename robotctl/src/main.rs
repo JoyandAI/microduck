@@ -526,7 +526,7 @@ fn run_health(robot_socket: &Path, json: bool) -> Result<(), Failure> {
     }
 }
 
-fn run_version(socket: &Path, robot_socket: &Path, json: bool) -> Result<(), Failure> {
+fn run_version(socket: &Path, robot_socket: &Path, config_socket: &Path, json: bool) -> Result<(), Failure> {
     let build = proto::build_info!();
     let mut report = VersionReport {
         robotctl: build.version.to_owned(),
@@ -578,6 +578,30 @@ fn run_version(socket: &Path, robot_socket: &Path, json: bool) -> Result<(), Fai
             Err(failure) => report
                 .services
                 .push(ServiceReport::failed("robotd", failure.message)),
+        },
+    }
+
+    // configd, over its own socket. Same treatment as robotd: unreachable is a line in the
+    // report rather than an error, because this command has to work when a daemon is down.
+    //
+    // `btd` is deliberately absent from this report. It serves no socket — it is a *client* of
+    // the other three — so there is nothing to ask it, and every crate in the workspace shares
+    // one version line, so its version is the release's version. "Is btd running" is
+    // `systemctl status btd`, which is a different question from the one this command answers.
+    match Client::connect_to("configd", config_socket) {
+        Err(failure) => report
+            .services
+            .push(ServiceReport::failed("configd", failure.message)),
+        Ok(mut client) => match client.hello_result() {
+            Ok(hello) => report.services.push(ServiceReport {
+                name: "configd",
+                version: hello.daemon_version.map(|v| v.to_string()),
+                revision: hello.revision,
+                error: None,
+            }),
+            Err(failure) => report
+                .services
+                .push(ServiceReport::failed("configd", failure.message)),
         },
     }
 
@@ -680,6 +704,24 @@ fn version_warnings(
              robotd is in on_apply's restart set, so it should already be on the installed\n  \
              release: either the restart did not happen, or it failed and systemd restarted\n  \
              the old binary. Check `systemctl status robotd` and the update log."
+        ));
+    }
+
+    // configd joined on_apply's restart set with robotd, so the same reasoning applies: a
+    // mismatch means the restart did not take, not an expected lag.
+    let configd_running = report
+        .services
+        .iter()
+        .find(|s| s.name == "configd")
+        .and_then(|s| s.version.as_deref())
+        .and_then(|v| semver::Version::parse(v).ok());
+    if let (Some(running), Some(installed)) = (configd_running, daemon_installed.as_ref())
+        && &running != installed
+    {
+        warnings.push(format!(
+            "configd is running {running} but the installed daemon release is {installed}.\n  \
+             configd is in on_apply's restart set, so it should already be on the installed\n  \
+             release. Check `systemctl status configd` and the update log."
         ));
     }
 
@@ -1129,7 +1171,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return run_health(&cli.robot_socket, json);
         }
         Namespace::Version { json } => {
-            return run_version(&cli.socket, &cli.robot_socket, json);
+            return run_version(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }
         Namespace::Net { command } => {
             return run_net(&cli.config_socket, command);

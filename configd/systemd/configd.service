@@ -28,7 +28,18 @@ After=local-fs.target
 
 [Service]
 Type=exec
-ExecStart=/opt/robot/daemon/current/bin/configd
+# `--allow-user btd` is load-bearing, not tidy: without it every mutating call over Bluetooth
+# is refused, because SO_PEERCRED reports only a peer's *primary* gid and btd's is its own.
+# So `SupplementaryGroups=robot` in btd.service gets btd through the socket's 0660 mode and
+# no further, which is the correct two-tier split (§2.2) — but provisioning is exactly what
+# BLE exists for, so btd is named here explicitly.
+#
+# By name rather than by uid: systemd-sysusers allocates dynamically, and a number that is
+# right on one board is wrong on the next.
+#
+# Note what is NOT here: nothing grants the `robot` group as a whole. Being able to talk to
+# configd and being able to reconfigure the robot stay separate.
+ExecStart=/opt/robot/daemon/current/bin/configd --allow-user btd
 
 # Root, and this is the one thing here that deserves justification rather than assumption.
 #
