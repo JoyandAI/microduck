@@ -72,10 +72,51 @@ pub enum IoError {
 
 pub type Result<T> = std::result::Result<T, IoError>;
 
+/// What the servos report about their own supply and case, rather than their motion.
+///
+/// Sampled about once a second rather than every tick — see [`RobotIo::slow_sensors`]. A pack
+/// does not drain and a motor does not heat up in 20 ms, so the tick would be paying for a
+/// second bus transaction to learn nothing new.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlowSensors {
+    /// Mean supply voltage across the servos, in volts — the only battery measurement the
+    /// robot has, since there is no fuel gauge anywhere on the hat.
+    pub volts: f64,
+    /// Per-joint case temperature in °C, indexed as [`crate::model::JOINT_NAMES`].
+    ///
+    /// Per-joint rather than an average because the interesting case is one joint carrying
+    /// the load — a knee holding a squat runs far hotter than the mouth, and a mean over
+    /// fifteen servos hides exactly the servo about to latch its overheat shutdown.
+    pub temps_c: [f64; NUM_JOINTS],
+}
+
 pub trait RobotIo {
     /// One transaction: joints and IMU together.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
+
+    /// Supply voltage and case temperatures, in one extra transaction.
+    ///
+    /// Not part of [`Sensors`], and not on the tick's critical path: these registers sit at
+    /// 144–146, past the end of the contiguous block [`Self::read`] fetches, so reaching them
+    /// costs a transaction of its own — about a millisecond. Negligible once a second, 5% of
+    /// the budget at 50 Hz.
+    fn slow_sensors(&mut self) -> Result<SlowSensors>;
+
+    /// Diagnostics the bus keeps about itself. Default to "nothing to report" so a fake or a
+    /// future backend is not obliged to invent them.
+    ///
+    /// `sync_read` blocks identical to their predecessor: the board answered but did not
+    /// refresh, which means the policy would be fed dead orientation. Invisible unless
+    /// someone counts it, which is why it is counted.
+    fn imu_stale_blocks(&self) -> u64 {
+        0
+    }
+
+    /// Has the orientation filter converged? False for the first moments after startup.
+    fn imu_ready(&self) -> bool {
+        true
+    }
 }
 
 /// A robot made of nothing, for tests.
@@ -94,6 +135,10 @@ pub struct FakeIo {
     pub last_written: Option<JointTargets>,
     pub reads: usize,
     pub writes: usize,
+    /// What [`RobotIo::slow_sensors`] reports. Mid-pack and hand-warm by default so `--fake`
+    /// shows a plausible robot; set it to exercise a flat pack or a cooking servo. `None`
+    /// fails the read, which is what a robot with no bus does.
+    pub slow: Option<SlowSensors>,
     /// When true, `read` reports the last written targets as the present positions.
     track_targets: bool,
 }
@@ -113,6 +158,10 @@ impl FakeIo {
             last_written: None,
             reads: 0,
             writes: 0,
+            slow: Some(SlowSensors {
+                volts: 7.4,
+                temps_c: [32.0; NUM_JOINTS],
+            }),
             track_targets: true,
         }
     }
@@ -168,6 +217,10 @@ impl RobotIo for FakeIo {
             self.sensors.positions = targets.positions;
         }
         Ok(())
+    }
+
+    fn slow_sensors(&mut self) -> Result<SlowSensors> {
+        self.slow.ok_or(IoError::Simulated)
     }
 }
 

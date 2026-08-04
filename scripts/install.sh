@@ -609,6 +609,7 @@ report() {
     say "installed daemon ${version}"
     cat <<'EOF'
 
+  robotctl health                     the whole robot: hardware and software
   robotctl version                    what is running, and what is installed
   robotctl update status              update state per component
   robotctl update check               is a newer release available
