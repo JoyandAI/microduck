@@ -1,0 +1,194 @@
+//! Which calls BLE may make, and which socket answers them.
+//!
+//! BLE exposes a **subset** of the robot API (`architecture.md` §4.1): provisioning, status,
+//! and the update trigger with its progress. It is too slow and too constrained for the full
+//! surface, and — more to the point — a radio anybody within a few metres can talk to is not
+//! the transport over which to offer "reset this robot to factory state".
+//!
+//! One table decides both questions, because they are the same question: a call is permitted
+//! exactly when this file names the service that answers it.
+//!
+//! **The match is deliberately exhaustive.** Adding a variant to [`proto::Call`] makes this
+//! file fail to compile, so a new method cannot reach the radio because someone forgot this
+//! file existed. A `_ => None` wildcard would be the safe default in the moment and the wrong
+//! one over time: it would silently deny new methods, and the first symptom would be a phone
+//! app that cannot see a feature nobody remembered to route.
+
+use duck_ipc_proto as proto;
+
+/// The service that owns the answer to a call.
+///
+/// One socket per service, connected directly — there is no broker (`architecture.md` §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upstream {
+    /// `updaterd`, at `proto::DEFAULT_SOCKET`.
+    Updater,
+    /// `robotd`.
+    Robot,
+}
+
+/// Where this call goes, or `None` if BLE may not make it.
+///
+/// Read the `None` arms as the security boundary: each one is a deliberate decision that a
+/// phone in the room does not get to do this.
+pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
+    use proto::Call::*;
+    match call {
+        // The version handshake. Must be reachable or no client can establish anything.
+        Hello(_) => Some(Upstream::Updater),
+
+        // ── the update subset §4.1 names ────────────────────────────────────
+        //
+        // `Apply` is the only mutating call BLE may make, and it is intended: BLE implies
+        // physical presence plus pairing (§4.2), and "update the robot from the phone" is
+        // M6's headline. Note it still has to pass `updaterd`'s own peer policy — btd's uid
+        // must be in `allow_uids` for this to be more than a permission error. Leaving it
+        // out is a safe default: BLE can then read everything and change nothing.
+        Apply(_) => Some(Upstream::Updater),
+        Check(_) => Some(Upstream::Updater),
+        Status => Some(Upstream::Updater),
+        Subscribe => Some(Upstream::Updater),
+        // Read-only, and what support asks for first. `update.log` is the record that
+        // survives a wiped journal (§8.2), so a phone able to read it is worth having.
+        Log(_) => Some(Upstream::Updater),
+        ListInstalled(_) => Some(Upstream::Updater),
+
+        // Is the robot alright? The one `robot.*` call an app has any use for.
+        RobotHealth => Some(Upstream::Robot),
+
+        // ── refused ─────────────────────────────────────────────────────────
+
+        // Operator surgery. Choosing which installed release runs, or pinning one, is a
+        // considered decision made with `robotctl` and a record of who did it — not a
+        // mistap in a phone UI.
+        Select(_) | Pin(_) => None,
+
+        // Recovery, and deliberately not here *yet*. The engine reverts a bad release on its
+        // own (health gate plus boot counter), so the phone needs no button for the ordinary
+        // case. Recovery mode (§8.2) is what should reopen this, with its own thinking about
+        // what a stranger holding a broken robot is allowed to trigger.
+        Rollback(_) => None,
+
+        // Factory reset in all but name: back to the golden image, discarding every release
+        // since. Never over a radio.
+        ResetToGolden(_) => None,
+
+        // `updaterd`'s private questions to `robotd` — may I restart the control loop, which
+        // model API is this, is a telepresence session live. Internal plumbing of the update
+        // decision, of no use to a client and misleading if exposed: a phone reading
+        // `safeToRestart` would learn nothing it could act on.
+        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => None,
+    }
+}
+
+/// The JSON-RPC error to answer a refused call with.
+///
+/// [`proto::code::PERMISSION_DENIED`] rather than `METHOD_NOT_FOUND`, because the two mean
+/// different things to whoever is holding the phone: this method exists and this transport
+/// may not use it — "try `robotctl`", not "upgrade your app".
+pub fn refusal(call: &proto::Call) -> proto::Error {
+    proto::Error::new(
+        proto::code::PERMISSION_DENIED,
+        format!(
+            "{} is not available over Bluetooth; use robotctl on the robot",
+            call.method()
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duck_ipc_proto::{ComponentId, semver};
+
+    fn component() -> ComponentId {
+        ComponentId::new("daemon")
+    }
+
+    /// Nothing that replaces or discards software may be reached from the radio, except the
+    /// one call §4.1 puts there on purpose.
+    #[test]
+    fn apply_is_the_only_mutating_call_ble_may_make() {
+        let mutating_and_allowed: Vec<&str> = every_call()
+            .iter()
+            .filter(|c| c.is_mutating() && upstream_for(c).is_some())
+            .map(proto::Call::method)
+            .collect();
+
+        assert_eq!(mutating_and_allowed, vec![proto::method::APPLY]);
+    }
+
+    /// The refusals, named individually. If a future change makes one of these reachable it
+    /// should have to delete a line here and say why in the commit.
+    #[test]
+    fn the_refused_calls_stay_refused() {
+        for call in [
+            proto::Call::Rollback(proto::ComponentParams { component: component() }),
+            proto::Call::ResetToGolden(proto::ComponentParams { component: component() }),
+            proto::Call::Select(proto::SelectParams {
+                component: component(),
+                version: semver::Version::new(1, 0, 0),
+            }),
+            proto::Call::Pin(proto::PinParams { component: component(), version: None }),
+            proto::Call::RobotSafeToRestart,
+            proto::Call::RobotModelApi,
+            proto::Call::RobotRemoteSessionActive,
+        ] {
+            assert_eq!(upstream_for(&call), None, "{}", call.method());
+        }
+    }
+
+    /// A phone must be able to establish a session, see the robot's state, start an update
+    /// and watch it. Without all four the transport is not useful for what it exists to do.
+    #[test]
+    fn the_app_path_is_reachable() {
+        let expected = [
+            (proto::Call::Hello(proto::HelloParams { api_version: proto::API_VERSION }), Upstream::Updater),
+            (proto::Call::Status, Upstream::Updater),
+            (proto::Call::Subscribe, Upstream::Updater),
+            (proto::Call::RobotHealth, Upstream::Robot),
+        ];
+        for (call, want) in expected {
+            assert_eq!(upstream_for(&call), Some(want), "{}", call.method());
+        }
+    }
+
+    /// A refusal must be distinguishable from "no such method", because the two ask the user
+    /// for different things.
+    #[test]
+    fn a_refusal_says_permission_denied_and_names_the_method() {
+        let call = proto::Call::ResetToGolden(proto::ComponentParams { component: component() });
+        let err = refusal(&call);
+
+        assert_eq!(err.code, proto::code::PERMISSION_DENIED);
+        assert!(err.message.contains(proto::method::RESET_TO_GOLDEN), "{}", err.message);
+    }
+
+    /// Every variant, so the tests above cannot silently skip one. The exhaustive match in
+    /// `upstream_for` is what forces this list to be maintained: a new variant breaks the
+    /// build there, and whoever fixes it arrives here next.
+    fn every_call() -> Vec<proto::Call> {
+        let version = semver::Version::new(1, 4, 2);
+        vec![
+            proto::Call::Hello(proto::HelloParams { api_version: proto::API_VERSION }),
+            proto::Call::Check(proto::ComponentParams { component: component() }),
+            proto::Call::Apply(proto::ApplyParams {
+                component: component(),
+                target: proto::Target::Latest,
+                options: proto::ApplyOptions::default(),
+            }),
+            proto::Call::Rollback(proto::ComponentParams { component: component() }),
+            proto::Call::ResetToGolden(proto::ComponentParams { component: component() }),
+            proto::Call::Select(proto::SelectParams { component: component(), version: version.clone() }),
+            proto::Call::Pin(proto::PinParams { component: component(), version: Some(version) }),
+            proto::Call::Status,
+            proto::Call::ListInstalled(proto::ComponentParams { component: component() }),
+            proto::Call::Log(proto::LogParams { limit: 20 }),
+            proto::Call::Subscribe,
+            proto::Call::RobotSafeToRestart,
+            proto::Call::RobotHealth,
+            proto::Call::RobotModelApi,
+            proto::Call::RobotRemoteSessionActive,
+        ]
+    }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "btd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BLE transport adapter — a GATT front door onto the robot's JSON-RPC API"
+
+# A transport adapter and nothing else (architecture.md §4.1): `btd` owns no state. Every
+# request it accepts is forwarded verbatim to the service that owns the answer, over that
+# service's unix socket. So it depends on the method table and on nothing that implements
+# behaviour — no update engine, no control loop, no NetworkManager client.
+#
+# It is also the process that parses bytes arriving from anyone in radio range, which is why it
+# stays unprivileged while `configd` is the one running as root.
+[dependencies]
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+
+# `bluer` (BlueZ) and tokio are deliberately NOT here yet, and adding them needs a decision
+# rather than a line:
+#
+#  - BlueZ is Linux-only, so the real backend must sit behind a trait with a fake, as
+#    `duck-control` does for the Dynamixel bus — the suite runs on a macOS laptop with no
+#    hardware, no network and no Docker, and that must stay true.
+#  - `bluer` links libdbus, which the release pipeline **cross-compiles** for aarch64. A C
+#    dependency needs a sysroot that CI does not have today, so this is a build-system change
+#    and not a dependency addition. Measure it against a pure-Rust D-Bus client (`zbus`,
+#    already the likely choice for `configd`) before committing to either.
+#
+# Until that is settled this crate is the transport-independent half — framing and routing —
+# which is where all the logic worth testing lives anyway.

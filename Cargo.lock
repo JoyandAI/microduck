@@ -190,6 +190,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "btd"
+version = "0.1.4"
+dependencies = [
+ "duck-ipc-proto",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
