@@ -202,8 +202,14 @@ exit 0
 STUB
 chmod +x /stub/curl /stub/find /stub/systemctl
 
-# Already present, so install_onnxruntime returns early instead of fetching ~20 MB.
-touch /usr/local/lib/libonnxruntime.so
+# Already present at the version asked for, so install_onnxruntime returns early instead of
+# fetching ~20 MB. Both halves matter: the check resolves the symlink and reads the version out
+# of the target name, so a bare file would be treated as a mismatch and trigger a download.
+#
+# ONNX_VERSION is passed explicitly rather than mirroring the script default, so bumping that
+# default — which happens whenever ort moves — cannot silently break this test.
+touch /usr/local/lib/libonnxruntime.so.9.9.9
+ln -sf libonnxruntime.so.9.9.9 /usr/local/lib/libonnxruntime.so
 
 # The wrong overlay prefix and a console on the motor UART: what Armbian actually ships.
 cat > /boot/armbianEnv.txt <<"ENV"
@@ -211,7 +217,7 @@ overlay_prefix=rk35xx
 console=both
 ENV
 
-PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board.log 2>&1
+ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board.log 2>&1
 
 # The RK3566 shares overlays with the RK3568, so the wrong prefix boots happily with no
 # /dev/ttyS2 at all.
@@ -231,7 +237,7 @@ echo "    [ok] setup-board takes the kernel console off the UART"
 
 # Idempotent: it is re-run after the reboot it asks for, and must not undo its own work or
 # append a second copy of the overlay.
-PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board2.log 2>&1
+ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board2.log 2>&1
 grep -q "^overlay_prefix=rk3568$" /boot/armbianEnv.txt
 grep -q "^console=display$" /boot/armbianEnv.txt
 test "$(grep -c uart2-m0 /boot/armbianEnv.txt)" = 1
