@@ -650,7 +650,9 @@ pub struct SafeToRestartResult {
 ///
 /// A robot that is up but *not* healthy must say so rather than fail to answer: the
 /// difference decides whether an update rolls back for a known reason or for a timeout.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: the battery reading is a float. Nothing compares these for exact equality
+// outside tests, where `PartialEq` is what `assert_eq!` needs anyway.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthResult {
     pub healthy: bool,
     /// Set when the reason is a property of the *board*, not of the running release.
@@ -668,6 +670,31 @@ pub struct HealthResult {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Motor-bus voltage, when it has been read.
+    ///
+    /// **Reported, never judged.** Nothing here may influence `healthy` or `degraded`: a flat
+    /// pack is a fact about the robot, and a release rolled back over one would be replaced by
+    /// a release judged on the same flat pack — so the robot could not be updated at all until
+    /// someone charged it. It rides on this method because this is the one a human already
+    /// asks (`robotctl health`), not because the gate has any use for it.
+    ///
+    /// Absent means *not known yet* — the first second after startup, a bus that cannot
+    /// answer, or an older `robotd`. Absent is not zero volts, and a client must not render
+    /// it as an empty battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<Battery>,
+}
+
+/// Motor-bus voltage, and what fraction of a pack that is.
+///
+/// Both, deliberately. Volts is the measurement; percent is a *mapping* over a pack the
+/// robot knows and a client should not have to (`duck_control::model::battery_percent`).
+/// The prototype shipped volts only, and the mapping was duplicated into the app — which is
+/// how two screens end up disagreeing about the same battery.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Battery {
+    pub volts: f64,
+    pub percent: f64,
 }
 
 /// Answer to [`Call::RobotModelApi`].
@@ -966,6 +993,7 @@ mod tests {
             degraded: false,
             healthy: true,
             reason: None,
+            battery: None,
         };
         let line = serde_json::to_string(&healthy).unwrap();
         assert!(!line.contains("reason"), "{line}");
@@ -978,6 +1006,7 @@ mod tests {
             degraded: false,
             healthy: false,
             reason: Some("motors not responding".into()),
+            battery: None,
         };
         let line = serde_json::to_string(&sick).unwrap();
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), sick);
@@ -999,6 +1028,7 @@ mod tests {
             healthy: true,
             degraded: false,
             reason: None,
+            battery: None,
         };
         assert!(!serde_json::to_string(&plain).unwrap().contains("degraded"));
 
@@ -1006,10 +1036,44 @@ mod tests {
             healthy: false,
             degraded: true,
             reason: Some("no answer from the motor bus".into()),
+            battery: None,
         };
         let line = serde_json::to_string(&bench).unwrap();
         assert!(line.contains(r#""degraded":true"#), "{line}");
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), bench);
+    }
+
+    /// An absent battery must stay absent, not become zero volts.
+    ///
+    /// This is the answer for the first second after startup, for a bus that cannot reply,
+    /// and for an older `robotd` that has never heard of the field. A `0.0` default would
+    /// make every one of those render as a flat pack — alarming, and wrong.
+    #[test]
+    fn a_missing_battery_is_unknown_not_empty() {
+        let answer: HealthResult = serde_json::from_str(r#"{"healthy":true}"#).unwrap();
+        assert!(answer.battery.is_none());
+
+        let unread = HealthResult {
+            healthy: true,
+            degraded: false,
+            reason: None,
+            battery: None,
+        };
+        assert!(!serde_json::to_string(&unread).unwrap().contains("battery"));
+
+        let measured = HealthResult {
+            battery: Some(Battery {
+                volts: 7.62,
+                percent: 63.75,
+            }),
+            ..unread
+        };
+        let line = serde_json::to_string(&measured).unwrap();
+        assert!(line.contains(r#""volts":7.62"#), "{line}");
+        assert_eq!(
+            serde_json::from_str::<HealthResult>(&line).unwrap(),
+            measured
+        );
     }
 
     /// A local build must say so, rather than looking like a release whose revision was

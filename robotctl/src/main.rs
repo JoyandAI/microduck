@@ -382,18 +382,16 @@ struct VersionReport {
     warnings: Vec<String>,
 }
 
-/// Ask every daemon what it is running, and compare against what is installed.
-///
-/// Deliberately does **not** use the ordinary `Client::connect(..)?` + `hello()?` path.
-/// That exits non-zero when `updaterd` is unreachable, which is precisely the situation
-/// where someone is running this command. Every failure here becomes a line in the report
-/// instead.
 /// Ask `robotd` whether it is healthy.
 ///
 /// Exits non-zero when the robot is unhealthy or unreachable, so a script can gate on it —
 /// `robotctl health && do_the_thing`. The reason is always printed, because "unhealthy" on
 /// its own sends someone hunting: it distinguishes a loop that has not started from one
 /// missing its deadline from a policy that would not load.
+///
+/// Battery prints on its own line and never affects the verdict or the exit code. It is here
+/// because this is the command someone runs when a robot is behaving oddly, and "the pack is
+/// at 8%" answers that question more often than anything else on the socket.
 fn run_health(robot_socket: &Path, json: bool) -> Result<(), Failure> {
     let mut client = Client::connect_to("robotd", robot_socket)?;
     let response = client.call(&proto::Call::RobotHealth)?;
@@ -425,6 +423,14 @@ fn run_health(robot_socket: &Path, json: bool) -> Result<(), Failure> {
             },
             health.reason.as_deref().unwrap_or("no reason given")
         );
+    }
+
+    // After the verdict, and only in human output — the JSON already carries it. Silent when
+    // unknown rather than printing a zero: for the first second of uptime, and on a robot
+    // whose bus cannot answer, there is genuinely no reading, and "0.00 V" would read as a
+    // dead pack.
+    if !json && let Some(battery) = health.battery {
+        println!("battery: {:.2} V ({:.0}%)", battery.volts, battery.percent);
     }
 
     if health.healthy {

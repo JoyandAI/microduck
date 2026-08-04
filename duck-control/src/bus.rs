@@ -4,6 +4,10 @@
 //! `sync_write` of goal positions. The IMU is listed first so it answers before the servo
 //! burst.
 //!
+//! Battery is the one thing that does not fit that shape: it lives at a register outside the
+//! block the tick fetches, so [`RobotIo::bus_voltage`] is a transaction of its own, meant to
+//! be called about once a second rather than every tick.
+//!
 //! Written against `rustypot`, but the *numbers* — conversion factors and the EEPROM
 //! registers asserted at startup — come from `microduck_runtime`, where they were arrived
 //! at against real hardware. See [`crate::model`].
@@ -25,6 +29,12 @@ const READ_LEN: u8 = 12;
 
 /// 0.229 rev/min per count, in rad/s.
 const RAD_PER_SEC_PER_COUNT: f64 = 0.229 * (2.0 * PI / 60.0);
+
+/// `present_input_voltage` (address 144) counts 0.1 V each. Not in the block above: it sits
+/// eight bytes past its end, so battery costs a second transaction — see
+/// [`RobotIo::bus_voltage`]. Address 146 is `present_temperature`, one byte further, if
+/// motor temperature ever wants surfacing too.
+const VOLTS_PER_COUNT: f64 = 0.1;
 
 /// A healthy 16-device read completes well inside this. Capping it means a missing device
 /// costs a bounded hiccup rather than stalling the loop on the serial driver's default.
@@ -249,6 +259,36 @@ impl RobotIo for DynamixelIo {
         self.controller
             .sync_write_goal_position(&JOINT_IDS, &targets.positions)
             .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
+    }
+
+    /// Mean supply voltage across the servos.
+    ///
+    /// Averaged because all 15 sit on one pack: a single servo's reading is the same
+    /// measurement with more noise. Note that a silent servo does not produce a short
+    /// answer here — `rustypot`'s `sync_read` waits for every id and fails the whole
+    /// transaction if one does not reply — so this is all-or-nothing, and the caller is
+    /// expected to keep its previous reading rather than treat one miss as news. The zero
+    /// filter is for a device that answers with a nonsense value, which must not be
+    /// averaged in as if the pack were half flat.
+    fn bus_voltage(&mut self) -> Result<f64> {
+        let raw = self
+            .controller
+            .sync_read_present_input_voltage(&JOINT_IDS)
+            .map_err(|e| IoError::Bus(format!("read present input voltage: {e}")))?;
+
+        let answered: Vec<f64> = raw
+            .iter()
+            .map(|&counts| counts as f64 * VOLTS_PER_COUNT)
+            .filter(|&v| v > 0.0)
+            .collect();
+        if answered.is_empty() {
+            return Err(IoError::ShortRead {
+                what: "input voltage",
+                expected: NUM_JOINTS,
+                got: 0,
+            });
+        }
+        Ok(answered.iter().sum::<f64>() / answered.len() as f64)
     }
 }
 

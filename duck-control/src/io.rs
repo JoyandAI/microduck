@@ -76,6 +76,14 @@ pub trait RobotIo {
     /// One transaction: joints and IMU together.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
+
+    /// Mean motor-bus voltage, in volts — the only battery measurement the robot has.
+    ///
+    /// Its own transaction, and therefore not part of [`Sensors`]: `present_input_voltage`
+    /// lives at address 144, outside the contiguous block the tick fetches, so it cannot
+    /// ride along however much we would like it to. Costs about a millisecond, which is why
+    /// the caller is expected to ask roughly once a second rather than every tick.
+    fn bus_voltage(&mut self) -> Result<f64>;
 }
 
 /// A robot made of nothing, for tests.
@@ -94,6 +102,10 @@ pub struct FakeIo {
     pub last_written: Option<JointTargets>,
     pub reads: usize,
     pub writes: usize,
+    /// What [`RobotIo::bus_voltage`] reports. Mid-pack by default so `--fake` shows a
+    /// plausible battery; set it to exercise a flat one. `None` fails the read, which is
+    /// what a robot with no bus does.
+    pub battery_v: Option<f64>,
     /// When true, `read` reports the last written targets as the present positions.
     track_targets: bool,
 }
@@ -113,6 +125,7 @@ impl FakeIo {
             last_written: None,
             reads: 0,
             writes: 0,
+            battery_v: Some(7.4),
             track_targets: true,
         }
     }
@@ -168,6 +181,10 @@ impl RobotIo for FakeIo {
             self.sensors.positions = targets.positions;
         }
         Ok(())
+    }
+
+    fn bus_voltage(&mut self) -> Result<f64> {
+        self.battery_v.ok_or(IoError::Simulated)
     }
 }
 

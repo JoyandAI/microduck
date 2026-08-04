@@ -577,6 +577,7 @@ report() {
     cat <<'EOF'
 
   robotctl version                    what is running, and what is installed
+  robotctl health                     is the robot working, and how is its battery
   robotctl update status              update state per component
   robotctl update check               is a newer release available
   sudo robotctl update apply daemon   update now (mutations are root-only by design)

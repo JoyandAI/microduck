@@ -157,7 +157,7 @@ namespace (§7.4).
 
 | method | slice 1 |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count, plus the battery as a *reported* field the verdict never consults |
 | `robot.safeToRestart` | `true` (a constant pose is always safe to interrupt) |
 | `robot.modelApi` | unchanged constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
@@ -169,6 +169,15 @@ already built around.
 
 A loop running at 60% of target is alive, answers every request, and is badly broken. That
 distinction is the whole reason slice 1 exists.
+
+**What may and may not reach the verdict.** `healthy` and `degraded` are the update system's
+inputs, so only conditions a *release* can be blamed for may set them — that is what
+`degraded` already exists to enforce for an unpowered bench board. The battery rides on the
+same answer without touching either, because it is the number a human wants when a robot is
+behaving oddly and this is the command they run. Gating on it would mean a robot updated on a
+low pack rolls the release back, then judges its replacement on the same low pack, and cannot
+be updated at all until someone works out why. The same rule will apply to motor temperature
+when it lands (address 146, one register past the voltage this reads).
 
 ### 4.6 Done when
 
@@ -282,9 +291,20 @@ explanation, is unusable, and safety clamps things constantly:
   "t":1234.567,
   "move":{"requested":[0.4,0,0],"applied":[0.15,0,0],"limited_by":["max_velocity"]},
   "policy":"walk", "safety":{"fallen":false,"limp":false},
-  "loop":{"hz":49.8,"missed":0}
+  "loop":{"hz":49.8,"missed":0},
+  "battery":{"volts":7.62,"percent":64}
 }}
 ```
+
+**Battery carries both volts and percent**, here and in `robot.health`. The mapping — 6.6 V
+empty, 8.2 V full under load, an NP-F550 — lives in `duck_control::model::battery_percent` and
+travels already applied. The prototype sent volts only and the app re-derived the percentage
+from constants of its own, which is how the same pack shows two different numbers on two
+screens. A client drawing a battery pill should not have to know which pack this robot ships
+with.
+
+There is no fuel gauge: the measurement is the servos' own supply voltage, read once a second
+in its own bus transaction and smoothed, so it sags under load and recovers at rest.
 
 Same payload for `robotctl monitor` and, later, the app. This is what replaces the runtime's
 180-byte frame on 9870, the JPEG stream on 9871, the UDP command socket on 9872, the maploc

@@ -52,8 +52,16 @@ const MAX_LINE: usize = 64 * 1024;
 const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Window over which the achieved rate is measured, and therefore how quickly a degraded
-/// loop becomes visible to the health gate.
+/// loop becomes visible to the health gate. Doubles as the battery sampling interval
+/// ([`sample_battery`]).
 const RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Smoothing on the reported battery voltage. At one sample per [`RATE_WINDOW`] this is a
+/// ~10 s time constant, which is what makes the number readable: the raw voltage sags
+/// several tenths of a volt on every step and recovers between them, so an unsmoothed
+/// reading swings while the pack is doing nothing unusual. Borrowed, with the figure, from
+/// `microduck_runtime`.
+const BATTERY_EMA_ALPHA: f64 = 0.1;
 
 #[derive(Parser, Debug)]
 #[command(name = "robotd", about = "Robot control daemon", version)]
@@ -141,6 +149,10 @@ struct RobotState {
     /// reading the startup pose. Non-zero means the loop is still waiting for a robot to
     /// answer and has never commanded anything.
     startup_bus_failures: AtomicU32,
+    /// Motor-bus voltage, EMA-smoothed, as `f64::to_bits`. Zero means *not read yet* — a
+    /// distinction that has to survive to the wire, since zero volts and unknown volts look
+    /// nothing alike to whoever is deciding whether to charge the robot.
+    battery_v: AtomicU64,
     shutdown: AtomicBool,
 
     period_us: u64,
@@ -161,6 +173,7 @@ impl RobotState {
             achieved_hz: AtomicU64::new(0),
             consecutive_errors: AtomicU32::new(0),
             startup_bus_failures: AtomicU32::new(0),
+            battery_v: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
             min_achieved_hz: params.health.min_achieved_hz,
@@ -172,16 +185,22 @@ impl RobotState {
     }
 
     fn health(&self) -> proto::HealthResult {
+        // Attached to every answer, healthy or not, and consulted by none of the checks
+        // below. A verdict must never depend on it: see `HealthResult::battery`.
+        let battery = self.battery();
+
         let unhealthy = |reason: String| proto::HealthResult {
             healthy: false,
             degraded: false,
             reason: Some(reason),
+            battery,
         };
         // Not healthy, but not the release's fault either — see `HealthResult::degraded`.
         let degraded = |reason: String| proto::HealthResult {
             healthy: false,
             degraded: true,
             reason: Some(reason),
+            battery,
         };
 
         if self.force_unhealthy {
@@ -231,7 +250,23 @@ impl RobotState {
             healthy: true,
             degraded: false,
             reason: None,
+            battery,
         }
+    }
+
+    /// The last battery reading, mapped to a percentage — or `None` if there has not been
+    /// one.
+    ///
+    /// Zero is the "never read" sentinel rather than a measurement: the atomic starts there,
+    /// and a robot whose bus cannot answer never leaves it. Reporting that as `0.00 V, 0%`
+    /// would put a flat-battery warning in front of anyone whose robot has been up for less
+    /// than a second.
+    fn battery(&self) -> Option<proto::Battery> {
+        let volts = f64::from_bits(self.battery_v.load(Ordering::Relaxed));
+        (volts > 0.0).then(|| proto::Battery {
+            volts,
+            percent: duck_control::battery_percent(volts),
+        })
     }
 
     fn safe_to_restart(&self) -> proto::SafeToRestartResult {
@@ -629,11 +664,17 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
             window_start = Instant::now();
             window_ticks = 0;
 
+            sample_battery(&mut io, &state);
+
             if last_summary.elapsed() >= LOOP_SUMMARY_INTERVAL {
                 tracing::info!(
                     total = ticks,
                     hz = format!("{hz:.1}"),
                     missed = state.missed.load(Ordering::Relaxed),
+                    battery_v = format!(
+                        "{:.2}",
+                        f64::from_bits(state.battery_v.load(Ordering::Relaxed))
+                    ),
                     "control loop"
                 );
                 last_summary = Instant::now();
@@ -641,6 +682,35 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
         }
     }
     tracing::info!("control loop stopped");
+}
+
+/// Read the battery and publish it, once per [`RATE_WINDOW`].
+///
+/// Not part of the tick. `present_input_voltage` is a second bus transaction — about a
+/// millisecond — which is nothing once a second and would be 5% of the budget at 50 Hz. A
+/// second is also faster than a battery can meaningfully change.
+///
+/// Called from the loop thread because that thread owns the IO, and nothing else may touch
+/// the bus: a transaction issued from the IPC side would interleave bytes with a tick and
+/// corrupt both.
+fn sample_battery<T: RobotIo>(io: &mut T, state: &RobotState) {
+    match io.bus_voltage() {
+        Ok(volts) => {
+            let previous = f64::from_bits(state.battery_v.load(Ordering::Relaxed));
+            // Seed from the first reading rather than blending up from zero, which would
+            // spend ten seconds reporting a battery flatter than it is.
+            let smoothed = if previous > 0.0 {
+                BATTERY_EMA_ALPHA * volts + (1.0 - BATTERY_EMA_ALPHA) * previous
+            } else {
+                volts
+            };
+            state.battery_v.store(smoothed.to_bits(), Ordering::Relaxed);
+        }
+        // Keep the last reading. A single failed transaction is ordinary on a serial bus, and
+        // dropping to "unknown" over one would make the reported battery flicker. A bus that
+        // is really gone already shows up in the health verdict itself.
+        Err(e) => tracing::debug!(error = %e, "voltage read failed; keeping the last reading"),
+    }
 }
 
 async fn serve(state: Arc<RobotState>, socket_path: PathBuf) -> std::io::Result<()> {
@@ -1077,6 +1147,57 @@ mod tests {
         assert_eq!(written.positions, resting);
     }
 
+    /// **The invariant the battery field lives or dies by.** A flat pack must be reported and
+    /// must not touch the verdict.
+    ///
+    /// If it ever did, updating a robot on a low battery would roll the release back — and the
+    /// replacement would be judged on the same low battery, so the robot could not be updated
+    /// at all until someone noticed and charged it. The whole reason `degraded` exists is to
+    /// keep board conditions out of the rollback decision; a battery that gated would walk
+    /// straight back into it.
+    #[test]
+    fn a_flat_battery_is_reported_and_changes_no_verdict() {
+        let s = state();
+        ticked(&s, 100);
+        // Below BATTERY_EMPTY_V: the pack is done and the robot is struggling.
+        s.battery_v.store(6.1f64.to_bits(), Ordering::Relaxed);
+
+        let health = s.health();
+        let battery = health.battery.expect("a flat battery is still a reading");
+        assert!(battery.volts < duck_control::BATTERY_EMPTY_V);
+        assert_eq!(battery.percent, 0.0);
+
+        assert!(health.healthy, "{:?}", health.reason);
+        assert!(!health.degraded);
+    }
+
+    /// Zero volts is what the atomic holds before the first read lands, and it must reach the
+    /// wire as absent rather than as a pack at 0 V — otherwise `robotctl health` announces a
+    /// flat battery on every robot that has been up for less than a second.
+    #[test]
+    fn an_unread_battery_is_absent_not_empty() {
+        let s = state();
+        ticked(&s, 1);
+        assert_eq!(s.battery_v.load(Ordering::Relaxed), 0);
+        assert!(s.health().battery.is_none());
+    }
+
+    /// The reading travels on every answer, not only the healthy one — a robot that is
+    /// unhealthy *because* it is out of power is exactly when someone wants to see the pack.
+    #[test]
+    fn battery_is_reported_alongside_an_unhealthy_verdict() {
+        let s = state();
+        s.startup_bus_failures.store(4, Ordering::Relaxed);
+        s.battery_v.store(7.5f64.to_bits(), Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(!health.healthy);
+        assert!(
+            health.battery.is_some(),
+            "battery dropped from a bad answer"
+        );
+    }
+
     /// While waiting, health must say *why*. The update system quotes this string as the
     /// reason it rolled a release back, and "control loop has not completed a cycle yet"
     /// describes a robot that is about to start, not one that cannot see its servos.
@@ -1210,6 +1331,9 @@ mod tests {
             }
             fn write(&mut self, t: &JointTargets) -> duck_control::io::Result<()> {
                 self.0.write(t)
+            }
+            fn bus_voltage(&mut self) -> duck_control::io::Result<f64> {
+                self.0.bus_voltage()
             }
         }
         control_loop(Borrowed(io), state, period).await
