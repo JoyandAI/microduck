@@ -191,9 +191,9 @@ impl RobotState {
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
-            min_achieved_hz: params.health.min_achieved_hz,
-            stall_periods: params.health.stall_periods,
-            max_consecutive_errors: params.health.max_consecutive_errors,
+            min_achieved_hz: params.update_gate.min_achieved_hz,
+            stall_periods: params.update_gate.stall_periods,
+            max_consecutive_errors: params.update_gate.max_consecutive_errors,
             force_unhealthy,
             force_busy,
         }
@@ -981,7 +981,7 @@ mod tests {
         // A short window so the test does not sleep for the real 500 ms default. Two
         // periods at 50 Hz is 40 ms.
         let mut params = Params::default();
-        params.health.stall_periods = 2;
+        params.update_gate.stall_periods = 2;
         let s = RobotState::new(&params, false, false);
 
         s.ticks.store(1, Ordering::Relaxed);

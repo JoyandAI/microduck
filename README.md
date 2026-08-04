@@ -20,7 +20,7 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-310 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+311 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
 The fastest way to actually *see* the update engine work is the playground, which drives
 the real engine — real signatures, real atomic swaps, real rollback — against a fake remote
