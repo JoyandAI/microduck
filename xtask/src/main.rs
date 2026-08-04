@@ -332,6 +332,24 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
             append_file(&mut builder, Path::new(src), dest, mode)?;
         }
 
+        // The preinstall hook, always, generated from its template.
+        //
+        // Not an `--include` the release workflow has to remember: the board prerequisites it
+        // asserts are a property of every release, and a check that ships only when someone
+        // adds a flag is a check that will one day be missing from the release that needed it.
+        const PREINSTALL_TEMPLATE: &str = "hooks/preinstall.in";
+        if args
+            .includes
+            .iter()
+            .any(|i| i.ends_with("=hooks/preinstall"))
+        {
+            return Err("hooks/preinstall is generated; remove the --include for it".into());
+        }
+        let template = std::fs::read_to_string(PREINSTALL_TEMPLATE)
+            .map_err(|e| format!("reading {PREINSTALL_TEMPLATE}: {e}"))?;
+        let hook = render_preinstall_hook(&template)?;
+        append_bytes(&mut builder, "hooks/preinstall", hook.as_bytes(), 0o755)?;
+
         // Recorded inside the release so a robot can identify what it is running even
         // with no network and no manifest.
         let version_toml = format!(
@@ -706,6 +724,44 @@ fn promote(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// ONNX Runtime floor and target from `[workspace.metadata.onnxruntime]`.
+///
+/// One source of truth for a value that has to agree in three places — the preinstall hook,
+/// `scripts/setup-board.sh`, and whatever `ort` requires. Two of those drifted apart once
+/// already, and the board that resulted could install a release and then only load a policy
+/// far enough to panic.
+fn onnxruntime_versions() -> Result<(String, String), Box<dyn std::error::Error>> {
+    let manifest: toml::Value = toml::from_str(&std::fs::read_to_string("Cargo.toml")?)?;
+    let table = manifest
+        .get("workspace")
+        .and_then(|w| w.get("metadata"))
+        .and_then(|m| m.get("onnxruntime"))
+        .ok_or("Cargo.toml has no [workspace.metadata.onnxruntime]")?;
+    let get = |key: &str| -> Result<String, Box<dyn std::error::Error>> {
+        Ok(table
+            .get(key)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("[workspace.metadata.onnxruntime] has no {key}"))?
+            .to_owned())
+    };
+    Ok((get("floor")?, get("target")?))
+}
+
+/// Fill in the preinstall hook from its template.
+///
+/// Generated rather than committed so the hook cannot disagree with the release it ships
+/// inside: both come from the same `Cargo.toml` in the same build.
+fn render_preinstall_hook(template: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let (floor, target) = onnxruntime_versions()?;
+    let rendered = template
+        .replace("@ONNX_FLOOR@", &floor)
+        .replace("@ONNX_TARGET@", &target);
+    if rendered.contains("@ONNX_") {
+        return Err("preinstall template still has unsubstituted @ONNX_...@ placeholders".into());
+    }
+    Ok(rendered)
+}
+
 fn workspace_version() -> Result<semver::Version, Box<dyn std::error::Error>> {
     let manifest: toml::Value = toml::from_str(&std::fs::read_to_string("Cargo.toml")?)?;
     let raw = manifest
@@ -753,4 +809,50 @@ fn sha256_hex(bytes: &[u8]) -> String {
             let _ = write!(s, "{b:02x}");
             s
         })
+}
+
+#[cfg(test)]
+mod tests {
+    /// `scripts/setup-board.sh` is fetched standalone with `curl`, so it cannot read
+    /// Cargo.toml and has to carry a literal version. This is what stops that literal
+    /// drifting from the value the preinstall hook is generated with — the exact failure that
+    /// left 1.20.1 on a board against an `ort` that requires 1.23 and panics below it.
+    #[test]
+    fn setup_board_pins_the_same_onnx_target() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let target = manifest["workspace"]["metadata"]["onnxruntime"]["target"]
+            .as_str()
+            .unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-board.sh")).unwrap();
+        let expected = format!("ONNX_VERSION=\"${{ONNX_VERSION:-{target}}}\"");
+        assert!(
+            script.contains(&expected),
+            "setup-board.sh must pin ONNX_VERSION to {target}; expected the line {expected:?}"
+        );
+    }
+
+    /// The shipped hook must be fully substituted. A placeholder reaching a board would be
+    /// compared against a version number and silently fail every board the same way.
+    #[test]
+    fn the_preinstall_template_renders_completely() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let template = std::fs::read_to_string(root.join("hooks/preinstall.in")).unwrap();
+        assert!(
+            template.contains("@ONNX_FLOOR@") && template.contains("@ONNX_TARGET@"),
+            "the template should carry both placeholders"
+        );
+
+        let rendered = template
+            .replace("@ONNX_FLOOR@", "1.23")
+            .replace("@ONNX_TARGET@", "1.28.0");
+        assert!(
+            !rendered.contains("@ONNX_"),
+            "nothing may remain unsubstituted"
+        );
+        assert!(rendered.contains("ONNX_FLOOR=\"1.23\""));
+        assert!(rendered.contains("ONNX_TARGET=\"1.28.0\""));
+    }
 }
