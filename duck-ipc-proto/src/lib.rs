@@ -691,6 +691,16 @@ pub struct HealthResult {
     /// never judged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motors: Option<MotorThermal>,
+    /// Board temperature in °C — the hottest of the SoC's thermal zones.
+    ///
+    /// Distinct from [`Self::motors`], and the pair is the point: a robot that has been walking
+    /// has hot *servos*, while a board in a warm enclosure with a blocked vent has a hot *SoC*
+    /// and cool motors. They fail differently and are fixed differently, and one number cannot
+    /// stand for both.
+    ///
+    /// Absent off Linux, and on a kernel without thermal sysfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_temp_c: Option<f64>,
     /// The control loop's own numbers — the ones `healthy` was decided from.
     ///
     /// Carried so a verdict can be *checked* rather than taken on faith. "unhealthy: control

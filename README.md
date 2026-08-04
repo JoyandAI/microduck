@@ -20,7 +20,7 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-311 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+317 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
 The fastest way to actually *see* the update engine work is the playground, which drives
 the real engine — real signatures, real atomic swaps, real rollback — against a fake remote
@@ -83,8 +83,8 @@ docs/           architecture · update design · robotd design · roadmap · CI 
 Everything below assumes a **dev board**, never a customer robot.
 
 The state of the robot, hardware and software, in one answer — control loop, motor bus, IMU,
-battery, motor temperature, then what is running, what is installed, what is pinned and how
-the last update went:
+battery, servo and board temperatures, then what is running, what is installed, what is
+pinned and how the last update went:
 
 ```bash
 robotctl health
@@ -97,6 +97,7 @@ robot     healthy
   imu       ready
   battery   7.62 V (64%)
   motors    41 °C max (left_knee) · 36 °C mean
+  cpu       52 °C
 
 software
   updaterd  0.1.4 (rev abc1234)

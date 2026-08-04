@@ -157,7 +157,7 @@ namespace (§7.4).
 
 | method | slice 1 |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, motor temperature |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature |
 | `robot.safeToRestart` | `true` (a constant pose is always safe to interrupt) |
 | `robot.modelApi` | unchanged constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
@@ -193,6 +193,15 @@ once a second in a second transaction (~1 ms) rather than widening the tick's re
 per servo at 50 Hz. Temperature is reported per joint reduced to *the hottest* one and named:
 a knee holding a squat runs far above the mouth, and a mean over fifteen servos hides the one
 approaching the overheat shutdown its error mask latches on.
+
+**Board temperature is a third source, and not on the bus at all.** The hottest of the SoC's
+thermal zones, read from `sysfs` in the same once-a-second sample (`robotd/src/soc.rs`). It
+lives in `robotd` rather than `duck-control` because it is a property of the Linux board, not
+of the robot — which is also why it keeps answering when the motor bus does not, and that is
+precisely when it earns its place: a board cooking behind a blocked vent and a robot with dead
+servos are the same symptom until you can see both numbers. Servo and board temperature are
+reported separately for the same reason. The maximum across zones rather than one zone by name,
+so a board that wires its sensors differently cannot silently omit the one that was climbing.
 
 ### 4.6 Done when
 

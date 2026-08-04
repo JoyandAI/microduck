@@ -20,6 +20,7 @@
 //! than hanging the caller.
 
 mod params;
+mod soc;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -159,6 +160,9 @@ struct RobotState {
     motor_mean_c: AtomicU64,
     /// Index into [`duck_control::JOINT_NAMES`] of the hottest joint.
     motor_hottest: AtomicU32,
+    /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
+    /// kernel with no thermal sysfs ([`soc`]).
+    cpu_temp_c: AtomicU64,
     /// Mirrors of the bus's own IMU diagnostics, refreshed with the thermal sample. Held here
     /// so the IPC side can report them without touching the loop's IO.
     imu_stale_blocks: AtomicU64,
@@ -187,6 +191,7 @@ impl RobotState {
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
             motor_hottest: AtomicU32::new(0),
+            cpu_temp_c: AtomicU64::new(0),
             imu_stale_blocks: AtomicU64::new(0),
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
@@ -214,6 +219,12 @@ impl RobotState {
                 reason,
                 battery: self.battery(),
                 motors: self.motor_thermal(),
+                cpu_temp_c: {
+                    // Zero is "never read", the same sentinel the battery uses: a board at
+                    // 0 °C is a sensor that is not there, not a cold robot.
+                    let c = f64::from_bits(self.cpu_temp_c.load(Ordering::Relaxed));
+                    (c > 0.0).then_some(c)
+                },
                 control_loop: Some(self.loop_health()),
                 bus: proto::BusHealth {
                     consecutive_errors: self.consecutive_errors.load(Ordering::Relaxed),
@@ -732,6 +743,10 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
                         "{:.0}",
                         f64::from_bits(state.motor_max_c.load(Ordering::Relaxed))
                     ),
+                    cpu_c = format!(
+                        "{:.0}",
+                        f64::from_bits(state.cpu_temp_c.load(Ordering::Relaxed))
+                    ),
                     "control loop"
                 );
                 last_summary = Instant::now();
@@ -757,6 +772,13 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut T, state: &RobotState) {
         .imu_stale_blocks
         .store(io.imu_stale_blocks(), Ordering::Relaxed);
     state.imu_ready.store(io.imu_ready(), Ordering::Relaxed);
+
+    // Before the bus read, and unconditionally: this is a `sysfs` read that owes the motor bus
+    // nothing, and a board cooking behind a blocked vent is *more* likely to be worth seeing on
+    // a robot whose servos have stopped answering, not less.
+    if let Some(celsius) = soc::hottest_zone_c() {
+        state.cpu_temp_c.store(celsius.to_bits(), Ordering::Relaxed);
+    }
 
     match io.slow_sensors() {
         Ok(slow) => {
@@ -1341,6 +1363,25 @@ mod tests {
         let s = state();
         ticked(&s, 1);
         assert!(s.health().motors.is_none());
+        assert!(s.health().cpu_temp_c.is_none());
+    }
+
+    /// Board and servo temperatures are separate readings, and the case that justifies both is
+    /// them disagreeing: a board cooking behind a blocked vent while the motors sit idle and
+    /// cool. One number could not express it.
+    #[test]
+    fn a_hot_board_and_cool_motors_are_both_reported() {
+        let s = state();
+        ticked(&s, 100);
+        s.cpu_temp_c.store(84.0f64.to_bits(), Ordering::Relaxed);
+        s.motor_max_c.store(31.0f64.to_bits(), Ordering::Relaxed);
+        s.motor_mean_c.store(30.0f64.to_bits(), Ordering::Relaxed);
+
+        let health = s.health();
+        assert_eq!(health.cpu_temp_c, Some(84.0));
+        assert_eq!(health.motors.expect("thermals").max_c, 31.0);
+        // And neither touches the verdict — a warm afternoon is not a bad release.
+        assert!(health.healthy);
     }
 
     /// While waiting, health must say *why*. The update system quotes this string as the

@@ -556,6 +556,12 @@ fn render_health(report: &HealthReport) -> String {
                     "motors", m.max_c, m.hottest, m.mean_c
                 );
             }
+            // Its own line, next to the motors rather than merged with them: hot servos and a
+            // hot board are different faults with different fixes, and a reader scanning for
+            // "what is too hot here" needs to see which.
+            if let Some(cpu) = health.cpu_temp_c {
+                let _ = writeln!(out, "  {:<9} {cpu:.0} °C", "cpu");
+            }
         }
         (None, Some(why)) => {
             // First line only: a multi-line message would break the column layout, and the
@@ -582,7 +588,7 @@ fn render_health(report: &HealthReport) -> String {
                     service.name,
                     service.version.as_deref().unwrap_or("unknown"),
                     match &service.revision {
-                        Some(rev) => format!("(rev {rev})"),
+                        Some(rev) => format!("(rev {})", short_revision(rev)),
                         None => "(rev unknown)".to_owned(),
                     }
                 );
@@ -757,48 +763,108 @@ fn describe_attempt(entry: &proto::LogEntry) -> String {
 /// mismatch is the one support will actually hit, and it must be explained rather than
 /// merely flagged — it is *expected* right after an update and alarming only if it
 /// survives a reboot.
+/// Is a running process from a different build than the installed release?
+///
+/// **Revisions decide it when both are known**, and versions only stand in when one is not.
+/// That is not a refinement, it is the difference between right and wrong on a dev build: a
+/// binary reports `CARGO_PKG_VERSION`, while the release it was packaged into is versioned
+/// `0.1.4-dev.91.7f685a0` — the prerelease suffix is minted by `xtask package` at package
+/// time, from a run number and a SHA the compiler never saw. So a dev-channel `robotd` reports
+/// `0.1.4` against an installed `0.1.4-dev.91.7f685a0` *while being exactly that build*, and
+/// comparing versions accused every single dev install of having failed its restart — the
+/// louder of the two warnings, and always false.
+///
+/// A prefix match counts as equal so a short SHA and a full one agree; `dev.yml` passes
+/// `GITHUB_SHA` in full and `DUCK_REVISION` is likewise full, but a hand-built release with a
+/// `--short` revision must not read as a mismatch. Seven characters minimum, because a prefix
+/// rule with no floor would make an empty string match everything.
+fn is_behind(
+    running_version: &semver::Version,
+    running_revision: Option<&str>,
+    installed_version: &semver::Version,
+    installed_revision: Option<&str>,
+) -> bool {
+    match (running_revision, installed_revision) {
+        (Some(running), Some(installed)) => !same_revision(running, installed),
+        _ => running_version != installed_version,
+    }
+}
+
+/// A revision as a human wants to read it: seven characters, the abbreviation git itself uses
+/// and the one `xtask` embeds in a dev version. `DUCK_REVISION` carries the full 40, which in a
+/// column of output is noise around the seven characters anyone actually compares.
+///
+/// `get` rather than slicing: it returns `None` on a non-boundary rather than panicking, and a
+/// revision from a config file is not guaranteed to be a hex string.
+fn short_revision(revision: &str) -> &str {
+    revision.get(..7).unwrap_or(revision)
+}
+
+/// Two git revisions naming the same commit, allowing one to be an abbreviation of the other.
+fn same_revision(a: &str, b: &str) -> bool {
+    const MIN_ABBREV: usize = 7;
+    let shortest = a.len().min(b.len());
+    shortest >= MIN_ABBREV && a[..shortest] == b[..shortest]
+}
+
 fn version_warnings(
     report: &VersionReport,
     updaterd_running: Option<&semver::Version>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    let daemon_installed = report
-        .components
-        .iter()
-        .find(|c| c.name == "daemon")
+    let daemon = report.components.iter().find(|c| c.name == "daemon");
+    let daemon_installed = daemon
         .and_then(|c| c.installed.as_deref())
         .and_then(|v| semver::Version::parse(v).ok());
+    let daemon_revision = daemon.and_then(|c| c.revision.as_deref());
+
+    let updaterd_revision = report
+        .services
+        .iter()
+        .find(|s| s.name == "updaterd")
+        .and_then(|s| s.revision.as_deref());
+
+    // Name the revision alongside the version wherever it is known, because on the dev channel
+    // the version alone cannot show a difference: both sides read `0.1.4` and the SHA is the
+    // whole story.
+    let identify = |version: &semver::Version, revision: Option<&str>| match revision {
+        Some(rev) => format!("{version} (rev {})", short_revision(rev)),
+        None => version.to_string(),
+    };
 
     if let (Some(running), Some(installed)) = (updaterd_running, daemon_installed.as_ref())
-        && running != installed
+        && is_behind(running, updaterd_revision, installed, daemon_revision)
     {
         warnings.push(format!(
-            "updaterd is running {running} but the installed daemon release is {installed}.\n  \
+            "updaterd is running {} but the installed daemon release is {}.\n  \
              Expected right after an update — updaterd never restarts itself, so it keeps\n  \
              running the old binary until the next reboot. If this survives a reboot, the\n  \
              new release is not being launched: check the `current` symlink and the unit's\n  \
-             ExecStart path."
+             ExecStart path.",
+            identify(running, updaterd_revision),
+            identify(installed, daemon_revision)
         ));
     }
 
     // robotd is in `on_apply`'s restart set, so unlike updaterd it *should* already be on
     // the installed release. A mismatch here means the restart did not take effect, which
     // is a different and more serious situation than updaterd's expected lag.
-    let robotd_running = report
-        .services
-        .iter()
-        .find(|s| s.name == "robotd")
+    let robotd = report.services.iter().find(|s| s.name == "robotd");
+    let robotd_running = robotd
         .and_then(|s| s.version.as_deref())
         .and_then(|v| semver::Version::parse(v).ok());
-    if let (Some(running), Some(installed)) = (robotd_running, daemon_installed.as_ref())
-        && &running != installed
+    let robotd_revision = robotd.and_then(|s| s.revision.as_deref());
+    if let (Some(running), Some(installed)) = (robotd_running.as_ref(), daemon_installed.as_ref())
+        && is_behind(running, robotd_revision, installed, daemon_revision)
     {
         warnings.push(format!(
-            "robotd is running {running} but the installed daemon release is {installed}.\n  \
+            "robotd is running {} but the installed daemon release is {}.\n  \
              robotd is in on_apply's restart set, so it should already be on the installed\n  \
              release: either the restart did not happen, or it failed and systemd restarted\n  \
-             the old binary. Check `systemctl status robotd` and the update log."
+             the old binary. Check `systemctl status robotd` and the update log.",
+            identify(running, robotd_revision),
+            identify(installed, daemon_revision)
         ));
     }
 
@@ -820,7 +886,7 @@ fn render_version(report: &VersionReport) -> String {
     let mut out = String::new();
 
     let rev = |r: &Option<String>| match r {
-        Some(rev) => format!("rev {rev}"),
+        Some(rev) => format!("rev {}", short_revision(rev)),
         None => "rev unknown".to_owned(),
     };
 
@@ -1298,6 +1364,7 @@ mod tests {
                     max_c: 48.0,
                     mean_c: 36.0,
                 }),
+                cpu_temp_c: Some(52.0),
                 control_loop: Some(proto::LoopHealth {
                     target_hz: 50.0,
                     achieved_hz: Some(49.8),
@@ -1320,6 +1387,8 @@ mod tests {
         assert!(out.contains("2490 ticks"), "{out}");
         assert!(out.contains("7.62 V (64%)"), "{out}");
         assert!(out.contains("48 °C max (left_knee)"), "{out}");
+        // Board and servos on separate lines: they fail differently.
+        assert!(out.contains("cpu       52 °C"), "{out}");
         assert!(out.contains("bus       ok"), "{out}");
         assert!(out.contains("imu       ready"), "{out}");
         // And the software half, in the same answer — the whole point of one command.
@@ -1513,6 +1582,93 @@ mod tests {
             revision: None,
             error: None,
         }
+    }
+
+    fn service_at(name: &'static str, version: &str, revision: &str) -> ServiceReport {
+        ServiceReport {
+            revision: Some(revision.into()),
+            ..service(name, version)
+        }
+    }
+
+    /// **From a real board.** A dev-channel install accused itself of a failed restart.
+    ///
+    /// `robotctl health` on the Radxa reported "robotd is running 0.1.4 but the installed
+    /// daemon release is 0.1.4-dev.91.7f685a0 … either the restart did not happen, or it
+    /// failed" — while `robotd`'s own revision was `7f685a0`, the very commit that release was
+    /// built from. It *was* the new build.
+    ///
+    /// A binary reports `CARGO_PKG_VERSION`; the prerelease suffix is minted by `xtask
+    /// package` from a run number and a SHA, long after the compiler has gone. So on the dev
+    /// channel the versions differ by construction and can never agree, and the loudest
+    /// warning this command has was firing on every single dev install — training its reader
+    /// to ignore it, which is worse than not having it.
+    #[test]
+    fn a_dev_build_matching_by_revision_is_not_reported_as_behind() {
+        let sha = "7f685a0c0a51ba928a3bba5b575b2b78ca8dd59b";
+        let mut report = report(
+            vec![
+                service_at("updaterd", "0.1.4", sha),
+                service_at("robotd", "0.1.4", sha),
+            ],
+            Some("0.1.4-dev.91.7f685a0"),
+        );
+        // What `listInstalled` reports for the active release: the same commit, in full.
+        report.components[0].revision = Some(sha.to_owned());
+
+        let warnings = version_warnings(&report, Some(&semver::Version::parse("0.1.4").unwrap()));
+        assert!(
+            warnings.is_empty(),
+            "same commit on both sides must not warn: {warnings:?}"
+        );
+    }
+
+    /// The other half of that fix: a genuinely stale `robotd` must still be caught, and on the
+    /// dev channel the *revision* is the only thing that can catch it — both sides say `0.1.4`.
+    #[test]
+    fn a_dev_build_from_another_commit_is_still_reported_as_behind() {
+        let mut report = report(
+            vec![service_at(
+                "robotd",
+                "0.1.4",
+                "28c8f3b636fd0ada2b30cd8b7c367ef375c27f29",
+            )],
+            Some("0.1.4-dev.91.7f685a0"),
+        );
+        report.components[0].revision = Some("7f685a0c0a51ba928a3bba5b575b2b78ca8dd59b".to_owned());
+
+        let warnings = version_warnings(&report, None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("robotd is running"), "{warnings:?}");
+        // Named by revision, since the versions are identical and would show no difference.
+        assert!(warnings[0].contains("rev 28c8f3b"), "{warnings:?}");
+        assert!(warnings[0].contains("rev 7f685a0"), "{warnings:?}");
+        // Abbreviated, not forty characters of hex in the middle of a sentence.
+        assert!(!warnings[0].contains("28c8f3b636"), "{warnings:?}");
+    }
+
+    /// A short revision and a full one name the same commit. `dev.yml` passes `GITHUB_SHA` in
+    /// full, but nothing guarantees a hand-cut release does.
+    #[test]
+    fn an_abbreviated_revision_matches_its_full_form() {
+        assert!(same_revision(
+            "7f685a0",
+            "7f685a0c0a51ba928a3bba5b575b2b78ca8dd59b"
+        ));
+        assert!(!same_revision(
+            "28c8f3b",
+            "7f685a0c0a51ba928a3bba5b575b2b78ca8dd59b"
+        ));
+        // Too short to mean anything: a prefix rule with no floor would match everything,
+        // including an empty string, and silently stop reporting stale daemons.
+        assert!(!same_revision(
+            "",
+            "7f685a0c0a51ba928a3bba5b575b2b78ca8dd59b"
+        ));
+        assert!(!same_revision(
+            "7f68",
+            "7f685a0c0a51ba928a3bba5b575b2b78ca8dd59b"
+        ));
     }
 
     /// The whole point of the command: after an update, `updaterd` is still running the old
