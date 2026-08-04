@@ -311,6 +311,25 @@ report() {
         printf '  %-22s %s\n' "ONNX Runtime" "ABSENT — robotd cannot load a policy"
     fi
 
+    # Failed units, named.
+    #
+    # Here rather than in board-test.sh because that runs in a container with no systemd, so
+    # this is the only place it can be asked. It exists because a unit failing at boot is
+    # invisible until someone thinks to look: `systemd-networkd-wait-online` failed on every
+    # boot of this board for a week, costing 20s each time and delaying updaterd behind
+    # network-online.target, and nothing reported it.
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        failed="$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null \
+            | awk '{print $1}' | tr '\n' ' ')"
+        if [ -n "$failed" ]; then
+            printf '  %-22s %s\n' "failed units" "$failed"
+            warn "these units failed this boot. Even one that looks unrelated delays boot and
+  can hold up network-online.target:  systemctl status ${failed%% *}"
+        else
+            printf '  %-22s %s\n' "failed units" "none"
+        fi
+    fi
+
     # A board with no battery-backed RTC reading 1970 fails TLS certificate validation, and
     # that surfaces as an opaque handshake error several steps into an install.
     if command -v timedatectl >/dev/null 2>&1; then

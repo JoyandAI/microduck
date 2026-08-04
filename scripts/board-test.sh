@@ -177,6 +177,109 @@ echo "    [ok] group member cannot mutate (exit 6, denied)"
 
 kill $DAEMON2 2>/dev/null || true
 
+# ── configd: the same two layers, plus the wifi outcomes ──
+#
+# configd is the service BLE provisioning goes through, so its authorisation is the thing
+# standing between "a phone in the room" and the network configuration of this robot. The deny
+# path needs two uids and a real unix socket, so this is the only place it can be tested at
+# all — the unit tests can only reach the allow path.
+#
+# `--fake-net` serves an in-memory wifi stack: there is no NetworkManager in a container, and
+# the point here is the socket, the authorisation and the outcome codes rather than D-Bus.
+mkdir -p /var/lib/robot/config
+setpriv --regid robot --clear-groups \
+    /bin/robot/configd --fake-net --socket /run/c.sock \
+    --state-dir /var/lib/robot/config --allow-user member \
+    >/tmp/c.log 2>&1 &
+CONFIGD=$!
+i=0
+while [ ! -S /run/c.sock ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
+test -S /run/c.sock
+
+test "$(stat -c %A /run/c.sock)" = "srw-rw----"
+test "$(stat -c %U:%G /run/c.sock)" = "root:robot"
+echo "    [ok] configd socket is root:robot 0660"
+
+# The name is resolved to a uid at startup, because sysusers allocates dynamically and a
+# number in a unit file would be wrong on the next board.
+grep -q "may change configuration" /tmp/c.log
+echo "    [ok] --allow-user resolved to a uid"
+
+# Layer 1: the group decides who may talk at all.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock net status" >/dev/null
+echo "    [ok] group member can read net status"
+
+code=0
+su outsider -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock net status" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 3 || { echo "    [FAIL] non-member should be blocked, got $code"; exit 1; }
+echo "    [ok] non-member blocked by socket mode"
+
+# Layer 2, the allow side: the named user may change configuration. This is the property
+# `--allow-user btd` relies on, and without it every provisioning call over BLE is refused.
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock system set-name Ducky" >/dev/null
+echo "    [ok] named user may change configuration"
+
+# Layer 2, the deny side. It needs a peer that CAN reach the socket but is NOT the named user,
+# so a second member of the robot group: reaching the daemon and being allowed to change it are
+# different permissions, and this is the check that proves they are still separate.
+useradd -r -G robot bystander 2>/dev/null || true
+code=0
+su bystander -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock system set-name Sneaky" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 6 || { echo "    [FAIL] unnamed member should be denied (6), got $code"; exit 1; }
+echo "    [ok] unnamed group member cannot change configuration (exit 6)"
+
+# And nothing changed: a refused call must not have taken effect.
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock system info" | grep -q "Ducky"
+echo "    [ok] the refused rename did not take effect"
+
+# The outcome that made NetworkManager worth choosing: a rejected passphrase is its own
+# answer, distinguishable by exit code from "could not ask".
+code=0
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock net connect Pollen --psk wrong" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 5 || { echo "    [FAIL] bad key should be refused (5), got $code"; exit 1; }
+echo "    [ok] a rejected passphrase exits 5, not 1"
+
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock net connect Pollen --psk correct-key" \
+    | grep -q "connected to Pollen"
+echo "    [ok] a correct passphrase joins"
+
+# A PIN keeps its leading zero. It is stored as a string precisely so that "012345" does not
+# become 12345, and the two sides of a pairing must agree on six characters.
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock system set-pin 012345" >/dev/null
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock system pin" \
+    | grep -q "012345"
+echo "    [ok] a pairing PIN keeps its leading zero"
+
+# The passphrase must not be in the journal. NetConnectParams has a hand-written Debug that
+# redacts it, and this is the check that keeps it honest on the shipped binary rather than in
+# a unit test of the type alone.
+if grep -q "correct-key" /tmp/c.log; then
+    echo "    [FAIL] a wifi passphrase reached the log"
+    exit 1
+fi
+echo "    [ok] no wifi passphrase in the log"
+
+kill $CONFIGD 2>/dev/null || true
+
+# ── btd: does the vendored libdbus actually link and run on the target? ──
+#
+# btd is the one binary pulling C code beyond zstd: `bluer` links libdbus, built from vendored
+# source by zig cc. That cross-link is exactly the class of failure this whole script exists
+# for, and it cannot be seen on the build host. There is no BlueZ in a container, so this asks
+# only that the binary loads and runs — which is what a dynamic-linker or glibc-floor problem
+# would break.
+/bin/robot/btd --version >/dev/null
+echo "    [ok] btd runs on the target (vendored libdbus links)"
+
 # ── setup-board.sh, the provisioning script nothing else covered ──
 #
 # Added because two green-CI regressions landed here in one day, including #13 deleting the
