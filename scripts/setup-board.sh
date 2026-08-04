@@ -41,6 +41,17 @@ MOTOR_PORT="${MOTOR_PORT:-/dev/ttyS2}"
 
 ENV_TXT=/boot/armbianEnv.txt
 
+BT_CONF=/etc/bluetooth/main.conf
+
+# Optionally pair a gamepad, e.g. PAD_MAC=78:86:2E:BB:13:28 sh setup-board.sh
+#
+# An environment variable rather than a flag, matching MOTOR_PORT and ONNX_VERSION above —
+# this script is usually run through `curl | sh`, where flags are awkward to pass.
+#
+# Optional because the MAC is per-pad and most of the value here is the two settings that
+# apply to every board regardless: the BlueZ privacy mode, and the `input` group.
+PAD_MAC="${PAD_MAC:-}"
+
 # Where this script puts itself so it is still around after the reboot it asks for.
 SELF=/usr/local/sbin/robot-setup-board
 
@@ -258,6 +269,94 @@ free_motor_port() {
     fi
 }
 
+# Bluetooth settings a gamepad needs, and the group that lets a human read one.
+#
+# `Privacy = device` is the fix for an Xbox controller that pairs and then drops straight back
+# out — it presents as an endless connect/disconnect loop, or as
+# `disconnected with reason 3` / `AuthenticationCanceled` during pairing. Taken from
+# microduck_runtime, whose installer sets exactly this and whose notes record the same
+# symptom; several hours went into rediscovering it as a supposed BR/EDR or ERTM problem,
+# which it is not. BLE is fine.
+#
+# The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon on
+# this board left the kernel holding hci0 while bluetoothd reported "No default controller
+# available", which needs a reboot to clear — so a reboot is the honest instruction, not an
+# extra step.
+configure_bluetooth() {
+    if [ ! -f "$BT_CONF" ]; then
+        warn "no ${BT_CONF}; skipping the gamepad Bluetooth settings"
+        return 0
+    fi
+
+    if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
+        say "bluetooth Privacy already set to device"
+    else
+        say "setting Privacy = device in ${BT_CONF}"
+        if grep -Eq '^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF"; then
+            sed -i -E 's|^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=.*|Privacy = device|' "$BT_CONF"
+        elif grep -q '^\[General\]' "$BT_CONF"; then
+            sed -i '/^\[General\]/a Privacy = device' "$BT_CONF"
+        else
+            printf '\n[General]\nPrivacy = device\n' >> "$BT_CONF"
+        fi
+        needs_reboot=1
+    fi
+
+    add_operator_to_input_group
+    pair_pad
+}
+
+# A gamepad is read through /dev/input/event*, which is root:input mode 0660. Without this
+# `padd` starts, reports nothing, and silently sees no pad at all — the same shape of failure
+# as the `robot` group, and just as hard to guess from the outside.
+add_operator_to_input_group() {
+    operator="${SUDO_USER:-}"
+    if [ -z "$operator" ] || [ "$operator" = root ]; then
+        return 0
+    fi
+    if id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
+        return 0
+    fi
+    if usermod -aG input "$operator"; then
+        say "added ${operator} to the input group"
+        warn "${operator} must log out and back in before padd can read a gamepad."
+    else
+        warn "could not add ${operator} to the input group; padd will see no gamepad"
+    fi
+}
+
+# Trust and connect a known pad, when its MAC was supplied.
+#
+# Deliberately not a scan: discovery needs the pad held in pairing mode at the right moment,
+# which a provisioning script cannot arrange. Supplying the MAC of a pad already in pairing
+# mode is the part that can be automated; the rest stays a human at a keyboard.
+pair_pad() {
+    [ -n "$PAD_MAC" ] || return 0
+
+    if ! command -v bluetoothctl >/dev/null 2>&1; then
+        warn "bluetoothctl is not installed; cannot pair ${PAD_MAC}"
+        return 0
+    fi
+
+    say "pairing gamepad ${PAD_MAC} (hold it in pairing mode)"
+    # Discovery has to be running for a first-time connect to resolve the address.
+    bluetoothctl --timeout 15 scan on >/dev/null 2>&1 || true
+
+    # `connect` before `pair`, which is the order microduck_runtime's notes give and the one
+    # that works; leading with `pair` returns AuthenticationCanceled.
+    if bluetoothctl connect "$PAD_MAC" >/dev/null 2>&1; then
+        bluetoothctl trust "$PAD_MAC" >/dev/null 2>&1 || true
+        say "gamepad ${PAD_MAC} connected and trusted"
+    else
+        warn "could not connect ${PAD_MAC}. If Privacy was just changed, reboot first — it
+  does not take effect until then. Otherwise pair by hand:
+    sudo bluetoothctl
+    scan on            (hold the pad in pairing mode until it is listed by: devices)
+    connect ${PAD_MAC}
+    trust ${PAD_MAC}"
+    fi
+}
+
 # What the board looks like now. Printed whether or not anything was changed, because "is
 # this board ready" is a question worth being able to ask on its own.
 report() {
@@ -273,6 +372,29 @@ report() {
   is wrong. Check:  dmesg | grep -iE 'ttyS|serial'
   robotd will start, fail to open the bus, and report unhealthy — which is honest, but it
   will not drive anything."
+    fi
+
+    # Gamepad readiness, which is three separate things that each fail silently.
+    if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
+        printf '  %-22s %s\n' "bluetooth privacy" "device"
+    else
+        printf '  %-22s %s\n' "bluetooth privacy" "NOT SET — a pad will drop on connect"
+    fi
+
+    operator="${SUDO_USER:-}"
+    if [ -z "$operator" ] || [ "$operator" = root ]; then
+        printf '  %-22s %s\n' "input group" "not applicable (no sudo user)"
+    elif id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
+        printf '  %-22s %s\n' "input group" "${operator} is a member"
+    else
+        printf '  %-22s %s\n' "input group" "${operator} NOT a member — padd sees no pad"
+    fi
+
+    # The device node is what gilrs opens, so this is the only claim that matters.
+    if ls /dev/input/js* >/dev/null 2>&1; then
+        printf '  %-22s %s\n' "gamepad" "$(ls /dev/input/js* | tr '\n' ' ')"
+    else
+        printf '  %-22s %s\n' "gamepad" "none connected"
     fi
 
     # Named explicitly, because "the port exists" and "the port is usable" are different
@@ -359,6 +481,7 @@ main() {
     persist_self
     configure_overlay
     free_motor_port
+    configure_bluetooth
     install_onnxruntime
     report
 }
