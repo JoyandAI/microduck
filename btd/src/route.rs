@@ -25,6 +25,8 @@ pub enum Upstream {
     Updater,
     /// `robotd`.
     Robot,
+    /// `configd` — wifi and the robot's identity.
+    Config,
 }
 
 /// Where this call goes, or `None` if BLE may not make it.
@@ -55,6 +57,28 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
 
         // Is the robot alright? The one `robot.*` call an app has any use for.
         RobotHealth => Some(Upstream::Robot),
+
+        // ── provisioning, which is what §4.1 puts BLE here for ──────────────
+        //
+        // This is the case the whole transport exists to serve: a robot that has never seen a
+        // network cannot be configured over that network, so BLE is the only way in. All four
+        // are permitted, including the two that change things.
+        NetStatus => Some(Upstream::Config),
+        NetScan => Some(Upstream::Config),
+        // Carries a wifi passphrase. §7 requires the characteristic to be paired and
+        // encrypted, and it is not yet — see the comment on `write` in `bluez.rs`. Routing it
+        // before that lands is the one ordering mistake to avoid here.
+        NetConnect(_) => Some(Upstream::Config),
+        NetForget(_) => Some(Upstream::Config),
+
+        // Name and identity. Renaming from the app is the reason `system.setName` exists.
+        SystemInfo => Some(Upstream::Config),
+        SystemSetName(_) => Some(Upstream::Config),
+
+        // Rebooting is drastic but recoverable, and it is what an app offers when a robot is
+        // confused — the alternative being "unplug it", which for a walking robot is worse.
+        // Unlike `resetToGolden` it discards nothing.
+        SystemReboot => Some(Upstream::Config),
 
         // ── refused ─────────────────────────────────────────────────────────
 
@@ -105,17 +129,47 @@ mod tests {
         ComponentId::new("daemon")
     }
 
-    /// Nothing that replaces or discards software may be reached from the radio, except the
-    /// one call §4.1 puts there on purpose.
+    /// Exactly which mutating calls BLE may make, named one by one.
+    ///
+    /// The list is the security boundary, so it is spelled out rather than counted: adding a
+    /// mutating method and routing it should have to change this line and say why in the
+    /// commit. `update.apply` is the update trigger §4.1 names; the rest are provisioning,
+    /// which is what BLE is *for* — a robot that has never seen a network cannot be configured
+    /// over that network.
     #[test]
-    fn apply_is_the_only_mutating_call_ble_may_make() {
+    fn only_these_mutating_calls_are_reachable_over_ble() {
         let mutating_and_allowed: Vec<&str> = every_call()
             .iter()
             .filter(|c| c.is_mutating() && upstream_for(c).is_some())
             .map(proto::Call::method)
             .collect();
 
-        assert_eq!(mutating_and_allowed, vec![proto::method::APPLY]);
+        assert_eq!(
+            mutating_and_allowed,
+            vec![
+                proto::method::APPLY,
+                proto::method::NET_CONNECT,
+                proto::method::NET_FORGET,
+                proto::method::SYSTEM_SET_NAME,
+                proto::method::SYSTEM_REBOOT,
+            ]
+        );
+    }
+
+    /// Provisioning must be reachable, and reach `configd` — the case BLE exists for.
+    #[test]
+    fn provisioning_reaches_configd() {
+        for call in [
+            proto::Call::NetStatus,
+            proto::Call::NetScan,
+            proto::Call::NetConnect(proto::NetConnectParams { ssid: "Home".into(), psk: None }),
+            proto::Call::NetForget(proto::NetForgetParams { ssid: "Home".into() }),
+            proto::Call::SystemInfo,
+            proto::Call::SystemSetName(proto::SetNameParams { name: "duck".into() }),
+            proto::Call::SystemReboot,
+        ] {
+            assert_eq!(upstream_for(&call), Some(Upstream::Config), "{}", call.method());
+        }
     }
 
     /// The refusals, named individually. If a future change makes one of these reachable it
@@ -189,6 +243,16 @@ mod tests {
             proto::Call::RobotHealth,
             proto::Call::RobotModelApi,
             proto::Call::RobotRemoteSessionActive,
+            proto::Call::NetStatus,
+            proto::Call::NetScan,
+            proto::Call::NetConnect(proto::NetConnectParams {
+                ssid: "Home".into(),
+                psk: Some("secret".into()),
+            }),
+            proto::Call::NetForget(proto::NetForgetParams { ssid: "Home".into() }),
+            proto::Call::SystemInfo,
+            proto::Call::SystemSetName(proto::SetNameParams { name: "duck".into() }),
+            proto::Call::SystemReboot,
         ]
     }
 }

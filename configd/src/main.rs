@@ -1,0 +1,414 @@
+//! `configd` — see the crate docs in `lib.rs` for why this is its own service.
+//!
+//! This file is the socket, the peer policy and the dispatch.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use clap::Parser;
+use configd::net::{FakeNet, Net};
+use configd::power;
+use configd::store::Store;
+use duck_ipc_proto as proto;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+
+/// Owner and group read/write, nothing for others — the same as every other socket here. This
+/// is the first layer of access control: reaching the socket at all requires the group.
+const SOCKET_MODE: u32 = 0o660;
+
+/// Refuse absurdly long lines rather than buffering them.
+const MAX_LINE: usize = 64 * 1024;
+
+const DEFAULT_STATE_DIR: &str = "/var/lib/robot/config";
+
+#[derive(Parser, Debug)]
+#[command(
+    version,
+    about = "Wifi and robot identity",
+    long_about = "Serves net.* and system.* over a unix socket. Drives NetworkManager for wifi \
+                  and never stores a credential. Lives apart from robotd because config must be \
+                  reachable when the robot is not."
+)]
+struct Args {
+    #[arg(long, default_value = proto::socket::CONFIG)]
+    socket: PathBuf,
+
+    /// Where the config file lives. Outside any release directory, so it survives an update
+    /// *and* a rollback.
+    #[arg(long, default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+
+    /// uids permitted to make changes. Read-only calls are never gated.
+    #[arg(long, value_delimiter = ',')]
+    allow_uid: Vec<u32>,
+
+    /// gids permitted to make changes.
+    #[arg(long, value_delimiter = ',')]
+    allow_gid: Vec<u32>,
+
+    /// Serve an in-memory wifi stack instead of NetworkManager.
+    ///
+    /// The whole `net.*` surface, including the failures that are awkward to provoke against a
+    /// real access point — a wrong passphrase especially — without a board or a radio.
+    #[arg(long)]
+    fake_net: bool,
+}
+
+/// Who may change this robot's configuration.
+///
+/// Two tiers, matching `updaterd` (`architecture.md` §2.2): the socket's group decides who may
+/// *talk*, and this decides who may *change*. Read-only calls are deliberately ungated so
+/// support can inspect a robot it is not authorised to reconfigure — and so `btd` can report
+/// wifi status without being trusted to join a network.
+///
+/// An unknown peer is denied. `SO_PEERCRED` failing is not something to shrug at when the
+/// decision is "may this reboot the robot".
+struct PeerPolicy {
+    owner_uid: u32,
+    allow_uids: Vec<u32>,
+    allow_gids: Vec<u32>,
+}
+
+impl PeerPolicy {
+    fn may_mutate(&self, peer: Option<&tokio::net::unix::UCred>) -> Result<(), String> {
+        let Some(peer) = peer else {
+            return Err("peer credentials unavailable; refusing a mutating request".into());
+        };
+        if peer.uid() == self.owner_uid
+            || self.allow_uids.contains(&peer.uid())
+            || self.allow_gids.contains(&peer.gid())
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "uid {} / gid {} may not change this robot's configuration; add it to --allow-uid \
+             or --allow-gid, or run as uid {}",
+            peer.uid(),
+            peer.gid(),
+            self.owner_uid
+        ))
+    }
+}
+
+struct Service {
+    net: Arc<dyn Net>,
+    store: Store,
+    policy: PeerPolicy,
+}
+
+fn log_startup_identity(service: &str) {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    tracing::warn!(
+        service,
+        build = %proto::build_info!(),
+        exe,
+        pid = std::process::id(),
+        "starting"
+    );
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_owned())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "robot".to_owned())
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let args = Args::parse();
+    log_startup_identity("configd");
+
+    let net: Arc<dyn Net> = match backend(args.fake_net).await {
+        Ok(net) => net,
+        Err(e) => {
+            tracing::error!(error = %e, "no wifi backend");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let service = Arc::new(Service {
+        net,
+        store: Store::new(args.state_dir.join("config.json"), hostname()),
+        policy: PeerPolicy {
+            owner_uid: unsafe { libc::getuid() },
+            allow_uids: args.allow_uid,
+            allow_gids: args.allow_gid,
+        },
+    });
+
+    tokio::select! {
+        result = serve(service, args.socket) => match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!(error = %e, "IPC server failed");
+                ExitCode::FAILURE
+            }
+        },
+        () = shutdown() => {
+            tracing::info!("shutting down");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn backend(fake: bool) -> Result<Arc<dyn Net>, String> {
+    if fake {
+        tracing::warn!("serving a FAKE wifi stack; nothing here touches a real network");
+        return Ok(Arc::new(FakeNet::new()));
+    }
+    // A failure here means NetworkManager is not on the bus at all, which on this board means
+    // the wifi migration was never run. Say that, rather than reporting a D-Bus error nobody
+    // can act on.
+    configd::nm::NetworkManager::new()
+        .await
+        .map(|nm| Arc::new(nm) as Arc<dyn Net>)
+        .map_err(|e| {
+            format!(
+                "cannot reach NetworkManager on the system bus ({e}). If this board still runs \
+                 netplan, run scripts/migrate-network.sh first."
+            )
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn backend(_fake: bool) -> Result<Arc<dyn Net>, String> {
+    // NetworkManager is Linux-only, so off-board there is only the fake — and saying so is more
+    // useful than refusing to start, because `--fake-net` is how the surface is exercised from a
+    // laptop anyway.
+    tracing::warn!("not Linux: serving a FAKE wifi stack");
+    Ok(Arc::new(FakeNet::new()))
+}
+
+async fn serve(service: Arc<Service>, socket_path: PathBuf) -> std::io::Result<()> {
+    // A leftover socket from a killed process must not stop us coming up.
+    if socket_path.exists() {
+        tracing::warn!(path = %socket_path.display(), "removing stale socket");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let listener = UnixListener::bind(&socket_path)?;
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
+
+    tracing::info!(
+        path = %socket_path.display(),
+        mode = format!("{SOCKET_MODE:o}"),
+        "serving config IPC"
+    );
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                continue;
+            }
+        };
+        let service = Arc::clone(&service);
+        tokio::spawn(async move {
+            if let Err(e) = handle(service, stream).await {
+                tracing::debug!(error = %e, "connection ended");
+            }
+        });
+    }
+}
+
+async fn handle(service: Arc<Service>, stream: UnixStream) -> std::io::Result<()> {
+    // Read once, per connection: credentials cannot change under a live socket, and asking per
+    // request would be a syscall for an answer that is already known.
+    let peer = stream.peer_cred().ok();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.len() > MAX_LINE {
+            let response = proto::Response::err(
+                None,
+                proto::Error::new(proto::code::INVALID_REQUEST, "request too large"),
+            );
+            write_line(&mut write_half, &response).await?;
+            continue;
+        }
+
+        let request: proto::Request = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(e) => {
+                let response = proto::Response::err(
+                    None,
+                    proto::Error::new(proto::code::PARSE_ERROR, e.to_string()),
+                );
+                write_line(&mut write_half, &response).await?;
+                continue;
+            }
+        };
+
+        // Notifications get no reply, per the spec.
+        let Some(id) = request.id.clone() else { continue };
+
+        let response = match request.as_call() {
+            Ok(call) => dispatch(&service, peer.as_ref(), id, &call).await,
+            Err(e) => proto::Response::err(Some(id), e),
+        };
+        write_line(&mut write_half, &response).await?;
+    }
+    Ok(())
+}
+
+async fn dispatch(
+    service: &Service,
+    peer: Option<&tokio::net::unix::UCred>,
+    id: proto::Id,
+    call: &proto::Call,
+) -> proto::Response {
+    // Authorise before doing anything, and log the caller alongside the method: "who told this
+    // robot to reboot" is the first thing support asks.
+    if call.is_mutating() {
+        if let Err(reason) = service.policy.may_mutate(peer) {
+            tracing::warn!(method = call.method(), %reason, "refused");
+            return proto::Response::err(
+                Some(id),
+                proto::Error::new(proto::code::PERMISSION_DENIED, reason),
+            );
+        }
+        tracing::info!(
+            method = call.method(),
+            uid = peer.map(|p| p.uid()),
+            gid = peer.map(|p| p.gid()),
+            "authorised"
+        );
+    }
+
+    match call {
+        proto::Call::Hello(_) => proto::Response::ok(
+            Some(id),
+            &proto::HelloResult {
+                api_version: proto::API_VERSION,
+                daemon_version: proto::semver::Version::parse(env!("CARGO_PKG_VERSION")).ok(),
+                revision: proto::build_info!().revision.map(str::to_owned),
+            },
+        ),
+
+        proto::Call::NetStatus => reply(id, service.net.status().await),
+        proto::Call::NetScan => reply(id, service.net.scan().await),
+        proto::Call::NetConnect(params) => {
+            // `params` redacts the key in its own Debug, which is what makes logging the request
+            // safe. See `NetConnectParams` in duck-ipc-proto.
+            tracing::info!(?params, "joining a network");
+            reply(id, service.net.connect(&params.ssid, params.psk.as_deref()).await)
+        }
+        proto::Call::NetForget(params) => reply(id, service.net.forget(&params.ssid).await),
+
+        proto::Call::SystemInfo => proto::Response::ok(
+            Some(id),
+            &proto::SystemInfoResult {
+                name: service.store.name(),
+                // No per-device identity exists yet; provisioning has to define one
+                // (`updater-design.md` §5.7). `None` rather than something invented.
+                serial: None,
+                uptime_seconds: uptime_seconds(),
+            },
+        ),
+        proto::Call::SystemSetName(params) => match service.store.set_name(&params.name) {
+            Ok(name) => {
+                // The advertised BLE name does not change until btd restarts, and saying so is
+                // better than a client wondering why the phone still shows the old one.
+                tracing::info!(%name, "renamed; btd advertises the new name after a restart");
+                proto::Response::ok(Some(id), &proto::SetNameResult { name })
+            }
+            Err(e) => proto::Response::err(
+                Some(id),
+                proto::Error::new(proto::code::INVALID_PARAMS, e.to_string()),
+            ),
+        },
+        proto::Call::SystemReboot => {
+            power::schedule();
+            proto::Response::ok(
+                Some(id),
+                &proto::RebootResult { in_seconds: power::REBOOT_DELAY.as_secs() },
+            )
+        }
+
+        // `update.*` is `updaterd`'s and `robot.*` is `robotd`'s. A client reaching here aimed at
+        // the wrong socket, so say that rather than report a generic failure.
+        other => proto::Response::err(
+            Some(id),
+            proto::Error::new(
+                proto::code::METHOD_NOT_FOUND,
+                format!("{} is not served by configd", other.method()),
+            ),
+        ),
+    }
+}
+
+/// A backend result becomes a response. Backend failures are `INTERNAL_ERROR` because they mean
+/// the machinery broke — a *refusal* is a successful call with a `Failed` outcome, which is a
+/// distinction a client acts on.
+fn reply<T: serde::Serialize>(id: proto::Id, result: Result<T, String>) -> proto::Response {
+    match result {
+        Ok(value) => proto::Response::ok(Some(id), &value),
+        Err(e) => {
+            tracing::warn!(error = %e, "backend failed");
+            proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))
+        }
+    }
+}
+
+/// Seconds since boot, from `/proc/uptime`. Zero where there is no procfs, which is only ever a
+/// developer's laptop.
+fn uptime_seconds() -> u64 {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .map(|secs| secs as u64)
+        .unwrap_or(0)
+}
+
+async fn write_line<T: serde::Serialize>(
+    out: &mut tokio::net::unix::OwnedWriteHalf,
+    message: &T,
+) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(message)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push(b'\n');
+    out.write_all(&line).await?;
+    out.flush().await
+}
+
+/// Resolve on SIGTERM (systemd stop) or SIGINT (Ctrl-C).
+async fn shutdown() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot listen for SIGTERM");
+            return std::future::pending().await;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}

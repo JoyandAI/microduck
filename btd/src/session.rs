@@ -202,7 +202,12 @@ mod tests {
     }
 
     fn sockets(dir: &std::path::Path, updater: &str, robot: &str) -> Sockets {
-        Sockets { updater: dir.join(updater), robot: dir.join(robot) }
+        Sockets {
+            updater: dir.join(updater),
+            robot: dir.join(robot),
+            // Not exercised by these tests; `configd` gets its own once it has a fake.
+            config: dir.join("configd.sock"),
+        }
     }
 
     /// The ordinary path: an allowed call reaches the right daemon **byte for byte**, and its

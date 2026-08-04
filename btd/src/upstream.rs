@@ -32,6 +32,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Sockets {
     pub updater: PathBuf,
     pub robot: PathBuf,
+    pub config: PathBuf,
 }
 
 impl Sockets {
@@ -39,6 +40,7 @@ impl Sockets {
         match upstream {
             Upstream::Updater => &self.updater,
             Upstream::Robot => &self.robot,
+            Upstream::Config => &self.config,
         }
     }
 }

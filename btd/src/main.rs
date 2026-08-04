@@ -9,11 +9,6 @@ use std::process::ExitCode;
 use btd::upstream::Sockets;
 use clap::Parser;
 
-/// `robotd`'s socket. Not in `duck-ipc-proto` because that crate's `DEFAULT_SOCKET` is
-/// `updaterd`'s, and inventing a second constant there would imply a contract that does not
-/// exist — `robotd.service` names this path on its command line.
-const ROBOT_SOCKET: &str = "/run/robotd.sock";
-
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -24,12 +19,16 @@ const ROBOT_SOCKET: &str = "/run/robotd.sock";
 )]
 struct Args {
     /// `updaterd`'s socket.
-    #[arg(long, default_value = duck_ipc_proto::DEFAULT_SOCKET)]
+    #[arg(long, default_value = duck_ipc_proto::socket::UPDATER)]
     update_socket: PathBuf,
 
     /// `robotd`'s socket.
-    #[arg(long, default_value = ROBOT_SOCKET)]
+    #[arg(long, default_value = duck_ipc_proto::socket::ROBOT)]
     robot_socket: PathBuf,
+
+    /// `configd`'s socket — wifi and the robot's identity.
+    #[arg(long, default_value = duck_ipc_proto::socket::CONFIG)]
+    config_socket: PathBuf,
 
     /// Name to advertise. Defaults to the hostname.
     ///
@@ -85,6 +84,7 @@ async fn main() -> ExitCode {
     let sockets = Sockets {
         updater: args.update_socket,
         robot: args.robot_socket,
+        config: args.config_socket,
     };
     let name = args.name.unwrap_or_else(hostname);
 
