@@ -391,8 +391,16 @@ report() {
     fi
 
     # The device node is what gilrs opens, so this is the only claim that matters.
-    if ls /dev/input/js* >/dev/null 2>&1; then
-        printf '  %-22s %s\n' "gamepad" "$(ls /dev/input/js* | tr '\n' ' ')"
+    #
+    # A glob rather than `ls`: an unmatched glob stays literal in sh, so the `-e` test is what
+    # distinguishes "no pad" from a device actually being there.
+    pads=""
+    for node in /dev/input/js*; do
+        [ -e "$node" ] || continue
+        pads="${pads}${node} "
+    done
+    if [ -n "$pads" ]; then
+        printf '  %-22s %s\n' "gamepad" "$pads"
     else
         printf '  %-22s %s\n' "gamepad" "none connected"
     fi
