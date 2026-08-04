@@ -60,7 +60,8 @@ to watch the boot counter undo a release that never confirmed healthy.
 | `duck-control` | the control core — robot model, bus, sensing. A library, not a service: no tokio, no sockets, no systemd. |
 | `updaterd` | the update engine. Resident, and deliberately independent of `robotd` — it is the recovery path, so it must work when the robot does not. |
 | `mediad` | camera, audio, WebRTC gateway. **Not built yet.** |
-| `btd` | BLE: wifi provisioning, naming, update trigger from the phone. **Not built yet.** |
+| `btd` | BLE: the phone's front door. A pipe carrying the same JSON-RPC lines as every other transport, over one GATT characteristic. Owns no state. **Built, never met a radio** ([`docs/app-path-design.md`](docs/app-path-design.md)). |
+| `configd` | wifi (via NetworkManager), robot name, pairing PIN, reboot. Its own service because config must be reachable when `robotd` is dead, and because `btd` owns nothing. **Built, never met a real NetworkManager.** |
 
 They talk over unix sockets, JSON-RPC 2.0 one object per line. The contract lives in
 `duck-ipc-proto`, which depends on serde and semver and nothing else — so `btd` and `robotd`
@@ -71,11 +72,13 @@ duck-ipc-proto/ the wire contract
 duck-control/   the control core: robot model · Dynamixel bus · IMU · the RobotIo seam
 updater/        engine + updaterd
 robotd/         control daemon
+configd/        wifi · robot name · pairing PIN · reboot
+btd/            the BLE front door, plus btctl (a laptop client, never shipped)
 robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
-scripts/        install.sh (provisioning) · board-test.sh (aarch64 checks)
-docs/           architecture · update design · robotd design · roadmap · CI setup
+scripts/        install.sh · setup-board.sh · migrate-network.sh · board-test.sh
+docs/           architecture · update design · robotd design · app path · roadmap · CI setup
 ```
 
 ## Working on the robot
@@ -298,7 +301,16 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
 - **`robotd` holds a pose.** A real 50 Hz loop on the Dynamixel bus, and `robot.health`
   now means *the loop is meeting its deadline* rather than *it ticked once* — which is what
   makes the updater's auto-rollback gate on something real. Walking is slice 2.
-- **Not started:** `mediad`, `btd`, the phone app, the SDK, safety authority.
+- **The app path exists, untested against hardware.** `btd` serves a GATT pipe and `configd`
+  serves `net.*`/`system.*` — wifi scan and join, robot name, pairing PIN, reboot — with
+  `robotctl net`/`robotctl system` on the robot and `btctl` as a laptop-side BLE client. Neither
+  has met a radio or a real NetworkManager; both type-check and run for aarch64, and
+  `configd --fake-net` serves the whole surface off-board. A board must be migrated from netplan
+  to NetworkManager once (`scripts/migrate-network.sh`) before wifi works.
+- **BLE pairing is a six-digit PIN**, default `000000` and therefore not a secret: out of the box
+  it proves physical presence and nothing more. Per-robot PINs are a provisioning step that does
+  not exist yet, and the security of the app path rests on it.
+- **Not started:** `mediad`, the phone app, the SDK, safety authority.
 - **Runs on aarch64 Linux, emulated.** `scripts/board-test.sh` runs in CI: it
   cross-compiles for the board and executes 13 checks — rollback, tampered-artifact
   refusal, boot-counter recovery, socket modes, peer-credential authorization — on
