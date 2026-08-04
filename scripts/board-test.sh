@@ -211,6 +211,14 @@ chmod +x /stub/curl /stub/find /stub/systemctl
 touch /usr/local/lib/libonnxruntime.so.9.9.9
 ln -sf libonnxruntime.so.9.9.9 /usr/local/lib/libonnxruntime.so
 
+# A BlueZ config with [General] but no Privacy key — the insert-after-[General] branch, which
+# is the one a stock Armbian image takes.
+mkdir -p /etc/bluetooth
+cat > /etc/bluetooth/main.conf <<"BTCONF"
+[General]
+Name = radxa
+BTCONF
+
 # The wrong overlay prefix and a console on the motor UART: what Armbian actually ships.
 cat > /boot/armbianEnv.txt <<"ENV"
 overlay_prefix=rk35xx
@@ -242,6 +250,16 @@ grep -q "^overlay_prefix=rk3568$" /boot/armbianEnv.txt
 grep -q "^console=display$" /boot/armbianEnv.txt
 test "$(grep -c uart2-m0 /boot/armbianEnv.txt)" = 1
 echo "    [ok] setup-board is idempotent on a second run"
+
+# The gamepad settings, which are the kind that fail silently: a pad that pairs and drops, or
+# a padd that reads nothing because the user is not in `input`.
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
+echo "    [ok] setup-board sets Privacy = device for gamepad pairing"
+
+# Idempotent too: the second run above must not have added a duplicate key, which BlueZ
+# would read as a conflicting setting.
+test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
+echo "    [ok] Privacy is set exactly once"
 
 # ── the generated preinstall hook ──
 #
