@@ -608,6 +608,23 @@ impl Server {
                     "robot.* is served by robotd, not updaterd",
                 ),
             ),
+
+            // `net.*` and `system.*` belong to `configd`, for the reason that service exists:
+            // config must be reachable when the robot is dead, and wiring it into the update
+            // engine would put provisioning behind the engine's lock.
+            Call::NetStatus
+            | Call::NetScan
+            | Call::NetConnect(_)
+            | Call::NetForget(_)
+            | Call::SystemInfo
+            | Call::SystemSetName(_)
+            | Call::SystemReboot => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "net.* and system.* are served by configd, not updaterd",
+                ),
+            ),
         }
     }
 

@@ -39,6 +39,19 @@ pub enum FramingError {
     NotUtf8,
 }
 
+impl std::fmt::Display for FramingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LineTooLong => write!(f, "no newline within {MAX_LINE} bytes"),
+            Self::NotUtf8 => write!(f, "not valid UTF-8"),
+        }
+    }
+}
+
+// A real error, not just a Debug-able enum: this crate is a library, and a client using it — the
+// `btctl` example is the first — wants `?` to work.
+impl std::error::Error for FramingError {}
+
 impl Reassembler {
     pub fn new() -> Self {
         Self::default()

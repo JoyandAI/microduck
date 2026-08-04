@@ -29,6 +29,7 @@
 #[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod framing;
+pub mod gatt;
 pub mod link;
 pub mod route;
 pub mod session;

@@ -19,6 +19,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# The GATT UUIDs are a wire contract every client needs, not a Linux detail — see src/gatt.rs.
+uuid = "1"
 
 # BlueZ, reached over bluetoothd's D-Bus API. Only on Linux, and this only ever *runs* on the
 # Radxa — but the crate must still *build* on a macOS laptop, because `cargo test` there is the
@@ -40,8 +42,17 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "=0.17.4", features = ["bluetoothd"] }
 dbus = { version = "0.9", features = ["vendored"] }
-uuid = "1"
 futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# `btctl`, the laptop-side client in examples/. A dev-dependency on purpose: an example's deps
+# never reach the shipped artifact, so btleplug is not on the robot.
+#
+# btleplug rather than bluer because this half runs on a developer's machine — CoreBluetooth on
+# macOS, BlueZ on Linux, WinRT on Windows. bluer would make the client Linux-only, which defeats
+# the point of having one.
+btleplug = "0.11"
+futures = "0.3"
+serde_json = "1"

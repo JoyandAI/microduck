@@ -28,20 +28,10 @@ use bluer::gatt::{CharacteristicReader, CharacteristicWriter};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::gatt::{REQUEST_UUID, RESPONSE_UUID, SERVICE_UUID};
 use crate::link::{Link, QUEUE};
 use crate::session;
 use crate::upstream::Sockets;
-
-/// The robot's GATT service, and its two characteristics.
-///
-/// Random v4 UUIDs rather than anything derived: these are ours, they are a contract with the
-/// phone app, and they must not change once an app ships against them. Written out in full so
-/// that grepping for a value finds this comment.
-pub const SERVICE_UUID: uuid::Uuid = uuid::uuid!("6f5d2a10-3b47-4c8e-9a1f-2d7e8c4b6019");
-/// Central → robot. NDJSON request bytes, chunked.
-pub const REQUEST_UUID: uuid::Uuid = uuid::uuid!("6f5d2a11-3b47-4c8e-9a1f-2d7e8c4b6019");
-/// Robot → central. NDJSON response and notification bytes, chunked.
-pub const RESPONSE_UUID: uuid::Uuid = uuid::uuid!("6f5d2a12-3b47-4c8e-9a1f-2d7e8c4b6019");
 
 /// How long to wait between attempts to find a usable adapter.
 ///
@@ -223,20 +213,3 @@ fn spawn_session(
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The three UUIDs are a contract with the phone app: distinct, and stable forever once an
-    /// app ships against them. A copy-paste making two of them equal would present one
-    /// characteristic and hang a client waiting for the other.
-    #[test]
-    fn the_uuids_are_distinct() {
-        let all = [SERVICE_UUID, REQUEST_UUID, RESPONSE_UUID];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a, b);
-            }
-        }
-    }
-}
