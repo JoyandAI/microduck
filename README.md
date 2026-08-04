@@ -116,6 +116,17 @@ The update history is separate from the journal on purpose — `fsync`ed per ent
 robotctl update log
 ```
 
+`install.sh` sets up tab-completion for `robotctl` in `/etc/bash_completion.d/`, as a loader
+that asks the binary for its own completions — so they follow the installed release instead
+of going stale when an update adds a command. For a shell it did not cover, or for a build
+you are running straight out of `target/`:
+
+```bash
+eval "$(robotctl completions bash)"
+```
+
+`zsh`, `fish`, `elvish` and `powershell` work in place of `bash`.
+
 Provisioning a board from scratch, and the log-retention caveats on Armbian, are in
 [`deploy/README.md`](deploy/README.md).
 

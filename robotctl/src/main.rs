@@ -35,7 +35,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 
 /// Exit codes. Stable — CI asserts on these.
@@ -110,6 +110,19 @@ enum Namespace {
         /// Machine-readable output, for support bundles and scripts.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Print a shell completion script on stdout.
+    ///
+    /// Generated from this binary's own command tree, so the completions a robot offers
+    /// are the commands that robot's release actually has. `install.sh` therefore drops a
+    /// loader that sources this at shell start rather than a snapshot of it: the snapshot
+    /// would go stale the first time an update adds a subcommand.
+    ///
+    ///   robotctl completions bash > /etc/bash_completion.d/robotctl
+    Completions {
+        /// bash, zsh, fish, elvish or powershell.
+        shell: clap_complete::Shell,
     },
 }
 
@@ -791,6 +804,18 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Version { json } => {
             return run_version(&cli.socket, &cli.robot_socket, json);
         }
+        // Pure codegen: no socket, no daemon, no root. It must keep working on a robot
+        // where nothing is running, since that is where an operator most wants to type
+        // less.
+        Namespace::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "robotctl",
+                &mut std::io::stdout(),
+            );
+            return Ok(());
+        }
         Namespace::Update { command } => command,
     };
 
@@ -944,6 +969,58 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `completions` must name a shell rather than defaulting to one: a script that
+    /// redirects the output into a file for the wrong shell would produce a file that is
+    /// silently never used.
+    #[test]
+    fn completions_requires_a_shell() {
+        assert!(
+            Cli::try_parse_from(["robotctl", "completions"]).is_err(),
+            "a bare `completions` must be a usage error"
+        );
+
+        let cli = Cli::try_parse_from(["robotctl", "completions", "bash"])
+            .expect("`completions bash` must parse");
+        assert!(matches!(
+            cli.namespace,
+            Namespace::Completions {
+                shell: clap_complete::Shell::Bash
+            }
+        ));
+    }
+
+    /// The completion script is generated from this parser, so the only way the two can
+    /// drift is if generation stops covering a namespace. Asserting on the commands an
+    /// operator types is what catches that — including the nested ones, since `update` is
+    /// where all the useful completions are.
+    #[test]
+    fn bash_completions_cover_the_command_tree() {
+        let mut out = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut Cli::command(),
+            "robotctl",
+            &mut out,
+        );
+        let script = String::from_utf8(out).expect("the completion script must be UTF-8");
+
+        for command in [
+            "update",
+            "version",
+            "health",
+            "completions",
+            "apply",
+            "rollback",
+            "reset-to-golden",
+            "--interrupt-sessions",
+        ] {
+            assert!(
+                script.contains(command),
+                "the bash completions never mention `{command}`"
+            );
+        }
     }
 
     #[test]
