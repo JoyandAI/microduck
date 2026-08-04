@@ -16,15 +16,20 @@
 //! local socket — is the one running as root. Putting the parser on the safe side of that
 //! boundary matters more than hardening the dispatcher.
 //!
-//! ## What exists today
+//! ## Layout
 //!
-//! The transport-independent half: [`framing`] and [`route`], both tested without a radio.
-//! The GATT backend and the daemon binary follow — and BLE on this board is not usable until
-//! roughly 73s after power-on (`aic-bluetooth.service` brings `hci0` up late), so whatever
-//! drives the adapter must wait and retry for one rather than assume it exists at startup.
+//! [`framing`] and [`route`] are pure logic. [`session`] is the whole of the behaviour, and it
+//! reaches the radio only through [`link::Link`] — two channels, not a trait — so the tests
+//! drive a complete session over real unix sockets with no Bluetooth involved. [`upstream`]
+//! holds the connections to the services that own the answers.
 //!
 //! `net.*` and `system.*` — wifi, name, reboot — are not in [`route`] yet because `configd`
 //! does not exist yet. When it does they are one arm each, and nothing else here changes.
 
+#[cfg(target_os = "linux")]
+pub mod bluez;
 pub mod framing;
+pub mod link;
 pub mod route;
+pub mod session;
+pub mod upstream;

@@ -19,7 +19,7 @@ use duck_ipc_proto as proto;
 /// The service that owns the answer to a call.
 ///
 /// One socket per service, connected directly — there is no broker (`architecture.md` §2.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Upstream {
     /// `updaterd`, at `proto::DEFAULT_SOCKET`.
     Updater,

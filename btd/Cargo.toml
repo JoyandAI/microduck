@@ -14,17 +14,34 @@ description = "BLE transport adapter — a GATT front door onto the robot's JSON
 # stays unprivileged while `configd` is the one running as root.
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
-# `bluer` (BlueZ) and tokio are deliberately NOT here yet, and adding them needs a decision
-# rather than a line:
+# BlueZ, reached over bluetoothd's D-Bus API. Only on Linux, and this only ever *runs* on the
+# Radxa — but the crate must still *build* on a macOS laptop, because `cargo test` there is the
+# whole onboarding path for a teammate (roadmap, "Organisation"). Those are different claims and
+# only the first is true, so the radio sits behind `cfg(target_os = "linux")` while the session
+# logic is driven by channels and needs no radio to test.
 #
-#  - BlueZ is Linux-only, so the real backend must sit behind a trait with a fake, as
-#    `duck-control` does for the Dynamixel bus — the suite runs on a macOS laptop with no
-#    hardware, no network and no Docker, and that must stay true.
-#  - `bluer` links libdbus, which the release pipeline **cross-compiles** for aarch64. A C
-#    dependency needs a sysroot that CI does not have today, so this is a build-system change
-#    and not a dependency addition. Measure it against a pure-Rust D-Bus client (`zbus`,
-#    already the likely choice for `configd`) before committing to either.
+# Pinned rather than floated: bluer is 0.x and breaks across minor versions, and its GATT-server
+# API is the part most likely to move.
 #
-# Until that is settled this crate is the transport-independent half — framing and routing —
-# which is where all the logic worth testing lives anyway.
+# `dbus/vendored` builds libdbus from source with `cc` instead of linking the target's copy.
+# That is what makes this cross-compile: `cargo board` uses cargo-zigbuild, and `zig cc`
+# supplies a cross C compiler — the same mechanism that already builds `zstd-sys` — but the
+# sysroot has libc, not libdbus. Verified: a full aarch64 release build links clean.
+#
+# The cost of vendoring is that this libdbus is ours to keep current rather than the distro's.
+# Acceptable for a library reached only over a local socket by a daemon we wrote, but it is a
+# thing to remember exists.
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "=0.17.4", features = ["bluetoothd"] }
+dbus = { version = "0.9", features = ["vendored"] }
+uuid = "1"
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
