@@ -77,8 +77,8 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
     adapter.set_powered(true).await?;
 
     // Pairable only matters while we advertise, and the board reports `Pairable: no` by default.
-    // A pairing *window* — opened by a physical button rather than left open — is the obvious
-    // next step and needs a button that does not exist yet.
+    // Left open rather than gated behind a window: the PIN carries what a window would add, as
+    // long as it is per-robot. See `crate::pairing` for why that was chosen over a button.
     if require_pairing {
         adapter.set_pairable(true).await?;
     }

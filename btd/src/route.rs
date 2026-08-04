@@ -41,11 +41,11 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
 
         // ── the update subset §4.1 names ────────────────────────────────────
         //
-        // `Apply` is the only mutating call BLE may make, and it is intended: BLE implies
-        // physical presence plus pairing (§4.2), and "update the robot from the phone" is
-        // M6's headline. Note it still has to pass `updaterd`'s own peer policy — btd's uid
-        // must be in `allow_uids` for this to be more than a permission error. Leaving it
-        // out is a safe default: BLE can then read everything and change nothing.
+        // `Apply` is intended: BLE implies physical presence plus pairing (§4.2), and "update
+        // the robot from the phone" is M6's headline. It also has to pass `updaterd`'s own peer
+        // policy, and does — `deploy/updater.toml` names `btd` in `allow_users`, which is a
+        // narrower claim than granting the robot group. Routing it here without that grant would
+        // have produced a phone button that always returned PERMISSION_DENIED.
         Apply(_) => Some(Upstream::Updater),
         Check(_) => Some(Upstream::Updater),
         Status => Some(Upstream::Updater),

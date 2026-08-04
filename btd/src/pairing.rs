@@ -18,13 +18,27 @@
 //! per-robot PIN printed under the robot is what turns this into security, and that is
 //! `updater-design.md` §5.7's per-device state.
 //!
-//! Two things this deliberately does *not* do yet, both of which need a decision rather than
-//! code:
+//! ## No pairing window, and that is decided rather than deferred
 //!
-//!  - **No pairing window.** The robot is pairable whenever it advertises. A physical
-//!    button-held window is the usual answer and there is no button defined yet.
-//!  - **No bond management.** Every paired phone stays paired; nothing revokes one. `bluetoothctl
-//!    untrust` is the manual escape hatch until there is an API for it.
+//! The robot is pairable whenever it advertises. A physical button-held window is the usual
+//! answer, and it was considered and rejected: a **per-robot PIN already carries the property a
+//! window would add.** If the PIN is unique and printed under the robot, knowing it requires
+//! physical access — and anyone who can read the sticker can also pick the robot up. A window
+//! would defend only against someone in range while the factory default is still in place, and
+//! the answer to that is a real PIN, not a button.
+//!
+//! What a button would buy beyond this: a visible consent moment, a recovery path when the PIN is
+//! lost, and defence in depth if a sticker is photographed. None is needed for v1, and each is
+//! additive later — an enclosure with a button can gate `set_pairable` without changing anything
+//! here.
+//!
+//! So the security of this rests entirely on the PIN being per-robot, which makes it a
+//! provisioning obligation rather than a software one: something has to generate it, print it and
+//! record what was printed. That is `updater-design.md` §5.7's per-device state — the same slot
+//! that owes us a serial number, which is a reason to define it once.
+//!
+//! Still open, and smaller: **no bond management.** Every paired phone stays paired and nothing
+//! revokes one; `bluetoothctl untrust` is the manual escape until there is an API for it.
 
 use std::time::Duration;
 

@@ -153,6 +153,42 @@ fn log_startup_identity(service: &str) {
     );
 }
 
+/// A user name to a uid, and a group name to a gid.
+///
+/// `SO_PEERCRED` reports numbers, so a name has to become one somewhere. Doing it here, once at
+/// startup, is what lets `deploy/updater.toml` name `btd` and stay correct on a board where
+/// `systemd-sysusers` allocated a different uid.
+///
+/// Duplicated in `configd`, deliberately: the obvious shared home would be `duck-ipc-proto`, and
+/// that crate is types only — every service speaks it, including the ones on the recovery path,
+/// so it may not grow a libc dependency for the convenience of two callers.
+fn resolve_uid(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // Safety: `getpwnam` takes a NUL-terminated string and returns a pointer into a static
+    // buffer, or null. Read immediately; nothing is retained.
+    let entry = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if entry.is_null() {
+        tracing::warn!(user = name, "no such user; it cannot change this robot's software");
+        return None;
+    }
+    let uid = unsafe { (*entry).pw_uid };
+    tracing::info!(user = name, uid, "may change this robot's software");
+    Some(uid)
+}
+
+fn resolve_gid(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // Safety: as above, for the group database.
+    let entry = unsafe { libc::getgrnam(cname.as_ptr()) };
+    if entry.is_null() {
+        tracing::warn!(group = name, "no such group; it cannot change this robot's software");
+        return None;
+    }
+    let gid = unsafe { (*entry).gr_gid };
+    tracing::info!(group = name, gid, "may change this robot's software");
+    Some(gid)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
@@ -478,8 +514,12 @@ async fn serve(args: Args) -> ExitCode {
     // Read before `config` is moved into the engine.
     let config_check_interval = config.check_interval;
     let config_auto_apply = config.auto_apply;
-    let allow_uids = config.allow_uids.clone();
-    let allow_gids = config.allow_gids.clone();
+    // Numeric ids from the config, plus whatever the names resolve to. Names are what a shipped
+    // config should use; the numeric lists remain for a bench override.
+    let mut allow_uids = config.allow_uids.clone();
+    allow_uids.extend(config.allow_users.iter().filter_map(|name| resolve_uid(name)));
+    let mut allow_gids = config.allow_gids.clone();
+    allow_gids.extend(config.allow_groups.iter().filter_map(|name| resolve_gid(name)));
 
     let mut engine = match updater::engine::Engine::new(config, keys, robot, faults) {
         Ok(engine) => engine,
