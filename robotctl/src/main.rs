@@ -71,8 +71,8 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::DEFAULT_SOCKET)]
     socket: PathBuf,
 
-    /// Path to the robotd socket. Only used by `version`, which asks each daemon what it
-    /// is running.
+    /// Path to the robotd socket. Used by `health` and `version`, the two commands that ask
+    /// the robot about itself rather than telling the update engine to do something.
     #[arg(long, global = true, default_value = "/run/robotd.sock")]
     robot_socket: PathBuf,
 
@@ -91,11 +91,21 @@ enum Namespace {
         command: UpdateCommand,
     },
 
-    /// Is the robot healthy, and if not, why not.
+    /// The full state of this robot: hardware and software.
     ///
-    /// The same question the update system's health gate asks, and the reason auto-rollback
-    /// means anything. It was previously only answerable by hand-writing JSON at the socket,
-    /// which is a poor way to ask the one thing that decides whether a release is kept.
+    /// Hardware from `robotd` — the verdict the update system's health gate turns on, the loop
+    /// and bus numbers behind it, the IMU, the battery and the motor temperatures. Software
+    /// from `updaterd` — what is running, what is installed, what is pinned, and how the last
+    /// update went.
+    ///
+    /// One command because that is how the question arrives. "What is wrong with this robot"
+    /// does not divide into hardware and software until after it is answered, and a robot that
+    /// reverted a release an hour ago looks exactly like a robot with unpowered servos until
+    /// both halves are on screen together.
+    ///
+    /// Exits non-zero when the robot is unhealthy or unreachable, so it can gate a script.
+    /// Nothing else here affects the exit code: a flat pack, a hot motor and a pinned
+    /// component are reported, not judged.
     Health {
         /// Machine-readable output, for scripts and support bundles.
         #[arg(long)]
@@ -370,6 +380,14 @@ struct ComponentReport {
     name: String,
     installed: Option<String>,
     revision: Option<String>,
+    /// Set when this component refuses anything but one version. Worth surfacing without
+    /// being asked: a pinned component silently ignores every release published after it,
+    /// and the symptom — "updates stopped arriving" — points nowhere near the cause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned: Option<String>,
+    /// The last update attempt, as one line. `None` on a robot that has never updated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_attempt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -382,67 +400,240 @@ struct VersionReport {
     warnings: Vec<String>,
 }
 
-/// Ask `robotd` whether it is healthy.
+// ── health reporting ─────────────────────────────────────────────────────────
+
+/// The whole state of one robot: what the hardware is doing, and what software is on it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct HealthReport {
+    /// `robotd`'s answer. `None` when it could not be asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    robot: Option<proto::HealthResult>,
+    /// Why `robotd` could not be asked. Reported rather than fatal: a stopped `robotd` is
+    /// itself the most useful sentence this command can print, and the software half is still
+    /// worth having — that is often what explains the stopped daemon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    robot_error: Option<String>,
+    software: VersionReport,
+}
+
+impl HealthReport {
+    /// Is the robot working? `None` when `robotd` could not be asked.
+    fn healthy(&self) -> Option<bool> {
+        self.robot.as_ref().map(|r| r.healthy)
+    }
+}
+
+/// Report the full state of the robot: control loop, bus, IMU, battery, motor temperature,
+/// and the software running and installed.
+///
+/// Both halves, in one command, because the question "what is wrong with this robot" does not
+/// divide along that line — a robot that reverted a release an hour ago and a robot whose
+/// servos are unpowered look identical until you can see both at once. `robotctl version`
+/// remains the software half on its own, for when that is all that is wanted.
 ///
 /// Exits non-zero when the robot is unhealthy or unreachable, so a script can gate on it —
-/// `robotctl health && do_the_thing`. The reason is always printed, because "unhealthy" on
-/// its own sends someone hunting: it distinguishes a loop that has not started from one
-/// missing its deadline from a policy that would not load.
-///
-/// Battery prints on its own line and never affects the verdict or the exit code. It is here
-/// because this is the command someone runs when a robot is behaving oddly, and "the pack is
-/// at 8%" answers that question more often than anything else on the socket.
-fn run_health(robot_socket: &Path, json: bool) -> Result<(), Failure> {
-    let mut client = Client::connect_to("robotd", robot_socket)?;
-    let response = client.call(&proto::Call::RobotHealth)?;
+/// `robotctl health && do_the_thing`, which `install.sh` relies on. Nothing else here affects
+/// the exit code: a flat pack, a hot motor and a pinned component are all *reported*, and a
+/// command that failed because of a low battery would be a command nobody could script.
+fn run_health(socket: &Path, robot_socket: &Path, json: bool) -> Result<(), Failure> {
+    let mut report = HealthReport {
+        robot: None,
+        robot_error: None,
+        software: collect_version_report(socket, robot_socket),
+    };
 
-    let health: proto::HealthResult = response.result_as().map_err(|e| {
-        Failure::new(
-            exit::FAILED,
-            format!("robotd answered robot.health with something unexpected: {e}"),
-        )
-    })?;
+    match Client::connect_to("robotd", robot_socket) {
+        Err(failure) => report.robot_error = Some(failure.message),
+        Ok(mut client) => match client.call(&proto::Call::RobotHealth) {
+            Err(failure) => report.robot_error = Some(failure.message),
+            Ok(response) => match response.result_as::<proto::HealthResult>() {
+                Ok(health) => report.robot = Some(health),
+                Err(e) => {
+                    report.robot_error =
+                        Some(format!("robotd answered robot.health unreadably: {e}"));
+                }
+            },
+        },
+    }
 
     if json {
         println!(
             "{}",
-            serde_json::to_string(&health).unwrap_or_else(|_| "{}".to_owned())
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned())
         );
-    } else if health.healthy {
-        println!("healthy");
     } else {
-        // "degraded" reads as what it is: this release is fine, this board cannot move.
-        // Still a non-zero exit — `install.sh` and anyone else scripting this should hear
-        // about an unpowered robot rather than see a silent success.
-        println!(
-            "{}: {}",
-            if health.degraded {
-                "degraded"
-            } else {
-                "unhealthy"
-            },
-            health.reason.as_deref().unwrap_or("no reason given")
-        );
+        print!("{}", render_health(&report));
     }
 
-    // After the verdict, and only in human output — the JSON already carries it. Silent when
-    // unknown rather than printing a zero: for the first second of uptime, and on a robot
-    // whose bus cannot answer, there is genuinely no reading, and "0.00 V" would read as a
-    // dead pack.
-    if !json && let Some(battery) = health.battery {
-        println!("battery: {:.2} V ({:.0}%)", battery.volts, battery.percent);
-    }
-
-    if health.healthy {
-        Ok(())
-    } else {
-        // REFUSED, not FAILED: the robot answered correctly and the answer was "no". That is
-        // a verdict, not a malfunction, and a script should be able to tell them apart.
-        Err(Failure::silent(exit::REFUSED))
+    match report.healthy() {
+        Some(true) => Ok(()),
+        // REFUSED, not FAILED: the robot answered correctly and the answer was "no". That is a
+        // verdict, not a malfunction, and a script should be able to tell them apart.
+        Some(false) => Err(Failure::silent(exit::REFUSED)),
+        // Nothing answered. Distinct again: there is no verdict to act on.
+        None => Err(Failure::silent(exit::UNREACHABLE)),
     }
 }
 
+/// The report as a human reads it: the verdict first, then the evidence, then the software.
+///
+/// Pure, so the cases that matter are testable without a robot — and the cases that matter are
+/// the missing ones, which a live test on a working robot never produces.
+fn render_health(report: &HealthReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    match (&report.robot, &report.robot_error) {
+        (Some(health), _) => {
+            let verdict = match (health.healthy, health.degraded) {
+                (true, _) => "healthy".to_owned(),
+                // "degraded" reads as what it is: this release is fine, this board cannot move.
+                (false, true) => format!(
+                    "degraded: {}",
+                    health.reason.as_deref().unwrap_or("no reason given")
+                ),
+                (false, false) => format!(
+                    "unhealthy: {}",
+                    health.reason.as_deref().unwrap_or("no reason given")
+                ),
+            };
+            let _ = writeln!(out, "robot     {verdict}");
+
+            if let Some(l) = &health.control_loop {
+                let _ = writeln!(
+                    out,
+                    "  {:<9} {} of {:.1} Hz · {} ticks · {} missed · last {} ms ago",
+                    "loop",
+                    // Unknown is not 0 Hz: for the first second there is no measurement, and
+                    // printing one would describe a healthy robot as stopped.
+                    match l.achieved_hz {
+                        Some(hz) => format!("{hz:.1}"),
+                        None => "not measured yet,".to_owned(),
+                    },
+                    l.target_hz,
+                    l.ticks,
+                    l.missed,
+                    l.last_tick_age_ms
+                );
+            }
+
+            let bus = match (health.bus.consecutive_errors, health.bus.startup_failures) {
+                (0, 0) => "ok".to_owned(),
+                (0, n) => format!("waiting for a robot to answer, {n} attempts"),
+                (n, _) => format!("{n} consecutive read failures"),
+            };
+            let _ = writeln!(out, "  {:<9} {bus}", "bus");
+
+            if let Some(imu) = &health.imu {
+                let _ = writeln!(
+                    out,
+                    "  {:<9} {}{}",
+                    "imu",
+                    if imu.ready { "ready" } else { "not ready" },
+                    match imu.stale_blocks {
+                        0 => String::new(),
+                        // Worth shouting about: the board answers, so nothing else reports a
+                        // fault, while the orientation being fed to the policy is frozen.
+                        n => format!(", {n} stale reads — orientation may be dead"),
+                    }
+                );
+            }
+
+            // Silent when unknown rather than printing a zero: for the first second of uptime,
+            // and on a robot whose bus cannot answer, there is genuinely no reading, and
+            // "0.00 V" would read as a dead pack.
+            if let Some(b) = &health.battery {
+                let _ = writeln!(
+                    out,
+                    "  {:<9} {:.2} V ({:.0}%)",
+                    "battery", b.volts, b.percent
+                );
+            }
+            if let Some(m) = &health.motors {
+                let _ = writeln!(
+                    out,
+                    "  {:<9} {:.0} °C max ({}) · {:.0} °C mean",
+                    "motors", m.max_c, m.hottest, m.mean_c
+                );
+            }
+        }
+        (None, Some(why)) => {
+            // First line only: a multi-line message would break the column layout, and the
+            // rest of it is the `systemctl status` hint the connect error already carries.
+            let brief = why.lines().next().unwrap_or("unavailable");
+            let _ = writeln!(out, "robot     unavailable — {brief}");
+        }
+        (None, None) => {
+            let _ = writeln!(out, "robot     unavailable");
+        }
+    }
+
+    let _ = writeln!(out, "\nsoftware");
+    for service in &report.software.services {
+        match &service.error {
+            Some(why) => {
+                let brief = why.lines().next().unwrap_or("unavailable");
+                let _ = writeln!(out, "  {:<9} unavailable — {brief}", service.name);
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  {:<9} {} {}",
+                    service.name,
+                    service.version.as_deref().unwrap_or("unknown"),
+                    match &service.revision {
+                        Some(rev) => format!("(rev {rev})"),
+                        None => "(rev unknown)".to_owned(),
+                    }
+                );
+            }
+        }
+    }
+    for component in &report.software.components {
+        let _ = writeln!(
+            out,
+            "  {:<9} {} installed{}",
+            component.name,
+            component.installed.as_deref().unwrap_or("none"),
+            match &component.pinned {
+                Some(v) => format!(", pinned to {v}"),
+                None => String::new(),
+            }
+        );
+        if let Some(attempt) = &component.last_attempt {
+            let _ = writeln!(out, "  {:<9} last update {attempt}", "");
+        }
+    }
+
+    // Same shape `robotctl version` uses, blank line and all: these are often multi-line —
+    // the `systemctl status` hint on an unreachable daemon is the useful half — and the two
+    // commands should not disagree about how a warning looks.
+    for warning in &report.software.warnings {
+        let _ = writeln!(out, "\n! {warning}");
+    }
+
+    out
+}
+
 fn run_version(socket: &Path, robot_socket: &Path, json: bool) -> Result<(), Failure> {
+    let report = collect_version_report(socket, robot_socket);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        print!("{}", render_version(&report));
+    }
+    Ok(())
+}
+
+/// Ask both daemons what they are running and `updaterd` what is installed.
+///
+/// Shared by `version` and `health` so the software half of a support report is gathered one
+/// way. Two commands assembling it separately is how they start disagreeing.
+fn collect_version_report(socket: &Path, robot_socket: &Path) -> VersionReport {
     let build = proto::build_info!();
     let mut report = VersionReport {
         robotctl: build.version.to_owned(),
@@ -498,16 +689,7 @@ fn run_version(socket: &Path, robot_socket: &Path, json: bool) -> Result<(), Fai
     }
 
     report.warnings = version_warnings(&report, updaterd_running.as_ref());
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        );
-    } else {
-        print!("{}", render_version(&report));
-    }
-    Ok(())
+    report
 }
 
 /// Installed release per component, with the revision of the active one.
@@ -543,9 +725,30 @@ fn installed_components(client: &mut Client) -> Vec<ComponentReport> {
                 name: status.component.to_string(),
                 installed: status.installed.map(|v| v.to_string()),
                 revision,
+                pinned: status.pinned.map(|v| v.to_string()),
+                last_attempt: status.last_attempt.as_ref().map(describe_attempt),
             }
         })
         .collect()
+}
+
+/// One update attempt in one line: what it tried, and how it went.
+///
+/// The outcome's *reason* is kept for the failures, not trimmed to "rolled back" — it is the
+/// only place the cause of an automatic revert appears outside the journal, and a robot that
+/// reverted a week ago is exactly the robot someone is asking about.
+fn describe_attempt(entry: &proto::LogEntry) -> String {
+    let target = match (&entry.from, &entry.to) {
+        (Some(from), Some(to)) => format!("{from} → {to}"),
+        (None, Some(to)) => to.to_string(),
+        (Some(from), None) => format!("from {from}"),
+        (None, None) => "unknown version".to_owned(),
+    };
+    match &entry.outcome {
+        proto::Outcome::Success => format!("{target}: applied"),
+        proto::Outcome::RolledBack { reason } => format!("{target}: ROLLED BACK — {reason}"),
+        proto::Outcome::Aborted { reason } => format!("{target}: refused — {reason}"),
+    }
 }
 
 /// Disagreements worth telling a human about.
@@ -792,7 +995,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
         Namespace::Health { json } => {
-            return run_health(&cli.robot_socket, json);
+            return run_health(&cli.socket, &cli.robot_socket, json);
         }
         Namespace::Version { json } => {
             return run_version(&cli.socket, &cli.robot_socket, json);
@@ -1067,6 +1270,224 @@ mod tests {
         assert!(result.is_err(), "--ref with --version must be rejected");
     }
 
+    // ── health reporting ─────────────────────────────────────────────────────
+
+    fn health_report(
+        robot: Option<proto::HealthResult>,
+        robot_error: Option<&str>,
+    ) -> HealthReport {
+        HealthReport {
+            robot,
+            robot_error: robot_error.map(str::to_owned),
+            software: report(vec![service("robotd", "0.2.0")], Some("0.2.0")),
+        }
+    }
+
+    /// A working robot, rendered whole: every section present, one line each.
+    #[test]
+    fn health_renders_hardware_and_software_together() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                battery: Some(proto::Battery {
+                    volts: 7.62,
+                    percent: 63.75,
+                }),
+                motors: Some(proto::MotorThermal {
+                    hottest: "left_knee".into(),
+                    max_c: 48.0,
+                    mean_c: 36.0,
+                }),
+                control_loop: Some(proto::LoopHealth {
+                    target_hz: 50.0,
+                    achieved_hz: Some(49.8),
+                    ticks: 2490,
+                    missed: 2,
+                    last_tick_age_ms: 12,
+                }),
+                bus: proto::BusHealth::default(),
+                imu: Some(proto::ImuHealth {
+                    ready: true,
+                    stale_blocks: 0,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(out.contains("robot     healthy"), "{out}");
+        assert!(out.contains("49.8 of 50.0 Hz"), "{out}");
+        assert!(out.contains("2490 ticks"), "{out}");
+        assert!(out.contains("7.62 V (64%)"), "{out}");
+        assert!(out.contains("48 °C max (left_knee)"), "{out}");
+        assert!(out.contains("bus       ok"), "{out}");
+        assert!(out.contains("imu       ready"), "{out}");
+        // And the software half, in the same answer — the whole point of one command.
+        assert!(out.contains("software"), "{out}");
+        assert!(out.contains("robotd    0.2.0"), "{out}");
+        assert!(out.contains("daemon    0.2.0 installed"), "{out}");
+    }
+
+    /// A stopped `robotd` must still produce the software half.
+    ///
+    /// This is the shape of a real support case — "the robot does nothing" is very often a
+    /// daemon that failed to start, and what is *installed* is then the interesting half. A
+    /// command that bailed out on the first unreachable socket would withhold exactly the
+    /// information that explains the unreachable socket.
+    #[test]
+    fn health_reports_software_when_robotd_is_down() {
+        let out = render_health(&health_report(
+            None,
+            Some(
+                "cannot reach robotd at /run/robotd.sock: No such file or directory\nIs the service running?",
+            ),
+        ));
+
+        assert!(
+            out.contains("robot     unavailable — cannot reach robotd"),
+            "{out}"
+        );
+        // First line only: the hint belongs in the warnings block, not wrapped through a
+        // column layout.
+        assert!(!out.contains("robot     unavailable — cannot reach robotd at /run/robotd.sock: No such file or directory\nIs"), "{out}");
+        assert!(out.contains("software"), "{out}");
+        assert!(out.contains("daemon    0.2.0 installed"), "{out}");
+    }
+
+    /// Nothing measured yet must not render as zeros.
+    ///
+    /// This is every robot for its first second, and the state a live test never catches. "0.0
+    /// Hz" and "0.00 V" describe a stopped loop on a dead battery — the opposite of a robot
+    /// that has only just started.
+    #[test]
+    fn health_renders_unknowns_as_unknown() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                reason: Some("control loop has not completed a cycle yet".into()),
+                control_loop: Some(proto::LoopHealth {
+                    target_hz: 50.0,
+                    achieved_hz: None,
+                    ticks: 0,
+                    missed: 0,
+                    last_tick_age_ms: 0,
+                }),
+                imu: Some(proto::ImuHealth {
+                    ready: false,
+                    stale_blocks: 0,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(
+            out.contains("unhealthy: control loop has not completed"),
+            "{out}"
+        );
+        assert!(out.contains("not measured yet"), "{out}");
+        assert!(out.contains("not ready"), "{out}");
+        // No battery line and no motors line at all, rather than zeroed ones.
+        assert!(!out.contains(" V ("), "{out}");
+        assert!(!out.contains("°C"), "{out}");
+    }
+
+    /// The two findings that must not hide: a bus that has stopped answering, and an IMU that
+    /// answers without refreshing.
+    ///
+    /// Stale IMU reads are the nastiest of the lot — the reads *succeed*, so nothing else
+    /// reports a fault, while the orientation feeding the policy is frozen.
+    #[test]
+    fn health_renders_a_broken_bus_and_a_stale_imu() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: false,
+                reason: Some("7 consecutive bus read failures".into()),
+                bus: proto::BusHealth {
+                    consecutive_errors: 7,
+                    startup_failures: 0,
+                },
+                imu: Some(proto::ImuHealth {
+                    ready: true,
+                    stale_blocks: 41,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(out.contains("7 consecutive read failures"), "{out}");
+        assert!(out.contains("41 stale reads"), "{out}");
+        assert!(out.contains("orientation may be dead"), "{out}");
+    }
+
+    /// An unpowered bench board reads as *degraded*, and the attempt count is the actionable
+    /// part: it is how you tell "still coming up" from "there is no robot on this bus".
+    #[test]
+    fn health_renders_a_degraded_board_waiting_for_its_bus() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                degraded: true,
+                reason: Some("no robot on the motor bus after 4 attempts".into()),
+                bus: proto::BusHealth {
+                    consecutive_errors: 0,
+                    startup_failures: 4,
+                },
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(out.contains("degraded: no robot on the motor bus"), "{out}");
+        assert!(
+            out.contains("waiting for a robot to answer, 4 attempts"),
+            "{out}"
+        );
+    }
+
+    /// A pinned component and a rollback are both things nobody thinks to ask about, and both
+    /// explain "updates stopped working" — so they appear without being asked for.
+    #[test]
+    fn health_surfaces_a_pin_and_the_last_update() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].pinned = Some("0.1.9".into());
+        report.software.components[0].last_attempt =
+            Some("0.1.9 → 0.2.0: ROLLED BACK — not healthy within 30s".into());
+
+        let out = render_health(&report);
+        assert!(out.contains("pinned to 0.1.9"), "{out}");
+        assert!(out.contains("ROLLED BACK"), "{out}");
+    }
+
+    /// The summary line for one update attempt, including the reason a revert happened —
+    /// which outside the journal exists nowhere else.
+    #[test]
+    fn an_attempt_is_summarised_with_its_reason() {
+        let entry = |outcome| proto::LogEntry {
+            at: 0,
+            component: proto::ComponentId::new("daemon"),
+            from: Some(semver::Version::new(0, 1, 9)),
+            to: Some(semver::Version::new(0, 2, 0)),
+            outcome,
+        };
+
+        assert_eq!(
+            describe_attempt(&entry(proto::Outcome::Success)),
+            "0.1.9 → 0.2.0: applied"
+        );
+        let rolled = describe_attempt(&entry(proto::Outcome::RolledBack {
+            reason: "not healthy within 30s".into(),
+        }));
+        assert!(rolled.contains("ROLLED BACK"), "{rolled}");
+        assert!(rolled.contains("not healthy within 30s"), "{rolled}");
+
+        // A first install has no `from`, and must not render as "None → 1.0.0".
+        let first = proto::LogEntry {
+            from: None,
+            ..entry(proto::Outcome::Success)
+        };
+        assert_eq!(describe_attempt(&first), "0.2.0: applied");
+    }
+
     // ── version reporting ────────────────────────────────────────────────────
 
     fn report(services: Vec<ServiceReport>, daemon_installed: Option<&str>) -> VersionReport {
@@ -1078,6 +1499,8 @@ mod tests {
                 name: "daemon".into(),
                 installed: daemon_installed.map(str::to_owned),
                 revision: None,
+                pinned: None,
+                last_attempt: None,
             }],
             warnings: Vec::new(),
         }

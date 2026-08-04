@@ -652,7 +652,11 @@ pub struct SafeToRestartResult {
 /// difference decides whether an update rolls back for a known reason or for a timeout.
 // No `Eq`: the battery reading is a float. Nothing compares these for exact equality
 // outside tests, where `PartialEq` is what `assert_eq!` needs anyway.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+//
+// `Default` is "nothing known": not healthy, nothing measured. That is the honest starting
+// point — and it means the next reported field added here does not break every caller that
+// builds one.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct HealthResult {
     pub healthy: bool,
     /// Set when the reason is a property of the *board*, not of the running release.
@@ -683,6 +687,80 @@ pub struct HealthResult {
     /// it as an empty battery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery: Option<Battery>,
+    /// Hottest servo, when temperatures have been read. Same rule as the battery: reported,
+    /// never judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motors: Option<MotorThermal>,
+    /// The control loop's own numbers — the ones `healthy` was decided from.
+    ///
+    /// Carried so a verdict can be *checked* rather than taken on faith. "unhealthy: control
+    /// loop at 43.9 Hz" is a better bug report when the reader can also see that the loop has
+    /// ticked two million times and missed none of its deadlines, which says late wakeups
+    /// rather than overrunning work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_loop: Option<LoopHealth>,
+    /// What the motor bus is doing. Present on every answer; the zero values are meaningful
+    /// ("no failures"), not missing data.
+    #[serde(default)]
+    pub bus: BusHealth,
+    /// Orientation source. Absent from an older `robotd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu: Option<ImuHealth>,
+}
+
+/// The control loop's rate and timing.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoopHealth {
+    /// What the loop is configured to run at, so the achieved figure means something without
+    /// the reader having the params file open.
+    pub target_hz: f64,
+    /// Achieved rate over the last window. `None` until the first window closes — which is
+    /// *unknown*, not zero: a rate of 0 Hz describes a stopped loop, and printing that for
+    /// the first second of every robot's uptime would be a lie.
+    pub achieved_hz: Option<f64>,
+    pub ticks: u64,
+    /// Ticks whose work overran the period, cumulative. Distinct from a rate shortfall: this
+    /// is the loop doing too much, a low rate is the loop being woken late, and telling them
+    /// apart is the difference between optimising and fixing a timer.
+    pub missed: u64,
+    /// Age of the last completed tick. Large means wedged.
+    pub last_tick_age_ms: u64,
+}
+
+/// The motor bus, as the loop sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BusHealth {
+    /// Consecutive failed reads; any success resets it. One is ordinary on a serial bus,
+    /// which is why the cumulative count is not what is reported.
+    pub consecutive_errors: u32,
+    /// Failed attempts to bring the bus up at all. Non-zero means the loop has never
+    /// commanded anything and is still waiting for a robot to answer — the signature of
+    /// servo power being off.
+    pub startup_failures: u32,
+}
+
+/// The IMU board, which rides the motor bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImuHealth {
+    /// Has the orientation filter converged?
+    pub ready: bool,
+    /// Reads that returned the previous sample unchanged. Non-zero means the board is
+    /// answering without refreshing: the reads succeed, nothing reports an error, and the
+    /// orientation is frozen.
+    pub stale_blocks: u64,
+}
+
+/// Servo case temperature, reduced to the part worth acting on.
+///
+/// The hottest joint rather than a mean over fifteen: a knee holding a squat runs far hotter
+/// than the mouth, and averaging hides the one servo approaching the overheat shutdown its
+/// error mask latches on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MotorThermal {
+    /// Name of the hottest joint, as `duck_control::model::JOINT_NAMES` spells it.
+    pub hottest: String,
+    pub max_c: f64,
+    pub mean_c: f64,
 }
 
 /// Motor-bus voltage, and what fraction of a pack that is.
@@ -990,10 +1068,8 @@ mod tests {
     #[test]
     fn robot_results_round_trip() {
         let healthy = HealthResult {
-            degraded: false,
             healthy: true,
-            reason: None,
-            battery: None,
+            ..Default::default()
         };
         let line = serde_json::to_string(&healthy).unwrap();
         assert!(!line.contains("reason"), "{line}");
@@ -1003,10 +1079,8 @@ mod tests {
         );
 
         let sick = HealthResult {
-            degraded: false,
-            healthy: false,
             reason: Some("motors not responding".into()),
-            battery: None,
+            ..Default::default()
         };
         let line = serde_json::to_string(&sick).unwrap();
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), sick);
@@ -1026,17 +1100,14 @@ mod tests {
     fn degraded_is_omitted_when_false_and_present_when_true() {
         let plain = HealthResult {
             healthy: true,
-            degraded: false,
-            reason: None,
-            battery: None,
+            ..Default::default()
         };
         assert!(!serde_json::to_string(&plain).unwrap().contains("degraded"));
 
         let bench = HealthResult {
-            healthy: false,
             degraded: true,
             reason: Some("no answer from the motor bus".into()),
-            battery: None,
+            ..Default::default()
         };
         let line = serde_json::to_string(&bench).unwrap();
         assert!(line.contains(r#""degraded":true"#), "{line}");
@@ -1055,9 +1126,7 @@ mod tests {
 
         let unread = HealthResult {
             healthy: true,
-            degraded: false,
-            reason: None,
-            battery: None,
+            ..Default::default()
         };
         assert!(!serde_json::to_string(&unread).unwrap().contains("battery"));
 

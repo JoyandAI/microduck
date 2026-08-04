@@ -52,8 +52,8 @@ const MAX_LINE: usize = 64 * 1024;
 const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Window over which the achieved rate is measured, and therefore how quickly a degraded
-/// loop becomes visible to the health gate. Doubles as the battery sampling interval
-/// ([`sample_battery`]).
+/// loop becomes visible to the health gate. Doubles as the slow-sensor sampling interval
+/// ([`publish_slow_sensors`]).
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
 /// Smoothing on the reported battery voltage. At one sample per [`RATE_WINDOW`] this is a
@@ -153,6 +153,16 @@ struct RobotState {
     /// distinction that has to survive to the wire, since zero volts and unknown volts look
     /// nothing alike to whoever is deciding whether to charge the robot.
     battery_v: AtomicU64,
+    /// Hottest servo of the last thermal sample: temperature as `f64::to_bits`, and which
+    /// joint it was. Zero means *not read yet*, same as the battery.
+    motor_max_c: AtomicU64,
+    motor_mean_c: AtomicU64,
+    /// Index into [`duck_control::JOINT_NAMES`] of the hottest joint.
+    motor_hottest: AtomicU32,
+    /// Mirrors of the bus's own IMU diagnostics, refreshed with the thermal sample. Held here
+    /// so the IPC side can report them without touching the loop's IO.
+    imu_stale_blocks: AtomicU64,
+    imu_ready: AtomicBool,
     shutdown: AtomicBool,
 
     period_us: u64,
@@ -174,6 +184,11 @@ impl RobotState {
             consecutive_errors: AtomicU32::new(0),
             startup_bus_failures: AtomicU32::new(0),
             battery_v: AtomicU64::new(0),
+            motor_max_c: AtomicU64::new(0),
+            motor_mean_c: AtomicU64::new(0),
+            motor_hottest: AtomicU32::new(0),
+            imu_stale_blocks: AtomicU64::new(0),
+            imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
             min_achieved_hz: params.health.min_achieved_hz,
@@ -185,23 +200,34 @@ impl RobotState {
     }
 
     fn health(&self) -> proto::HealthResult {
-        // Attached to every answer, healthy or not, and consulted by none of the checks
-        // below. A verdict must never depend on it: see `HealthResult::battery`.
-        let battery = self.battery();
+        // Everything the robot can say about itself, attached to every answer whatever the
+        // verdict — and consulted by none of the checks below.
+        //
+        // Two separate jobs in one method, deliberately. `healthy`/`degraded` are the update
+        // system's inputs and may only reflect what a *release* can be blamed for. The rest
+        // is a description of the robot for whoever is looking at it, and it travels on the
+        // same answer because a robot behaving oddly is asked exactly one question, once.
+        let describe =
+            |healthy: bool, degraded: bool, reason: Option<String>| proto::HealthResult {
+                healthy,
+                degraded,
+                reason,
+                battery: self.battery(),
+                motors: self.motor_thermal(),
+                control_loop: Some(self.loop_health()),
+                bus: proto::BusHealth {
+                    consecutive_errors: self.consecutive_errors.load(Ordering::Relaxed),
+                    startup_failures: self.startup_bus_failures.load(Ordering::Relaxed),
+                },
+                imu: Some(proto::ImuHealth {
+                    ready: self.imu_ready.load(Ordering::Relaxed),
+                    stale_blocks: self.imu_stale_blocks.load(Ordering::Relaxed),
+                }),
+            };
 
-        let unhealthy = |reason: String| proto::HealthResult {
-            healthy: false,
-            degraded: false,
-            reason: Some(reason),
-            battery,
-        };
+        let unhealthy = |reason: String| describe(false, false, Some(reason));
         // Not healthy, but not the release's fault either — see `HealthResult::degraded`.
-        let degraded = |reason: String| proto::HealthResult {
-            healthy: false,
-            degraded: true,
-            reason: Some(reason),
-            battery,
-        };
+        let degraded = |reason: String| describe(false, true, Some(reason));
 
         if self.force_unhealthy {
             return unhealthy("forced unhealthy by --unhealthy".into());
@@ -246,12 +272,39 @@ impl RobotState {
             ));
         }
 
-        proto::HealthResult {
-            healthy: true,
-            degraded: false,
-            reason: None,
-            battery,
+        describe(true, false, None)
+    }
+
+    /// The loop's own numbers, as the readout reports them.
+    fn loop_health(&self) -> proto::LoopHealth {
+        let hz = f64::from_bits(self.achieved_hz.load(Ordering::Relaxed));
+        let now_us = self.started.elapsed().as_micros() as u64;
+        proto::LoopHealth {
+            target_hz: 1_000_000.0 / self.period_us as f64,
+            // Zero is the "no window has closed yet" sentinel, not a measured rate.
+            achieved_hz: (hz > 0.0).then_some(hz),
+            ticks: self.ticks.load(Ordering::Relaxed),
+            missed: self.missed.load(Ordering::Relaxed),
+            last_tick_age_ms: now_us.saturating_sub(self.last_tick_us.load(Ordering::Relaxed))
+                / 1000,
         }
+    }
+
+    /// The hottest servo of the last thermal sample, or `None` before the first one.
+    fn motor_thermal(&self) -> Option<proto::MotorThermal> {
+        let max_c = f64::from_bits(self.motor_max_c.load(Ordering::Relaxed));
+        if max_c <= 0.0 {
+            return None;
+        }
+        let hottest = self.motor_hottest.load(Ordering::Relaxed) as usize;
+        Some(proto::MotorThermal {
+            hottest: duck_control::JOINT_NAMES
+                .get(hottest)
+                .unwrap_or(&"unknown")
+                .to_string(),
+            max_c,
+            mean_c: f64::from_bits(self.motor_mean_c.load(Ordering::Relaxed)),
+        })
     }
 
     /// The last battery reading, mapped to a percentage — or `None` if there has not been
@@ -664,7 +717,7 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
             window_start = Instant::now();
             window_ticks = 0;
 
-            sample_battery(&mut io, &state);
+            publish_slow_sensors(&mut io, &state);
 
             if last_summary.elapsed() >= LOOP_SUMMARY_INTERVAL {
                 tracing::info!(
@@ -675,6 +728,10 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
                         "{:.2}",
                         f64::from_bits(state.battery_v.load(Ordering::Relaxed))
                     ),
+                    motor_max_c = format!(
+                        "{:.0}",
+                        f64::from_bits(state.motor_max_c.load(Ordering::Relaxed))
+                    ),
                     "control loop"
                 );
                 last_summary = Instant::now();
@@ -684,32 +741,55 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
     tracing::info!("control loop stopped");
 }
 
-/// Read the battery and publish it, once per [`RATE_WINDOW`].
+/// Sample and publish everything that does not need sampling every tick, once per
+/// [`RATE_WINDOW`].
 ///
-/// Not part of the tick. `present_input_voltage` is a second bus transaction — about a
-/// millisecond — which is nothing once a second and would be 5% of the budget at 50 Hz. A
-/// second is also faster than a battery can meaningfully change.
+/// Not part of the tick. The voltage/temperature registers are a second bus transaction —
+/// about a millisecond — which is nothing once a second and would be 5% of the budget at
+/// 50 Hz. A second is also faster than a pack can drain or a servo can heat up.
 ///
 /// Called from the loop thread because that thread owns the IO, and nothing else may touch
 /// the bus: a transaction issued from the IPC side would interleave bytes with a tick and
-/// corrupt both.
-fn sample_battery<T: RobotIo>(io: &mut T, state: &RobotState) {
-    match io.bus_voltage() {
-        Ok(volts) => {
+/// corrupt both. The IMU counters come from the same `io`, so they are mirrored here rather
+/// than reached for from the socket.
+fn publish_slow_sensors<T: RobotIo>(io: &mut T, state: &RobotState) {
+    state
+        .imu_stale_blocks
+        .store(io.imu_stale_blocks(), Ordering::Relaxed);
+    state.imu_ready.store(io.imu_ready(), Ordering::Relaxed);
+
+    match io.slow_sensors() {
+        Ok(slow) => {
             let previous = f64::from_bits(state.battery_v.load(Ordering::Relaxed));
             // Seed from the first reading rather than blending up from zero, which would
             // spend ten seconds reporting a battery flatter than it is.
             let smoothed = if previous > 0.0 {
-                BATTERY_EMA_ALPHA * volts + (1.0 - BATTERY_EMA_ALPHA) * previous
+                BATTERY_EMA_ALPHA * slow.volts + (1.0 - BATTERY_EMA_ALPHA) * previous
             } else {
-                volts
+                slow.volts
             };
             state.battery_v.store(smoothed.to_bits(), Ordering::Relaxed);
+
+            // Temperature is not smoothed: a servo's case is already a slow signal, and an
+            // EMA would only delay the one reading anybody cares about — the joint climbing
+            // towards its overheat shutdown.
+            let (hottest, max_c) = slow.temps_c.iter().enumerate().fold(
+                (0usize, f64::MIN),
+                |(best, high), (joint, &t)| {
+                    if t > high { (joint, t) } else { (best, high) }
+                },
+            );
+            let mean_c = slow.temps_c.iter().sum::<f64>() / slow.temps_c.len() as f64;
+            state.motor_max_c.store(max_c.to_bits(), Ordering::Relaxed);
+            state
+                .motor_mean_c
+                .store(mean_c.to_bits(), Ordering::Relaxed);
+            state.motor_hottest.store(hottest as u32, Ordering::Relaxed);
         }
-        // Keep the last reading. A single failed transaction is ordinary on a serial bus, and
+        // Keep the last sample. A single failed transaction is ordinary on a serial bus, and
         // dropping to "unknown" over one would make the reported battery flicker. A bus that
-        // is really gone already shows up in the health verdict itself.
-        Err(e) => tracing::debug!(error = %e, "voltage read failed; keeping the last reading"),
+        // is really gone already shows up in the verdict and in `bus.consecutive_errors`.
+        Err(e) => tracing::debug!(error = %e, "slow-sensor read failed; keeping the last sample"),
     }
 }
 
@@ -1189,6 +1269,7 @@ mod tests {
         let s = state();
         s.startup_bus_failures.store(4, Ordering::Relaxed);
         s.battery_v.store(7.5f64.to_bits(), Ordering::Relaxed);
+        s.motor_max_c.store(48.0f64.to_bits(), Ordering::Relaxed);
 
         let health = s.health();
         assert!(!health.healthy);
@@ -1196,6 +1277,70 @@ mod tests {
             health.battery.is_some(),
             "battery dropped from a bad answer"
         );
+        // The rest of the description too: an unhealthy robot is exactly when someone needs
+        // the whole picture, not a verdict on its own.
+        assert!(health.motors.is_some(), "thermals dropped");
+        assert!(health.control_loop.is_some(), "loop section dropped");
+        assert!(health.imu.is_some(), "imu section dropped");
+        // And the number *this* verdict was based on: "no robot on the motor bus" is only
+        // actionable next to the count of attempts behind it.
+        assert_eq!(health.bus.startup_failures, 4);
+    }
+
+    /// The loop section must carry the numbers the verdict was decided from, so a reader can
+    /// check it rather than take it on faith.
+    ///
+    /// That distinction has already paid once: 43.9 Hz with `missed = 0` is a loop being
+    /// *woken* late, not a loop doing too much, and the two have entirely different fixes.
+    #[test]
+    fn the_loop_section_reports_what_the_verdict_used() {
+        let s = state();
+        ticked(&s, 2490);
+        s.achieved_hz.store(49.8f64.to_bits(), Ordering::Relaxed);
+        s.missed.store(3, Ordering::Relaxed);
+
+        let l = s.health().control_loop.expect("loop section");
+        assert_eq!(l.achieved_hz, Some(49.8));
+        assert_eq!(l.target_hz, 50.0);
+        assert_eq!(l.ticks, 2490);
+        assert_eq!(l.missed, 3);
+
+        // Unmeasured stays unmeasured rather than becoming 0 Hz — that would describe a
+        // stopped loop, which is the opposite of "started less than a second ago".
+        s.achieved_hz.store(0, Ordering::Relaxed);
+        assert_eq!(s.health().control_loop.unwrap().achieved_hz, None);
+    }
+
+    /// The hottest joint is named, not merely measured. "48 °C" prompts "which one?", and the
+    /// answer decides whether it is the knee holding the robot up or something wrong.
+    #[test]
+    fn thermals_name_the_hottest_joint() {
+        let s = state();
+        ticked(&s, 100);
+        let knee = duck_control::JOINT_NAMES
+            .iter()
+            .position(|n| *n == "left_knee")
+            .unwrap();
+        s.motor_max_c.store(48.0f64.to_bits(), Ordering::Relaxed);
+        s.motor_mean_c.store(36.0f64.to_bits(), Ordering::Relaxed);
+        s.motor_hottest.store(knee as u32, Ordering::Relaxed);
+
+        let motors = s.health().motors.expect("thermals");
+        assert_eq!(motors.hottest, "left_knee");
+        assert_eq!(motors.max_c, 48.0);
+        assert_eq!(motors.mean_c, 36.0);
+
+        // A servo cooking must not change the verdict, for the same reason a flat pack must
+        // not: it is a fact about the robot, not evidence about the release.
+        assert!(s.health().healthy);
+    }
+
+    /// Unread thermals are absent, not 0 °C — which would read as a robot in a freezer.
+    #[test]
+    fn unread_thermals_are_absent() {
+        let s = state();
+        ticked(&s, 1);
+        assert!(s.health().motors.is_none());
     }
 
     /// While waiting, health must say *why*. The update system quotes this string as the
@@ -1332,8 +1477,8 @@ mod tests {
             fn write(&mut self, t: &JointTargets) -> duck_control::io::Result<()> {
                 self.0.write(t)
             }
-            fn bus_voltage(&mut self) -> duck_control::io::Result<f64> {
-                self.0.bus_voltage()
+            fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
+                self.0.slow_sensors()
             }
         }
         control_loop(Borrowed(io), state, period).await

@@ -4,9 +4,9 @@
 //! `sync_write` of goal positions. The IMU is listed first so it answers before the servo
 //! burst.
 //!
-//! Battery is the one thing that does not fit that shape: it lives at a register outside the
-//! block the tick fetches, so [`RobotIo::bus_voltage`] is a transaction of its own, meant to
-//! be called about once a second rather than every tick.
+//! Battery and thermals are the one thing that does not fit that shape: they live at registers
+//! outside the block the tick fetches, so [`RobotIo::slow_sensors`] is a transaction of its
+//! own, meant to be called about once a second rather than every tick.
 //!
 //! Written against `rustypot`, but the *numbers* — conversion factors and the EEPROM
 //! registers asserted at startup — come from `microduck_runtime`, where they were arrived
@@ -18,7 +18,7 @@ use std::time::Duration;
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
 
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
-use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors};
+use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{BAUD_RATE, EXPECTED_REGISTERS, IMU_DXL_ID, JOINT_IDS, NUM_JOINTS};
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
@@ -30,10 +30,18 @@ const READ_LEN: u8 = 12;
 /// 0.229 rev/min per count, in rad/s.
 const RAD_PER_SEC_PER_COUNT: f64 = 0.229 * (2.0 * PI / 60.0);
 
-/// `present_input_voltage` (address 144) counts 0.1 V each. Not in the block above: it sits
-/// eight bytes past its end, so battery costs a second transaction — see
-/// [`RobotIo::bus_voltage`]. Address 146 is `present_temperature`, one byte further, if
-/// motor temperature ever wants surfacing too.
+/// The second, slower block: `present_input_voltage` (144, `u16`) then `present_temperature`
+/// (146, `u8`). Three bytes covers both, so voltage and thermals cost *one* extra transaction
+/// between them rather than two — see [`RobotIo::slow_sensors`].
+///
+/// It starts eight bytes past the end of the tick's block, which is why it cannot simply be
+/// folded into [`READ_LEN`]: the gap is `velocity_trajectory`/`position_trajectory`, twelve
+/// bytes nothing here wants, and a servo answering a 22-byte read every tick would cost more
+/// bus time than the two transactions do.
+const SLOW_READ_ADDR: u8 = 144;
+const SLOW_READ_LEN: u8 = 3;
+
+/// `present_input_voltage` counts 0.1 V each.
 const VOLTS_PER_COUNT: f64 = 0.1;
 
 /// A healthy 16-device read completes well inside this. Capping it means a missing device
@@ -180,16 +188,6 @@ impl DynamixelIo {
         }
         Ok(())
     }
-
-    /// Blocks identical to their predecessor since startup. Non-zero means the IMU board
-    /// is answering without refreshing.
-    pub fn stale_imu_blocks(&self) -> u64 {
-        self.stale_imu_blocks
-    }
-
-    pub fn imu_ready(&self) -> bool {
-        self.imu.ready()
-    }
 }
 
 impl RobotIo for DynamixelIo {
@@ -261,34 +259,70 @@ impl RobotIo for DynamixelIo {
             .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
     }
 
-    /// Mean supply voltage across the servos.
+    /// Supply voltage and case temperatures, in one `sync_read` over registers 144–146.
     ///
-    /// Averaged because all 15 sit on one pack: a single servo's reading is the same
-    /// measurement with more noise. Note that a silent servo does not produce a short
-    /// answer here — `rustypot`'s `sync_read` waits for every id and fails the whole
-    /// transaction if one does not reply — so this is all-or-nothing, and the caller is
-    /// expected to keep its previous reading rather than treat one miss as news. The zero
-    /// filter is for a device that answers with a nonsense value, which must not be
-    /// averaged in as if the pack were half flat.
-    fn bus_voltage(&mut self) -> Result<f64> {
-        let raw = self
+    /// Voltage is averaged because all 15 servos sit on one pack: a single reading is the
+    /// same measurement with more noise. Temperature is *not* averaged here — the caller gets
+    /// every joint, because one loaded joint running hot is the case worth seeing and a mean
+    /// over fifteen hides it.
+    ///
+    /// Note that a silent servo does not produce a short answer: `rustypot`'s `sync_read`
+    /// waits for every id and fails the whole transaction if one does not reply. So this is
+    /// all-or-nothing, and the caller is expected to keep its previous sample rather than
+    /// treat one miss as news. The zero filter on voltage guards a device that answers with a
+    /// nonsense value, which must not be averaged in as if the pack were half flat.
+    fn slow_sensors(&mut self) -> Result<SlowSensors> {
+        let blocks = self
             .controller
-            .sync_read_present_input_voltage(&JOINT_IDS)
-            .map_err(|e| IoError::Bus(format!("read present input voltage: {e}")))?;
+            .sync_read_raw_data(&JOINT_IDS, SLOW_READ_ADDR, SLOW_READ_LEN)
+            .map_err(|e| IoError::Bus(format!("voltage+temperature sync_read: {e}")))?;
 
-        let answered: Vec<f64> = raw
-            .iter()
-            .map(|&counts| counts as f64 * VOLTS_PER_COUNT)
-            .filter(|&v| v > 0.0)
-            .collect();
-        if answered.is_empty() {
+        if blocks.len() != NUM_JOINTS {
+            return Err(IoError::ShortRead {
+                what: "voltage+temperature blocks",
+                expected: NUM_JOINTS,
+                got: blocks.len(),
+            });
+        }
+
+        let mut temps_c = [0.0; NUM_JOINTS];
+        let mut volts = Vec::with_capacity(NUM_JOINTS);
+        for (joint, block) in blocks.iter().enumerate() {
+            if block.len() != SLOW_READ_LEN as usize {
+                return Err(IoError::ShortRead {
+                    what: "voltage+temperature block",
+                    expected: SLOW_READ_LEN as usize,
+                    got: block.len(),
+                });
+            }
+            // [0..2] present_input_voltage · [2] present_temperature, already in whole °C.
+            let counts = u16::from_le_bytes([block[0], block[1]]);
+            let v = counts as f64 * VOLTS_PER_COUNT;
+            if v > 0.0 {
+                volts.push(v);
+            }
+            temps_c[joint] = block[2] as f64;
+        }
+
+        if volts.is_empty() {
             return Err(IoError::ShortRead {
                 what: "input voltage",
                 expected: NUM_JOINTS,
                 got: 0,
             });
         }
-        Ok(answered.iter().sum::<f64>() / answered.len() as f64)
+        Ok(SlowSensors {
+            volts: volts.iter().sum::<f64>() / volts.len() as f64,
+            temps_c,
+        })
+    }
+
+    fn imu_stale_blocks(&self) -> u64 {
+        self.stale_imu_blocks
+    }
+
+    fn imu_ready(&self) -> bool {
+        self.imu.ready()
     }
 }
 

@@ -157,7 +157,7 @@ namespace (§7.4).
 
 | method | slice 1 |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count, plus the battery as a *reported* field the verdict never consults |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, motor temperature |
 | `robot.safeToRestart` | `true` (a constant pose is always safe to interrupt) |
 | `robot.modelApi` | unchanged constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
@@ -172,12 +172,27 @@ distinction is the whole reason slice 1 exists.
 
 **What may and may not reach the verdict.** `healthy` and `degraded` are the update system's
 inputs, so only conditions a *release* can be blamed for may set them — that is what
-`degraded` already exists to enforce for an unpowered bench board. The battery rides on the
-same answer without touching either, because it is the number a human wants when a robot is
-behaving oddly and this is the command they run. Gating on it would mean a robot updated on a
-low pack rolls the release back, then judges its replacement on the same low pack, and cannot
-be updated at all until someone works out why. The same rule will apply to motor temperature
-when it lands (address 146, one register past the voltage this reads).
+`degraded` already exists to enforce for an unpowered bench board. Everything else on the
+answer is a **description**, and no automatic decision may read it: battery, motor
+temperature, and the loop/bus/IMU counters. Gating on the battery would mean a robot updated
+on a low pack rolls the release back, then judges its replacement on the same low pack, and
+cannot be updated at all until someone works out why. Motor temperature would do the same on
+a hot afternoon.
+
+**Why they travel together anyway.** One method, because the question arrives once: a robot
+behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just
+starts a second round of questions. The loop section carries the very figures the verdict was
+computed from, so `unhealthy: control loop at 43.9 Hz` can be read next to `missed = 0` —
+which distinguishes a loop being woken late from a loop doing too much, and those have
+different fixes. `robotctl health` adds the software half from `updaterd` and prints both.
+
+**Two bus transactions, not one.** The tick reads a contiguous block at 124–136 (pwm, current,
+velocity, position). Voltage and temperature sit at 144–146, eight bytes past its end, with
+twelve bytes of trajectory registers nothing wants in between — so they are sampled together
+once a second in a second transaction (~1 ms) rather than widening the tick's read to 22 bytes
+per servo at 50 Hz. Temperature is reported per joint reduced to *the hottest* one and named:
+a knee holding a squat runs far above the mouth, and a mean over fifteen servos hides the one
+approaching the overheat shutdown its error mask latches on.
 
 ### 4.6 Done when
 
