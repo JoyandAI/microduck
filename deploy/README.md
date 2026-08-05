@@ -13,24 +13,41 @@ next to their service (`updater/systemd/`, `robotd/systemd/`); anything robot-wi
 
 ## Quickstart
 
-Two cases. Pick one, paste down the list. Everything after this section is the same thing with
-the reasons attached — read it when something disagrees with you, not before.
+Three ways in, in order of how much you have to type. Everything after this section is the same
+thing with the reasons attached — read it when something disagrees with you, not before.
 
 ### Dev board, repository private — this is today
 
-Three commands, and the first one runs on your laptop rather than the board.
+One command, from a clone on your own machine. Substitute your board's hostname:
 
-`team.dev.pub` is what lets this board install `--ref <branch>` builds, and it is deliberately
-not in the repository: a robot that trusts it installs anything anyone on the team builds, so
-that has to stay a per-board decision rather than the default for every board we image
-([`trusted_keys/README.md`](trusted_keys/README.md) has the argument). Nothing can fetch it for
-you — carrying it there by hand *is* the opt-in. Substitute your board's hostname:
+```bash
+export DUCK_TOKEN=github_pat_replace_with_your_token
+```
+
+```bash
+./scripts/provision-board.sh radxa-zero3
+```
+
+That sends the dev key from `~/.duck-keys/team.dev.pub` if you have one, starts provisioning,
+waits out the reboot, streams the log the unattended half writes, and ends on `robotctl health`.
+It needs ssh key access, because it has to reconnect by itself after the board reboots — a
+password prompt cannot survive that. `--no-dev-key` for a board that should only take releases,
+`--ref BRANCH` to provision from a branch, `--local` to send this clone's `provision.sh` rather
+than fetching it, which is what makes testing an unpushed change to it possible.
+
+`team.dev.pub` is deliberately not in the repository — a robot that trusts it installs anything
+anyone on the team builds, so that stays a per-board decision
+([`trusted_keys/README.md`](trusted_keys/README.md) has the argument). Carrying it to the board
+*is* the opt-in, which is why this script copies yours rather than fetching one.
+
+### On the board, without a clone
+
+Three commands, the first from your machine, and what `provision-board.sh` is doing on your
+behalf above:
 
 ```bash
 scp ~/.duck-keys/team.dev.pub radxa-zero3:/tmp/
 ```
-
-Then on the board — your token is the only placeholder left:
 
 ```bash
 export DUCK_TOKEN=github_pat_replace_with_your_token
@@ -60,19 +77,16 @@ sudo tail -f /var/lib/robot/provision.log
 
 That log is the record of the half nobody watched, and it is a file rather than the journal on
 purpose: journald persistence is configured by a drop-in inside the release being installed, so
-during this exact window the journal can still be RAM-only.
-
-Drop the `scp` and the `DUCK_DEV_KEY=` for a board that should only ever take releases. Nothing
-else changes. A mistyped path fails immediately, before anything on the board is touched, and
-the log ends with `DEV BOARD` only when the key really is installed — so which kind of board you
-ended up with is a thing you can check rather than a thing you have to remember:
+during this exact window the journal can still be RAM-only. It ends with `DEV BOARD` only when
+the key really installed, so which kind of board you ended up with is a thing you can check
+rather than a thing you have to remember:
 
 ```bash
 grep -c 'DEV BOARD' /var/lib/robot/provision.log
 ```
 
-No `newgrp robot`, and that is deliberate rather than an omission: the `robot` group is created
-before the reboot, so the session you log back into already has it.
+No `newgrp robot` on either path, and that is deliberate rather than an omission: the `robot`
+group is created before the reboot, so the session you log back into already has it.
 
 ### Regular user, repository public
 
@@ -124,6 +138,12 @@ rather than maintained the day we build an image with NetworkManager in it.
 a dev-key path, and the boot id it uses to tell whether you have actually rebooted. It has no
 provisioning logic of its own, on purpose: three scripts with different lifetimes should not
 become one script whose parts cannot be removed separately.
+
+`provision-board.sh` is a further layer out and runs on your machine, not the robot. It exists
+for the seam in the middle: `provision.sh` reboots and finishes on its own, which is right, but
+from outside that looks like an ssh session dying followed by a guess about when to log back in.
+It waits for the board, streams the log, and ends on the health report — so provisioning is one
+command with continuous output rather than three with a gap.
 
 It does take the reboot, which the scripts it calls deliberately never do. That is not a
 contradiction: they are single-purpose and can be run on a robot that is doing something else,

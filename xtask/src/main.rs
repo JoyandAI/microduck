@@ -889,6 +889,7 @@ mod tests {
             "migrate-network.sh",
             "install.sh",
             "provision.sh",
+            "provision-board.sh",
         ] {
             let script = std::fs::read_to_string(root.join("scripts").join(name)).unwrap();
             for (n, line) in script.lines().enumerate() {
