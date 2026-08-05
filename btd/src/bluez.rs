@@ -209,6 +209,8 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                     method: CharacteristicWriteMethod::Fun(Box::new(move |value, req| {
                         let inbound = inbound.clone();
                         let bytes = value.len();
+                        let head =
+                            String::from_utf8_lossy(&value[..value.len().min(8)]).to_string();
                         let result = match inbound.try_send(value) {
                             Ok(()) => Ok(()),
                             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -227,11 +229,16 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                             }
                         };
                         async move {
+                            // The first bytes are logged so a reordering is *visible* rather than
+                            // inferred from a parse error three layers up. Truncated because a
+                            // request may carry a wifi passphrase, and a journal is not the place
+                            // for one: eight bytes shows the order without showing the payload.
                             tracing::debug!(
                                 peer = %req.device_address,
                                 mtu = req.mtu,
                                 bytes,
                                 ok = result.is_ok(),
+                                head = %head,
                                 "write"
                             );
                             result

@@ -165,36 +165,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     tokio::time::sleep(SCAN_TIME).await;
 
+    // Candidates, most likely first.
+    //
+    // The advertised service UUID is an *optimisation*, not the identity check — and treating it as
+    // the latter broke as soon as the Mac bonded with the robot. CoreBluetooth does not reliably
+    // return a paired peripheral from a scan, and for a cached one the advertised service list is
+    // often empty, so a robot that had been found every time became invisible. The authoritative
+    // test is whether it serves our characteristic, which is only knowable after connecting.
     let mut found: Vec<(Peripheral, String)> = Vec::new();
+    let mut fallback: Vec<(Peripheral, String)> = Vec::new();
+
     for peripheral in adapter.peripherals().await? {
         let Some(properties) = peripheral.properties().await? else {
             continue;
         };
-        if !properties.services.contains(&SERVICE_UUID) {
-            continue;
-        }
         let name = properties
             .local_name
+            .clone()
             .unwrap_or_else(|| properties.address.to_string());
-        found.push((peripheral, name));
+
+        if properties.services.contains(&SERVICE_UUID) {
+            found.push((peripheral, name));
+        } else if cli.name.as_deref() == Some(name.as_str()) || peripheral.is_connected().await? {
+            // Named explicitly, or already connected — both are strong enough hints to be worth a
+            // connection attempt, which will reject it soon enough if it is something else.
+            fallback.push((peripheral, name));
+        }
     }
     let _ = adapter.stop_scan().await;
 
-    if found.is_empty() {
-        return Err("no robot found advertising the duck service. \
-                    Is btd running, and is the robot in range?"
-            .into());
+    if found.is_empty() && !fallback.is_empty() {
+        if cli.verbose {
+            eprintln!(
+                "no robot advertised the service; trying {} known peripheral(s) — a bonded robot \
+                 often stops advertising it to a Mac that has already paired",
+                fallback.len()
+            );
+        }
+        found = fallback;
     }
 
-    if matches!(cli.command, Command::Scan) {
-        for (peripheral, name) in &found {
-            let address = peripheral
-                .properties()
-                .await?
-                .map(|p| p.address.to_string());
-            println!("{name}  {}", address.unwrap_or_default());
-        }
-        return Ok(());
+    if found.is_empty() {
+        return Err(
+            "no robot found. Is btd running, and is the robot in range?\n\
+                    If the Mac has paired with it before, it may not appear in a scan: pass \
+                    `--name <robot hostname>` to try it by name anyway."
+                .into(),
+        );
     }
 
     let (peripheral, name) = match &cli.name {

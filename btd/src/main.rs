@@ -75,7 +75,23 @@ fn hostname() -> String {
         .unwrap_or_else(|| "robot".to_owned())
 }
 
-#[tokio::main]
+/// **Single-threaded on purpose**, which `bluer`'s own examples also do.
+///
+/// A chunked request arrives as several `WriteValue` calls, and `dbus-crossroads` dispatches each
+/// as its own task. On a multi-threaded runtime those tasks can be invoked out of order, and a
+/// reordered chunk does not fail — it reassembles into something that parses as the wrong thing.
+/// `{"id":1,"jsonrpc":"2.0","method":"system.info","params":{}}` arriving as chunks 1, 3, 2 becomes
+/// `{"id":1,"jsonrpc":"2.info","params":{}}`: valid JSON, missing a field, and a parse error that
+/// blames the client. It cost two rounds of debugging on hardware.
+///
+/// On one thread the dispatcher invokes handlers in the order it reads them off the D-Bus socket,
+/// which is the order the client sent them — and the client acknowledges each write before sending
+/// the next, so that order is well-defined.
+///
+/// Affordable because this daemon does no CPU work: it moves bytes between a radio and three unix
+/// sockets. Anything blocking added later would stall the whole service, which is a reason to keep
+/// it that way rather than an argument against it.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
