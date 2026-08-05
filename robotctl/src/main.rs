@@ -640,17 +640,38 @@ fn render_health(report: &HealthReport) -> String {
             let _ = writeln!(out, "  {:<9} {bus}", "bus");
 
             if let Some(imu) = &health.imu {
+                // Ticks are what make a stale count mean anything: 9 of them is a healthy board
+                // over 100k reads and a broken one over 20. Taken from the loop line above
+                // rather than carried in `ImuHealth`, since it is the same number of reads.
+                let ticks = health.control_loop.as_ref().map_or(0, |l| l.ticks);
+                let stale = if imu.frozen() {
+                    // The one case worth shouting about: the board answers, so the bus reports
+                    // no error and `ready` stays true, while the orientation being fed to the
+                    // policy has not changed in half a second.
+                    format!(
+                        ", orientation frozen — {} stale reads running",
+                        imu.consecutive_stale_blocks
+                    )
+                } else {
+                    match (imu.stale_blocks, ticks) {
+                        (0, _) => String::new(),
+                        // Reported as a rate, because the absolute count is the thing that read
+                        // as an alarm on a robot that was fine. One in five figures is a board
+                        // keeping its own clock; one in three reads is a board in trouble, and
+                        // the ratio says which without needing a threshold here.
+                        (n, ticks) if ticks > n => {
+                            format!(", {n} stale reads — 1 in {}", ticks / n)
+                        }
+                        // No tick count to scale against, or more stale reads than ticks
+                        // sampled. Say the number plainly rather than divide by it.
+                        (n, _) => format!(", {n} stale reads"),
+                    }
+                };
                 let _ = writeln!(
                     out,
-                    "  {:<9} {}{}",
+                    "  {:<9} {}{stale}",
                     "imu",
                     if imu.ready { "ready" } else { "not ready" },
-                    match imu.stale_blocks {
-                        0 => String::new(),
-                        // Worth shouting about: the board answers, so nothing else reports a
-                        // fault, while the orientation being fed to the policy is frozen.
-                        n => format!(", {n} stale reads — orientation may be dead"),
-                    }
                 );
             }
 
@@ -1558,6 +1579,7 @@ mod tests {
                 imu: Some(proto::ImuHealth {
                     ready: true,
                     stale_blocks: 0,
+                    consecutive_stale_blocks: 0,
                 }),
                 ..Default::default()
             }),
@@ -1625,6 +1647,7 @@ mod tests {
                 imu: Some(proto::ImuHealth {
                     ready: false,
                     stale_blocks: 0,
+                    consecutive_stale_blocks: 0,
                 }),
                 ..Default::default()
             }),
@@ -1646,9 +1669,11 @@ mod tests {
     /// answers without refreshing.
     ///
     /// Stale IMU reads are the nastiest of the lot — the reads *succeed*, so nothing else
-    /// reports a fault, while the orientation feeding the policy is frozen.
+    /// reports a fault, while the orientation feeding the policy is frozen. What earns the
+    /// alarm is the *run*: 41 reads without a refresh is most of a second of a robot balancing
+    /// on an orientation that is no longer being measured.
     #[test]
-    fn health_renders_a_broken_bus_and_a_stale_imu() {
+    fn health_renders_a_broken_bus_and_a_frozen_imu() {
         let out = render_health(&health_report(
             Some(proto::HealthResult {
                 healthy: false,
@@ -1660,6 +1685,7 @@ mod tests {
                 imu: Some(proto::ImuHealth {
                     ready: true,
                     stale_blocks: 41,
+                    consecutive_stale_blocks: 41,
                 }),
                 ..Default::default()
             }),
@@ -1667,8 +1693,94 @@ mod tests {
         ));
 
         assert!(out.contains("7 consecutive read failures"), "{out}");
-        assert!(out.contains("41 stale reads"), "{out}");
-        assert!(out.contains("orientation may be dead"), "{out}");
+        assert!(out.contains("orientation frozen"), "{out}");
+        assert!(out.contains("41 stale reads running"), "{out}");
+    }
+
+    /// A handful of stale reads over a long run is a healthy board, and must not wear an alarm.
+    ///
+    /// This is the case the old rendering got wrong: any non-zero count said "orientation may be
+    /// dead", so a robot that had hiccuped nine times in 40 minutes looked broken for its whole
+    /// uptime — and a warning that shows up on healthy robots stops being read at all. The rate
+    /// is what carries the meaning here, so the count has to appear scaled by the reads it is
+    /// drawn from.
+    #[test]
+    fn health_renders_sporadic_stale_reads_as_a_rate_without_alarm() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                control_loop: Some(proto::LoopHealth {
+                    target_hz: 50.0,
+                    achieved_hz: Some(50.1),
+                    ticks: 118_631,
+                    missed: 137,
+                    last_tick_age_ms: 12,
+                }),
+                imu: Some(proto::ImuHealth {
+                    ready: true,
+                    stale_blocks: 9,
+                    // The board refreshed on the most recent read, so nothing is frozen.
+                    consecutive_stale_blocks: 0,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(out.contains("robot     healthy"), "{out}");
+        assert!(out.contains("9 stale reads — 1 in 13181"), "{out}");
+        assert!(!out.contains("frozen"), "{out}");
+        assert!(!out.contains("dead"), "{out}");
+    }
+
+    /// A run below the threshold is still not an alarm — one repeated block is ordinary, and the
+    /// robot must not be described as frozen for being sampled mid-hiccup.
+    #[test]
+    fn health_does_not_call_a_single_repeat_frozen() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                control_loop: Some(proto::LoopHealth {
+                    target_hz: 50.0,
+                    achieved_hz: Some(50.0),
+                    ticks: 1000,
+                    missed: 0,
+                    last_tick_age_ms: 10,
+                }),
+                imu: Some(proto::ImuHealth {
+                    ready: true,
+                    stale_blocks: 2,
+                    consecutive_stale_blocks: 1,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(out.contains("2 stale reads — 1 in 500"), "{out}");
+        assert!(!out.contains("frozen"), "{out}");
+    }
+
+    /// Before the loop has reported any ticks there is nothing to divide by, and a rate would be
+    /// a division by zero. The count still has to appear — this is also the shape a fake or a
+    /// future backend produces if it counts stale reads without a loop behind them.
+    #[test]
+    fn health_renders_stale_reads_with_no_ticks_to_scale_against() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: true,
+                imu: Some(proto::ImuHealth {
+                    ready: true,
+                    stale_blocks: 3,
+                    consecutive_stale_blocks: 0,
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(out.contains("imu       ready, 3 stale reads"), "{out}");
+        assert!(!out.contains("1 in"), "{out}");
     }
 
     /// An unpowered bench board reads as *degraded*, and the attempt count is the actionable

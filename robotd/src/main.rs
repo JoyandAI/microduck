@@ -187,6 +187,10 @@ struct RobotState {
     /// Mirrors of the bus's own IMU diagnostics, refreshed with the thermal sample. Held here
     /// so the IPC side can report them without touching the loop's IO.
     imu_stale_blocks: AtomicU64,
+    /// Stale reads in a row as of the last sample. Sampled rather than watched, which is fine
+    /// for the fault it describes: a board that has stopped refreshing keeps repeating, so its
+    /// run is still growing whenever the next sample lands.
+    imu_stale_run: AtomicU64,
     imu_ready: AtomicBool,
     shutdown: AtomicBool,
     /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
@@ -223,6 +227,7 @@ impl RobotState {
             motor_hottest: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
             imu_stale_blocks: AtomicU64::new(0),
+            imu_stale_run: AtomicU64::new(0),
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
@@ -267,6 +272,7 @@ impl RobotState {
                 imu: Some(proto::ImuHealth {
                     ready: self.imu_ready.load(Ordering::Relaxed),
                     stale_blocks: self.imu_stale_blocks.load(Ordering::Relaxed),
+                    consecutive_stale_blocks: self.imu_stale_run.load(Ordering::Relaxed),
                 }),
             };
 
@@ -1026,9 +1032,9 @@ fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
 /// corrupt both. The IMU counters come from the same `io`, so they are mirrored here rather
 /// than reached for from the socket.
 fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
-    state
-        .imu_stale_blocks
-        .store(io.imu_stale_blocks(), Ordering::Relaxed);
+    let stale = io.imu_stale();
+    state.imu_stale_blocks.store(stale.total, Ordering::Relaxed);
+    state.imu_stale_run.store(stale.run, Ordering::Relaxed);
     state.imu_ready.store(io.imu_ready(), Ordering::Relaxed);
 
     // Before the bus read, and unconditionally: this is a `sysfs` read that owes the motor bus
