@@ -170,6 +170,39 @@ logind performs the reboot and `configd` only asks, so a capability there would 
 
 If polkit ever arrives for another reason, `configd` should drop to a dedicated user plus two rules.
 
+### 3.2 One session per subscription, and the bug that decided it  · **measured**
+
+`btd` keeps one session — one reassembly buffer, one outbound queue, one authorisation state — and
+the question was how long it lives. The first answer was "as long as the service", because BlueZ's
+callback model gives a subscribe no peer identity and only ever holds *one* notify state per
+characteristic, so per-peer sessions looked like machinery for a case that cannot arise. A stale
+partial line seemed to cost at most one bad request.
+
+It cost the *next* client instead, which is worse, and it took three symptoms on a board to see it:
+
+| symptom | cause |
+|---|---|
+| a request answered, then the following one timing out | the outbound receiver was taken out of the shared slot by the first pump, so the second subscription had no pump: the reply was written to a channel nobody read |
+| `":0,"result":{"authenticated":true}}` — a reply with its beginning missing | those orphaned chunks surfacing through a later notifier |
+| `no robot found`, then the same command working | unrelated: a client-side scan taking one snapshot after a fixed sleep, so whether the advertisement fell inside that window was luck |
+
+Only the third was a client bug. The first two are the same defect: **state that outlives the peer it
+belonged to.** A disconnect is invisible in this model, so nothing reset it.
+
+So the session is created when a central subscribes and discarded when it goes away — the reassembler
+and the queue go with it, and a reconnecting phone starts unauthenticated, which is the behaviour §5.2
+already claimed. Two details are load-bearing and both were wrong first:
+
+- The pump waits on `notifier.stopped()` as well as the queue. Learning of a departure only from a
+  failed notify needs a reply to send, so a client that disconnects while idle would hold the slot
+  until a request arrived for nobody.
+- Teardown clears the slot only if it still holds *its own* sender. A notify to a vanished central
+  takes as long as BlueZ takes to give up, by which time a reconnecting central may have installed a
+  newer session that a blind clear would kill.
+
+The write path still refuses a write with no live subscription. Accepting one would be a lie: there
+is nowhere to send the answer.
+
 ## 5. Pairing: just-works, and a PIN the transport checks
 
 A six-digit PIN, stored by `configd`, checked by `btd` before it serves anything. **Not** by the

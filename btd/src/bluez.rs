@@ -37,7 +37,9 @@ use bluer::gatt::local::{
     CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod, Service,
 };
 use futures::FutureExt;
-use tokio::sync::{Mutex, mpsc};
+use std::sync::Mutex as StdMutex;
+
+use tokio::sync::mpsc;
 
 use crate::gatt::{RPC_UUID, SERVICE_UUID};
 use crate::link::Link;
@@ -134,18 +136,24 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
     };
     let _adv = adapter.advertise(advertisement).await?;
 
-    // One session for the service's lifetime, and one set of channels feeding it. Created before
-    // the application is registered so a central quick off the mark cannot arrive first.
+    // **One session per subscription**, not one per daemon.
     //
-    // Centrals subscribe *before* they write — that is the order every client uses, including
-    // `btctl` — so the notify callback must have somewhere to read from before any write has
-    // happened. Pre-creating the channels is what makes the order irrelevant.
-    let (link, inbound, from_session) = Link::pair(FLOOR_MTU, "central");
-    tokio::spawn(session::run(link, sockets));
-
-    // Handed to the notify callback when a central subscribes, and handed back when it goes away,
-    // so a reconnecting central can subscribe again.
-    let outbound = Arc::new(Mutex::new(Some(from_session)));
+    // The first version kept a single session alive for the whole service, which is simpler and
+    // wrong: a client that vanishes mid-request leaves a partial line in the reassembler and
+    // undelivered chunks in the outbound queue, and the *next* client is handed them. That
+    // presented as a reply arriving without its beginning —
+    // `":0,"result":{"authenticated":true}}` — which is the tail of a previous run's answer.
+    //
+    // Created when a central subscribes, torn down when it goes away. Subscribing first is the
+    // order every client uses, and a write with no live subscription is refused: there would be
+    // nowhere to send the answer.
+    //
+    // A `std::sync::Mutex` rather than tokio's, deliberately: the write callback must read this
+    // without awaiting, because a yield point there lets two chunks swap places. Nothing is held
+    // across an await.
+    let current: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(StdMutex::new(None));
+    let for_write = current.clone();
+    let for_notify = current.clone();
 
     let app = Application {
         services: vec![Service {
@@ -156,31 +164,22 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                 // A read whose only job is to force a bond before anything is written.
                 //
                 // §7 requires the characteristic carrying wifi credentials to be paired and
-                // encrypted, and `encrypt_authenticated_write` below does require that — but
-                // nothing *triggers* the pairing. A central subscribes (which needs no
-                // encryption, because bluer 0.17 has no flag for it), then writes, and the write
-                // is refused on an unpaired link. On macOS the refusal produced no prompt and no
-                // error: the client simply waited out its timeout against a working robot.
+                // encrypted. A read is acknowledged, so an unpaired central gets "insufficient
+                // authentication" and starts pairing there and then, which a subscribe cannot do:
+                // `CharacteristicNotify` carries no encryption flags at all.
                 //
-                // A read is acknowledged, so an unpaired central gets "insufficient
-                // authentication" and CoreBluetooth starts pairing there and then. Requiring it
-                // on the read is the only encryption trigger bluer exposes for a subscribe-then-
-                // write flow: `CharacteristicNotify` carries no encryption flags.
+                // NOTE: this is currently the *unencrypted* path in practice — see
+                // `docs/app-path-design.md` §5.5. Requiring encryption here hangs CoreBluetooth.
                 //
-                // The value returned matters far less than the fact that reading it needs a bond;
-                // the API version is simply the most useful byte available, and a client that
-                // finds a version it does not know can say so before writing anything.
+                // The value matters less than the fact that reading it needs a bond; the API
+                // version is the most useful byte available, and a client that finds a version it
+                // does not know can say so before writing anything.
                 read: Some(CharacteristicRead {
                     read: true,
-                    // `encrypt_read`, not `encrypt_authenticated_read`: a just-works bond is
-                    // encrypted but unauthenticated, so demanding authentication here would
-                    // refuse every client that ever pairs with this robot. The read still forces
-                    // the bond, which is its job.
                     encrypt_read: require_pairing,
                     fun: Box::new(|req| {
                         // Logged because this read is the pairing trigger, so "did the central get
-                        // this far" is the first question when a client hangs — and without a line
-                        // here the answer was invisible.
+                        // this far" is the first question when a client hangs.
                         tracing::debug!(peer = %req.device_address, "version read");
                         async move { Ok(vec![duck_ipc_proto::API_VERSION as u8]) }.boxed()
                     }),
@@ -189,50 +188,53 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                 write: Some(CharacteristicWrite {
                     write: true,
                     // Write-without-response as well: a chunked request needs no ATT
-                    // acknowledgement per chunk. A client that wants a *refusal* to be visible —
-                    // "insufficient authentication" on an unpaired link — must use the
-                    // acknowledged form, which is why `btctl` does.
+                    // acknowledgement per chunk. A client that wants a *refusal* to be visible
+                    // must use the acknowledged form, which is why `btctl` does.
                     write_without_response: true,
-                    // §7: anything carrying wifi credentials must travel over a paired, encrypted
-                    // link, and `net.connect` does. Encryption comes from the bond; the
-                    // *authentication* §7 also wants comes from `system.authenticate` rather than
-                    // from the pairing, because BLE cannot carry a fixed printed passkey — see
-                    // `crate::pairing`.
                     encrypt_write: require_pairing,
-                    // **No `.await` between receiving a chunk and enqueueing it.** BlueZ
-                    // dispatches each `WriteValue` as its own task, so a yield point here lets
-                    // two chunks swap places — and a reordered chunk corrupts a request silently.
-                    // Chunk 2 of 3 arriving last produced
-                    // `{"id":1,"jsonrpc":"2.info","params":{}}`: valid JSON, missing a field, and
-                    // a parse error that blamed the client. `try_send` is synchronous, so arrival
-                    // order is preserved.
+                    // No `.await` between receiving a chunk and enqueueing it. BlueZ dispatches
+                    // each `WriteValue` as its own task, so a yield point here lets two chunks swap
+                    // places — and a reordered chunk corrupts a request silently rather than
+                    // failing it. `main` also pins the runtime to one thread for the same reason.
                     method: CharacteristicWriteMethod::Fun(Box::new(move |value, req| {
-                        let inbound = inbound.clone();
                         let bytes = value.len();
                         let head =
                             String::from_utf8_lossy(&value[..value.len().min(8)]).to_string();
-                        let result = match inbound.try_send(value) {
-                            Ok(()) => Ok(()),
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // Refusing the write is recoverable — the client can send the
-                                // whole request again. Dropping the chunk would not be: the line
-                                // would reassemble into something that parses as the wrong thing.
+                        let sender = for_write.lock().expect("write slot poisoned").clone();
+
+                        let result = match sender {
+                            None => {
+                                // Nowhere to send an answer, so accepting the request would be a
+                                // lie. Clients subscribe first; this is a client that did not.
                                 tracing::warn!(
                                     peer = %req.device_address,
-                                    "inbound queue full; refusing the write"
+                                    "write with no subscription; refusing"
                                 );
                                 Err(GattError::Failed)
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                tracing::error!("the session task has ended; refusing writes");
-                                Err(GattError::Failed)
-                            }
+                            Some(tx) => match tx.try_send(value) {
+                                Ok(()) => Ok(()),
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // Refusing is recoverable — the client resends. Dropping the
+                                    // chunk is not: the line would reassemble into something that
+                                    // parses as the wrong thing.
+                                    tracing::warn!(
+                                        peer = %req.device_address,
+                                        "inbound queue full; refusing the write"
+                                    );
+                                    Err(GattError::Failed)
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    tracing::warn!("the session has ended; refusing the write");
+                                    Err(GattError::Failed)
+                                }
+                            },
                         };
+
                         async move {
-                            // The first bytes are logged so a reordering is *visible* rather than
-                            // inferred from a parse error three layers up. Truncated because a
-                            // request may carry a wifi passphrase, and a journal is not the place
-                            // for one: eight bytes shows the order without showing the payload.
+                            // Eight bytes of the chunk, so a reordering is visible in the journal
+                            // rather than inferred from a parse error three layers up. Truncated
+                            // because a request may carry a wifi passphrase.
                             tracing::debug!(
                                 peer = %req.device_address,
                                 mtu = req.mtu,
@@ -250,33 +252,74 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                 notify: Some(CharacteristicNotify {
                     notify: true,
                     method: CharacteristicNotifyMethod::Fun(Box::new(move |mut notifier| {
-                        let outbound = outbound.clone();
+                        let slot = for_notify.clone();
+                        let sockets = sockets.clone();
                         async move {
                             tokio::spawn(async move {
-                                let Some(mut chunks) = outbound.lock().await.take() else {
-                                    // bluer keeps one notify state per characteristic, so this is
-                                    // a second central while the first still holds the session.
-                                    // Refusing is the honest answer: sharing one reassembly buffer
-                                    // between two clients would interleave their requests.
-                                    tracing::warn!(
-                                        "another central is already subscribed; only one at a \
-                                         time is supported"
-                                    );
-                                    return;
-                                };
+                                // A fresh session, so nothing from a previous central can leak
+                                // into this one.
+                                let (link, inbound, mut outbound) =
+                                    Link::pair(FLOOR_MTU, "central");
+                                let mine = inbound.clone();
+                                {
+                                    let mut slot = slot.lock().expect("write slot poisoned");
+                                    if slot.is_some() {
+                                        // bluer keeps one notify state per characteristic, so this
+                                        // replaces rather than shares: two clients through one
+                                        // reassembly buffer would interleave their requests.
+                                        tracing::warn!(
+                                            "another central was subscribed; replacing its session"
+                                        );
+                                    }
+                                    *slot = Some(inbound);
+                                }
+                                let session = tokio::spawn(session::run(link, sockets));
                                 tracing::info!("central subscribed");
 
-                                while let Some(chunk) = chunks.recv().await {
-                                    if let Err(e) = notifier.notify(chunk).await {
-                                        tracing::debug!(error = %e, "notify failed; central gone");
-                                        break;
+                                loop {
+                                    tokio::select! {
+                                        // Biased so a central that has gone away is noticed before
+                                        // another chunk is pulled out of the queue and lost in the
+                                        // notify that follows.
+                                        biased;
+                                        // Without this the pump only learns the central is gone
+                                        // when a notify fails — which needs a reply to send, so a
+                                        // client that disconnects while idle would hold the slot
+                                        // until the next request arrives for nobody.
+                                        () = notifier.stopped() => break,
+                                        chunk = outbound.recv() => match chunk {
+                                            None => break,
+                                            Some(chunk) => {
+                                                if let Err(e) = notifier.notify(chunk).await {
+                                                    tracing::debug!(
+                                                        error = %e, "notify failed; central gone"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        },
                                     }
                                 }
 
-                                // Give the receiver back, or a central that reconnects would find
-                                // the slot empty and be refused for this daemon's whole life.
-                                *outbound.lock().await = Some(chunks);
-                                tracing::info!("central unsubscribed");
+                                // Only clear the slot if it is still *ours*. This task can outlive
+                                // its subscription — a notify to a vanished central takes as long
+                                // as BlueZ takes to give up — and by then a reconnecting central may
+                                // have installed a newer session, which a blind `take()` would kill.
+                                {
+                                    let mut slot = slot.lock().expect("write slot poisoned");
+                                    if slot.as_ref().is_some_and(|tx| tx.same_channel(&mine)) {
+                                        // Dropping the sender ends the session task, which discards
+                                        // its reassembly buffer and its upstream connections.
+                                        slot.take();
+                                        session.abort();
+                                        tracing::info!("central unsubscribed; session discarded");
+                                    } else {
+                                        tracing::debug!(
+                                            "a newer session holds the slot; leaving it alone"
+                                        );
+                                        session.abort();
+                                    }
+                                }
                             });
                         }
                         .boxed()

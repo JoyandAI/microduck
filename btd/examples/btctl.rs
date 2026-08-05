@@ -23,7 +23,7 @@
 //! cargo run -p btd --example btctl -- call robot.health
 //! ```
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use btd::framing::{self, Reassembler};
 use btd::gatt::{RPC_UUID, SERVICE_UUID};
@@ -39,6 +39,14 @@ use futures::StreamExt;
 /// Generous, because BLE discovery is genuinely slow and a robot advertises at whatever interval
 /// BlueZ chose. Shorter than this and a laptop that was simply unlucky reports "no robot".
 const SCAN_TIME: Duration = Duration::from_secs(8);
+/// How often the scan results are re-read while waiting.
+///
+/// A single snapshot after a fixed sleep is what this used to do, and it failed intermittently:
+/// BLE advertising is periodic and CoreBluetooth's view of a bonded peripheral comes and goes, so
+/// whether the robot was in that one snapshot was partly luck — `no robot found` for a robot that
+/// answered fine on the next attempt. Polling until something appears also makes the common case
+/// finish in well under a second instead of always paying `SCAN_TIME`.
+const SCAN_POLL: Duration = Duration::from_millis(250);
 
 /// How long to wait for a reply once the request is written.
 ///
@@ -154,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("no Bluetooth adapter on this machine")?;
 
-    eprintln!("scanning for {SCAN_TIME:?}…");
+    eprintln!("scanning for up to {SCAN_TIME:?}…");
     // Filter by our service UUID so a busy office does not drown the robot in headphones. Note
     // some platforms ignore the filter and return everything, which is why the name check below
     // still happens.
@@ -163,7 +171,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             services: vec![SERVICE_UUID],
         })
         .await?;
-    tokio::time::sleep(SCAN_TIME).await;
 
     // Candidates, most likely first.
     //
@@ -174,23 +181,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // test is whether it serves our characteristic, which is only knowable after connecting.
     let mut found: Vec<(Peripheral, String)> = Vec::new();
     let mut fallback: Vec<(Peripheral, String)> = Vec::new();
+    let deadline = Instant::now() + SCAN_TIME;
 
-    for peripheral in adapter.peripherals().await? {
-        let Some(properties) = peripheral.properties().await? else {
-            continue;
-        };
-        let name = properties
-            .local_name
-            .clone()
-            .unwrap_or_else(|| properties.address.to_string());
+    loop {
+        found.clear();
+        fallback.clear();
 
-        if properties.services.contains(&SERVICE_UUID) {
-            found.push((peripheral, name));
-        } else if cli.name.as_deref() == Some(name.as_str()) || peripheral.is_connected().await? {
-            // Named explicitly, or already connected — both are strong enough hints to be worth a
-            // connection attempt, which will reject it soon enough if it is something else.
-            fallback.push((peripheral, name));
+        for peripheral in adapter.peripherals().await? {
+            let Some(properties) = peripheral.properties().await? else {
+                continue;
+            };
+            let name = properties
+                .local_name
+                .clone()
+                .unwrap_or_else(|| properties.address.to_string());
+
+            if properties.services.contains(&SERVICE_UUID) {
+                found.push((peripheral, name));
+            } else if cli.name.as_deref() == Some(name.as_str())
+                || peripheral.is_connected().await?
+            {
+                // Named explicitly, or already connected — both are strong enough hints to be worth
+                // a connection attempt, which will reject it soon enough if it is something else.
+                fallback.push((peripheral, name));
+            }
         }
+
+        // Stop as soon as there is anything worth connecting to, including a fallback: a bonded
+        // robot may never re-advertise the service to this Mac, so waiting out the deadline for a
+        // better candidate would just be eight seconds of nothing.
+        if !found.is_empty() || !fallback.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(SCAN_POLL).await;
     }
     let _ = adapter.stop_scan().await;
 
