@@ -47,6 +47,30 @@ const SCAN_TIME: Duration = Duration::from_secs(8);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const SLOW_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Every step before the first reply gets its own budget and its own message.
+///
+/// btleplug bounds none of these, so without them a stall anywhere between "found the robot" and
+/// "sent a request" prints `connecting to …` and then nothing at all — which says only that
+/// something is wrong, not what. Each of connect, discovery and the first read fails differently
+/// and wants a different next move, so each says which one it was.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const DISCOVER_TIMEOUT: Duration = Duration::from_secs(20);
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Run one step with a budget, naming it if the budget runs out.
+async fn step<T>(
+    what: &str,
+    hint: &str,
+    budget: Duration,
+    f: impl std::future::Future<Output = Result<T, btleplug::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    match tokio::time::timeout(budget, f).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(format!("{what} failed: {e}\n{hint}").into()),
+        Err(_) => Err(format!("{what} timed out after {budget:?}\n{hint}").into()),
+    }
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -182,8 +206,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("connecting to {name}…");
 
-    peripheral.connect().await?;
-    peripheral.discover_services().await?;
+    step(
+        "connecting",
+        "The robot advertised but would not accept a connection. If macOS shows it as paired, \
+         forget it there and retry; `sudo pkill bluetoothd` also clears a half-finished bond.",
+        CONNECT_TIMEOUT,
+        peripheral.connect(),
+    )
+    .await?;
+    if cli.verbose {
+        eprintln!("connected; discovering services…");
+    }
+
+    step(
+        "service discovery",
+        "Connected, but the robot never described its services. Check `journalctl -u btd -b` on \
+         the robot for whether the GATT application is registered.",
+        DISCOVER_TIMEOUT,
+        peripheral.discover_services(),
+    )
+    .await?;
 
     let (request, response) = characteristics(&peripheral)?;
 
@@ -196,7 +238,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // The value is the robot's API version. Worth checking before sending anything: a client one
     // version ahead can say so rather than have every call refused.
-    match peripheral.read(&response).await {
+    let read = step(
+        "reading the API version",
+        "This read requires an encrypted link, so it is what triggers pairing. A hang here usually \
+         means the bond did not complete: forget the robot in macOS Bluetooth settings, or run \
+         `sudo pkill bluetoothd`, and retry.",
+        READ_TIMEOUT,
+        peripheral.read(&response),
+    )
+    .await;
+
+    match read {
         Ok(value) => {
             let theirs = value.first().copied().unwrap_or(0);
             if cli.verbose {
@@ -211,16 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
         }
-        Err(e) => {
-            // The likely causes are worth naming, because "read failed" alone sends people to
-            // the wrong place.
-            return Err(format!(
-                "cannot read the robot's API version: {e}\n\
-                 If pairing was refused or cancelled, forget the robot in Bluetooth settings and \
-                 try again — the PIN is on the robot (`robotctl system pin`)."
-            )
-            .into());
-        }
+        Err(e) => return Err(e),
     }
 
     // Subscribe *before* writing, or a reply can arrive before there is anywhere to put it.

@@ -177,7 +177,11 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                     // refuse every client that ever pairs with this robot. The read still forces
                     // the bond, which is its job.
                     encrypt_read: require_pairing,
-                    fun: Box::new(|_req| {
+                    fun: Box::new(|req| {
+                        // Logged because this read is the pairing trigger, so "did the central get
+                        // this far" is the first question when a client hangs — and without a line
+                        // here the answer was invisible.
+                        tracing::debug!(peer = %req.device_address, "version read");
                         async move { Ok(vec![duck_ipc_proto::API_VERSION as u8]) }.boxed()
                     }),
                     ..Default::default()
