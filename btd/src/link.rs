@@ -67,27 +67,17 @@ impl Link {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The queue must be deep enough that a maximal line never needs a blocking send.
-    ///
-    /// This is the invariant behind the radio backend using a synchronous `try_send`: it may not
-    /// await, because a yield point between receiving a chunk and enqueueing it lets two chunks
-    /// swap places, and a reordered chunk corrupts a request rather than failing it. If `MAX_LINE`
-    /// grows or `QUEUE` shrinks, this fails here rather than as an occasional mangled request on a
-    /// robot.
-    #[test]
-    fn the_queue_holds_a_maximal_line_at_the_ble_floor() {
-        // 20 bytes is the payload every BLE link is required to support, and therefore the
-        // smallest chunk size a client may use.
-        const FLOOR: usize = 20;
-        assert!(
-            QUEUE * FLOOR >= crate::framing::MAX_LINE,
-            "QUEUE ({QUEUE}) * {FLOOR} must be at least MAX_LINE ({}), or a full-length request \
-             can fill the queue and be refused",
-            crate::framing::MAX_LINE
-        );
-    }
-}
+/// The queue must be deep enough that a maximal line never needs a blocking send.
+///
+/// A compile-time check rather than a test, because it is a relationship between two constants
+/// and nothing about it can be true at runtime and false at build time. 20 bytes is the payload
+/// every BLE link is required to support, and therefore the smallest chunk a client may use.
+///
+/// This is the invariant behind the radio backend using a synchronous `try_send`: it may not
+/// await, because a yield point between receiving a chunk and enqueueing it lets two chunks swap
+/// places, and a reordered chunk corrupts a request rather than failing it.
+const _: () = assert!(
+    QUEUE * 20 >= crate::framing::MAX_LINE,
+    "QUEUE * 20 must be at least framing::MAX_LINE, or a full-length request can fill the \
+     inbound queue and be refused"
+);
