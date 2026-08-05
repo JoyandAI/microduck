@@ -91,6 +91,12 @@ enum Command {
         /// Skip the crate-version match. Only for testing the tool itself.
         #[arg(long)]
         allow_version_drift: bool,
+
+        /// zstd compression level. The default is what a release should ship; lower it
+        /// only when the artifact is thrown away, as CI's smoke test does — see the
+        /// encoder below for why that one constant dominates the run.
+        #[arg(long, default_value_t = 19)]
+        zstd_level: i32,
     },
 
     /// Sign the artifact and manifest in `--dir` with a minisign secret key.
@@ -203,6 +209,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             min_supported,
             includes,
             allow_version_drift,
+            zstd_level,
         } => package(PackageArgs {
             version,
             channel,
@@ -214,6 +221,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             min_supported,
             includes,
             allow_version_drift,
+            zstd_level,
         }),
         Command::Keygen {
             kind,
@@ -256,6 +264,7 @@ struct PackageArgs {
     min_supported: Option<semver::Version>,
     includes: Vec<String>,
     allow_version_drift: bool,
+    zstd_level: i32,
 }
 
 fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -295,8 +304,13 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
     // ── build the artifact ──
     {
         let file = std::fs::File::create(&artifact)?;
-        // Level 19: publishing is a one-off, download bandwidth is not.
-        let encoder = zstd::Encoder::new(file, 19)?.auto_finish();
+        // Level 19 by default: publishing is a one-off, download bandwidth is not.
+        //
+        // But this is single-threaded, and the cost is set by what you feed it. A release
+        // packs stripped aarch64 binaries in ~15s; CI's smoke test packs unstripped debug
+        // ones and took ~400s at the same level — over half of that job, for an artifact
+        // it deletes. Hence `--zstd-level`, so the throwaway case can pay level 1.
+        let encoder = zstd::Encoder::new(file, args.zstd_level)?.auto_finish();
         let mut builder = tar::Builder::new(encoder);
 
         let mut shipped = Vec::new();

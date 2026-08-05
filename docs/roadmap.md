@@ -11,9 +11,10 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | | |
 |---|---|
 | `updater/` | engine, verification, store, journal, hooks, preflight, GitHub/HF/local sources, IPC server, systemd unit — **done** |
-| `duck-control/` | robot model · Dynamixel bus · IMU · the `RobotIo` seam — **slice 1 done**. A library: no tokio, no sockets, no systemd |
+| `duck-control/` | robot model · bus · IMU · `RobotIo` · observations · ONNX policy · safety — **slices 1–2 done**, untested on a board. A library: no tokio, no sockets, no systemd |
 | `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
-| `robotd/` | a real 50 Hz loop on the Dynamixel bus holding the startup pose, health from deadline adherence, the four `robot.*` methods, systemd unit — **slice 1 done**, untested on a board; no policy, no kinematics |
+| `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done**, untested on a board; no kinematics |
+| `padd/` | gamepad → intents, as an ordinary socket client — **done**, ships in the release; needs libudev, installed by CI and the board cross-build |
 | `robotctl/` | CLI over the update socket — **done** for the `update` namespace; depends on `duck-ipc-proto`, not `updater` |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
 | `.github/` | ci · release · promote — **ci passing**; release/promote still unrun (needs secrets + the `release` environment) |
@@ -22,7 +23,7 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
 | `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Built, never met a radio** ([`app-path-design.md`](app-path-design.md)) |
 | `configd/` | wifi over NetworkManager, robot name, pairing PIN, reboot. **Built, never met a real NetworkManager**; `--fake-net` serves the whole surface off-board |
-| tests | **340 passing**, including the health gate against a real `robotd` process and `configd`'s authorisation over real sockets in `board-test.sh` |
+| tests | **403 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | missing | `mediad`, app, SDK |
 | never run on hardware | every claim above is from CI and a laptop. Slice 1's whole purpose is to change that |
 

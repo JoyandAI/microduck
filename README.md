@@ -11,6 +11,11 @@ This repo is the daemons plus the update system. Start with
 [`docs/architecture.md`](docs/architecture.md) for how the services fit together, and
 [`docs/roadmap.md`](docs/roadmap.md) for what exists today versus what is designed.
 
+For the control side specifically, [`docs/robotd-design.md`](docs/robotd-design.md) §3.1 is
+the fastest way in — who talks to `robotd` and where the crate boundary sits — with the
+per-tick dataflow in §5.10 and the thread-to-thread channels in §7.1. Those three diagrams
+are the part that is hardest to reconstruct from prose.
+
 ## Getting started
 
 Needs Rust **1.89+** (stable) and nothing else. macOS and Linux both work for development;
@@ -20,44 +25,25 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-272 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+352 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
-The fastest way to actually *see* the update engine work is the playground, which drives
-the real engine — real signatures, real atomic swaps, real rollback — against a fake remote
-in a temp directory, with no daemon and no robot:
+Those tests are also where the engine's failure paths are: a bad signature, a release that
+comes up unhealthy, a post-install hook that fails, power loss between the swap and the
+health gate. Each drives the real engine with the fault injected rather than a mock of it, so
+`updater/tests/apply.rs` is the honest answer to "what does this actually guarantee" — more
+so than anything you could run by hand here.
 
-```bash
-cargo run -p updater --example playground -- init /tmp/pg
-```
-```bash
-cargo run -p updater --example playground -- publish /tmp/pg 1.0.0
-```
-```bash
-cargo run -p updater --example playground -- apply /tmp/pg
-```
-```bash
-cargo run -p updater --example playground -- status /tmp/pg
-```
-
-Then break it on purpose, which is the interesting half — install a release that comes up
-unhealthy and watch it revert:
-
-```bash
-cargo run -p updater --example playground -- publish /tmp/pg 1.1.0
-```
-```bash
-cargo run -p updater --example playground -- apply /tmp/pg --unhealthy
-```
-
-`--fault abort_after_swap` simulates power loss mid-update; run `recover` twice afterwards
-to watch the boot counter undo a release that never confirmed healthy.
+Using the updater for real needs a board. Provisioning one from nothing is two commands, in
+[`deploy/README.md`](deploy/README.md). Everything you do to it afterwards is
+[Working on the robot](#working-on-the-robot) below.
 
 ## The services
 
 | | |
 |---|---|
-| `robotd` | motor control, kinematics, gait model, **safety authority**. Currently holds the pose it starts in: a real 50 Hz loop on the Dynamixel bus, plus the four `robot.*` methods the updater needs. Walking arrives in slice 2 ([`docs/robotd-design.md`](docs/robotd-design.md)). |
-| `duck-control` | the control core — robot model, bus, sensing. A library, not a service: no tokio, no sockets, no systemd. |
+| `robotd` | motor control, gait policy, **safety authority**. A real 50 Hz loop driving walk/stand through a safety layer that holds the only write handle, plus intents and the four `robot.*` methods the updater needs. **Never run on a robot** ([`docs/robotd-design.md`](docs/robotd-design.md)). |
+| `duck-control` | the control core — robot model, bus, sensing, observations, ONNX policy, safety. A library, not a service: no tokio, no sockets, no systemd. |
+| `padd` | a gamepad, as an ordinary intent client. No privileged access; it sends what the app and SDK will send. |
 | `updaterd` | the update engine. Resident, and deliberately independent of `robotd` — it is the recovery path, so it must work when the robot does not. |
 | `mediad` | camera, audio, WebRTC gateway. **Not built yet.** |
 | `btd` | BLE: the phone's front door. A pipe carrying the same JSON-RPC lines as every other transport, over one GATT characteristic. Owns no state. **Built, never met a radio** ([`docs/app-path-design.md`](docs/app-path-design.md)). |
@@ -69,7 +55,8 @@ never inherit the update engine's http/tar/crypto tree.
 
 ```
 duck-ipc-proto/ the wire contract
-duck-control/   the control core: robot model · Dynamixel bus · IMU · the RobotIo seam
+duck-control/   the control core: model · bus · IMU · observations · policy · safety
+padd/           gamepad → intents — an ordinary socket client, no privileged access
 updater/        engine + updaterd
 robotd/         control daemon
 configd/        wifi · robot name · pairing PIN · reboot
@@ -85,9 +72,38 @@ docs/           architecture · update design · robotd design · app path · ro
 
 Everything below assumes a **dev board**, never a customer robot.
 
-What is running, and what is installed — these are different questions, because `updaterd`
-never restarts itself during an update and so legitimately lags the installed release until
-the next reboot:
+The state of the robot, hardware and software, in one answer — control loop, motor bus, IMU,
+battery, servo and board temperatures, then what is running, what is installed, what is
+pinned and how the last update went:
+
+```bash
+robotctl health
+```
+
+```
+robot     healthy
+  loop      50.1 of 50.0 Hz · 2834 ticks · 0 missed · last 13 ms ago
+  bus       ok
+  imu       ready
+  battery   7.62 V (64%)
+  motors    41 °C max (left_knee) · 36 °C mean
+  cpu       52 °C
+
+software
+  updaterd  0.1.4 (rev abc1234)
+  robotd    0.1.5 (rev def5678)
+  daemon    0.1.5 installed
+            last update 0.1.4 → 0.1.5: applied
+```
+
+It exits non-zero when the robot is unhealthy or unreachable, so it can gate a script.
+Nothing else there affects the exit code: a flat pack, a hot motor and a pinned component are
+reported, not judged — a release must never be rolled back for the state of the board it
+landed on.
+
+`version` is the software half on its own, for when that is all you want. What is running and
+what is installed are different questions, because `updaterd` never restarts itself during an
+update and so legitimately lags the installed release until the next reboot:
 
 ```bash
 robotctl version
@@ -112,12 +128,32 @@ directory the process was launched from, at `warn`, so it survives any log level
 journalctl -u robotd -b
 ```
 
+Logs say what happened; `monitor` says what is happening. It shows what a client asked for
+next to what was actually applied, and names the reason when they differ — safety clamps
+things constantly, and "the stick is forward and the robot is still" is unreadable without
+that:
+
+```bash
+robotctl monitor
+```
+
 The update history is separate from the journal on purpose — `fsync`ed per entry under
 `/var/lib/robot/updater/` — so it survives a robot whose logs were volatile:
 
 ```bash
 robotctl update log
 ```
+
+`install.sh` sets up tab-completion for `robotctl` in `/etc/bash_completion.d/`, as a loader
+that asks the binary for its own completions — so they follow the installed release instead
+of going stale when an update adds a command. For a shell it did not cover, or for a build
+you are running straight out of `target/`:
+
+```bash
+eval "$(robotctl completions bash)"
+```
+
+`zsh`, `fish`, `elvish` and `powershell` work in place of `bash`.
 
 Provisioning a board from scratch, and the log-retention caveats on Armbian, are in
 [`deploy/README.md`](deploy/README.md).
@@ -230,6 +266,39 @@ sudo robotctl update pin daemon 0.1.4    # accept nothing else
 sudo robotctl update pin daemon          # unpin
 ```
 
+Installing with no network at all — a factory or offline install, or sideloading a build you
+carried in on a stick. This one is `updaterd` rather than `robotctl`, because it is also the
+path a board takes *before* there is a daemon to ask, and `updaterd` is deliberately not on
+`PATH`:
+
+```bash
+sudo /opt/robot/daemon/current/bin/updaterd install --from /media/usb/release
+```
+
+The directory holds what a release is: `<version>.manifest.json`, its `.minisig`, the artifact
+and the artifact's `.minisig`. Signatures, hashes and compatibility are checked exactly as they
+are for a download — `--from` changes where the bytes come from, not what is trusted.
+
+That command refuses to run once a release is live, because it forces `on_apply` and the
+health gate off, and doing that to a working robot would silently disable auto-rollback. One
+situation needs it anyway, and `robotctl update apply` cannot help with it — a board whose
+installed `updaterd` is too old to accept the release that *fixes* being too old. It rolls the
+new release back every time, and the binary running that gate is the one being replaced. Stop
+the robot and say so explicitly:
+
+```bash
+sudo systemctl stop robotd
+```
+
+```bash
+sudo /opt/robot/daemon/current/bin/updaterd install --from /media/usb/release --force
+```
+
+`--force` is itself refused while `robotd` is still answering, since the objection is about a
+*working* robot losing its safety net. It gives up auto-rollback for that one install and
+nothing else — signatures, hashes and compatibility are still checked, and
+`sudo robotctl update rollback daemon` is the recovery path if the release misbehaves.
+
 Three things that are easy to get wrong.
 
 **`rollback` needs a predecessor, but an update creates one.** A freshly provisioned board has
@@ -298,6 +367,12 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
 - **Open:** artifact hosting. This repo is private, and a robot without a token cannot
   download from it (§6.1). Dev boards have tokens; the fleet will need a public
   artifact-only repository or an object store. Blocks hardware bring-up, not development.
+- **`robotd` walks — in principle.** A real 50 Hz loop, one 61-D observation builder, the
+  walk/stand policy pair, and a safety layer holding the only write handle. `robot.health`
+  means *the loop is meeting its deadline and the policy loaded*, which is what makes
+  auto-rollback gate on something real. **None of it has met a robot**: the tests prove the
+  logic is self-consistent, not that it walks. Needs ONNX Runtime on the board, which
+  `install.sh` now installs.
 - **`robotd` holds a pose.** A real 50 Hz loop on the Dynamixel bus, and `robot.health`
   now means *the loop is meeting its deadline* rather than *it ticked once* — which is what
   makes the updater's auto-rollback gate on something real. Walking is slice 2.

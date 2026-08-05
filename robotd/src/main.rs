@@ -19,7 +19,10 @@
 //! publishes and never calls into the loop — a wedged loop reports itself unhealthy rather
 //! than hanging the caller.
 
+mod control;
+mod intents;
 mod params;
+mod soc;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,13 +30,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use clap::{Parser, Subcommand};
 use duck_control::io::RobotIo;
-use duck_control::{DEFAULT_POSITION, FakeIo, JointTargets, NUM_JOINTS};
+use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy};
+use duck_control::safety::{Safety, SafetyConfig};
+use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use control::{Controller, Tuning};
+use intents::Intents;
 use params::Params;
 
 /// Model API version this build implements (`updater-design.md` §5.5). Bump when the
@@ -51,9 +59,23 @@ const MAX_LINE: usize = 64 * 1024;
 /// journal size cap it is what *evicts* the logs support needs.
 const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How far a subscriber may fall behind before it starts losing frames.
+///
+/// Five seconds at 50 Hz. State is advisory: a client that cannot keep up gets a gap, never
+/// backpressure onto the control loop. Same rule the updater applies to progress.
+const STATE_BUFFER: usize = 256;
+
 /// Window over which the achieved rate is measured, and therefore how quickly a degraded
-/// loop becomes visible to the health gate.
+/// loop becomes visible to the health gate. Doubles as the slow-sensor sampling interval
+/// ([`publish_slow_sensors`]).
 const RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Smoothing on the reported battery voltage. At one sample per [`RATE_WINDOW`] this is a
+/// ~10 s time constant, which is what makes the number readable: the raw voltage sags
+/// several tenths of a volt on every step and recovers between them, so an unsmoothed
+/// reading swings while the pack is doing nothing unusual. Borrowed, with the figure, from
+/// `microduck_runtime`.
+const BATTERY_EMA_ALPHA: f64 = 0.1;
 
 #[derive(Parser, Debug)]
 #[command(name = "robotd", about = "Robot control daemon", version)]
@@ -75,6 +97,14 @@ struct Args {
     /// simulator yet, and this is what stands in for one.
     #[arg(long)]
     fake: bool,
+
+    /// Do not load a policy: run the loop and hold the startup pose.
+    ///
+    /// Distinct from a policy that failed to load, which is unhealthy. This is the
+    /// configuration to use when the thing under test is the updater rather than the gait —
+    /// nothing falls over when a deliberately broken release lands.
+    #[arg(long)]
+    no_policy: bool,
 
     /// Report unhealthy. For exercising the updater's rollback path on a bench robot
     /// without having to break a real build.
@@ -141,7 +171,33 @@ struct RobotState {
     /// reading the startup pose. Non-zero means the loop is still waiting for a robot to
     /// answer and has never commanded anything.
     startup_bus_failures: AtomicU32,
+    /// Motor-bus voltage, EMA-smoothed, as `f64::to_bits`. Zero means *not read yet* — a
+    /// distinction that has to survive to the wire, since zero volts and unknown volts look
+    /// nothing alike to whoever is deciding whether to charge the robot.
+    battery_v: AtomicU64,
+    /// Hottest servo of the last thermal sample: temperature as `f64::to_bits`, and which
+    /// joint it was. Zero means *not read yet*, same as the battery.
+    motor_max_c: AtomicU64,
+    motor_mean_c: AtomicU64,
+    /// Index into [`duck_control::JOINT_NAMES`] of the hottest joint.
+    motor_hottest: AtomicU32,
+    /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
+    /// kernel with no thermal sysfs ([`soc`]).
+    cpu_temp_c: AtomicU64,
+    /// Mirrors of the bus's own IMU diagnostics, refreshed with the thermal sample. Held here
+    /// so the IPC side can report them without touching the loop's IO.
+    imu_stale_blocks: AtomicU64,
+    imu_ready: AtomicBool,
     shutdown: AtomicBool,
+    /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
+    state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
+    /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
+    /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
+    policy_error: ArcSwapOption<String>,
+    /// Published by the loop so the IPC side can answer without consulting it.
+    fallen: AtomicBool,
+    /// The policy is driving and has been asked for a non-zero velocity.
+    moving: AtomicBool,
 
     period_us: u64,
     min_achieved_hz: f64,
@@ -161,28 +217,62 @@ impl RobotState {
             achieved_hz: AtomicU64::new(0),
             consecutive_errors: AtomicU32::new(0),
             startup_bus_failures: AtomicU32::new(0),
+            battery_v: AtomicU64::new(0),
+            motor_max_c: AtomicU64::new(0),
+            motor_mean_c: AtomicU64::new(0),
+            motor_hottest: AtomicU32::new(0),
+            cpu_temp_c: AtomicU64::new(0),
+            imu_stale_blocks: AtomicU64::new(0),
+            imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
+            policy_error: ArcSwapOption::empty(),
+            fallen: AtomicBool::new(false),
+            moving: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
-            min_achieved_hz: params.health.min_achieved_hz,
-            stall_periods: params.health.stall_periods,
-            max_consecutive_errors: params.health.max_consecutive_errors,
+            min_achieved_hz: params.update_gate.min_achieved_hz,
+            stall_periods: params.update_gate.stall_periods,
+            max_consecutive_errors: params.update_gate.max_consecutive_errors,
             force_unhealthy,
             force_busy,
         }
     }
 
     fn health(&self) -> proto::HealthResult {
-        let unhealthy = |reason: String| proto::HealthResult {
-            healthy: false,
-            degraded: false,
-            reason: Some(reason),
-        };
+        // Everything the robot can say about itself, attached to every answer whatever the
+        // verdict — and consulted by none of the checks below.
+        //
+        // Two separate jobs in one method, deliberately. `healthy`/`degraded` are the update
+        // system's inputs and may only reflect what a *release* can be blamed for. The rest
+        // is a description of the robot for whoever is looking at it, and it travels on the
+        // same answer because a robot behaving oddly is asked exactly one question, once.
+        let describe =
+            |healthy: bool, degraded: bool, reason: Option<String>| proto::HealthResult {
+                healthy,
+                degraded,
+                reason,
+                battery: self.battery(),
+                motors: self.motor_thermal(),
+                cpu_temp_c: {
+                    // Zero is "never read", the same sentinel the battery uses: a board at
+                    // 0 °C is a sensor that is not there, not a cold robot.
+                    let c = f64::from_bits(self.cpu_temp_c.load(Ordering::Relaxed));
+                    (c > 0.0).then_some(c)
+                },
+                control_loop: Some(self.loop_health()),
+                bus: proto::BusHealth {
+                    consecutive_errors: self.consecutive_errors.load(Ordering::Relaxed),
+                    startup_failures: self.startup_bus_failures.load(Ordering::Relaxed),
+                },
+                imu: Some(proto::ImuHealth {
+                    ready: self.imu_ready.load(Ordering::Relaxed),
+                    stale_blocks: self.imu_stale_blocks.load(Ordering::Relaxed),
+                }),
+            };
+
+        let unhealthy = |reason: String| describe(false, false, Some(reason));
         // Not healthy, but not the release's fault either — see `HealthResult::degraded`.
-        let degraded = |reason: String| proto::HealthResult {
-            healthy: false,
-            degraded: true,
-            reason: Some(reason),
-        };
+        let degraded = |reason: String| describe(false, true, Some(reason));
 
         if self.force_unhealthy {
             return unhealthy("forced unhealthy by --unhealthy".into());
@@ -203,6 +293,13 @@ impl RobotState {
                 ));
             }
             return unhealthy("control loop has not completed a cycle yet".into());
+        }
+
+        // A daemon that came up but cannot run its policy is not healthy, however well the
+        // loop is ticking. This is what makes the updater roll back a release whose bundle
+        // is wrong, instead of leaving a robot that holds a pose and never walks again.
+        if let Some(reason) = self.policy_error.load_full() {
+            return unhealthy(format!("policy unavailable: {reason}"));
         }
 
         let errors = self.consecutive_errors.load(Ordering::Relaxed);
@@ -227,11 +324,54 @@ impl RobotState {
             ));
         }
 
-        proto::HealthResult {
-            healthy: true,
-            degraded: false,
-            reason: None,
+        describe(true, false, None)
+    }
+
+    /// The loop's own numbers, as the readout reports them.
+    fn loop_health(&self) -> proto::LoopHealth {
+        let hz = f64::from_bits(self.achieved_hz.load(Ordering::Relaxed));
+        let now_us = self.started.elapsed().as_micros() as u64;
+        proto::LoopHealth {
+            target_hz: 1_000_000.0 / self.period_us as f64,
+            // Zero is the "no window has closed yet" sentinel, not a measured rate.
+            achieved_hz: (hz > 0.0).then_some(hz),
+            ticks: self.ticks.load(Ordering::Relaxed),
+            missed: self.missed.load(Ordering::Relaxed),
+            last_tick_age_ms: now_us.saturating_sub(self.last_tick_us.load(Ordering::Relaxed))
+                / 1000,
         }
+    }
+
+    /// The hottest servo of the last thermal sample, or `None` before the first one.
+    fn motor_thermal(&self) -> Option<proto::MotorThermal> {
+        let max_c = f64::from_bits(self.motor_max_c.load(Ordering::Relaxed));
+        if max_c <= 0.0 {
+            return None;
+        }
+        let hottest = self.motor_hottest.load(Ordering::Relaxed) as usize;
+        Some(proto::MotorThermal {
+            hottest: duck_control::JOINT_NAMES
+                .get(hottest)
+                .unwrap_or(&"unknown")
+                .to_string(),
+            max_c,
+            mean_c: f64::from_bits(self.motor_mean_c.load(Ordering::Relaxed)),
+        })
+    }
+
+    /// The last battery reading, mapped to a percentage — or `None` if there has not been
+    /// one.
+    ///
+    /// Zero is the "never read" sentinel rather than a measurement: the atomic starts there,
+    /// and a robot whose bus cannot answer never leaves it. Reporting that as `0.00 V, 0%`
+    /// would put a flat-battery warning in front of anyone whose robot has been up for less
+    /// than a second.
+    fn battery(&self) -> Option<proto::Battery> {
+        let volts = f64::from_bits(self.battery_v.load(Ordering::Relaxed));
+        (volts > 0.0).then(|| proto::Battery {
+            volts,
+            percent: duck_control::battery_percent(volts),
+        })
     }
 
     fn safe_to_restart(&self) -> proto::SafeToRestartResult {
@@ -241,9 +381,15 @@ impl RobotState {
                 reason: Some("forced busy by --busy".into()),
             };
         }
-        // Slice 1 holds a constant pose, so interrupting it cannot put the robot anywhere it
-        // was not already. Slice 2 must consult actual motion state: restarting motor
-        // control mid-stride is how a robot falls over (`updater-design.md` §7.2).
+        // Restarting motor control mid-stride is how a robot falls over
+        // (`updater-design.md` §7.2). A robot that is merely standing, or already down, is
+        // safe to interrupt — it is going nowhere either way.
+        if self.moving.load(Ordering::Relaxed) && !self.fallen.load(Ordering::Relaxed) {
+            return proto::SafeToRestartResult {
+                safe: false,
+                reason: Some("the robot is walking".into()),
+            };
+        }
         proto::SafeToRestartResult {
             safe: true,
             reason: None,
@@ -301,6 +447,9 @@ async fn main() -> ExitCode {
     if let Some(port) = args.port.clone() {
         params.bus.port = port;
     }
+    if args.no_policy {
+        params.policy.enabled = false;
+    }
 
     if let Some(Command::Init { duration }) = args.command {
         return run_init(&params, duration);
@@ -315,15 +464,22 @@ async fn main() -> ExitCode {
         tracing::warn!("--busy: will refuse restarts, so updates will be held off");
     }
 
-    let control = match spawn_control_thread(&args, &params, Arc::clone(&state)) {
-        Ok(handle) => handle,
-        Err(e) => {
-            tracing::error!(error = %e, "cannot start the control loop");
-            return ExitCode::FAILURE;
-        }
-    };
+    let intents = Arc::new(Intents::new());
 
-    let serving = serve(Arc::clone(&state), args.socket.clone());
+    let control =
+        match spawn_control_thread(&args, &params, Arc::clone(&state), Arc::clone(&intents)) {
+            Ok(handle) => handle,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot start the control loop");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let serving = serve(
+        Arc::clone(&state),
+        Arc::clone(&intents),
+        args.socket.clone(),
+    );
     let mut code = ExitCode::SUCCESS;
     tokio::select! {
         result = serving => {
@@ -361,6 +517,19 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
         tracing::error!(error = %e, "cannot enable torque");
         return ExitCode::FAILURE;
     }
+    // Before the ramp, not after: position_p_gain is a RAM register that survives this
+    // process, so whatever was written last is what the robot stands up with. A previous fall
+    // leaves `gain_limp` (50) there, and `init` would then take the robot to its home pose at
+    // a third of the intended stiffness — soft enough to be a fall risk in the one command
+    // whose whole job is establishing a known state.
+    //
+    // `robotd`'s control loop sets its own gain on the first tick, so this only governs the
+    // ramp and the window before the daemon starts — which is exactly the window where the
+    // robot is standing up unsupported.
+    if let Err(e) = io.set_gain(params.policy.gain) {
+        tracing::error!(error = %e, gain = params.policy.gain, "cannot set the position gain");
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = io.interpolate_to(&DEFAULT_POSITION, duration, Duration::from_millis(20)) {
         tracing::error!(error = %e, "interpolation to the home pose failed");
         return ExitCode::FAILURE;
@@ -385,10 +554,12 @@ fn spawn_control_thread(
     args: &Args,
     params: &Params,
     state: Arc<RobotState>,
+    intents: Arc<Intents>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let period = params.period();
     let fake = args.fake;
     let port = params.bus.port.clone();
+    let params = params.clone();
 
     std::thread::Builder::new()
         .name("control".into())
@@ -406,7 +577,13 @@ fn spawn_control_thread(
 
             if fake {
                 tracing::warn!("--fake: no bus, no robot");
-                runtime.block_on(control_loop(FakeIo::at(DEFAULT_POSITION), state, period));
+                runtime.block_on(control_loop(
+                    FakeIo::at(DEFAULT_POSITION),
+                    state,
+                    intents,
+                    params,
+                    period,
+                ));
                 return;
             }
 
@@ -418,7 +595,7 @@ fn spawn_control_thread(
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
                 if let Some(io) = open_bus_waiting(&port, &state).await {
-                    control_loop(io, state, period).await;
+                    control_loop(io, state, intents, params, period).await;
                 }
             });
         })
@@ -522,24 +699,32 @@ const STARTUP_READ_LOG_EVERY: u32 = 30;
 /// that a restart was what was needed. Retrying makes the ordinary order of operations —
 /// power the board, then power the servos — just work.
 ///
+/// Read through `Safety` rather than the bus directly: safety owns the only `RobotIo`, so
+/// this is the only way to reach it, and going through it keeps that invariant intact even
+/// for the one read that happens before the loop starts.
+///
 /// Returns `None` only if shutdown is requested while waiting.
 async fn adopt_startup_pose<T: RobotIo>(
-    io: &mut T,
+    safety: &mut Safety<T>,
     state: &RobotState,
     period: Duration,
-) -> Option<JointTargets> {
+) -> Option<[f64; NUM_JOINTS]> {
     let mut attempt = 0u32;
 
     while !state.shutdown.load(Ordering::Relaxed) {
-        match io.read() {
+        match safety.read() {
             Ok(sensors) => {
                 state.startup_bus_failures.store(0, Ordering::Relaxed);
-                tracing::warn!(
-                    joints = NUM_JOINTS,
-                    hz = 1.0 / period.as_secs_f64(),
-                    "holding the pose found at startup"
-                );
-                return Some(JointTargets::new(sensors.positions));
+                if attempt > 0 {
+                    // Only worth a line if it had to wait — otherwise "control loop running"
+                    // below already says everything, and this would just double it.
+                    tracing::warn!(
+                        attempt,
+                        hz = 1.0 / period.as_secs_f64(),
+                        "the motor bus answered; holding the pose found at startup"
+                    );
+                }
+                return Some(sensors.positions);
             }
             Err(e) => {
                 attempt += 1;
@@ -563,13 +748,83 @@ async fn adopt_startup_pose<T: RobotIo>(
 
 /// The tick.
 ///
-/// Slice 1 reads, publishes, and writes back the pose adopted at startup. The sensor sample
-/// is read every tick even though nothing consumes it yet — it is what makes the bus load,
-/// and therefore the timing, representative of what slice 2 will do.
-async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Duration) {
-    let Some(targets) = adopt_startup_pose(&mut io, &state, period).await else {
+/// ```text
+/// read → observe (fall) → gate (deadman) → policy → safety.apply
+/// ```
+///
+/// Safety holds the only `RobotIo`, so everything above it can propose targets and nothing
+/// above it can command a motor.
+///
+/// A policy that failed to load is survivable, and deliberately so: the loop keeps running
+/// at rate, holds its pose, and `robot.health` says why. The updater then rolls the release
+/// back. The alternative — refusing to start — becomes a crashloop under
+/// `Restart=always` and reaches the health gate as `Unreachable`, which blames the wrong
+/// thing in the journal.
+async fn control_loop<T: RobotIo>(
+    io: T,
+    state: Arc<RobotState>,
+    intents: Arc<Intents>,
+    params: Params,
+    period: Duration,
+) {
+    let mut safety = Safety::new(
+        io,
+        SafetyConfig {
+            fall_gravity_z: params.safety.fall_gravity_z,
+            fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
+            deadman: Duration::from_millis(params.safety.deadman_ms),
+            gain_running: params.policy.gain,
+            gain_limp: params.safety.gain_limp,
+        },
+    );
+
+    let Some(mut hold) = adopt_startup_pose(&mut safety, &state, period).await else {
         return;
     };
+
+    // A policy that was *not wanted* is healthy; one that was wanted and could not be
+    // loaded is not. Collapsing those two would either make a bench robot look broken or
+    // let a release with an unusable bundle pass the health gate.
+    let mut controller = if !params.policy.enabled {
+        tracing::warn!("policy disabled; holding the startup pose");
+        None
+    } else {
+        let tuning = Tuning {
+            action_scale: params.policy.action_scale,
+            standing_action_scale: params.policy.standing_action_scale,
+            standing_gain_ratio: params.policy.standing_gain_ratio,
+            gain: params.policy.gain,
+            head_lowpass: params.policy.head_lowpass,
+            legs_lowpass: params.policy.legs_lowpass,
+        };
+        match Policy::load(
+            &params.policy.walk,
+            params.policy.stand.as_deref(),
+            DEFAULT_STANDING_THRESHOLD,
+        ) {
+            Ok(policy) => {
+                tracing::warn!(
+                    walk = %params.policy.walk.display(),
+                    stand = ?params.policy.stand.as_ref().map(|p| p.display().to_string()),
+                    "policy loaded"
+                );
+                Some(Controller::new(policy, tuning))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "policy unavailable; holding the pose");
+                state.policy_error.store(Some(Arc::new(e.to_string())));
+                None
+            }
+        }
+    };
+
+    tracing::warn!(
+        joints = NUM_JOINTS,
+        hz = 1.0 / period.as_secs_f64(),
+        driving = controller.is_some(),
+        "control loop running"
+    );
+
     let mut ticker = tokio::time::interval(period);
     // `Skip`, not `Burst` and not `Delay`.
     //
@@ -590,13 +845,17 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
     let mut window_start = Instant::now();
     let mut window_ticks = 0u64;
     let mut last_summary = Instant::now();
+    let mut was_driving = false;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
 
-        match io.read() {
-            Ok(_sensors) => state.consecutive_errors.store(0, Ordering::Relaxed),
+        let sensors = match safety.read() {
+            Ok(sensors) => {
+                state.consecutive_errors.store(0, Ordering::Relaxed);
+                Some(sensors)
+            }
             Err(e) => {
                 let n = state.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
                 // One dropped transaction is ordinary on a serial bus; a run of them is not.
@@ -605,11 +864,93 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
                 if n == 1 || n.is_multiple_of(10) {
                     tracing::warn!(error = %e, consecutive = n, "bus read failed");
                 }
+                None
+            }
+        };
+
+        if let Some(sensors) = sensors.as_ref() {
+            safety.observe(sensors, period);
+        }
+        state.fallen.store(safety.fallen(), Ordering::Relaxed);
+
+        let snapshot = intents.snapshot();
+        let (command, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
+        let mut limits: Vec<duck_control::safety::Limit> = deadman.into_iter().collect();
+
+        // Drive only with a sample to drive from: a tick whose read failed has no
+        // observation to build, and inventing one would feed the policy a stale robot.
+        let driving =
+            snapshot.enabled && controller.is_some() && !safety.fallen() && sensors.is_some();
+
+        if driving && !was_driving {
+            // Starting fresh: a stale previous action in the observation, or a filter
+            // anchored to where the robot was a minute ago, would both show up as a lurch.
+            if let Some(controller) = controller.as_mut() {
+                controller.reset();
             }
         }
+        if was_driving && !driving {
+            // Freeze where it is rather than snapping back to the startup pose. Captured
+            // once, not re-read each tick, or the hold target would sag under gravity.
+            if let Some(sensors) = sensors.as_ref() {
+                hold = sensors.positions;
+            }
+        }
+        was_driving = driving;
 
-        if let Err(e) = io.write(&targets) {
-            tracing::warn!(error = %e, "bus write failed");
+        let (targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+            (true, Some(sensors)) => {
+                let controller = controller.as_mut().expect("driving implies a controller");
+                match controller.step(sensors, &command) {
+                    Ok(step) => (
+                        step.targets,
+                        step.gain,
+                        command.twist_magnitude() > 0.0,
+                        if step.standing { "stand" } else { "walk" },
+                    ),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "inference failed; holding");
+                        (hold, params.policy.gain, false, "held")
+                    }
+                }
+            }
+            _ => (hold, params.policy.gain, false, "held"),
+        };
+        state.moving.store(moving, Ordering::Relaxed);
+
+        match safety.apply(targets, hold, gain) {
+            Ok(applied) => limits.extend(applied.limits),
+            Err(e) => tracing::warn!(error = %e, "bus write failed"),
+        }
+
+        // Only assemble a frame when somebody is subscribed. On a robot nobody usually is,
+        // and this would otherwise be a per-tick allocation on the thread that should not
+        // be visiting the allocator without a reason.
+        if state.state_tx.receiver_count() > 0
+            && let Some(sensors) = sensors.as_ref()
+        {
+            let _ = state.state_tx.send(proto::RobotState {
+                t: state.started.elapsed().as_secs_f64(),
+                movement: proto::MoveState {
+                    requested: snapshot.command.twist,
+                    applied: command.twist,
+                    limited_by: limits.iter().map(|l| limit_name(*l).to_owned()).collect(),
+                },
+                head: command.head,
+                policy: policy_label.to_owned(),
+                safety: proto::SafetyState {
+                    fallen: safety.fallen(),
+                    limp: safety.fallen(),
+                    gravity: sensors.imu.gravity,
+                    gain: safety.gain(),
+                },
+                control_loop: proto::LoopState {
+                    hz: f64::from_bits(state.achieved_hz.load(Ordering::Relaxed)),
+                    missed: state.missed.load(Ordering::Relaxed),
+                },
+                joints: sensors.positions.to_vec(),
+                targets: targets.to_vec(),
+            });
         }
 
         let ticks = state.ticks.fetch_add(1, Ordering::Relaxed) + 1;
@@ -629,11 +970,27 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
             window_start = Instant::now();
             window_ticks = 0;
 
+            publish_slow_sensors(&mut safety, &state);
+
             if last_summary.elapsed() >= LOOP_SUMMARY_INTERVAL {
                 tracing::info!(
                     total = ticks,
                     hz = format!("{hz:.1}"),
                     missed = state.missed.load(Ordering::Relaxed),
+                    driving,
+                    fallen = safety.fallen(),
+                    battery_v = format!(
+                        "{:.2}",
+                        f64::from_bits(state.battery_v.load(Ordering::Relaxed))
+                    ),
+                    motor_max_c = format!(
+                        "{:.0}",
+                        f64::from_bits(state.motor_max_c.load(Ordering::Relaxed))
+                    ),
+                    cpu_c = format!(
+                        "{:.0}",
+                        f64::from_bits(state.cpu_temp_c.load(Ordering::Relaxed))
+                    ),
                     "control loop"
                 );
                 last_summary = Instant::now();
@@ -643,7 +1000,84 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
     tracing::info!("control loop stopped");
 }
 
-async fn serve(state: Arc<RobotState>, socket_path: PathBuf) -> std::io::Result<()> {
+/// Stable wire names for the reasons a command was altered.
+///
+/// Spelled out rather than `Debug`-formatted: this goes over the wire, and a client
+/// branching on it must not break because a variant was renamed in Rust.
+fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
+    use duck_control::safety::Limit;
+    match limit {
+        Limit::Deadman => "deadman",
+        Limit::Range => "joint_range",
+        Limit::NotFinite => "not_finite",
+        Limit::Fallen => "fallen",
+    }
+}
+
+/// Sample and publish everything that does not need sampling every tick, once per
+/// [`RATE_WINDOW`].
+///
+/// Not part of the tick. The voltage/temperature registers are a second bus transaction —
+/// about a millisecond — which is nothing once a second and would be 5% of the budget at
+/// 50 Hz. A second is also faster than a pack can drain or a servo can heat up.
+///
+/// Called from the loop thread because that thread owns the IO, and nothing else may touch
+/// the bus: a transaction issued from the IPC side would interleave bytes with a tick and
+/// corrupt both. The IMU counters come from the same `io`, so they are mirrored here rather
+/// than reached for from the socket.
+fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
+    state
+        .imu_stale_blocks
+        .store(io.imu_stale_blocks(), Ordering::Relaxed);
+    state.imu_ready.store(io.imu_ready(), Ordering::Relaxed);
+
+    // Before the bus read, and unconditionally: this is a `sysfs` read that owes the motor bus
+    // nothing, and a board cooking behind a blocked vent is *more* likely to be worth seeing on
+    // a robot whose servos have stopped answering, not less.
+    if let Some(celsius) = soc::hottest_zone_c() {
+        state.cpu_temp_c.store(celsius.to_bits(), Ordering::Relaxed);
+    }
+
+    match io.slow_sensors() {
+        Ok(slow) => {
+            let previous = f64::from_bits(state.battery_v.load(Ordering::Relaxed));
+            // Seed from the first reading rather than blending up from zero, which would
+            // spend ten seconds reporting a battery flatter than it is.
+            let smoothed = if previous > 0.0 {
+                BATTERY_EMA_ALPHA * slow.volts + (1.0 - BATTERY_EMA_ALPHA) * previous
+            } else {
+                slow.volts
+            };
+            state.battery_v.store(smoothed.to_bits(), Ordering::Relaxed);
+
+            // Temperature is not smoothed: a servo's case is already a slow signal, and an
+            // EMA would only delay the one reading anybody cares about — the joint climbing
+            // towards its overheat shutdown.
+            let (hottest, max_c) = slow.temps_c.iter().enumerate().fold(
+                (0usize, f64::MIN),
+                |(best, high), (joint, &t)| {
+                    if t > high { (joint, t) } else { (best, high) }
+                },
+            );
+            let mean_c = slow.temps_c.iter().sum::<f64>() / slow.temps_c.len() as f64;
+            state.motor_max_c.store(max_c.to_bits(), Ordering::Relaxed);
+            state
+                .motor_mean_c
+                .store(mean_c.to_bits(), Ordering::Relaxed);
+            state.motor_hottest.store(hottest as u32, Ordering::Relaxed);
+        }
+        // Keep the last sample. A single failed transaction is ordinary on a serial bus, and
+        // dropping to "unknown" over one would make the reported battery flicker. A bus that
+        // is really gone already shows up in the verdict and in `bus.consecutive_errors`.
+        Err(e) => tracing::debug!(error = %e, "slow-sensor read failed; keeping the last sample"),
+    }
+}
+
+async fn serve(
+    state: Arc<RobotState>,
+    intents: Arc<Intents>,
+    socket_path: PathBuf,
+) -> std::io::Result<()> {
     // A leftover socket from a killed process must not stop us coming up.
     if socket_path.exists() {
         tracing::warn!(path = %socket_path.display(), "removing stale socket");
@@ -674,19 +1108,64 @@ async fn serve(state: Arc<RobotState>, socket_path: PathBuf) -> std::io::Result<
             }
         };
         let state = Arc::clone(&state);
+        let intents = Arc::clone(&intents);
         tokio::spawn(async move {
-            if let Err(e) = handle(state, stream).await {
+            if let Err(e) = handle(state, intents, stream).await {
                 tracing::debug!(error = %e, "connection ended");
             }
         });
     }
 }
 
-async fn handle(state: Arc<RobotState>, stream: UnixStream) -> std::io::Result<()> {
+async fn handle(
+    state: Arc<RobotState>,
+    intents: Arc<Intents>,
+    stream: UnixStream,
+) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
-    while let Some(line) = lines.next_line().await? {
+    // `None` until the client subscribes. Once set, the connection is both a request
+    // channel and a state stream, so the loop below waits on whichever speaks first.
+    let mut states: Option<tokio::sync::broadcast::Receiver<proto::RobotState>> = None;
+    let mut decimate = Duration::ZERO;
+    let mut last_sent: Option<Instant> = None;
+
+    loop {
+        let line = match states.as_mut() {
+            None => lines.next_line().await?,
+            Some(rx) => {
+                tokio::select! {
+                    line = lines.next_line() => line?,
+                    received = rx.recv() => {
+                        match received {
+                            Ok(state) => {
+                                // Decimate per subscriber: a dashboard asking for 10 Hz
+                                // should not cost what a digital twin asking for 50 does.
+                                let due = last_sent
+                                    .map(|at| at.elapsed() >= decimate)
+                                    .unwrap_or(true);
+                                if due {
+                                    last_sent = Some(Instant::now());
+                                    write_line(&mut write_half, &proto::Request::notify_state(&state))
+                                        .await?;
+                                }
+                            }
+                            // Lagged: the client fell behind and lost frames. That is the
+                            // designed behaviour — state is advisory and must never apply
+                            // backpressure to the control loop — so carry on from the newest.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::debug!(dropped = n, "state subscriber fell behind");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        let Some(line) = line else { return Ok(()) };
+
         if line.trim().is_empty() {
             continue;
         }
@@ -711,26 +1190,93 @@ async fn handle(state: Arc<RobotState>, stream: UnixStream) -> std::io::Result<(
             }
         };
 
-        // Notifications get no reply, per the spec.
+        let call = request.as_call();
+
+        // Notifications get no reply, per the spec. Continuous intents arrive this way —
+        // at 50 Hz a response per message would be pure overhead, and there is nothing
+        // useful to say about a velocity that is superseded 20 ms later.
         let Some(id) = request.id.clone() else {
+            if let Ok(call) = call {
+                apply_intent(&intents, &call);
+            }
             continue;
         };
 
-        let response = match request.as_call() {
-            Ok(call) => dispatch(&state, id, &call),
+        if let Ok(proto::Call::RobotSubscribe(params)) = &call {
+            decimate = params
+                .hz
+                .filter(|hz| *hz > 0)
+                .map(|hz| Duration::from_secs_f64(1.0 / hz as f64))
+                .unwrap_or(Duration::ZERO);
+            // Subscribing again replaces the rate rather than opening a second stream.
+            states = Some(state.state_tx.subscribe());
+            last_sent = None;
+        }
+
+        let response = match call {
+            Ok(call) => dispatch(&state, &intents, id, &call),
             Err(e) => proto::Response::err(Some(id), e),
         };
         write_line(&mut write_half, &response).await?;
     }
-    Ok(())
 }
 
 /// Answer one request.
 ///
 /// Synchronous and allocation-light on purpose: these answers must be available even when
 /// everything else is broken.
-fn dispatch(state: &RobotState, id: proto::Id, call: &proto::Call) -> proto::Response {
+/// Apply a continuous intent. Shared by the notification path and the request path, so a
+/// client that sends `robot.move` with an `id` is not silently ignored — the spec permits
+/// either, and refusing one because of a framing choice would be a surprise.
+fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
     match call {
+        proto::Call::RobotMove(p) => {
+            intents.set_twist([p.vx, p.vy, p.vyaw]);
+            true
+        }
+        proto::Call::RobotHead(p) => {
+            intents.set_head([p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll]);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn dispatch(
+    state: &RobotState,
+    intents: &Intents,
+    id: proto::Id,
+    call: &proto::Call,
+) -> proto::Response {
+    match call {
+        proto::Call::RobotMove(_) | proto::Call::RobotHead(_) => {
+            apply_intent(intents, call);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        // Handled by the caller, which owns the connection; answering here keeps the
+        // request/response pairing in one place.
+        proto::Call::RobotSubscribe(_) => {
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        proto::Call::RobotStop => {
+            intents.stop();
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        // Refusing to enable a fallen robot is a normal answer with a reason, not an
+        // error: the client asked something reasonable and safety declined.
+        proto::Call::RobotEnable(p) => {
+            let result = if p.on && state.fallen.load(Ordering::Relaxed) {
+                proto::IntentResult::refused("the robot is down; stand it up first")
+            } else {
+                intents.set_enabled(p.on);
+                proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         proto::Call::RobotHealth => proto::Response::ok(Some(id), &state.health()),
         proto::Call::RobotSafeToRestart => proto::Response::ok(Some(id), &state.safe_to_restart()),
         proto::Call::RobotModelApi => proto::Response::ok(
@@ -831,7 +1377,7 @@ mod tests {
         // A short window so the test does not sleep for the real 500 ms default. Two
         // periods at 50 Hz is 40 ms.
         let mut params = Params::default();
-        params.health.stall_periods = 2;
+        params.update_gate.stall_periods = 2;
         let s = RobotState::new(&params, false, false);
 
         s.ticks.store(1, Ordering::Relaxed);
@@ -956,20 +1502,26 @@ mod tests {
         ticked(&s, 1);
         let id = || proto::Id::Number(1);
 
-        let health: proto::HealthResult = dispatch(&s, id(), &proto::Call::RobotHealth)
-            .result_as()
-            .expect("robot.health must deserialize as HealthResult");
+        let health: proto::HealthResult =
+            dispatch(&s, &Intents::new(), id(), &proto::Call::RobotHealth)
+                .result_as()
+                .expect("robot.health must deserialize as HealthResult");
         assert!(health.healthy);
 
-        let safe: proto::SafeToRestartResult = dispatch(&s, id(), &proto::Call::RobotSafeToRestart)
-            .result_as()
-            .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
+        let safe: proto::SafeToRestartResult =
+            dispatch(&s, &Intents::new(), id(), &proto::Call::RobotSafeToRestart)
+                .result_as()
+                .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
         assert!(safe.safe);
 
-        let session: proto::SessionActiveResult =
-            dispatch(&s, id(), &proto::Call::RobotRemoteSessionActive)
-                .result_as()
-                .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
+        let session: proto::SessionActiveResult = dispatch(
+            &s,
+            &Intents::new(),
+            id(),
+            &proto::Call::RobotRemoteSessionActive,
+        )
+        .result_as()
+        .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
         assert!(!session.active);
     }
 
@@ -978,7 +1530,12 @@ mod tests {
     #[test]
     fn calls_belonging_to_updaterd_are_refused() {
         let s = state();
-        let response = dispatch(&s, proto::Id::Number(1), &proto::Call::Status);
+        let response = dispatch(
+            &s,
+            &Intents::new(),
+            proto::Id::Number(1),
+            &proto::Call::Status,
+        );
         let error = response.error.expect("update.status must be refused");
         assert_eq!(error.code, proto::code::METHOD_NOT_FOUND);
         assert!(error.message.contains("robotd"), "{}", error.message);
@@ -987,7 +1544,12 @@ mod tests {
     #[test]
     fn model_api_is_reported() {
         let s = state();
-        let response = dispatch(&s, proto::Id::Number(1), &proto::Call::RobotModelApi);
+        let response = dispatch(
+            &s,
+            &Intents::new(),
+            proto::Id::Number(1),
+            &proto::Call::RobotModelApi,
+        );
         let result: proto::ModelApiResult = response.result_as().unwrap();
         assert_eq!(result.model_api, MODEL_API);
     }
@@ -1034,6 +1596,171 @@ mod tests {
         );
     }
 
+    /// **The policy-failure contract.** A policy that cannot load must not stop the robot
+    /// working: the loop keeps ticking at rate, holds its pose, and health says why.
+    ///
+    /// This is the branch that makes a broken bundle a rollback instead of an outage. It
+    /// nearly did not work at all — `ort` does not return an error when ONNX Runtime is
+    /// missing, it `expect`s deep inside a lazy init, so the control thread died, no tick
+    /// ever landed, and health reported "the loop has not completed a cycle" forever. The
+    /// daemon looked wedged rather than saying what was wrong.
+    ///
+    /// Works whether or not ONNX Runtime is installed: with it, the bogus path fails to
+    /// load; without it, the runtime probe fails first. Either way the contract is the same.
+    #[tokio::test]
+    async fn an_unloadable_policy_holds_the_pose_and_reports_why() {
+        let mut params = Params::default();
+        params.policy.walk = PathBuf::from("/nonexistent/definitely-not-a-policy.onnx");
+        params.policy.stand = None;
+
+        let resting = DEFAULT_POSITION;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        // Enabled, so this is not passing merely because nothing asked the robot to move.
+        intents.set_enabled(true);
+        intents.set_twist([0.4, 0.0, 0.0]);
+
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            FakeIo::at(resting).frozen(),
+            loop_state,
+            Arc::clone(&intents),
+            params,
+            Duration::from_millis(2),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.ticks.load(Ordering::Relaxed) < 5 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let ticks = s.ticks.load(Ordering::Relaxed);
+        let health = s.health();
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert!(
+            ticks >= 5,
+            "the loop must keep running without a policy, got {ticks} ticks"
+        );
+        assert!(!health.healthy, "a robot that cannot walk is not healthy");
+        let reason = health.reason.unwrap_or_default();
+        assert!(
+            reason.contains("policy"),
+            "health must name the policy as the cause, got {reason:?}"
+        );
+        // The detail, not just the category. The updater quotes this string as the reason it
+        // rolled a release back, so "policy unavailable" on its own is not actionable — that
+        // is the same failure as the useless "loop has not completed a cycle" this branch
+        // exists to avoid. Which detail arrives depends on the machine: the bogus path where
+        // ONNX Runtime is installed, the runtime's own diagnosis where it is not.
+        assert!(
+            reason.contains("definitely-not-a-policy.onnx") || reason.contains("ONNX Runtime"),
+            "health must carry the underlying cause, got {reason:?}"
+        );
+        assert!(
+            !s.moving.load(Ordering::Relaxed),
+            "nothing should be reported as moving"
+        );
+    }
+
+    /// **The reporting claim.** Safety says it reports what it refused rather than silently
+    /// altering commands — that is only true if the reason reaches the state stream.
+    ///
+    /// The deadman is the easiest limit to provoke: intents start maximally stale, so a
+    /// loop with the policy enabled and nothing driving it must publish a frame whose twist
+    /// was zeroed and whose `limited_by` says why. Without this, a client watching the robot
+    /// ignore its command has no way to tell a limit from a bug.
+    #[tokio::test]
+    async fn the_state_stream_reports_why_a_command_was_refused() {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params::PolicyParams::default()
+            },
+            ..Params::default()
+        };
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let mut states = s.state_tx.subscribe();
+
+        let intents = Arc::new(Intents::new());
+        intents.set_enabled(true);
+        // Asked for, but never refreshed — so already past the deadman.
+        intents.set_twist([0.4, 0.0, 0.0]);
+        tokio::time::sleep(Duration::from_millis(params.safety.deadman_ms + 20)).await;
+
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            FakeIo::at(DEFAULT_POSITION),
+            loop_state,
+            Arc::clone(&intents),
+            params,
+            Duration::from_millis(2),
+        ));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), states.recv())
+            .await
+            .expect("a frame within five seconds")
+            .expect("the stream stayed open");
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert_eq!(
+            frame.movement.requested,
+            [0.4, 0.0, 0.0],
+            "what the client asked for must survive to the stream"
+        );
+        assert_eq!(
+            frame.movement.applied, [0.0; 3],
+            "a stale twist must be zeroed"
+        );
+        assert!(
+            frame.movement.limited_by.contains(&"deadman".to_owned()),
+            "the reason must be named, got {:?}",
+            frame.movement.limited_by
+        );
+        assert_eq!(frame.policy, "held", "no policy was loaded");
+        assert_eq!(frame.joints.len(), NUM_JOINTS);
+    }
+
+    /// Assembling a frame allocates, on the thread that should not be visiting the
+    /// allocator without reason. With nobody subscribed — the normal case on a robot —
+    /// nothing should be built at all.
+    #[tokio::test]
+    async fn no_subscribers_means_no_frames() {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params::PolicyParams::default()
+            },
+            ..Params::default()
+        };
+        let s = Arc::new(RobotState::new(&params, false, false));
+        assert_eq!(s.state_tx.receiver_count(), 0);
+
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            FakeIo::at(DEFAULT_POSITION),
+            loop_state,
+            Arc::new(Intents::new()),
+            params,
+            Duration::from_millis(2),
+        ));
+        while s.ticks.load(Ordering::Relaxed) < 5 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        // Subscribing afterwards must find an empty channel: nothing was published while
+        // no one was listening.
+        let mut late = s.state_tx.subscribe();
+        assert!(
+            late.try_recv().is_err(),
+            "frames were built with nobody subscribed"
+        );
+    }
+
     /// **The regression.** A board powered on before its servos gets no answer from the bus.
     /// That used to kill the control thread outright — `robotd` stayed up, kept serving the
     /// socket, and never ticked again no matter what happened to the robot afterwards. Only
@@ -1075,6 +1802,141 @@ mod tests {
         // not cost the startup invariant.
         let written = rx.recv().unwrap().expect("the loop must command something");
         assert_eq!(written.positions, resting);
+    }
+
+    /// **The invariant the battery field lives or dies by.** A flat pack must be reported and
+    /// must not touch the verdict.
+    ///
+    /// If it ever did, updating a robot on a low battery would roll the release back — and the
+    /// replacement would be judged on the same low battery, so the robot could not be updated
+    /// at all until someone noticed and charged it. The whole reason `degraded` exists is to
+    /// keep board conditions out of the rollback decision; a battery that gated would walk
+    /// straight back into it.
+    #[test]
+    fn a_flat_battery_is_reported_and_changes_no_verdict() {
+        let s = state();
+        ticked(&s, 100);
+        // Below BATTERY_EMPTY_V: the pack is done and the robot is struggling.
+        s.battery_v.store(6.1f64.to_bits(), Ordering::Relaxed);
+
+        let health = s.health();
+        let battery = health.battery.expect("a flat battery is still a reading");
+        assert!(battery.volts < duck_control::BATTERY_EMPTY_V);
+        assert_eq!(battery.percent, 0.0);
+
+        assert!(health.healthy, "{:?}", health.reason);
+        assert!(!health.degraded);
+    }
+
+    /// Zero volts is what the atomic holds before the first read lands, and it must reach the
+    /// wire as absent rather than as a pack at 0 V — otherwise `robotctl health` announces a
+    /// flat battery on every robot that has been up for less than a second.
+    #[test]
+    fn an_unread_battery_is_absent_not_empty() {
+        let s = state();
+        ticked(&s, 1);
+        assert_eq!(s.battery_v.load(Ordering::Relaxed), 0);
+        assert!(s.health().battery.is_none());
+    }
+
+    /// The reading travels on every answer, not only the healthy one — a robot that is
+    /// unhealthy *because* it is out of power is exactly when someone wants to see the pack.
+    #[test]
+    fn battery_is_reported_alongside_an_unhealthy_verdict() {
+        let s = state();
+        s.startup_bus_failures.store(4, Ordering::Relaxed);
+        s.battery_v.store(7.5f64.to_bits(), Ordering::Relaxed);
+        s.motor_max_c.store(48.0f64.to_bits(), Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(!health.healthy);
+        assert!(
+            health.battery.is_some(),
+            "battery dropped from a bad answer"
+        );
+        // The rest of the description too: an unhealthy robot is exactly when someone needs
+        // the whole picture, not a verdict on its own.
+        assert!(health.motors.is_some(), "thermals dropped");
+        assert!(health.control_loop.is_some(), "loop section dropped");
+        assert!(health.imu.is_some(), "imu section dropped");
+        // And the number *this* verdict was based on: "no robot on the motor bus" is only
+        // actionable next to the count of attempts behind it.
+        assert_eq!(health.bus.startup_failures, 4);
+    }
+
+    /// The loop section must carry the numbers the verdict was decided from, so a reader can
+    /// check it rather than take it on faith.
+    ///
+    /// That distinction has already paid once: 43.9 Hz with `missed = 0` is a loop being
+    /// *woken* late, not a loop doing too much, and the two have entirely different fixes.
+    #[test]
+    fn the_loop_section_reports_what_the_verdict_used() {
+        let s = state();
+        ticked(&s, 2490);
+        s.achieved_hz.store(49.8f64.to_bits(), Ordering::Relaxed);
+        s.missed.store(3, Ordering::Relaxed);
+
+        let l = s.health().control_loop.expect("loop section");
+        assert_eq!(l.achieved_hz, Some(49.8));
+        assert_eq!(l.target_hz, 50.0);
+        assert_eq!(l.ticks, 2490);
+        assert_eq!(l.missed, 3);
+
+        // Unmeasured stays unmeasured rather than becoming 0 Hz — that would describe a
+        // stopped loop, which is the opposite of "started less than a second ago".
+        s.achieved_hz.store(0, Ordering::Relaxed);
+        assert_eq!(s.health().control_loop.unwrap().achieved_hz, None);
+    }
+
+    /// The hottest joint is named, not merely measured. "48 °C" prompts "which one?", and the
+    /// answer decides whether it is the knee holding the robot up or something wrong.
+    #[test]
+    fn thermals_name_the_hottest_joint() {
+        let s = state();
+        ticked(&s, 100);
+        let knee = duck_control::JOINT_NAMES
+            .iter()
+            .position(|n| *n == "left_knee")
+            .unwrap();
+        s.motor_max_c.store(48.0f64.to_bits(), Ordering::Relaxed);
+        s.motor_mean_c.store(36.0f64.to_bits(), Ordering::Relaxed);
+        s.motor_hottest.store(knee as u32, Ordering::Relaxed);
+
+        let motors = s.health().motors.expect("thermals");
+        assert_eq!(motors.hottest, "left_knee");
+        assert_eq!(motors.max_c, 48.0);
+        assert_eq!(motors.mean_c, 36.0);
+
+        // A servo cooking must not change the verdict, for the same reason a flat pack must
+        // not: it is a fact about the robot, not evidence about the release.
+        assert!(s.health().healthy);
+    }
+
+    /// Unread thermals are absent, not 0 °C — which would read as a robot in a freezer.
+    #[test]
+    fn unread_thermals_are_absent() {
+        let s = state();
+        ticked(&s, 1);
+        assert!(s.health().motors.is_none());
+        assert!(s.health().cpu_temp_c.is_none());
+    }
+
+    /// Board and servo temperatures are separate readings, and the case that justifies both is
+    /// them disagreeing: a board cooking behind a blocked vent while the motors sit idle and
+    /// cool. One number could not express it.
+    #[test]
+    fn a_hot_board_and_cool_motors_are_both_reported() {
+        let s = state();
+        ticked(&s, 100);
+        s.cpu_temp_c.store(84.0f64.to_bits(), Ordering::Relaxed);
+        s.motor_max_c.store(31.0f64.to_bits(), Ordering::Relaxed);
+        s.motor_mean_c.store(30.0f64.to_bits(), Ordering::Relaxed);
+
+        let health = s.health();
+        assert_eq!(health.cpu_temp_c, Some(84.0));
+        assert_eq!(health.motors.expect("thermals").max_c, 31.0);
+        // And neither touches the verdict — a warm afternoon is not a bad release.
+        assert!(health.healthy);
     }
 
     /// While waiting, health must say *why*. The update system quotes this string as the
@@ -1208,10 +2070,23 @@ mod tests {
             fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
                 self.0.read()
             }
-            fn write(&mut self, t: &JointTargets) -> duck_control::io::Result<()> {
+            fn write(&mut self, t: &duck_control::JointTargets) -> duck_control::io::Result<()> {
                 self.0.write(t)
             }
+            fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
+                self.0.set_gain(kp)
+            }
+            fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
+                self.0.slow_sensors()
+            }
         }
-        control_loop(Borrowed(io), state, period).await
+        control_loop(
+            Borrowed(io),
+            state,
+            Arc::new(Intents::new()),
+            Params::default(),
+            period,
+        )
+        .await
     }
 }

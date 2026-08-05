@@ -65,9 +65,10 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // are permitted, including the two that change things.
         NetStatus => Some(Upstream::Config),
         NetScan => Some(Upstream::Config),
-        // Carries a wifi passphrase. §7 requires the characteristic to be paired and
-        // encrypted, and it is not yet — see the comment on `write` in `bluez.rs`. Routing it
-        // before that lands is the one ordering mistake to avoid here.
+        // Carries a wifi passphrase, which §7 requires to travel over a paired, encrypted link.
+        // It does: the characteristic sets `encrypt_authenticated_write` and the PIN agent makes
+        // the bond an authenticated one (`crate::pairing`). Routing this before that existed
+        // would have been the ordering mistake.
         NetConnect(_) => Some(Upstream::Config),
         NetForget(_) => Some(Upstream::Config),
 
@@ -107,6 +108,28 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // decision, of no use to a client and misleading if exposed: a phone reading
         // `safeToRestart` would learn nothing it could act on.
         RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => None,
+
+        // Motor control. **Never over BLE**, which is what §4.1 means by a subset: BLE is too
+        // slow and too constrained for the full surface, and teleop belongs on WebRTC's
+        // unreliable `teleop` datachannel where a stale command is dropped rather than
+        // retransmitted (§5.2). A 20-byte notification budget and a link that does not exist for
+        // the first ~73s of a boot is not a control transport.
+        RobotMove(_) | RobotHead(_) | RobotEnable(_) => None,
+
+        // `robot.stop` deserves its own line, because refusing it looks wrong. An emergency stop
+        // in the app is exactly what someone reaches for, and §6 does say local should preempt
+        // remote — but a stop button that works over an unbonded, high-latency, sometimes-absent
+        // radio is worse than no button, because it *looks* like an e-stop and is not one. The
+        // deadman in `robotd` already stops the robot when intents stop arriving, which is the
+        // mechanism that does not depend on a phone being in range. A real e-stop is physical.
+        // Reconsider deliberately if the app ever needs it, with that caveat stated in the UI.
+        RobotStop => None,
+
+        // High-rate telemetry. `robot.subscribe` streams state at up to the control rate; over
+        // BLE that is a firehose into a 20-byte pipe, and a client would get a decimated,
+        // unpredictably-lagged view it could not reason about. `robot.health` is the question an
+        // app actually has.
+        RobotSubscribe(_) => None,
     }
 }
 
@@ -274,6 +297,16 @@ mod tests {
             proto::Call::SystemInfo,
             proto::Call::SystemSetName(proto::SetNameParams { name: "duck".into() }),
             proto::Call::SystemReboot,
+            proto::Call::RobotMove(proto::MoveParams { vx: 0.1, vy: 0.0, vyaw: 0.0 }),
+            proto::Call::RobotHead(proto::HeadParams {
+                neck_pitch: 0.0,
+                head_pitch: 0.0,
+                head_yaw: 0.0,
+                head_roll: 0.0,
+            }),
+            proto::Call::RobotStop,
+            proto::Call::RobotEnable(proto::EnableParams { on: true }),
+            proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
             proto::Call::SystemPairingPin,
             proto::Call::SystemSetPairingPin(proto::SetPairingPinParams { pin: "000000".into() }),
         ]
