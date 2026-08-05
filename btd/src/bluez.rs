@@ -27,9 +27,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bluer::adv::Advertisement;
-use bluer::agent::{Agent, ReqError as AgentError};
-// Two distinct error types with the same name: one for the pairing agent, one for a
-// characteristic. Aliased so a mix-up is a name error rather than a puzzling type error.
+use bluer::agent::Agent;
+// Aliased: `bluer` has two error types called `ReqError`, one for the pairing agent and one for a
+// characteristic. Naming this one makes a mix-up a name error rather than a puzzling type error,
+// which is how it first presented.
 use bluer::gatt::local::ReqError as GattError;
 use bluer::gatt::local::{
     Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod,
@@ -40,7 +41,6 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::gatt::{RPC_UUID, SERVICE_UUID};
 use crate::link::Link;
-use crate::pairing;
 use crate::session;
 use crate::upstream::Sockets;
 
