@@ -614,6 +614,37 @@ pub struct SubscribeParams {
     pub hz: Option<u32>,
 }
 
+/// Answer to [`Call::RobotSubscribe`].
+///
+/// Carries what is **constant for the life of the process** — which policy this `robotd` is
+/// running — so a client can name it without the per-tick frame repeating it fifty times a
+/// second. [`RobotState::policy`] says which policy *drove this tick* (`walk`, `stand`,
+/// `held`); this says which network that is, which is the question anyone comparing two
+/// gaits is actually asking.
+///
+/// `accepted` keeps the shape [`IntentResult`] had here, so a client reading only that field
+/// is unaffected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubscribeResult {
+    pub accepted: bool,
+    /// Walking policy, as a file name rather than a path: the directory is the release
+    /// directory, which `robotctl version` already reports, and the file name is the part
+    /// that differs between two builds someone is comparing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walk: Option<String>,
+    /// Standing policy, when one is configured. Without it the walking policy runs at every
+    /// velocity — a real configuration, and one worth being able to see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stand: Option<String>,
+    /// Why nothing is driving, when nothing is: the policy is disabled in params, or it was
+    /// wanted and could not be loaded. Those are different situations — the first is a
+    /// legitimate bench configuration, the second is a robot that should be rolled back —
+    /// and both are invisible in a stream whose `policy` field just says `held`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

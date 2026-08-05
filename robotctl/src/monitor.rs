@@ -57,9 +57,15 @@ const IDLE_REDRAW: Duration = Duration::from_millis(250);
 /// limit appears would shift every joint row down at the moment the reader is staring at one.
 const HEADER_HEIGHT: u16 = 8;
 
+/// Request id for the subscribe call, so its answer can be told apart from the stream that
+/// follows it on the same connection.
+const SUBSCRIBE_ID: u64 = 1;
+
 /// What the reader thread has to say.
 enum Update {
     State(Box<proto::RobotState>),
+    /// The subscribe acknowledgement, which names the policy this `robotd` is running.
+    Policy(Box<proto::SubscribeResult>),
     /// The stream ended. Carries the sentence to exit with.
     Ended(String),
 }
@@ -74,7 +80,10 @@ pub fn run(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> {
     let call = proto::Call::RobotSubscribe(proto::SubscribeParams {
         hz: (hz > 0).then_some(hz),
     });
-    client.send(&proto::Request::call(proto::Id::Number(1), &call))?;
+    client.send(&proto::Request::call(
+        proto::Id::Number(SUBSCRIBE_ID),
+        &call,
+    ))?;
 
     if json || !stdout_is_a_terminal() {
         return stream_lines(client, json);
@@ -171,10 +180,8 @@ fn read_states(mut reader: impl BufRead, tx: &mpsc::Sender<Update>) {
             Err(e) => format!("stream ended: {e}"),
             Ok(0) => "robotd closed the connection".to_owned(),
             Ok(_) => {
-                if let Some(state) = serde_json::from_str::<proto::Request>(&line)
-                    .ok()
-                    .and_then(|request| request.as_state())
-                    && tx.send(Update::State(Box::new(state))).is_err()
+                if let Some(update) = decode(&line)
+                    && tx.send(update).is_err()
                 {
                     return; // the UI is gone
                 }
@@ -184,6 +191,29 @@ fn read_states(mut reader: impl BufRead, tx: &mpsc::Sender<Update>) {
         let _ = tx.send(Update::Ended(ended));
         return;
     }
+}
+
+/// Read one line of the connection.
+///
+/// Two shapes arrive on it: the answer to `robot.subscribe`, once, and `robot.state`
+/// notifications forever after. A notification carries `method`, a response does not, so the
+/// two cannot be confused — and anything else is ignored rather than treated as an error,
+/// because a `robotd` newer than this build may say things this one has no use for.
+fn decode(line: &str) -> Option<Update> {
+    if let Ok(request) = serde_json::from_str::<proto::Request>(line) {
+        return request.as_state().map(|s| Update::State(Box::new(s)));
+    }
+    let response = serde_json::from_str::<proto::Response>(line).ok()?;
+    if response.id != Some(proto::Id::Number(SUBSCRIBE_ID)) {
+        return None;
+    }
+    // A `robotd` that predates `SubscribeResult` answered with `IntentResult`, whose
+    // `accepted` field this parses and whose missing policy fields stay `None` — so an old
+    // robot reports an unknown policy rather than failing to render.
+    response
+        .result_as::<proto::SubscribeResult>()
+        .ok()
+        .map(|r| Update::Policy(Box::new(r)))
 }
 
 /// The live view's loop: absorb whatever has arrived, honour the keyboard, repaint.
@@ -273,6 +303,9 @@ fn terminal_failure(e: std::io::Error) -> Failure {
 struct View {
     /// Requested rate, for judging whether the stream has stalled.
     hz: u32,
+    /// Which policy this `robotd` is running, from the subscribe acknowledgement. `None`
+    /// until it arrives, and on a `robotd` too old to say.
+    policy: Option<proto::SubscribeResult>,
     latest: Option<proto::RobotState>,
     /// When `latest` arrived, so its age can be shown. A frozen number with nothing saying
     /// it is frozen is the one failure mode a live view must not have.
@@ -297,6 +330,7 @@ impl View {
     fn new(hz: u32) -> Self {
         Self {
             hz,
+            policy: None,
             latest: None,
             arrived: None,
             trace: VecDeque::with_capacity(TRACE_SAMPLES),
@@ -326,6 +360,10 @@ impl View {
     fn absorb(&mut self, update: Update) -> Result<bool, Failure> {
         match update {
             Update::Ended(why) => Err(Failure::new(exit::UNREACHABLE, why)),
+            Update::Policy(policy) => {
+                self.policy = Some(*policy);
+                Ok(true)
+            }
             Update::State(state) => {
                 if self.trace.len() == TRACE_SAMPLES {
                     self.trace.pop_back();
@@ -409,13 +447,16 @@ impl View {
         area: ratatui::layout::Rect,
         state: &proto::RobotState,
     ) {
+        // The policy's identity goes on the bottom border: it never changes while the command
+        // runs, so it belongs where a caption belongs rather than taking a row from the joints.
         let block = Block::bordered()
             .title(Line::from(self.title(state)))
             .title_top(
                 Line::from(" q quits · ↑↓ scrolls joints ")
                     .dim()
                     .right_aligned(),
-            );
+            )
+            .title_bottom(Line::from(self.policy_caption()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -430,6 +471,47 @@ impl View {
         frame.render_widget(self.movement(state), asked);
         frame.render_widget(self.imu(state), felt);
         frame.render_widget(self.limits_and_head(state), bottom);
+    }
+
+    /// Which network is driving this robot, from the subscribe acknowledgement.
+    ///
+    /// [`proto::RobotState::policy`] says `walk`, `stand` or `held` — the mode of *this tick*.
+    /// That is not the same question as which policy is loaded, and it was the only one this
+    /// view could answer: two releases with different gaits both say `walk`, and "which
+    /// network is this?" is the first thing anyone comparing them asks.
+    fn policy_caption(&self) -> Vec<Span<'static>> {
+        let Some(policy) = self.policy.as_ref() else {
+            // No acknowledgement yet, or a `robotd` that predates it. Said out loud, because
+            // the alternative is a caption that looks like a robot with no policy.
+            return vec![Span::raw(" policy · not reported by robotd ").dim()];
+        };
+
+        let mut caption = vec![Span::raw(" policy · ").dim()];
+        match policy.walk.as_deref() {
+            Some(walk) => {
+                caption.push(Span::styled(
+                    walk.to_owned(),
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ));
+                if let Some(stand) = policy.stand.as_deref() {
+                    caption.push(Span::raw(" · standing ").dim());
+                    caption.push(Span::styled(stand.to_owned(), Style::new().fg(Color::Cyan)));
+                } else {
+                    // Not an omission: without a standing network the walking one runs at
+                    // every velocity, which changes how the robot behaves at rest.
+                    caption.push(Span::raw(" · no standing policy").dim());
+                }
+            }
+            None => caption.push(Span::raw("none loaded").dim()),
+        }
+        if let Some(why) = policy.unavailable.as_deref() {
+            caption.push(Span::styled(
+                format!(" — {why}"),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        caption.push(Span::raw(" ").dim());
+        caption
     }
 
     /// The block's own title: who is driving, how fast the loop is going, and whether the
@@ -973,6 +1055,106 @@ mod tests {
         }
         assert!(screen.contains("+0.30"), "what was asked for:\n{screen}");
         assert!(screen.contains("+0.15"), "what was applied:\n{screen}");
+    }
+
+    /// The policy driving the robot is named, not just its mode. `walk` is a mode two
+    /// different releases share; the file name is what tells them apart.
+    #[test]
+    fn the_frame_names_the_policy_it_was_told_about() {
+        let mut view = View::new(20);
+        assert!(
+            view.absorb(Update::Policy(Box::new(proto::SubscribeResult {
+                accepted: true,
+                walk: Some("alpha_walking.onnx".to_owned()),
+                stand: Some("alpha_stand.onnx".to_owned()),
+                unavailable: None,
+            })))
+            .is_ok()
+        );
+        assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("alpha_walking.onnx"), "{screen}");
+        assert!(screen.contains("standing alpha_stand.onnx"), "{screen}");
+    }
+
+    /// Nothing said about the policy is reported as such. The alternative — an empty caption —
+    /// looks exactly like a robot running no policy at all, which is a different robot.
+    #[test]
+    fn an_unnamed_policy_is_called_unreported() {
+        let screen = draw(100, 32, &a_state(), 0);
+        assert!(screen.contains("not reported by robotd"), "{screen}");
+    }
+
+    /// A walking policy with no standing one runs at every velocity, which changes how the
+    /// robot behaves at rest. Said out loud rather than left as an absence.
+    #[test]
+    fn a_missing_standing_policy_is_stated() {
+        let mut view = View::new(20);
+        assert!(
+            view.absorb(Update::Policy(Box::new(proto::SubscribeResult {
+                accepted: true,
+                walk: Some("alpha_walking.onnx".to_owned()),
+                stand: None,
+                unavailable: None,
+            })))
+            .is_ok()
+        );
+        assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("no standing policy"), "{screen}");
+    }
+
+    /// The two shapes that arrive on this connection are told apart by `method`, which only a
+    /// notification has — and the subscribe answer is matched by its id, so a response to
+    /// something else could not be mistaken for it.
+    #[test]
+    fn a_state_notification_and_a_subscribe_answer_are_told_apart() {
+        let state = serde_json::to_string(&proto::Request::notify_state(&a_state())).unwrap();
+        assert!(matches!(decode(&state), Some(Update::State(_))));
+
+        let ack = serde_json::to_string(&proto::Response::ok(
+            Some(proto::Id::Number(SUBSCRIBE_ID)),
+            &proto::SubscribeResult {
+                accepted: true,
+                walk: Some("alpha_walking.onnx".to_owned()),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        let Some(Update::Policy(policy)) = decode(&ack) else {
+            panic!("the subscribe answer must decode as a policy: {ack}");
+        };
+        assert_eq!(policy.walk.as_deref(), Some("alpha_walking.onnx"));
+
+        // A response to some other call is not the subscribe answer.
+        let other = serde_json::to_string(&proto::Response::ok(
+            Some(proto::Id::Number(SUBSCRIBE_ID + 1)),
+            &proto::SubscribeResult::default(),
+        ))
+        .unwrap();
+        assert!(decode(&other).is_none());
+    }
+
+    /// A `robotd` that predates `SubscribeResult` answers `robot.subscribe` with an
+    /// `IntentResult`. That must render as an unnamed policy, not as a failure to parse: the
+    /// two are installed separately, and a monitor that dies against last week's robot is a
+    /// monitor nobody can use to diagnose one.
+    #[test]
+    fn an_older_robotd_answer_still_decodes() {
+        let old = serde_json::to_string(&proto::Response::ok(
+            Some(proto::Id::Number(SUBSCRIBE_ID)),
+            &proto::IntentResult::accepted(),
+        ))
+        .unwrap();
+
+        let Some(Update::Policy(policy)) = decode(&old) else {
+            panic!("an older acknowledgement must still decode: {old}");
+        };
+        assert!(policy.accepted);
+        assert_eq!(policy.walk, None);
+        assert_eq!(policy.unavailable, None);
     }
 
     /// With nothing clamped, the limits row says so rather than going blank — a blank row reads

@@ -99,7 +99,8 @@ enum Namespace {
     /// alongside what was actually applied and why they differ — safety clamps things
     /// constantly, and "the stick is forward and the robot is still" is unreadable without
     /// the reason next to it. Every joint is there too, measured against commanded, so a
-    /// servo that is not keeping up is visible rather than inferred.
+    /// servo that is not keeping up is visible rather than inferred, and the policy that is
+    /// loaded is named — `walk` is a mode two releases with different gaits both report.
     ///
     /// On a terminal it repaints one frame in place: `q` quits, `↑`/`↓` scroll the joints if
     /// the window is too short for all of them. Redirected or piped it prints one line per

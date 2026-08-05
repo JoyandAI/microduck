@@ -146,6 +146,12 @@ Projected gravity is the only IMU quantity on this stream, and it is what `falle
 from — upright is about `[0, 0, -1]`. The stale-read counters and the rest of the sensing live
 in `robotctl health`.
 
+The bottom border names the policy that is loaded — the `.onnx` files, and whether a standing
+network is configured at all — because `walk` is a mode two releases with different gaits both
+report, and "which network is this?" is the first question when comparing them. A robot with no
+policy says so, and one whose policy would not load says that instead, which the stream's
+`held` cannot distinguish.
+
 Redirected or piped it prints one line per tick instead — `robotctl monitor > run.log` and
 `| grep FALLEN` behave as before. The joint vectors are in `--json`, which carries the whole
 state, one object per line:
