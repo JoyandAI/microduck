@@ -21,7 +21,10 @@ use crate::net::{Net, NetResult};
 /// Values from NetworkManager's own `nm-dbus-interface.h`, read from upstream rather than
 /// remembered. These are the numbers that make "you typed the password wrong" reportable, which
 /// is the entire reason NM was chosen over netplan — so they are named, not inlined.
-mod nm {
+///
+/// Named `ids` rather than `nm`: a module repeating its own file's name is what clippy's
+/// `module_inception` objects to, and `ids::ids::REASON_NO_SECRETS` read no better than this does.
+mod ids {
     pub const DEVICE_TYPE_WIFI: u32 = 2;
 
     pub const STATE_UNAVAILABLE: u32 = 20;
@@ -179,7 +182,7 @@ impl NetworkManager {
                 .build()
                 .await
                 .map_err(bus_err)?;
-            if device.device_type().await.unwrap_or(0) == nm::DEVICE_TYPE_WIFI {
+            if device.device_type().await.unwrap_or(0) == ids::DEVICE_TYPE_WIFI {
                 return Ok(Some(path));
             }
         }
@@ -230,13 +233,13 @@ fn bus_err(e: impl std::fmt::Display) -> String {
 /// AP security flags → what a client needs to know to ask for the right thing.
 fn security_of(flags: u32, rsn: u32, wpa: u32) -> proto::Security {
     let key_mgmt = rsn | wpa;
-    if key_mgmt & nm::SEC_KEY_MGMT_802_1X != 0 {
+    if key_mgmt & ids::SEC_KEY_MGMT_802_1X != 0 {
         proto::Security::Enterprise
-    } else if key_mgmt & nm::SEC_KEY_MGMT_SAE != 0 {
+    } else if key_mgmt & ids::SEC_KEY_MGMT_SAE != 0 {
         proto::Security::Wpa3Sae
-    } else if key_mgmt & nm::SEC_KEY_MGMT_PSK != 0 {
+    } else if key_mgmt & ids::SEC_KEY_MGMT_PSK != 0 {
         proto::Security::WpaPsk
-    } else if flags & nm::AP_FLAGS_PRIVACY != 0 {
+    } else if flags & ids::AP_FLAGS_PRIVACY != 0 {
         // Privacy bit set but no WPA/RSN key management: WEP, which nothing should still be
         // using. Reported so a client can say "too old to join" rather than failing obscurely.
         proto::Security::Wep
@@ -252,11 +255,11 @@ fn security_of(flags: u32, rsn: u32, wpa: u32) -> proto::Security {
 fn failure_of(state: u32, reason: u32) -> (proto::ConnectFailure, Option<String>) {
     let detail = Some(format!("NetworkManager state {state}, reason {reason}"));
     let failure = match reason {
-        nm::REASON_NO_SECRETS => proto::ConnectFailure::BadKey,
-        nm::REASON_SSID_NOT_FOUND => proto::ConnectFailure::NotFound,
-        nm::REASON_SUPPLICANT_TIMEOUT
-        | nm::REASON_SUPPLICANT_DISCONNECT
-        | nm::REASON_IP_CONFIG_UNAVAILABLE => proto::ConnectFailure::Timeout,
+        ids::REASON_NO_SECRETS => proto::ConnectFailure::BadKey,
+        ids::REASON_SSID_NOT_FOUND => proto::ConnectFailure::NotFound,
+        ids::REASON_SUPPLICANT_TIMEOUT
+        | ids::REASON_SUPPLICANT_DISCONNECT
+        | ids::REASON_IP_CONFIG_UNAVAILABLE => proto::ConnectFailure::Timeout,
         _ => proto::ConnectFailure::Other,
     };
     (failure, detail)
@@ -290,11 +293,11 @@ impl Net for NetworkManager {
             .await
             .map_err(bus_err)?;
 
-        let raw_state = device.state().await.unwrap_or(nm::STATE_UNAVAILABLE);
+        let raw_state = device.state().await.unwrap_or(ids::STATE_UNAVAILABLE);
         let state = match raw_state {
-            nm::STATE_ACTIVATED => proto::NetState::Connected,
-            nm::STATE_UNAVAILABLE => proto::NetState::Unavailable,
-            nm::STATE_DISCONNECTED | nm::STATE_FAILED => proto::NetState::Disconnected,
+            ids::STATE_ACTIVATED => proto::NetState::Connected,
+            ids::STATE_UNAVAILABLE => proto::NetState::Unavailable,
+            ids::STATE_DISCONNECTED | ids::STATE_FAILED => proto::NetState::Disconnected,
             // Everything between disconnected and activated is "still trying", and a client
             // should poll rather than conclude anything.
             _ => proto::NetState::Connecting,
@@ -303,20 +306,18 @@ impl Net for NetworkManager {
         let (mut ssid, mut signal) = (None, None);
         if let Ok(ap_path) = wireless.active_access_point().await
             && ap_path.as_str() != "/"
-        {
-            if let Ok(ap) = AccessPointProxy::builder(&self.bus)
+            && let Ok(ap) = AccessPointProxy::builder(&self.bus)
                 .path(&ap_path)
                 .map_err(bus_err)?
                 .build()
                 .await
-            {
-                ssid = ap
-                    .ssid()
-                    .await
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok());
-                signal = ap.strength().await.ok();
-            }
+        {
+            ssid = ap
+                .ssid()
+                .await
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+            signal = ap.strength().await.ok();
         }
 
         let mut ip4 = None;
@@ -509,17 +510,17 @@ impl Net for NetworkManager {
             .map_err(bus_err)?;
 
         loop {
-            match device_proxy.state().await.unwrap_or(nm::STATE_UNAVAILABLE) {
-                nm::STATE_ACTIVATED => {
+            match device_proxy.state().await.unwrap_or(ids::STATE_UNAVAILABLE) {
+                ids::STATE_ACTIVATED => {
                     let status = self.status().await?;
                     return Ok(proto::ConnectResult::Connected {
                         ssid: status.ssid.unwrap_or_else(|| ssid.to_owned()),
                         ip4: status.ip4,
                     });
                 }
-                nm::STATE_FAILED => {
+                ids::STATE_FAILED => {
                     let (_, reason) = device_proxy.state_reason().await.unwrap_or((0, 0));
-                    let (failure, detail) = failure_of(nm::STATE_FAILED, reason);
+                    let (failure, detail) = failure_of(ids::STATE_FAILED, reason);
                     return Ok(proto::ConnectResult::Failed {
                         reason: failure,
                         detail,
@@ -532,7 +533,7 @@ impl Net for NetworkManager {
                 let (_, reason) = device_proxy.state_reason().await.unwrap_or((0, 0));
                 // A timeout still carries NM's reason: "still authenticating after 45s" and
                 // "waiting for DHCP" are different problems.
-                let (_, detail) = failure_of(nm::STATE_FAILED, reason);
+                let (_, detail) = failure_of(ids::STATE_FAILED, reason);
                 return Ok(proto::ConnectResult::Failed {
                     reason: proto::ConnectFailure::Timeout,
                     detail,
@@ -569,23 +570,23 @@ mod tests {
     fn security_flags_map_to_what_a_client_must_ask_for() {
         assert_eq!(security_of(0, 0, 0), proto::Security::Open);
         assert_eq!(
-            security_of(nm::AP_FLAGS_PRIVACY, 0, 0),
+            security_of(ids::AP_FLAGS_PRIVACY, 0, 0),
             proto::Security::Wep
         );
         assert_eq!(
-            security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_PSK, 0),
+            security_of(ids::AP_FLAGS_PRIVACY, ids::SEC_KEY_MGMT_PSK, 0),
             proto::Security::WpaPsk
         );
         assert_eq!(
-            security_of(nm::AP_FLAGS_PRIVACY, 0, nm::SEC_KEY_MGMT_PSK),
+            security_of(ids::AP_FLAGS_PRIVACY, 0, ids::SEC_KEY_MGMT_PSK),
             proto::Security::WpaPsk
         );
         assert_eq!(
-            security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_SAE, 0),
+            security_of(ids::AP_FLAGS_PRIVACY, ids::SEC_KEY_MGMT_SAE, 0),
             proto::Security::Wpa3Sae
         );
         assert_eq!(
-            security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_802_1X, 0),
+            security_of(ids::AP_FLAGS_PRIVACY, ids::SEC_KEY_MGMT_802_1X, 0),
             proto::Security::Enterprise
         );
 
@@ -593,8 +594,8 @@ mod tests {
         // gets the better of the two and PSK still works underneath.
         assert_eq!(
             security_of(
-                nm::AP_FLAGS_PRIVACY,
-                nm::SEC_KEY_MGMT_PSK | nm::SEC_KEY_MGMT_SAE,
+                ids::AP_FLAGS_PRIVACY,
+                ids::SEC_KEY_MGMT_PSK | ids::SEC_KEY_MGMT_SAE,
                 0
             ),
             proto::Security::Wpa3Sae
@@ -602,8 +603,8 @@ mod tests {
         // Enterprise outranks everything: attempting a PSK join there cannot work.
         assert_eq!(
             security_of(
-                nm::AP_FLAGS_PRIVACY,
-                nm::SEC_KEY_MGMT_PSK | nm::SEC_KEY_MGMT_802_1X,
+                ids::AP_FLAGS_PRIVACY,
+                ids::SEC_KEY_MGMT_PSK | ids::SEC_KEY_MGMT_802_1X,
                 0
             ),
             proto::Security::Enterprise
@@ -614,24 +615,24 @@ mod tests {
     /// most is pinned: a rejected key must be `BadKey` and nothing else.
     #[test]
     fn a_rejected_key_is_reported_as_bad_key() {
-        let (failure, detail) = failure_of(nm::STATE_FAILED, nm::REASON_NO_SECRETS);
+        let (failure, detail) = failure_of(ids::STATE_FAILED, ids::REASON_NO_SECRETS);
         assert_eq!(failure, proto::ConnectFailure::BadKey);
         // The detail carries NM's raw numbers for a support ticket, but is never the primary
         // message a user sees.
         assert!(detail.unwrap().contains("reason 7"));
 
         assert_eq!(
-            failure_of(nm::STATE_FAILED, nm::REASON_SSID_NOT_FOUND).0,
+            failure_of(ids::STATE_FAILED, ids::REASON_SSID_NOT_FOUND).0,
             proto::ConnectFailure::NotFound
         );
         assert_eq!(
-            failure_of(nm::STATE_FAILED, nm::REASON_SUPPLICANT_TIMEOUT).0,
+            failure_of(ids::STATE_FAILED, ids::REASON_SUPPLICANT_TIMEOUT).0,
             proto::ConnectFailure::Timeout
         );
         // An unmapped reason must not masquerade as a wrong password — that would send a user
         // round a loop retyping a key that was already correct.
         assert_eq!(
-            failure_of(nm::STATE_FAILED, 999).0,
+            failure_of(ids::STATE_FAILED, 999).0,
             proto::ConnectFailure::Other
         );
     }
