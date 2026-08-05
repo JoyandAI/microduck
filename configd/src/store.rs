@@ -61,7 +61,10 @@ pub struct Store {
 
 impl Store {
     pub fn new(path: impl Into<PathBuf>, fallback: impl Into<String>) -> Self {
-        Self { path: path.into(), fallback: fallback.into() }
+        Self {
+            path: path.into(),
+            fallback: fallback.into(),
+        }
     }
 
     /// The robot's name, or the fallback.
@@ -127,7 +130,10 @@ impl Store {
     /// compares against rather than in every caller.
     pub fn name_and_pin_result(&self) -> duck_ipc_proto::PairingPinResult {
         let pin = self.pairing_pin();
-        duck_ipc_proto::PairingPinResult { is_default: pin == DEFAULT_PIN, pin }
+        duck_ipc_proto::PairingPinResult {
+            is_default: pin == DEFAULT_PIN,
+            pin,
+        }
     }
 
     fn read(&self) -> std::io::Result<Config> {
@@ -151,7 +157,11 @@ impl Store {
         // `flock` serialises writers. Held on the lock file rather than the config itself, so
         // the lock outlives the rename that replaces the config.
         let lock_path = self.path.with_extension("lock");
-        let lock = fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path)?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
         lock.lock()?;
 
         let text = serde_json::to_string_pretty(config)
@@ -184,7 +194,12 @@ fn sanitise(requested: &str) -> String {
 
     // `chars().take()` rather than slicing by byte: a name is UTF-8 and truncating mid-codepoint
     // would panic.
-    cleaned.chars().take(MAX_NAME).collect::<String>().trim_end().to_owned()
+    cleaned
+        .chars()
+        .take(MAX_NAME)
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -210,7 +225,10 @@ mod tests {
         assert_eq!(store.set_name("Ducky").unwrap(), "Ducky");
         assert_eq!(store.name(), "Ducky");
         // A second store over the same file reads it too — this is a file, not process state.
-        assert_eq!(super::Store::new(dir.path().join("config.json"), "other").name(), "Ducky");
+        assert_eq!(
+            super::Store::new(dir.path().join("config.json"), "other").name(),
+            "Ducky"
+        );
     }
 
     /// A malformed file must not stop the daemon starting: it logs and falls back.
@@ -300,7 +318,11 @@ mod tests {
         assert_eq!(store.name(), "Ducky");
         assert_eq!(store.pairing_pin(), "424242");
         store.set_name("Other").unwrap();
-        assert_eq!(store.pairing_pin(), "424242", "the PIN was lost by a rename");
+        assert_eq!(
+            store.pairing_pin(),
+            "424242",
+            "the PIN was lost by a rename"
+        );
     }
 
     /// No temp or lock file left behind that a later read could mistake for the config.

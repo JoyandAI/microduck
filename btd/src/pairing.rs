@@ -68,10 +68,12 @@ pub async fn pin(config_socket: &std::path::Path) -> Result<u32, String> {
     // BlueZ wants the passkey as a number. Parsing loses the leading zeros, which is correct
     // here and exactly why the stored form is a string: `000000` is passkey 0, and the phone
     // displays six digits because the *spec* says six, not because we sent them.
-    result
-        .pin
-        .parse::<u32>()
-        .map_err(|_| format!("configd returned a PIN that is not a number: {} chars", result.pin.len()))
+    result.pin.parse::<u32>().map_err(|_| {
+        format!(
+            "configd returned a PIN that is not a number: {} chars",
+            result.pin.len()
+        )
+    })
 }
 
 async fn fetch(config_socket: &std::path::Path) -> Result<proto::PairingPinResult, String> {
@@ -108,7 +110,12 @@ mod tests {
     /// form a passkey has on the wire.
     #[test]
     fn a_pin_with_leading_zeros_is_the_right_passkey() {
-        for (pin, expected) in [("000000", 0u32), ("000042", 42), ("123456", 123456), ("999999", 999999)] {
+        for (pin, expected) in [
+            ("000000", 0u32),
+            ("000042", 42),
+            ("123456", 123456),
+            ("999999", 999999),
+        ] {
             assert_eq!(pin.parse::<u32>().unwrap(), expected, "{pin}");
         }
     }
@@ -135,11 +142,17 @@ mod tests {
             let mut lines = BufReader::new(read).lines();
             let request = lines.next_line().await.unwrap().unwrap();
             // The request must be the PIN method and nothing else.
-            assert!(request.contains(proto::method::SYSTEM_PAIRING_PIN), "{request}");
+            assert!(
+                request.contains(proto::method::SYSTEM_PAIRING_PIN),
+                "{request}"
+            );
 
             let response = proto::Response::ok(
                 Some(proto::Id::Number(1)),
-                &proto::PairingPinResult { pin: "000042".into(), is_default: false },
+                &proto::PairingPinResult {
+                    pin: "000042".into(),
+                    is_default: false,
+                },
             );
             let mut line = serde_json::to_vec(&response).unwrap();
             line.push(b'\n');

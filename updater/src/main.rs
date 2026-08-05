@@ -168,7 +168,10 @@ fn resolve_uid(name: &str) -> Option<u32> {
     // buffer, or null. Read immediately; nothing is retained.
     let entry = unsafe { libc::getpwnam(cname.as_ptr()) };
     if entry.is_null() {
-        tracing::warn!(user = name, "no such user; it cannot change this robot's software");
+        tracing::warn!(
+            user = name,
+            "no such user; it cannot change this robot's software"
+        );
         return None;
     }
     let uid = unsafe { (*entry).pw_uid };
@@ -181,7 +184,10 @@ fn resolve_gid(name: &str) -> Option<u32> {
     // Safety: as above, for the group database.
     let entry = unsafe { libc::getgrnam(cname.as_ptr()) };
     if entry.is_null() {
-        tracing::warn!(group = name, "no such group; it cannot change this robot's software");
+        tracing::warn!(
+            group = name,
+            "no such group; it cannot change this robot's software"
+        );
         return None;
     }
     let gid = unsafe { (*entry).gr_gid };
@@ -517,9 +523,19 @@ async fn serve(args: Args) -> ExitCode {
     // Numeric ids from the config, plus whatever the names resolve to. Names are what a shipped
     // config should use; the numeric lists remain for a bench override.
     let mut allow_uids = config.allow_uids.clone();
-    allow_uids.extend(config.allow_users.iter().filter_map(|name| resolve_uid(name)));
+    allow_uids.extend(
+        config
+            .allow_users
+            .iter()
+            .filter_map(|name| resolve_uid(name)),
+    );
     let mut allow_gids = config.allow_gids.clone();
-    allow_gids.extend(config.allow_groups.iter().filter_map(|name| resolve_gid(name)));
+    allow_gids.extend(
+        config
+            .allow_groups
+            .iter()
+            .filter_map(|name| resolve_gid(name)),
+    );
 
     let mut engine = match updater::engine::Engine::new(config, keys, robot, faults) {
         Ok(engine) => engine,

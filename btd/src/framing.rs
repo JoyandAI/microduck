@@ -180,7 +180,10 @@ mod tests {
     /// rests on. Checked across MTUs from the BLE floor to bigger than the message.
     #[test]
     fn chunking_round_trips_at_every_mtu() {
-        let line = format!(r#"{{"jsonrpc":"2.0","id":7,"result":{{"pad":"{}"}}}}"#, "y".repeat(300));
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":7,"result":{{"pad":"{}"}}}}"#,
+            "y".repeat(300)
+        );
 
         for mtu in [20, 23, 100, 185, 512, 4096] {
             let mut r = Reassembler::new();

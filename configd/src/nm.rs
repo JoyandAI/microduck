@@ -160,7 +160,9 @@ pub struct NetworkManager {
 
 impl NetworkManager {
     pub async fn new() -> zbus::Result<Self> {
-        Ok(Self { bus: zbus::Connection::system().await? })
+        Ok(Self {
+            bus: zbus::Connection::system().await?,
+        })
     }
 
     /// The first wifi device NM knows about.
@@ -201,7 +203,9 @@ impl NetworkManager {
                 .build()
                 .await
                 .map_err(bus_err)?;
-            let Ok(config) = connection.get_settings().await else { continue };
+            let Ok(config) = connection.get_settings().await else {
+                continue;
+            };
 
             // The SSID lives as raw bytes under the wifi section, because an SSID is not
             // required to be UTF-8. Ours are compared as text, which is what a user typed.
@@ -273,8 +277,18 @@ impl Net for NetworkManager {
             });
         };
 
-        let device = DeviceProxy::builder(&self.bus).path(&path).map_err(bus_err)?.build().await.map_err(bus_err)?;
-        let wireless = WirelessProxy::builder(&self.bus).path(&path).map_err(bus_err)?.build().await.map_err(bus_err)?;
+        let device = DeviceProxy::builder(&self.bus)
+            .path(&path)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
+        let wireless = WirelessProxy::builder(&self.bus)
+            .path(&path)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
 
         let raw_state = device.state().await.unwrap_or(nm::STATE_UNAVAILABLE);
         let state = match raw_state {
@@ -290,8 +304,17 @@ impl Net for NetworkManager {
         if let Ok(ap_path) = wireless.active_access_point().await
             && ap_path.as_str() != "/"
         {
-            if let Ok(ap) = AccessPointProxy::builder(&self.bus).path(&ap_path).map_err(bus_err)?.build().await {
-                ssid = ap.ssid().await.ok().and_then(|bytes| String::from_utf8(bytes).ok());
+            if let Ok(ap) = AccessPointProxy::builder(&self.bus)
+                .path(&ap_path)
+                .map_err(bus_err)?
+                .build()
+                .await
+            {
+                ssid = ap
+                    .ssid()
+                    .await
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
                 signal = ap.strength().await.ok();
             }
         }
@@ -299,7 +322,11 @@ impl Net for NetworkManager {
         let mut ip4 = None;
         if let Ok(config_path) = device.ip4_config().await
             && config_path.as_str() != "/"
-            && let Ok(config) = Ip4ConfigProxy::builder(&self.bus).path(&config_path).map_err(bus_err)?.build().await
+            && let Ok(config) = Ip4ConfigProxy::builder(&self.bus)
+                .path(&config_path)
+                .map_err(bus_err)?
+                .build()
+                .await
             && let Ok(addresses) = config.address_data().await
         {
             ip4 = self.first_address(addresses).await;
@@ -308,7 +335,11 @@ impl Net for NetworkManager {
         let mut ip6 = None;
         if let Ok(config_path) = device.ip6_config().await
             && config_path.as_str() != "/"
-            && let Ok(config) = Ip6ConfigProxy::builder(&self.bus).path(&config_path).map_err(bus_err)?.build().await
+            && let Ok(config) = Ip6ConfigProxy::builder(&self.bus)
+                .path(&config_path)
+                .map_err(bus_err)?
+                .build()
+                .await
             && let Ok(addresses) = config.address_data().await
         {
             ip6 = self.first_address(addresses).await;
@@ -327,9 +358,16 @@ impl Net for NetworkManager {
 
     async fn scan(&self) -> NetResult<proto::NetScanResult> {
         let Some(path) = self.wifi_device().await? else {
-            return Ok(proto::NetScanResult { networks: Vec::new() });
+            return Ok(proto::NetScanResult {
+                networks: Vec::new(),
+            });
         };
-        let wireless = WirelessProxy::builder(&self.bus).path(&path).map_err(bus_err)?.build().await.map_err(bus_err)?;
+        let wireless = WirelessProxy::builder(&self.bus)
+            .path(&path)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
 
         // A scan request is a hint, not a command: NM rate-limits it and refuses while one is in
         // flight. Either way the cached access-point list below is what we return, which is why
@@ -339,7 +377,12 @@ impl Net for NetworkManager {
 
         let mut networks: Vec<proto::Network> = Vec::new();
         for ap_path in wireless.get_all_access_points().await.map_err(bus_err)? {
-            let Ok(ap) = AccessPointProxy::builder(&self.bus).path(&ap_path).map_err(bus_err)?.build().await else {
+            let Ok(ap) = AccessPointProxy::builder(&self.bus)
+                .path(&ap_path)
+                .map_err(bus_err)?
+                .build()
+                .await
+            else {
                 continue;
             };
             let Some(ssid) = ap.ssid().await.ok().and_then(|b| String::from_utf8(b).ok()) else {
@@ -365,7 +408,12 @@ impl Net for NetworkManager {
             match networks.iter_mut().find(|n| n.ssid == ssid) {
                 Some(existing) if existing.signal < signal => existing.signal = signal,
                 Some(_) => {}
-                None => networks.push(proto::Network { ssid, signal, security, saved }),
+                None => networks.push(proto::Network {
+                    ssid,
+                    signal,
+                    security,
+                    saved,
+                }),
             }
         }
 
@@ -387,7 +435,14 @@ impl Net for NetworkManager {
         // Refuse what we cannot do, before changing anything. An enterprise network needs a
         // username and certificate flow this API has no shape for, and half-attempting it would
         // leave a broken profile behind.
-        if let Some(found) = self.scan().await?.networks.iter().find(|n| n.ssid == ssid).cloned() {
+        if let Some(found) = self
+            .scan()
+            .await?
+            .networks
+            .iter()
+            .find(|n| n.ssid == ssid)
+            .cloned()
+        {
             if found.security == proto::Security::Enterprise {
                 return Ok(proto::ConnectResult::Failed {
                     reason: proto::ConnectFailure::Unsupported,
@@ -432,7 +487,10 @@ impl Net for NetworkManager {
         let root = zbus::zvariant::ObjectPath::try_from("/").map_err(bus_err)?;
         let device = zbus::zvariant::ObjectPath::try_from(device_path.as_str()).map_err(bus_err)?;
 
-        if let Err(e) = manager.add_and_activate_connection(settings, &device, &root).await {
+        if let Err(e) = manager
+            .add_and_activate_connection(settings, &device, &root)
+            .await
+        {
             return Ok(proto::ConnectResult::Failed {
                 reason: proto::ConnectFailure::Other,
                 detail: Some(format!("{e}")),
@@ -443,7 +501,12 @@ impl Net for NetworkManager {
         // poll is what turns "config applied" into "associated, addressed, and here is the IP" —
         // the difference that made netplan unusable for provisioning.
         let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
-        let device_proxy = DeviceProxy::builder(&self.bus).path(&device_path).map_err(bus_err)?.build().await.map_err(bus_err)?;
+        let device_proxy = DeviceProxy::builder(&self.bus)
+            .path(&device_path)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
 
         loop {
             match device_proxy.state().await.unwrap_or(nm::STATE_UNAVAILABLE) {
@@ -457,7 +520,10 @@ impl Net for NetworkManager {
                 nm::STATE_FAILED => {
                     let (_, reason) = device_proxy.state_reason().await.unwrap_or((0, 0));
                     let (failure, detail) = failure_of(nm::STATE_FAILED, reason);
-                    return Ok(proto::ConnectResult::Failed { reason: failure, detail });
+                    return Ok(proto::ConnectResult::Failed {
+                        reason: failure,
+                        detail,
+                    });
                 }
                 _ => {}
             }
@@ -480,7 +546,12 @@ impl Net for NetworkManager {
         let Some(path) = self.saved_connection(ssid).await? else {
             return Ok(proto::ForgetResult { removed: false });
         };
-        let connection = ConnectionProxy::builder(&self.bus).path(&path).map_err(bus_err)?.build().await.map_err(bus_err)?;
+        let connection = ConnectionProxy::builder(&self.bus)
+            .path(&path)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
         connection.delete().await.map_err(bus_err)?;
         Ok(proto::ForgetResult { removed: true })
     }
@@ -497,10 +568,22 @@ mod tests {
     #[test]
     fn security_flags_map_to_what_a_client_must_ask_for() {
         assert_eq!(security_of(0, 0, 0), proto::Security::Open);
-        assert_eq!(security_of(nm::AP_FLAGS_PRIVACY, 0, 0), proto::Security::Wep);
-        assert_eq!(security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_PSK, 0), proto::Security::WpaPsk);
-        assert_eq!(security_of(nm::AP_FLAGS_PRIVACY, 0, nm::SEC_KEY_MGMT_PSK), proto::Security::WpaPsk);
-        assert_eq!(security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_SAE, 0), proto::Security::Wpa3Sae);
+        assert_eq!(
+            security_of(nm::AP_FLAGS_PRIVACY, 0, 0),
+            proto::Security::Wep
+        );
+        assert_eq!(
+            security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_PSK, 0),
+            proto::Security::WpaPsk
+        );
+        assert_eq!(
+            security_of(nm::AP_FLAGS_PRIVACY, 0, nm::SEC_KEY_MGMT_PSK),
+            proto::Security::WpaPsk
+        );
+        assert_eq!(
+            security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_SAE, 0),
+            proto::Security::Wpa3Sae
+        );
         assert_eq!(
             security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_802_1X, 0),
             proto::Security::Enterprise
@@ -509,12 +592,20 @@ mod tests {
         // A WPA2/WPA3 transition AP advertises both; SAE wins, because a client offering SAE
         // gets the better of the two and PSK still works underneath.
         assert_eq!(
-            security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_PSK | nm::SEC_KEY_MGMT_SAE, 0),
+            security_of(
+                nm::AP_FLAGS_PRIVACY,
+                nm::SEC_KEY_MGMT_PSK | nm::SEC_KEY_MGMT_SAE,
+                0
+            ),
             proto::Security::Wpa3Sae
         );
         // Enterprise outranks everything: attempting a PSK join there cannot work.
         assert_eq!(
-            security_of(nm::AP_FLAGS_PRIVACY, nm::SEC_KEY_MGMT_PSK | nm::SEC_KEY_MGMT_802_1X, 0),
+            security_of(
+                nm::AP_FLAGS_PRIVACY,
+                nm::SEC_KEY_MGMT_PSK | nm::SEC_KEY_MGMT_802_1X,
+                0
+            ),
             proto::Security::Enterprise
         );
     }
@@ -539,6 +630,9 @@ mod tests {
         );
         // An unmapped reason must not masquerade as a wrong password — that would send a user
         // round a loop retyping a key that was already correct.
-        assert_eq!(failure_of(nm::STATE_FAILED, 999).0, proto::ConnectFailure::Other);
+        assert_eq!(
+            failure_of(nm::STATE_FAILED, 999).0,
+            proto::ConnectFailure::Other
+        );
     }
 }

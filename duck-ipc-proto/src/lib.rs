@@ -364,7 +364,7 @@ impl Call {
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
             | Call::RobotStop => Value::Object(serde_json::Map::new()),
-            | Call::NetStatus
+            Call::NetStatus
             | Call::NetScan
             | Call::SystemInfo
             | Call::SystemReboot
@@ -767,7 +767,14 @@ impl std::fmt::Debug for NetConnectParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetConnectParams")
             .field("ssid", &self.ssid)
-            .field("psk", if self.psk.is_some() { &"<redacted>" } else { &"<none>" })
+            .field(
+                "psk",
+                if self.psk.is_some() {
+                    &"<redacted>"
+                } else {
+                    &"<none>"
+                },
+            )
             .finish()
     }
 }
@@ -1461,12 +1468,18 @@ mod tests {
                 ssid: "Pollen Guest".into(),
                 psk: Some("hunter2 with spaces".into()),
             }),
-            Call::NetForget(NetForgetParams { ssid: "Old Network".into() }),
+            Call::NetForget(NetForgetParams {
+                ssid: "Old Network".into(),
+            }),
             Call::SystemInfo,
-            Call::SystemSetName(SetNameParams { name: "duck-01".into() }),
+            Call::SystemSetName(SetNameParams {
+                name: "duck-01".into(),
+            }),
             Call::SystemReboot,
             Call::SystemPairingPin,
-            Call::SystemSetPairingPin(SetPairingPinParams { pin: "042042".into() }),
+            Call::SystemSetPairingPin(SetPairingPinParams {
+                pin: "042042".into(),
+            }),
         ]
     }
 
@@ -1830,12 +1843,18 @@ mod tests {
         };
 
         let debug = format!("{params:?}");
-        assert!(!debug.contains(secret), "the key reached Debug output: {debug}");
+        assert!(
+            !debug.contains(secret),
+            "the key reached Debug output: {debug}"
+        );
         assert!(debug.contains("Home"), "{debug}");
         // Presence still visible: "wrong password" and "no password sent" are different bugs.
         assert!(debug.contains("redacted"), "{debug}");
 
-        let open = NetConnectParams { ssid: "Cafe".into(), psk: None };
+        let open = NetConnectParams {
+            ssid: "Cafe".into(),
+            psk: None,
+        };
         assert!(format!("{open:?}").contains("none"), "{open:?}");
     }
 
@@ -1848,11 +1867,17 @@ mod tests {
         };
         let line = serde_json::to_string(&params).unwrap();
         assert!(line.contains("s3cret"), "{line}");
-        assert_eq!(serde_json::from_str::<NetConnectParams>(&line).unwrap(), params);
+        assert_eq!(
+            serde_json::from_str::<NetConnectParams>(&line).unwrap(),
+            params
+        );
 
         // An open network omits the field rather than sending null, so a backend can tell
         // "no key" from "empty key".
-        let open = NetConnectParams { ssid: "Cafe".into(), psk: None };
+        let open = NetConnectParams {
+            ssid: "Cafe".into(),
+            psk: None,
+        };
         assert!(!serde_json::to_string(&open).unwrap().contains("psk"));
     }
 

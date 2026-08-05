@@ -67,7 +67,11 @@ pub struct Pool {
 
 impl Pool {
     pub fn new(sockets: Sockets, replies: mpsc::Sender<String>) -> Self {
-        Self { sockets, conns: HashMap::new(), replies }
+        Self {
+            sockets,
+            conns: HashMap::new(),
+            replies,
+        }
     }
 
     /// Send one line to `upstream`, connecting first if needed.
@@ -97,7 +101,10 @@ impl Pool {
             }
             Err(_) => {
                 self.conns.remove(&upstream);
-                Err(io::Error::new(io::ErrorKind::TimedOut, "upstream write timed out"))
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "upstream write timed out",
+                ))
             }
         }
     }

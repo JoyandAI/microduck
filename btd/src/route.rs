@@ -193,9 +193,11 @@ mod tests {
     fn the_pairing_pin_is_not_reachable_over_ble() {
         assert_eq!(upstream_for(&proto::Call::SystemPairingPin), None);
         assert_eq!(
-            upstream_for(&proto::Call::SystemSetPairingPin(proto::SetPairingPinParams {
-                pin: "000000".into()
-            })),
+            upstream_for(&proto::Call::SystemSetPairingPin(
+                proto::SetPairingPinParams {
+                    pin: "000000".into()
+                }
+            )),
             None
         );
     }
@@ -206,13 +208,25 @@ mod tests {
         for call in [
             proto::Call::NetStatus,
             proto::Call::NetScan,
-            proto::Call::NetConnect(proto::NetConnectParams { ssid: "Home".into(), psk: None }),
-            proto::Call::NetForget(proto::NetForgetParams { ssid: "Home".into() }),
+            proto::Call::NetConnect(proto::NetConnectParams {
+                ssid: "Home".into(),
+                psk: None,
+            }),
+            proto::Call::NetForget(proto::NetForgetParams {
+                ssid: "Home".into(),
+            }),
             proto::Call::SystemInfo,
-            proto::Call::SystemSetName(proto::SetNameParams { name: "duck".into() }),
+            proto::Call::SystemSetName(proto::SetNameParams {
+                name: "duck".into(),
+            }),
             proto::Call::SystemReboot,
         ] {
-            assert_eq!(upstream_for(&call), Some(Upstream::Config), "{}", call.method());
+            assert_eq!(
+                upstream_for(&call),
+                Some(Upstream::Config),
+                "{}",
+                call.method()
+            );
         }
     }
 
@@ -221,13 +235,20 @@ mod tests {
     #[test]
     fn the_refused_calls_stay_refused() {
         for call in [
-            proto::Call::Rollback(proto::ComponentParams { component: component() }),
-            proto::Call::ResetToGolden(proto::ComponentParams { component: component() }),
+            proto::Call::Rollback(proto::ComponentParams {
+                component: component(),
+            }),
+            proto::Call::ResetToGolden(proto::ComponentParams {
+                component: component(),
+            }),
             proto::Call::Select(proto::SelectParams {
                 component: component(),
                 version: semver::Version::new(1, 0, 0),
             }),
-            proto::Call::Pin(proto::PinParams { component: component(), version: None }),
+            proto::Call::Pin(proto::PinParams {
+                component: component(),
+                version: None,
+            }),
             proto::Call::RobotSafeToRestart,
             proto::Call::RobotModelApi,
             proto::Call::RobotRemoteSessionActive,
@@ -241,7 +262,12 @@ mod tests {
     #[test]
     fn the_app_path_is_reachable() {
         let expected = [
-            (proto::Call::Hello(proto::HelloParams { api_version: proto::API_VERSION }), Upstream::Updater),
+            (
+                proto::Call::Hello(proto::HelloParams {
+                    api_version: proto::API_VERSION,
+                }),
+                Upstream::Updater,
+            ),
             (proto::Call::Status, Upstream::Updater),
             (proto::Call::Subscribe, Upstream::Updater),
             (proto::Call::RobotHealth, Upstream::Robot),
@@ -255,11 +281,17 @@ mod tests {
     /// for different things.
     #[test]
     fn a_refusal_says_permission_denied_and_names_the_method() {
-        let call = proto::Call::ResetToGolden(proto::ComponentParams { component: component() });
+        let call = proto::Call::ResetToGolden(proto::ComponentParams {
+            component: component(),
+        });
         let err = refusal(&call);
 
         assert_eq!(err.code, proto::code::PERMISSION_DENIED);
-        assert!(err.message.contains(proto::method::RESET_TO_GOLDEN), "{}", err.message);
+        assert!(
+            err.message.contains(proto::method::RESET_TO_GOLDEN),
+            "{}",
+            err.message
+        );
     }
 
     /// Every variant, so the tests above cannot silently skip one. The exhaustive match in
@@ -268,19 +300,35 @@ mod tests {
     fn every_call() -> Vec<proto::Call> {
         let version = semver::Version::new(1, 4, 2);
         vec![
-            proto::Call::Hello(proto::HelloParams { api_version: proto::API_VERSION }),
-            proto::Call::Check(proto::ComponentParams { component: component() }),
+            proto::Call::Hello(proto::HelloParams {
+                api_version: proto::API_VERSION,
+            }),
+            proto::Call::Check(proto::ComponentParams {
+                component: component(),
+            }),
             proto::Call::Apply(proto::ApplyParams {
                 component: component(),
                 target: proto::Target::Latest,
                 options: proto::ApplyOptions::default(),
             }),
-            proto::Call::Rollback(proto::ComponentParams { component: component() }),
-            proto::Call::ResetToGolden(proto::ComponentParams { component: component() }),
-            proto::Call::Select(proto::SelectParams { component: component(), version: version.clone() }),
-            proto::Call::Pin(proto::PinParams { component: component(), version: Some(version) }),
+            proto::Call::Rollback(proto::ComponentParams {
+                component: component(),
+            }),
+            proto::Call::ResetToGolden(proto::ComponentParams {
+                component: component(),
+            }),
+            proto::Call::Select(proto::SelectParams {
+                component: component(),
+                version: version.clone(),
+            }),
+            proto::Call::Pin(proto::PinParams {
+                component: component(),
+                version: Some(version),
+            }),
             proto::Call::Status,
-            proto::Call::ListInstalled(proto::ComponentParams { component: component() }),
+            proto::Call::ListInstalled(proto::ComponentParams {
+                component: component(),
+            }),
             proto::Call::Log(proto::LogParams { limit: 20 }),
             proto::Call::Subscribe,
             proto::Call::RobotSafeToRestart,
@@ -293,11 +341,19 @@ mod tests {
                 ssid: "Home".into(),
                 psk: Some("secret".into()),
             }),
-            proto::Call::NetForget(proto::NetForgetParams { ssid: "Home".into() }),
+            proto::Call::NetForget(proto::NetForgetParams {
+                ssid: "Home".into(),
+            }),
             proto::Call::SystemInfo,
-            proto::Call::SystemSetName(proto::SetNameParams { name: "duck".into() }),
+            proto::Call::SystemSetName(proto::SetNameParams {
+                name: "duck".into(),
+            }),
             proto::Call::SystemReboot,
-            proto::Call::RobotMove(proto::MoveParams { vx: 0.1, vy: 0.0, vyaw: 0.0 }),
+            proto::Call::RobotMove(proto::MoveParams {
+                vx: 0.1,
+                vy: 0.0,
+                vyaw: 0.0,
+            }),
             proto::Call::RobotHead(proto::HeadParams {
                 neck_pitch: 0.0,
                 head_pitch: 0.0,
@@ -308,7 +364,9 @@ mod tests {
             proto::Call::RobotEnable(proto::EnableParams { on: true }),
             proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
             proto::Call::SystemPairingPin,
-            proto::Call::SystemSetPairingPin(proto::SetPairingPinParams { pin: "000000".into() }),
+            proto::Call::SystemSetPairingPin(proto::SetPairingPinParams {
+                pin: "000000".into(),
+            }),
         ]
     }
 }

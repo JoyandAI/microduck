@@ -25,8 +25,8 @@
 
 use std::time::Duration;
 
-use btd::gatt::{RPC_UUID, SERVICE_UUID};
 use btd::framing::{self, Reassembler};
+use btd::gatt::{RPC_UUID, SERVICE_UUID};
 use btleplug::api::{
     Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
 };
@@ -127,17 +127,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // some platforms ignore the filter and return everything, which is why the name check below
     // still happens.
     adapter
-        .start_scan(ScanFilter { services: vec![SERVICE_UUID] })
+        .start_scan(ScanFilter {
+            services: vec![SERVICE_UUID],
+        })
         .await?;
     tokio::time::sleep(SCAN_TIME).await;
 
     let mut found: Vec<(Peripheral, String)> = Vec::new();
     for peripheral in adapter.peripherals().await? {
-        let Some(properties) = peripheral.properties().await? else { continue };
+        let Some(properties) = peripheral.properties().await? else {
+            continue;
+        };
         if !properties.services.contains(&SERVICE_UUID) {
             continue;
         }
-        let name = properties.local_name.unwrap_or_else(|| properties.address.to_string());
+        let name = properties
+            .local_name
+            .unwrap_or_else(|| properties.address.to_string());
         found.push((peripheral, name));
     }
     let _ = adapter.stop_scan().await;
@@ -150,7 +156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if matches!(cli.command, Command::Scan) {
         for (peripheral, name) in &found {
-            let address = peripheral.properties().await?.map(|p| p.address.to_string());
+            let address = peripheral
+                .properties()
+                .await?
+                .map(|p| p.address.to_string());
             println!("{name}  {}", address.unwrap_or_default());
         }
         return Ok(());
@@ -185,7 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 20 bytes — the floor every BLE link guarantees — is the safe assumption. Slower than
     // necessary on a good link, and correct on every link.
     for chunk in framing::chunks(&line, 20) {
-        peripheral.write(&request, &chunk, WriteType::WithoutResponse).await?;
+        peripheral
+            .write(&request, &chunk, WriteType::WithoutResponse)
+            .await?;
     }
 
     let mut reassembler = Reassembler::new();
@@ -236,13 +247,16 @@ fn characteristics(
     let all = peripheral.characteristics();
     let find = |uuid| all.iter().find(|c| c.uuid == uuid).cloned();
 
-    let rpc = find(RPC_UUID)
-        .ok_or("the robot has no RPC characteristic; is this the right service?")?;
+    let rpc =
+        find(RPC_UUID).ok_or("the robot has no RPC characteristic; is this the right service?")?;
 
     // One characteristic carries both directions, so it must be able to do both. Checking rather
     // than assuming turns a confusing silence — a write that lands nowhere — into a message
     // naming which half is missing.
-    if !rpc.properties.intersects(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE) {
+    if !rpc
+        .properties
+        .intersects(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE)
+    {
         return Err("the RPC characteristic is not writable".into());
     }
     if !rpc.properties.contains(CharPropFlags::NOTIFY) {
@@ -284,8 +298,9 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         ),
         Command::Call { method, params } => {
             let params = match params {
-                Some(text) => serde_json::from_str(text)
-                    .map_err(|e| format!("params must be JSON: {e}"))?,
+                Some(text) => {
+                    serde_json::from_str(text).map_err(|e| format!("params must be JSON: {e}"))?
+                }
                 None => serde_json::json!({}),
             };
             (method.as_str(), params, SLOW_REPLY_TIMEOUT)

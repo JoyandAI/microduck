@@ -108,7 +108,10 @@ fn resolve_uid(name: &str) -> Option<u32> {
     // buffer or null. Read immediately and nothing is retained.
     let entry = unsafe { libc::getpwnam(cname.as_ptr()) };
     if entry.is_null() {
-        tracing::warn!(user = name, "no such user; it cannot change this robot's configuration");
+        tracing::warn!(
+            user = name,
+            "no such user; it cannot change this robot's configuration"
+        );
         return None;
     }
     let uid = unsafe { (*entry).pw_uid };
@@ -121,7 +124,10 @@ fn resolve_gid(name: &str) -> Option<u32> {
     // Safety: as above, for the group database.
     let entry = unsafe { libc::getgrnam(cname.as_ptr()) };
     if entry.is_null() {
-        tracing::warn!(group = name, "no such group; it cannot change this robot's configuration");
+        tracing::warn!(
+            group = name,
+            "no such group; it cannot change this robot's configuration"
+        );
         return None;
     }
     let gid = unsafe { (*entry).gr_gid };
@@ -182,8 +188,16 @@ async fn main() -> ExitCode {
         store: Store::new(args.state_dir.join("config.json"), hostname()),
         policy: PeerPolicy {
             owner_uid: unsafe { libc::getuid() },
-            allow_uids: args.allow_user.iter().filter_map(|name| resolve_uid(name)).collect(),
-            allow_gids: args.allow_group.iter().filter_map(|name| resolve_gid(name)).collect(),
+            allow_uids: args
+                .allow_user
+                .iter()
+                .filter_map(|name| resolve_uid(name))
+                .collect(),
+            allow_gids: args
+                .allow_group
+                .iter()
+                .filter_map(|name| resolve_gid(name))
+                .collect(),
         },
     });
 
@@ -302,7 +316,9 @@ async fn handle(service: Arc<Service>, stream: UnixStream) -> std::io::Result<()
         };
 
         // Notifications get no reply, per the spec.
-        let Some(id) = request.id.clone() else { continue };
+        let Some(id) = request.id.clone() else {
+            continue;
+        };
 
         let response = match request.as_call() {
             Ok(call) => dispatch(&service, peer.as_ref(), id, &call).await,
@@ -353,7 +369,13 @@ async fn dispatch(
             // `params` redacts the key in its own Debug, which is what makes logging the request
             // safe. See `NetConnectParams` in duck-ipc-proto.
             tracing::info!(?params, "joining a network");
-            reply(id, service.net.connect(&params.ssid, params.psk.as_deref()).await)
+            reply(
+                id,
+                service
+                    .net
+                    .connect(&params.ssid, params.psk.as_deref())
+                    .await,
+            )
         }
         proto::Call::NetForget(params) => reply(id, service.net.forget(&params.ssid).await),
 
@@ -408,7 +430,9 @@ async fn dispatch(
             power::schedule();
             proto::Response::ok(
                 Some(id),
-                &proto::RebootResult { in_seconds: power::REBOOT_DELAY.as_secs() },
+                &proto::RebootResult {
+                    in_seconds: power::REBOOT_DELAY.as_secs(),
+                },
             )
         }
 

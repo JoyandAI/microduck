@@ -640,7 +640,12 @@ fn run_monitor(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> 
 /// `robotctl health && do_the_thing`, which `install.sh` relies on. Nothing else here affects
 /// the exit code: a flat pack, a hot motor and a pinned component are all *reported*, and a
 /// command that failed because of a low battery would be a command nobody could script.
-fn run_health(socket: &Path, robot_socket: &Path, config_socket: &Path, json: bool) -> Result<(), Failure> {
+fn run_health(
+    socket: &Path,
+    robot_socket: &Path,
+    config_socket: &Path,
+    json: bool,
+) -> Result<(), Failure> {
     let mut report = HealthReport {
         robot: None,
         robot_error: None,
@@ -826,7 +831,12 @@ fn render_health(report: &HealthReport) -> String {
     out
 }
 
-fn run_version(socket: &Path, robot_socket: &Path, config_socket: &Path, json: bool) -> Result<(), Failure> {
+fn run_version(
+    socket: &Path,
+    robot_socket: &Path,
+    config_socket: &Path,
+    json: bool,
+) -> Result<(), Failure> {
     let report = collect_version_report(socket, robot_socket, config_socket);
 
     if json {
@@ -844,7 +854,11 @@ fn run_version(socket: &Path, robot_socket: &Path, config_socket: &Path, json: b
 ///
 /// Shared by `version` and `health` so the software half of a support report is gathered one
 /// way. Two commands assembling it separately is how they start disagreeing.
-fn collect_version_report(socket: &Path, robot_socket: &Path, config_socket: &Path) -> VersionReport {
+fn collect_version_report(
+    socket: &Path,
+    robot_socket: &Path,
+    config_socket: &Path,
+) -> VersionReport {
     let build = proto::build_info!();
     let mut report = VersionReport {
         robotctl: build.version.to_owned(),
@@ -1259,10 +1273,22 @@ fn run_net(socket: &Path, command: NetCommand) -> Result<(), Failure> {
             proto::Call::NetForget(proto::NetForgetParams { ssid: ssid.clone() }),
             *json,
         ),
-        NetCommand::Connect { ssid, psk, psk_stdin, json } => {
-            let psk = if *psk_stdin { Some(read_secret()?) } else { psk.clone() };
+        NetCommand::Connect {
+            ssid,
+            psk,
+            psk_stdin,
+            json,
+        } => {
+            let psk = if *psk_stdin {
+                Some(read_secret()?)
+            } else {
+                psk.clone()
+            };
             (
-                proto::Call::NetConnect(proto::NetConnectParams { ssid: ssid.clone(), psk }),
+                proto::Call::NetConnect(proto::NetConnectParams {
+                    ssid: ssid.clone(),
+                    psk,
+                }),
                 *json,
             )
         }
@@ -1328,7 +1354,10 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
         SystemCommand::Info { .. } => {
             let info: proto::SystemInfoResult = decode(&result)?;
             println!("name    {}", info.name);
-            println!("serial  {}", info.serial.as_deref().unwrap_or("not provisioned"));
+            println!(
+                "serial  {}",
+                info.serial.as_deref().unwrap_or("not provisioned")
+            );
             println!("uptime  {}", format_uptime(info.uptime_seconds));
         }
         SystemCommand::SetName { .. } => {
@@ -1363,7 +1392,10 @@ fn render_net_status(result: &serde_json::Value) -> Result<String, Failure> {
     let mut out = String::new();
     let _ = writeln!(out, "state   {:?}", status.state);
     if let Some(ssid) = &status.ssid {
-        let signal = status.signal.map(|s| format!("  ({s}%)")).unwrap_or_default();
+        let signal = status
+            .signal
+            .map(|s| format!("  ({s}%)"))
+            .unwrap_or_default();
         let _ = writeln!(out, "ssid    {ssid}{signal}");
     }
     if let Some(ip4) = &status.ip4 {
@@ -1455,7 +1487,11 @@ fn read_secret() -> Result<String, Failure> {
 }
 
 fn format_uptime(seconds: u64) -> String {
-    let (days, hours, minutes) = (seconds / 86400, (seconds % 86400) / 3600, (seconds % 3600) / 60);
+    let (days, hours, minutes) = (
+        seconds / 86400,
+        (seconds % 86400) / 3600,
+        (seconds % 3600) / 60,
+    );
     if days > 0 {
         format!("{days}d {hours}h {minutes}m")
     } else if hours > 0 {
@@ -1474,7 +1510,9 @@ fn decode<T: for<'de> serde::Deserialize<'de>>(value: &serde_json::Value) -> Res
     serde_json::from_value(value.clone()).map_err(|e| {
         Failure::new(
             exit::FAILED,
-            format!("cannot read the daemon's answer ({e}). Are robotctl and configd the same build?"),
+            format!(
+                "cannot read the daemon's answer ({e}). Are robotctl and configd the same build?"
+            ),
         )
     })
 }

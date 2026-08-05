@@ -264,4 +264,3 @@ fn spawn_session(
         tracing::debug!(peer = %address, "radio writer closed");
     });
 }
-

@@ -39,11 +39,19 @@ pub struct Link {
 
 impl Link {
     /// A link wired to channels the caller drives. Used by tests and by `--fake`.
-    pub fn pair(mtu: usize, peer: impl Into<String>) -> (Self, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    pub fn pair(
+        mtu: usize,
+        peer: impl Into<String>,
+    ) -> (Self, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
         let (to_robot, inbound) = mpsc::channel(QUEUE);
         let (outbound, from_robot) = mpsc::channel(QUEUE);
         (
-            Self { inbound, outbound, mtu, peer: peer.into() },
+            Self {
+                inbound,
+                outbound,
+                mtu,
+                peer: peer.into(),
+            },
             to_robot,
             from_robot,
         )

@@ -67,7 +67,11 @@ impl FakeNet {
 
     pub fn with_visible(visible: Vec<(proto::Network, Option<String>)>) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(FakeState { visible, saved: Vec::new(), connected: None }),
+            inner: tokio::sync::Mutex::new(FakeState {
+                visible,
+                saved: Vec::new(),
+                connected: None,
+            }),
         }
     }
 }
@@ -113,7 +117,10 @@ impl Net for FakeNet {
         let mut networks: Vec<proto::Network> = state
             .visible
             .iter()
-            .map(|(n, _)| proto::Network { saved: state.saved.contains(&n.ssid), ..n.clone() })
+            .map(|(n, _)| proto::Network {
+                saved: state.saved.contains(&n.ssid),
+                ..n.clone()
+            })
             .collect();
         networks.sort_by_key(|n| std::cmp::Reverse(n.signal));
         Ok(proto::NetScanResult { networks })
@@ -166,7 +173,9 @@ impl Net for FakeNet {
         if state.connected.as_deref() == Some(ssid) {
             state.connected = None;
         }
-        Ok(proto::ForgetResult { removed: state.saved.len() != before })
+        Ok(proto::ForgetResult {
+            removed: state.saved.len() != before,
+        })
     }
 }
 
@@ -180,7 +189,10 @@ mod tests {
         let result = net.connect("Pollen", Some("wrong")).await.unwrap();
         assert!(matches!(
             result,
-            proto::ConnectResult::Failed { reason: proto::ConnectFailure::BadKey, .. }
+            proto::ConnectResult::Failed {
+                reason: proto::ConnectFailure::BadKey,
+                ..
+            }
         ));
     }
 
@@ -192,7 +204,10 @@ mod tests {
         let result = net.connect("Pollen", None).await.unwrap();
         assert!(matches!(
             result,
-            proto::ConnectResult::Failed { reason: proto::ConnectFailure::Unsupported, .. }
+            proto::ConnectResult::Failed {
+                reason: proto::ConnectFailure::Unsupported,
+                ..
+            }
         ));
     }
 
@@ -201,7 +216,10 @@ mod tests {
         let net = FakeNet::new();
         assert!(matches!(
             net.connect("Nowhere", Some("k")).await.unwrap(),
-            proto::ConnectResult::Failed { reason: proto::ConnectFailure::NotFound, .. }
+            proto::ConnectResult::Failed {
+                reason: proto::ConnectFailure::NotFound,
+                ..
+            }
         ));
     }
 
@@ -222,10 +240,20 @@ mod tests {
         assert!(status.ip4.is_some(), "connected with no address");
 
         let saved = net.scan().await.unwrap();
-        assert!(saved.networks.iter().find(|n| n.ssid == "Pollen").unwrap().saved);
+        assert!(
+            saved
+                .networks
+                .iter()
+                .find(|n| n.ssid == "Pollen")
+                .unwrap()
+                .saved
+        );
 
         assert!(net.forget("Pollen").await.unwrap().removed);
-        assert_eq!(net.status().await.unwrap().state, proto::NetState::Disconnected);
+        assert_eq!(
+            net.status().await.unwrap().state,
+            proto::NetState::Disconnected
+        );
         // Forgetting again is not an error — a client must not present it as one.
         assert!(!net.forget("Pollen").await.unwrap().removed);
     }
@@ -245,6 +273,9 @@ mod tests {
     async fn scan_results_are_sorted_by_signal() {
         let net = FakeNet::new();
         let networks = net.scan().await.unwrap().networks;
-        assert!(networks.windows(2).all(|w| w[0].signal >= w[1].signal), "{networks:?}");
+        assert!(
+            networks.windows(2).all(|w| w[0].signal >= w[1].signal),
+            "{networks:?}"
+        );
     }
 }

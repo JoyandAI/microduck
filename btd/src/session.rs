@@ -136,7 +136,8 @@ fn encode(response: &proto::Response) -> String {
     // A Response is plain strings, ints and enums; this cannot fail. If it somehow did,
     // sending nothing would hang the client, so send something it can parse as an error.
     serde_json::to_string(response).unwrap_or_else(|_| {
-        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}"#.to_owned()
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}"#
+            .to_owned()
     })
 }
 
@@ -160,10 +161,18 @@ mod tests {
     }
 
     impl FakeDaemon {
-        fn spawn(dir: &std::path::Path, name: &str, replies: Vec<String>) -> (PathBuf, Receiver<String>) {
+        fn spawn(
+            dir: &std::path::Path,
+            name: &str,
+            replies: Vec<String>,
+        ) -> (PathBuf, Receiver<String>) {
             let path = dir.join(name);
             let (seen, seen_rx) = mpsc::channel(16);
-            let daemon = FakeDaemon { path: path.clone(), seen, replies };
+            let daemon = FakeDaemon {
+                path: path.clone(),
+                seen,
+                replies,
+            };
 
             let listener = UnixListener::bind(&daemon.path).expect("bind");
             tokio::spawn(async move {
@@ -220,14 +229,25 @@ mod tests {
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
 
         let (link, to_robot, mut from_robot) = Link::pair(23, "AA:BB");
-        tokio::spawn(run(link, sockets(dir.path(), "updaterd.sock", "robotd.sock")));
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
 
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"api_version":2}}"#;
         to_robot.send(request.as_bytes().to_vec()).await.unwrap();
         to_robot.send(b"\n".to_vec()).await.unwrap();
 
-        assert_eq!(seen.recv().await.unwrap(), request, "not forwarded byte for byte");
-        assert!(read_reply(&mut from_robot).await.contains(r#""api_version":2"#));
+        assert_eq!(
+            seen.recv().await.unwrap(),
+            request,
+            "not forwarded byte for byte"
+        );
+        assert!(
+            read_reply(&mut from_robot)
+                .await
+                .contains(r#""api_version":2"#)
+        );
     }
 
     /// A refused call must never touch the upstream. Answering correctly is not enough — the
@@ -239,7 +259,10 @@ mod tests {
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
 
         let (link, to_robot, mut from_robot) = Link::pair(23, "AA:BB");
-        tokio::spawn(run(link, sockets(dir.path(), "updaterd.sock", "robotd.sock")));
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
 
         to_robot.send(
             format!("{}\n", r#"{"jsonrpc":"2.0","id":9,"method":"update.resetToGolden","params":{"component":"daemon"}}"#)
@@ -247,7 +270,10 @@ mod tests {
         ).await.unwrap();
 
         let reply = read_reply(&mut from_robot).await;
-        assert!(reply.contains(&proto::code::PERMISSION_DENIED.to_string()), "{reply}");
+        assert!(
+            reply.contains(&proto::code::PERMISSION_DENIED.to_string()),
+            "{reply}"
+        );
 
         // Nothing arrived at the daemon, and "nothing" needs a moment to be provable.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -260,17 +286,33 @@ mod tests {
     async fn robot_calls_go_to_robotd() {
         let dir = tempdir();
         let (_, mut updater_seen) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
-        let (_, mut robot_seen) = FakeDaemon::spawn(dir.path(), "robotd.sock",
-            vec![r#"{"jsonrpc":"2.0","id":2,"result":{"healthy":true}}"#.into()]);
+        let (_, mut robot_seen) = FakeDaemon::spawn(
+            dir.path(),
+            "robotd.sock",
+            vec![r#"{"jsonrpc":"2.0","id":2,"result":{"healthy":true}}"#.into()],
+        );
 
         let (link, to_robot, mut from_robot) = Link::pair(185, "AA:BB");
-        tokio::spawn(run(link, sockets(dir.path(), "updaterd.sock", "robotd.sock")));
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
 
-        to_robot.send(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"robot.health\"}\n".to_vec()).await.unwrap();
+        to_robot
+            .send(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"robot.health\"}\n".to_vec())
+            .await
+            .unwrap();
 
         assert!(robot_seen.recv().await.unwrap().contains("robot.health"));
-        assert!(read_reply(&mut from_robot).await.contains(r#""healthy":true"#));
-        assert!(updater_seen.try_recv().is_err(), "robotd's call went to updaterd");
+        assert!(
+            read_reply(&mut from_robot)
+                .await
+                .contains(r#""healthy":true"#)
+        );
+        assert!(
+            updater_seen.try_recv().is_err(),
+            "robotd's call went to updaterd"
+        );
     }
 
     /// A subscription is a stream of notifications on an open connection, and every one has to
@@ -289,9 +331,15 @@ mod tests {
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
 
         let (link, to_robot, mut from_robot) = Link::pair(23, "AA:BB");
-        tokio::spawn(run(link, sockets(dir.path(), "updaterd.sock", "robotd.sock")));
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
 
-        to_robot.send(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"update.subscribe\"}\n".to_vec()).await.unwrap();
+        to_robot
+            .send(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"update.subscribe\"}\n".to_vec())
+            .await
+            .unwrap();
 
         // A 23-byte MTU means each of these arrives in several chunks, so this also proves
         // reassembly survives back-to-back messages.
@@ -311,16 +359,26 @@ mod tests {
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
 
         let (link, to_robot, mut from_robot) = Link::pair(185, "AA:BB");
-        tokio::spawn(run(link, sockets(dir.path(), "updaterd.sock", "robotd.sock")));
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
 
         to_robot.send(b"not json at all\n".to_vec()).await.unwrap();
         let reply = read_reply(&mut from_robot).await;
-        assert!(reply.contains(&proto::code::PARSE_ERROR.to_string()), "{reply}");
+        assert!(
+            reply.contains(&proto::code::PARSE_ERROR.to_string()),
+            "{reply}"
+        );
         assert!(reply.contains(r#""id":null"#), "{reply}");
 
         // Still usable.
         to_robot.send(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"hello\",\"params\":{\"api_version\":2}}\n".to_vec()).await.unwrap();
-        assert!(read_reply(&mut from_robot).await.contains(r#""api_version":2"#));
+        assert!(
+            read_reply(&mut from_robot)
+                .await
+                .contains(r#""api_version":2"#)
+        );
     }
 
     /// A daemon that is not running must produce a diagnosable error naming it, rather than a
@@ -333,9 +391,15 @@ mod tests {
         // No robotd socket at all.
 
         let (link, to_robot, mut from_robot) = Link::pair(185, "AA:BB");
-        tokio::spawn(run(link, sockets(dir.path(), "updaterd.sock", "absent.sock")));
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "absent.sock"),
+        ));
 
-        to_robot.send(b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"robot.health\"}\n".to_vec()).await.unwrap();
+        to_robot
+            .send(b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"robot.health\"}\n".to_vec())
+            .await
+            .unwrap();
 
         let reply = read_reply(&mut from_robot).await;
         assert!(reply.contains("Robot is not answering"), "{reply}");
@@ -350,7 +414,10 @@ mod tests {
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
 
         let (link, to_robot, mut from_robot) = Link::pair(185, "AA:BB");
-        tokio::spawn(run(link, sockets(dir.path(), "updaterd.sock", "robotd.sock")));
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
 
         to_robot.send(
             format!("{}\n", r#"{"jsonrpc":"2.0","method":"update.resetToGolden","params":{"component":"daemon"}}"#)
@@ -358,13 +425,22 @@ mod tests {
         ).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(from_robot.try_recv().is_err(), "a notification was answered");
-        assert!(seen.try_recv().is_err(), "a refused notification was forwarded");
+        assert!(
+            from_robot.try_recv().is_err(),
+            "a notification was answered"
+        );
+        assert!(
+            seen.try_recv().is_err(),
+            "a refused notification was forwarded"
+        );
     }
 
     /// Sockets live in a temp directory, and unix socket paths are short by necessity — a
     /// long temp path would exceed `sun_path` and fail to bind for reasons unrelated to btd.
     fn tempdir() -> tempfile::TempDir {
-        tempfile::Builder::new().prefix("btd").tempdir().expect("tempdir")
+        tempfile::Builder::new()
+            .prefix("btd")
+            .tempdir()
+            .expect("tempdir")
     }
 }

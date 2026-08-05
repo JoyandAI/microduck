@@ -36,7 +36,9 @@ pub fn schedule() {
 #[cfg(target_os = "linux")]
 async fn reboot() -> Result<(), String> {
     // `Reboot(false)` — false meaning "not interactive", so logind does not try to ask anyone.
-    let bus = zbus::Connection::system().await.map_err(|e| e.to_string())?;
+    let bus = zbus::Connection::system()
+        .await
+        .map_err(|e| e.to_string())?;
     bus.call_method(
         Some("org.freedesktop.login1"),
         "/org/freedesktop/login1",
