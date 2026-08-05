@@ -41,6 +41,11 @@ MOTOR_PORT="${MOTOR_PORT:-/dev/ttyS2}"
 
 ENV_TXT=/boot/armbianEnv.txt
 
+# Boot args of the *running* kernel. A variable, like MOTOR_PORT and ENV_TXT above, so the
+# console check can be exercised against a fixture instead of only on a board that happens to
+# be misconfigured — which is the state you least want to discover the check is wrong in.
+CMDLINE="${CMDLINE:-/proc/cmdline}"
+
 BT_CONF=/etc/bluetooth/main.conf
 
 # Optionally pair a gamepad, e.g. PAD_MAC=78:86:2E:BB:13:28 sh setup-board.sh
@@ -55,9 +60,27 @@ PAD_MAC="${PAD_MAC:-}"
 # Where this script puts itself so it is still around after the reboot it asks for.
 SELF=/usr/local/sbin/robot-setup-board
 
+# Where the sibling scripts come from, for the commands this prints. Same override names as
+# `install.sh`, so a fork or a pinned tag is one decision for the whole bring-up rather than
+# per script. Nothing here is fetched by this script — see `fetch_cmd`.
+REPO="${DUCK_REPO:-pollen-robotics/microduck_daemon}"
+REF="${DUCK_REF:-main}"
+RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
+
+# For a private repository: a token with read access to contents. Only ever interpolated into
+# the commands this prints, and by name (`$DUCK_TOKEN`) rather than by value — a bring-up log
+# gets pasted into chat, and a token that leaks that way cannot be rotated without touching
+# every board. What it decides is *which form* to print, not what to run.
+TOKEN="${DUCK_TOKEN:-}"
+
 # Wifi migration lives in its own script — see `check_network` for why. Named here so the
 # advice this prints and the thing it points at cannot drift apart.
-MIGRATE=migrate-network.sh
+#
+# A full path, not a bare filename: the advice is copy-pasted, and `sudo sh migrate-network.sh`
+# only works from whichever directory happens to hold it. /tmp is where the fetch this prints
+# puts it, and where an operator following the README already has it.
+MIGRATE_NAME=migrate-network.sh
+MIGRATE="/tmp/${MIGRATE_NAME}"
 # Where that script leaves itself once run, which is what to point at after a reboot: by then
 # the copy in /tmp is gone, and telling someone to run a file that no longer exists is worse
 # than telling them nothing.
@@ -76,6 +99,68 @@ persisted=0
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# The command that puts a sibling script on this board, as a string to *print*.
+#
+# This script downloads exactly one thing — the ONNX Runtime tarball, from a public
+# microsoft/onnxruntime release — so it never needs a token itself. Its siblings do, while
+# the repository is private, and every step of bring-up that told someone to fetch one
+# without a header sent them into a 404 that reads like a wrong URL.
+#
+# Two forms, keyed on whether this run was given a token, because the wrong one is worse than
+# no advice: a private repo not told to send one 404s, and a public one told to send an unset
+# or stale one gets an auth failure rather than the file. Printing the form that matches the
+# situation this script is actually in is the only version an operator can paste blind.
+#
+# `$DUCK_TOKEN` stays unexpanded so the printed line is safe to paste into a bug report.
+fetch_cmd() {
+    # $1 script name, e.g. migrate-network.sh
+    if [ -n "$TOKEN" ]; then
+        # shellcheck disable=SC2016  # $DUCK_TOKEN must stay literal — see above.
+        printf 'curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" %s/%s -o /tmp/%s' \
+            "$RAW" "$1" "$1"
+    else
+        printf 'curl -fsSL %s/%s -o /tmp/%s' "$RAW" "$1" "$1"
+    fi
+}
+
+# How to run the wifi migration *from where this board actually is*, as a string to print.
+#
+# Three states, and naming the wrong one wastes a round trip: once run it lives at a
+# persistent path, before that it is a file in /tmp, and on a board that has not fetched it
+# there is nothing to run at all — which is the state a fresh board is in, and the one the
+# advice used to ignore.
+migrate_advice() {
+    if [ -x "$MIGRATE_SELF" ]; then
+        printf 'sudo %s' "$MIGRATE_SELF"
+    elif [ -f "$MIGRATE" ]; then
+        printf 'sudo sh %s' "$MIGRATE"
+    else
+        printf '%s\n    sudo sh %s' "$(fetch_cmd "$MIGRATE_NAME")" "$MIGRATE"
+    fi
+}
+
+# Which serial port the *running* kernel prints to — bare tty name, no baud — or nothing.
+#
+# `case` globs rather than a regex: the two substitutions in `free_motor_port` are already
+# split for exactly this reason, since BRE alternation differs between sed dialects and fails
+# by matching nothing. A check that silently never fires is worse here than no check.
+#
+# ttyFIQ* counts. It is Rockchip's FIQ debugger rather than an 8250, but it is attached to the
+# SoC debug UART — uart2 on the RK3566, which is the motor bus — so a kernel printing there
+# lands on the same wires. Worth naming even though the caller then hedges on the mapping.
+kernel_console_tty() {
+    for arg in $(cat "$CMDLINE" 2>/dev/null || true); do
+        case "$arg" in
+            console=ttyS*|console=ttyAMA*|console=ttyFIQ*) ;;
+            *) continue ;;
+        esac
+        arg="${arg#console=}"
+        # console=ttyS2,1500000 — the baud is not part of the device name.
+        printf '%s' "${arg%%,*}"
+        return 0
+    done
+}
 
 # Leave a copy somewhere that survives a reboot.
 #
@@ -103,7 +188,9 @@ persist_self() {
 }
 
 check_environment() {
-    [ "$(id -u)" = 0 ] || die "run as root (sudo sh setup-board.sh)"
+    # No path in the message: whatever the operator just typed is what needs `sudo` in front,
+    # and naming a file here is how the advice drifted from where the file actually is.
+    [ "$(id -u)" = 0 ] || die "run as root — re-run that same command with sudo"
 
     arch="$(uname -m)"
     [ "$arch" = aarch64 ] || die "this targets aarch64 boards, and this box is ${arch}"
@@ -243,13 +330,7 @@ install_onnxruntime() {
 # still on netplan answers every `net.*` call with "no such device", which is a confusing
 # failure to meet later rather than named here.
 check_network() {
-    # Prefer the persisted copy when it exists: after the reboot the migration asks for, the
-    # one in /tmp is gone.
-    if [ -x "$MIGRATE_SELF" ]; then
-        migrate_cmd="sudo ${MIGRATE_SELF}"
-    else
-        migrate_cmd="sudo sh ${MIGRATE}"
-    fi
+    migrate_cmd="$(migrate_advice)"
 
     if ! command -v nmcli >/dev/null 2>&1; then
         warn "wifi is still netplan's, so configd cannot manage it. Migrate first:
@@ -471,11 +552,35 @@ report() {
         printf '  %-22s %s\n' "motor bus owner" "free"
     fi
 
-    if grep -qE '(^| )console=tty(S|AMA)' /proc/cmdline 2>/dev/null; then
-        printf '  %-22s %s\n' "kernel console" "still on a serial port"
-        warn "the kernel prints to a UART (see /proc/cmdline). If that is ${MOTOR_PORT},
-  kernel messages will corrupt servo traffic intermittently. Set console=display in
-  ${ENV_TXT} and reboot."
+    # `/proc/cmdline` is the kernel that is *running*; `free_motor_port` edits ${ENV_TXT} for
+    # the kernel that will run *next*. They cannot agree until a reboot — so on the very run
+    # that fixed this, an unqualified "still on a serial port / set console=display" reads as
+    # "the fix did not take", and costs a round trip to disprove. Three distinct states.
+    console_tty="$(kernel_console_tty)"
+    if [ -n "$console_tty" ]; then
+        if [ "/dev/${console_tty}" = "$MOTOR_PORT" ]; then
+            console_what="${console_tty} (the motor bus)"
+        else
+            console_what="${console_tty}"
+        fi
+
+        if [ -f "$ENV_TXT" ] && grep -q '^console=display$' "$ENV_TXT"; then
+            if [ "$needs_reboot" = 1 ]; then
+                # Already handled. Say which way it is going, and do not warn.
+                printf '  %-22s %s\n' "kernel console" "${console_what}, until the reboot"
+            else
+                printf '  %-22s %s\n' "kernel console" "${console_what} — CONFLICT"
+                warn "${ENV_TXT} says console=display, yet this boot still prints to
+  ${console_tty}. Something outside that line wins — an extraargs= in ${ENV_TXT}, or bootargs
+  baked into U-Boot. Find it in /proc/cmdline; editing console= again will not help."
+            fi
+        else
+            printf '  %-22s %s\n' "kernel console" "${console_what}"
+            warn "the kernel prints to ${console_tty} and ${ENV_TXT} does not say
+  console=display, so this script left it alone — it only rewrites console=both and
+  console=serial. Kernel messages on the motor UART corrupt servo replies intermittently,
+  which is an unpatterned bus fault. Set console=display in ${ENV_TXT} and reboot."
+        fi
     fi
 
     if [ -e "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
@@ -530,8 +635,11 @@ report() {
         if [ "$persisted" = 1 ]; then
             echo "  sudo ${SELF}"
         else
-            echo "  # then fetch and run this script again — it was not copied anywhere"
-            echo "  # persistent, so /tmp will have cleared it"
+            # Piped in, so there was no file to persist. Print the fetch rather than a comment
+            # saying one is needed — /tmp is cleared by the reboot this is asking for, and the
+            # operator has no shell history to recover the command from either.
+            printf '  %s\n' "$(fetch_cmd setup-board.sh)"
+            echo "  sudo sh /tmp/setup-board.sh"
         fi
         cat <<'EOF'
 
@@ -542,16 +650,28 @@ EOF
     fi
 
     say "board ready — install the daemon next"
-    cat <<'EOF'
+    echo
+    printf '  %s\n' "$(fetch_cmd install.sh)"
+    if [ -n "$TOKEN" ]; then
+        # Literal, not expanded: this line gets pasted around, and the value must not.
+        # shellcheck disable=SC2016
+        printf '  %s\n' 'sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/install.sh'
+        cat <<'EOF'
 
-  URL=https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh
-  curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" "$URL" -o /tmp/install.sh
-  sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/install.sh
-
-  While the repository is private, both halves need the token: raw.githubusercontent.com
-  404s without it, and sudo does not pass the variable through on its own. Once the
+  Both halves need the token while the repository is private: raw.githubusercontent.com 404s
+  without the header, and sudo does not pass the variable through on its own. Once the
   repository is public, drop the header and the prefix.
 EOF
+    else
+        echo "  sudo sh /tmp/install.sh"
+        cat <<'EOF'
+
+  If that 404s rather than downloading, the repository is private and needs a token — a 404
+  is what GitHub returns for a private path, so it looks like a wrong URL. Export DUCK_TOKEN
+  and re-run this script: it reprints these two lines with the header and the sudo prefix.
+  install.sh needs the token for the release assets as well, not only for the fetch.
+EOF
+    fi
 }
 
 main() {

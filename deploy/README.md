@@ -18,16 +18,52 @@ device-tree overlays, ONNX Runtime — which changes rarely and needs a reboot. 
 installs a signed daemon release, which happens on every update. Conflating them would mean
 every update re-litigating boot configuration.
 
+Plus one that will not last: `migrate-network.sh` exists only because Armbian's stock image
+ships netplan, and it is numbered 1b below rather than 2 for that reason — it gets deleted, not
+maintained.
+
+**0. While the repository is private, set up the token first.** Every fetch below is from a
+private repo, and `raw.githubusercontent.com` answers **404** rather than 401 for a private
+path with no credentials — so `curl -f` reports what looks like a wrong URL. Create a
+fine-grained token (resource owner `pollen-robotics`, repository `microduck_daemon`,
+permission **Contents: Read-only**) and put it in the shell you are about to work in. That one
+permission also covers the release assets `updaterd` fetches later.
+
+```bash
+export DUCK_TOKEN=github_pat_replace_with_your_token
+```
+
+```bash
+RAW=https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts
+```
+
+```bash
+AUTH="Authorization: Bearer $DUCK_TOKEN"
+```
+
+These three are re-exported after any reboot. Once the repository is public, drop `AUTH` and
+the `-H` from each fetch.
+
+This token is for *your shell*, to fetch scripts. The one `updaterd` needs afterwards to reach
+release assets is a different decision with different consequences — see
+[While the repository is private, a robot needs a token](#-while-the-repository-is-private-a-robot-needs-a-token)
+below. Step 2 is where the two meet: passing `DUCK_TOKEN` to `install.sh` is what writes the
+robot's systemd drop-in, so it outlives the shell.
+
 **1. Prepare the board.** Idempotent, and it never reboots on its own: if it changes boot
 config it says so and stops, and running it again afterwards continues.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/setup-board.sh -o /tmp/setup-board.sh
+curl -fsSL -H "$AUTH" "$RAW/setup-board.sh" -o /tmp/setup-board.sh
 ```
 
 ```bash
 sudo sh /tmp/setup-board.sh
 ```
+
+No token on the `sudo` line, unlike step 2: the only thing this script downloads is the ONNX
+Runtime tarball from a public `microsoft/onnxruntime` release. It needs credentials to be
+*fetched*, not to run.
 
 The first run copies itself to `/usr/local/sbin/robot-setup-board`, so after the reboot it
 asks for there is still something to run:
@@ -55,11 +91,58 @@ the same reason, so the file is patched directly.
 ⚠ A kernel upgrade that repoints `/boot/{Image,dtb,uInitrd}` can undo it. A board that stops
 seeing its motors after an `apt upgrade` needs this re-run.
 
+⚠ The `kernel console` line in that status block reads `until the reboot` when the script has
+already fixed it and only the running kernel is stale — `/proc/cmdline` cannot change without
+a reboot. Anything else there is a real finding.
+
+**1b. Move wifi to NetworkManager** — while Armbian's stock image still ships netplan. A
+separate script because it has a different lifetime and a different risk: it disappears the day
+we build an image with NetworkManager in it, and it is the one step that can make a headless
+board unreachable. `setup-board.sh` only *checks* which stack owns wifi, and warns, because
+`configd` drives NetworkManager over D-Bus — a board still on netplan answers every `net.*`
+call with "no such device".
+
+```bash
+curl -fsSL -H "$AUTH" "$RAW/migrate-network.sh" -o /tmp/migrate-network.sh
+```
+
+```bash
+sudo sh /tmp/migrate-network.sh
+```
+
+```bash
+sudo reboot
+```
+
+```bash
+sudo /usr/local/sbin/robot-migrate-network
+```
+
+Four commands, not three: it must run **twice**, either side of the reboot. The first run arms
+a boot-time backstop that reverts to netplan if `wlan0` gets no IPv4 address, so a bad cutover
+costs a reboot instead of a serial cable; the second run retires it. Leaving it armed means any
+later boot where wifi is merely slow reverts the board — `setup-board.sh` warns while it is
+still there.
+
+It takes the SSID and key from netplan itself — `/run/netplan/wpa-wlan0.conf` if netplan
+generated one, otherwise the `access-points:` stanza in `/etc/netplan/*.yaml` — so an SSH
+session over that same wifi survives. If it can read neither it changes **nothing** and prints
+the two `nmcli` commands to create the profile by hand; re-running afterwards keeps the profile
+it finds.
+
 **2. Install the daemon.**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh | sudo sh
+curl -fsSL -H "$AUTH" "$RAW/install.sh" -o /tmp/install.sh
 ```
+
+```bash
+sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/install.sh
+```
+
+Two commands rather than the obvious `curl … | sudo sh`, and both halves need the token while
+the repository is private: the header for the fetch, and the `DUCK_TOKEN` prefix because `sudo`
+does not pass the variable through on its own. Piping to `sudo sh` cannot carry either.
 
 Needs `curl` and coreutils and nothing else — `tar` and `zstd` are linked into `updaterd`,
 so there is no package to install first. Idempotent, and it never overwrites an existing

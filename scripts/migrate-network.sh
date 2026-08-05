@@ -22,9 +22,12 @@
 #
 # Run it twice, either side of the reboot — the second run retires the backstop:
 #
-#   sudo sh migrate-network.sh
+#   sudo sh /tmp/migrate-network.sh
 #   sudo reboot
 #   sudo /usr/local/sbin/robot-migrate-network
+#
+# Full paths, because this advice gets copy-pasted: `sh migrate-network.sh` only works from
+# whichever directory happens to hold the file, and it is fetched to /tmp.
 #
 # Then continue with `setup-board.sh`.
 #
@@ -41,6 +44,15 @@ NET_CHECK_UNIT=/etc/systemd/system/robot-net-check.service
 # Where this script puts itself so it is still around after the reboot it asks for.
 SELF=/usr/local/sbin/robot-migrate-network
 
+# Where this script came from, for the commands it prints. Same override names as install.sh
+# and setup-board.sh, so a fork or a pinned tag is one decision for the whole bring-up.
+REPO="${DUCK_REPO:-pollen-robotics/microduck_daemon}"
+REF="${DUCK_REF:-main}"
+RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
+# For a private repository. Only ever interpolated into printed commands, and by name rather
+# than by value: a bring-up log gets pasted into chat.
+TOKEN="${DUCK_TOKEN:-}"
+
 # Whether this run staged the cutover, which decides what the closing advice must warn about.
 cutover=0
 
@@ -48,9 +60,26 @@ say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# These four helpers are duplicated from setup-board.sh rather than sourced. Both scripts are
+# These helpers are duplicated from setup-board.sh rather than sourced. Both scripts are
 # fetched and run standalone — `curl … | sh` cannot source a sibling — so sharing them would
 # cost a delivery mechanism to save twenty lines of shell.
+
+# The command that puts this script back on the board, as a string to print. Needed because a
+# piped invocation leaves no file to persist, and the reboot below clears /tmp — so the one
+# state where the operator has nothing is also the one that used to print a comment instead of
+# a command. Two forms, keyed on whether this run was given a token: a private repo 404s
+# without the header, and a public one sent an unset or stale token gets an auth failure
+# rather than the file.
+fetch_cmd() {
+    # $1 script name
+    if [ -n "$TOKEN" ]; then
+        # shellcheck disable=SC2016  # $DUCK_TOKEN must stay literal.
+        printf 'curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" %s/%s -o /tmp/%s' \
+            "$RAW" "$1" "$1"
+    else
+        printf 'curl -fsSL %s/%s -o /tmp/%s' "$RAW" "$1" "$1"
+    fi
+}
 
 # Write stdin to $1, and say whether that changed anything.
 #
@@ -96,7 +125,9 @@ persist_self() {
 }
 
 check_environment() {
-    [ "$(id -u)" = 0 ] || die "run as root (sudo sh migrate-network.sh)"
+    # No path in the message: whatever the operator just typed is what needs `sudo` in front,
+    # and naming a file here is how the advice drifted from where the file actually is.
+    [ "$(id -u)" = 0 ] || die "run as root — re-run that same command with sudo"
 
     for tool in systemctl apt-get install mktemp; do
         command -v "$tool" >/dev/null 2>&1 || die "${tool} is required"
@@ -187,11 +218,101 @@ EOF
     fi
 }
 
-# Copy the credentials netplan is currently using into an NM profile.
+# Strip one matching pair of surrounding quotes, and nothing else.
 #
-# Reads `/run/netplan/wpa-wlan0.conf` rather than parsing the YAML: netplan generates it from
-# the YAML in a flat, regular format, so it is both authoritative and parseable without a YAML
-# parser. It only exists while netplan still owns wifi — which is exactly now.
+# Not a `tr -d`: a passphrase may legitimately contain a quote, and silently deleting it
+# produces a profile that is created, accepted, and never associates — the failure this whole
+# script is most careful to avoid.
+unquote() {
+    printf '%s' "$1" | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# Credentials out of `/run/netplan/wpa-wlan0.conf` — what netplan generated for
+# wpa_supplicant. Sets `_ssid`, `_psk`, `_keymgmt`. Returns 1 if that file cannot answer.
+#
+# Preferred over the YAML because it is netplan's *own* translation: flat, regular, parseable
+# without a YAML parser, and it has already resolved key management, so a WPA3 network arrives
+# as SAE rather than being guessed at.
+credentials_from_wpa_conf() {
+    _wpa=/run/netplan/wpa-wlan0.conf
+    [ -f "$_wpa" ] || return 1
+
+    _ssid="$(sed -n 's/^[[:space:]]*ssid="\(.*\)"[[:space:]]*$/\1/p' "$_wpa" | head -1)"
+    [ -n "$_ssid" ] || return 1
+
+    # A quoted passphrase and a 64-hex pre-shared key are both valid here, and NM accepts
+    # either — so the quotes are stripped and the value passed through as it came.
+    _psk="$(unquote "$(sed -n 's/^[[:space:]]*psk=\(.*\)$/\1/p' "$_wpa" | head -1)")"
+
+    # WPA3-only networks are key_mgmt=SAE and must not be described as wpa-psk, or the profile
+    # is created and silently never associates.
+    if grep -qi '^[[:space:]]*key_mgmt=.*SAE' "$_wpa"; then
+        _keymgmt=sae
+    else
+        _keymgmt=wpa-psk
+    fi
+    return 0
+}
+
+# The same, from the netplan YAML. Sets `_ssid`, `_psk`, `_keymgmt`. Returns 1 if it cannot.
+#
+# The runtime file above is a *derived* artifact, and a board can be associated without it on
+# disk. This one arrived that way: netplan had a `wifis:` stanza in
+# /etc/netplan/30-wifis-dhcp.yaml, wifi was up, and /run/netplan/wpa-wlan0.conf did not exist —
+# so the migration refused and told the operator to hand-type a key they had already given
+# netplan once. Refusing is right when the credentials are genuinely unknown; they were not.
+#
+# Parsing YAML with awk is only defensible because of how narrow the shape is: netplan's own
+# schema, two levels under `access-points:`, no anchors, and the only flow mapping anything
+# writes there is the empty `{}` of an open network. If it finds nothing it says so and the
+# caller still refuses — a wrong guess here strands a headless board, so silence beats
+# invention.
+credentials_from_netplan_yaml() {
+    # $1 the YAML file with the wifis: stanza
+    [ -f "$1" ] || return 1
+
+    _parsed="$(awk '
+        /^[[:space:]]*access-points:[[:space:]]*$/ { inap = 1; next }
+        inap && ssid == "" {
+            line = $0
+            # "SSID: {}" is an access point with no options — an open network. Reduced to
+            # "SSID:" so one match below covers both spellings. Without this an open network
+            # reads as credentials that could not be found, which sends the operator off to
+            # type a password that does not exist.
+            sub(/:[[:space:]]*\{[[:space:]]*\}[[:space:]]*$/, ":", line)
+            # Ends in a colon, so `dhcp4: true` after the block cannot be taken for an SSID.
+            if (line ~ /^[[:space:]]*[^[:space:]#-][^:]*:[[:space:]]*$/) {
+                sub(/^[[:space:]]*/, "", line); sub(/:[[:space:]]*$/, "", line)
+                ssid = line
+            }
+            next
+        }
+        ssid != "" && /^[[:space:]]*password:/ {
+            line = $0
+            sub(/^[[:space:]]*password:[[:space:]]*/, "", line)
+            psk = line
+            exit
+        }
+        END { if (ssid != "") printf "%s\t%s\n", ssid, psk }
+    ' "$1")"
+
+    _ssid="$(unquote "$(printf '%s' "$_parsed" | cut -f1)")"
+    [ -n "$_ssid" ] || return 1
+    _psk="$(unquote "$(printf '%s' "$_parsed" | cut -f2)")"
+
+    # netplan spells WPA3 as `key-management: sae` under an `auth:` block. Checked across the
+    # whole file rather than within the access point: one wifis: stanza, one network, and a
+    # false positive here is a profile that will not associate on WPA2 — so it is reported.
+    if grep -qi 'key-management:[[:space:]]*sae' "$1"; then
+        _keymgmt=sae
+        say "netplan declares WPA3 (sae) for this network"
+    else
+        _keymgmt=wpa-psk
+    fi
+    return 0
+}
+
+# Copy the credentials netplan is currently using into an NM profile.
 #
 # Returns 0 if a profile exists afterwards, 1 if there was nothing to migrate.
 migrate_wifi_profile() {
@@ -200,25 +321,13 @@ migrate_wifi_profile() {
         return 0
     fi
 
-    _wpa=/run/netplan/wpa-wlan0.conf
-    if [ ! -f "$_wpa" ]; then
-        return 1
-    fi
-
-    _ssid="$(sed -n 's/^[[:space:]]*ssid="\(.*\)"[[:space:]]*$/\1/p' "$_wpa" | head -1)"
-    [ -n "$_ssid" ] || return 1
-
-    _psk="$(sed -n 's/^[[:space:]]*psk=\(.*\)$/\1/p' "$_wpa" | head -1)"
-    # A quoted passphrase and a 64-hex pre-shared key are both valid here, and NM accepts
-    # either — so the quotes are stripped and the value passed through as it came.
-    _psk="$(printf '%s' "$_psk" | sed 's/^"\(.*\)"$/\1/')"
-
-    # WPA3-only networks are key_mgmt=SAE and must not be described as wpa-psk, or the profile
-    # is created and silently never associates.
-    if grep -qi '^[[:space:]]*key_mgmt=.*SAE' "$_wpa"; then
-        _keymgmt=sae
+    _ssid=""; _psk=""; _keymgmt=wpa-psk
+    if credentials_from_wpa_conf; then
+        :
+    elif credentials_from_netplan_yaml "$1"; then
+        say "no /run/netplan/wpa-wlan0.conf; read the credentials from $1 instead"
     else
-        _keymgmt=wpa-psk
+        return 1
     fi
 
     say "migrating wifi credentials for \"${_ssid}\" into NetworkManager"
@@ -322,13 +431,15 @@ cut_over() {
         _netplan_wifi="$_found"
     fi
 
-    if [ -n "$_netplan_wifi" ] && ! migrate_wifi_profile; then
-        die "netplan has a wifis: stanza in ${_netplan_wifi} but its credentials could not be
-  read from /run/netplan/wpa-wlan0.conf, so handing wifi to NetworkManager would take this
-  board off the network with no way back. Nothing was changed.
-  Create the profile by hand, then re-run:
-    nmcli connection add type wifi con-name ${NM_PROFILE} ifname wlan0 ssid \"YOUR_SSID\"
-    nmcli connection modify ${NM_PROFILE} wifi-sec.key-mgmt wpa-psk wifi-sec.psk \"YOUR_PASSWORD\""
+    if [ -n "$_netplan_wifi" ] && ! migrate_wifi_profile "$_netplan_wifi"; then
+        die "netplan has a wifis: stanza in ${_netplan_wifi} but no credentials could be read
+  from it or from /run/netplan/wpa-wlan0.conf, so handing wifi to NetworkManager would take
+  this board off the network with no way back. Nothing was changed.
+  Check what is actually in there:
+    sudo grep -A4 access-points ${_netplan_wifi}
+  Then create the profile by hand and re-run this script, which will keep it:
+    sudo nmcli connection add type wifi con-name ${NM_PROFILE} ifname wlan0 ssid \"YOUR_SSID\"
+    sudo nmcli connection modify ${NM_PROFILE} wifi-sec.key-mgmt wpa-psk wifi-sec.psk \"YOUR_PASSWORD\""
     fi
 
     # Only arm the backstop when there is a wifi network to come back up on. On a board with
@@ -372,8 +483,10 @@ report() {
         if [ "$persisted" = 1 ]; then
             echo "  sudo ${SELF}"
         else
-            echo "  # then fetch and run this script again — it was not copied anywhere"
-            echo "  # persistent, so /tmp will have cleared it"
+            # Piped in, so there was no file to copy anywhere persistent, and the reboot
+            # clears /tmp. Print the fetch rather than a note saying one is needed.
+            printf '  %s\n' "$(fetch_cmd migrate-network.sh)"
+            echo "  sudo sh /tmp/migrate-network.sh"
         fi
         cat <<EOF
 
@@ -392,12 +505,16 @@ EOF
         nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>/dev/null \
             | sed 's/^/  /' || true
     fi
-    cat <<'EOF'
-
-  Continue with board bring-up:
-
-  sudo sh setup-board.sh
-EOF
+    # A full path and the persisted copy first, for the same reason this script's own advice
+    # uses one: the operator is in their home directory, not wherever the file landed.
+    echo
+    echo "  Continue with board bring-up:"
+    echo
+    if [ -x /usr/local/sbin/robot-setup-board ]; then
+        echo "  sudo /usr/local/sbin/robot-setup-board"
+    else
+        echo "  sudo sh /tmp/setup-board.sh"
+    fi
 }
 
 main() {
