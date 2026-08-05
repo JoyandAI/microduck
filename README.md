@@ -163,7 +163,7 @@ A board provisioned for this in one command, from a clone — it sends your dev 
 reboot and streams the log:
 
 ```bash
-./scripts/provision-board.sh pierre@192.168.1.42 --ref my-branch
+./scripts/provision-board.sh radxa@192.168.1.42 --ref my-branch
 ```
 
 Add `--local` to send this clone's `provision.sh` instead of fetching it, which is how to test a

@@ -2,7 +2,7 @@
 # Provision a board from your own machine, in one command.
 #
 #   export DUCK_TOKEN=...              # only while the repository is private
-#   ./scripts/provision-board.sh pierre@192.168.1.42
+#   ./scripts/provision-board.sh radxa@192.168.1.42
 #
 # The target is `[user@]host`, and the host can be a name or an address. An address is the
 # normal case on this hardware: mDNS on the Radxa image is unreliable, so `radxa-zero3.local`

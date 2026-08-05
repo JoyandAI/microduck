@@ -27,7 +27,7 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-./scripts/provision-board.sh pierre@192.168.1.42
+./scripts/provision-board.sh radxa@192.168.1.42
 ```
 
 That sends the dev key from `~/.duck-keys/team.dev.pub` if you have one, starts provisioning,
@@ -43,7 +43,7 @@ the board's host keys, so the address you used last time now presents a differen
 script recognises that failure and names the fix; `--forget-host-key` does it for you:
 
 ```bash
-./scripts/provision-board.sh pierre@192.168.1.42 --forget-host-key
+./scripts/provision-board.sh radxa@192.168.1.42 --forget-host-key
 ```
 
 Which matters more than it sounds, because a DHCP lease gets reused: the address that was one
@@ -61,7 +61,7 @@ Three commands, the first from your machine, and what `provision-board.sh` is do
 behalf above:
 
 ```bash
-scp ~/.duck-keys/team.dev.pub pierre@192.168.1.42:/tmp/
+scp ~/.duck-keys/team.dev.pub radxa@192.168.1.42:/tmp/
 ```
 
 ```bash
