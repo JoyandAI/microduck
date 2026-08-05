@@ -33,16 +33,11 @@ permission also covers the release assets `updaterd` fetches later.
 export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
-```bash
-RAW=https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts
-```
-
-```bash
-AUTH="Authorization: Bearer $DUCK_TOKEN"
-```
-
-These three are re-exported after any reboot. Once the repository is public, drop `AUTH` and
-the `-H` from each fetch.
+**That is the only thing to set.** Every command below carries its own URL and header, so
+nothing else has to be defined per board or re-established after a reboot — one line, not
+three, and each block below pastes on its own. The lines are long on purpose; they are meant to
+be pasted, not typed. Once the repository is public, drop the `-H` from each fetch and the
+token entirely.
 
 This token is for *your shell*, to fetch scripts. The one `updaterd` needs afterwards to reach
 release assets is a different decision with different consequences — see
@@ -50,11 +45,15 @@ release assets is a different decision with different consequences — see
 below. Step 2 is where the two meet: passing `DUCK_TOKEN` to `install.sh` is what writes the
 robot's systemd drop-in, so it outlives the shell.
 
+To provision from a branch instead of `main`, swap the `main` in each URL below, and add
+`DUCK_REF=<branch>` to the `sudo` line in step 2 — that one governs what `install.sh` itself
+fetches, not where these three files came from.
+
 **1. Prepare the board.** Idempotent, and it never reboots on its own: if it changes boot
 config it says so and stops, and running it again afterwards continues.
 
 ```bash
-curl -fsSL -H "$AUTH" "$RAW/setup-board.sh" -o /tmp/setup-board.sh
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/setup-board.sh -o /tmp/setup-board.sh
 ```
 
 ```bash
@@ -103,7 +102,7 @@ board unreachable. `setup-board.sh` only *checks* which stack owns wifi, and war
 call with "no such device".
 
 ```bash
-curl -fsSL -H "$AUTH" "$RAW/migrate-network.sh" -o /tmp/migrate-network.sh
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/migrate-network.sh -o /tmp/migrate-network.sh
 ```
 
 ```bash
@@ -133,7 +132,7 @@ it finds.
 **2. Install the daemon.**
 
 ```bash
-curl -fsSL -H "$AUTH" "$RAW/install.sh" -o /tmp/install.sh
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh -o /tmp/install.sh
 ```
 
 ```bash
