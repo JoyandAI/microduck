@@ -34,10 +34,23 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 **That is the only thing to set.** Every command below carries its own URL and header, so
-nothing else has to be defined per board or re-established after a reboot — one line, not
-three, and each block below pastes on its own. The lines are long on purpose; they are meant to
-be pasted, not typed. Once the repository is public, drop the `-H` from each fetch and the
-token entirely.
+nothing else has to be defined per board, and each block pastes on its own. The lines are long
+on purpose; they are meant to be pasted, not typed. Once the repository is public, drop the `-H`
+from each fetch and the token entirely.
+
+Provisioning reboots twice, though, and an `export` does not survive that. Keep it for the rest
+of this flash — idempotent, so re-running it replaces the line rather than adding another:
+
+```bash
+touch ~/.profile && sed -i '/^export DUCK_TOKEN=/d' ~/.profile && printf 'export DUCK_TOKEN=%s\n' "$DUCK_TOKEN" >> ~/.profile && chmod 600 ~/.profile
+```
+
+That is a credential at rest in a home directory, which is why it is `chmod 600` and why it is
+a **developer board** decision. It is the same trade the robot's own token makes one section
+down, for the same reason and with the same limit: fine on a board you provision and reflash,
+never on a robot you ship. Reflashing the card takes it with everything else, so this persists
+across the reboots in this flash and nothing further. To undo it early:
+`sed -i '/^export DUCK_TOKEN=/d' ~/.profile`.
 
 This token is for *your shell*, to fetch scripts. The one `updaterd` needs afterwards to reach
 release assets is a different decision with different consequences — see
