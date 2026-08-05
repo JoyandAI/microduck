@@ -113,228 +113,90 @@ is not: wifi still belongs to netplan, so add the two `migrate-network.sh` lines
 above — without the header — before installing the daemon. `setup-board.sh` says so if it
 applies.
 
-## Installing a robot from scratch
+## Notes on the steps above
 
-Two steps, because they answer to different things. `setup-board.sh` is OS-level bring-up —
+Two scripts because they answer to different things. `setup-board.sh` is OS-level bring-up —
 device-tree overlays, ONNX Runtime — which changes rarely and needs a reboot. `install.sh`
 installs a signed daemon release, which happens on every update. Conflating them would mean
-every update re-litigating boot configuration.
+every update re-litigating boot configuration. `migrate-network.sh` is a third that will not
+last: it exists only because Armbian's stock image ships netplan, and it gets deleted rather
+than maintained the day we build an image with NetworkManager in it.
 
-Plus one that will not last: `migrate-network.sh` exists only because Armbian's stock image
-ships netplan, and it is numbered 1b below rather than 2 for that reason — it gets deleted, not
-maintained.
+**The token, and why a wrong URL is the wrong diagnosis.** `raw.githubusercontent.com` answers
+**404**, not 401, for a private path with no credentials, so a missing header looks exactly like
+a typo. There are two separate tokens in play: the one in your shell, which fetches scripts, and
+the one `updaterd` needs to reach release assets — [that one](#-while-the-repository-is-private-a-robot-needs-a-token)
+is a systemd drop-in and outlives the shell. The `install.sh` line is where the two meet:
+passing `DUCK_TOKEN` to it is what writes the drop-in.
 
-**0. While the repository is private, set up the token first.** Every fetch below is from a
-private repo, and `raw.githubusercontent.com` answers **404** rather than 401 for a private
-path with no credentials — so `curl -f` reports what looks like a wrong URL. Create a
-fine-grained token (resource owner `pollen-robotics`, repository `microduck_daemon`,
-permission **Contents: Read-only**) and put it in the shell you are about to work in. That one
-permission also covers the release assets `updaterd` fetches later.
-
-```bash
-export DUCK_TOKEN=github_pat_replace_with_your_token
-```
-
-**That is the only thing to set.** Every command below carries its own URL and header, so
-nothing else has to be defined per board, and each block pastes on its own. The lines are long
-on purpose; they are meant to be pasted, not typed. Once the repository is public, drop the `-H`
-from each fetch and the token entirely.
-
-Provisioning reboots twice, though, and an `export` does not survive that. Keep it for the rest
-of this flash — idempotent, so re-running it replaces the line rather than adding another:
-
-```bash
-touch ~/.profile && sed -i '/^export DUCK_TOKEN=/d' ~/.profile && printf 'export DUCK_TOKEN=%s\n' "$DUCK_TOKEN" >> ~/.profile && chmod 600 ~/.profile
-```
-
-That is a credential at rest in a home directory, which is why it is `chmod 600` and why it is
-a **developer board** decision. It is the same trade the robot's own token makes one section
-down, for the same reason and with the same limit: fine on a board you provision and reflash,
-never on a robot you ship. Reflashing the card takes it with everything else, so this persists
-across the reboots in this flash and nothing further. To undo it early:
-`sed -i '/^export DUCK_TOKEN=/d' ~/.profile`.
-
-This token is for *your shell*, to fetch scripts. The one `updaterd` needs afterwards to reach
-release assets is a different decision with different consequences — see
-[While the repository is private, a robot needs a token](#-while-the-repository-is-private-a-robot-needs-a-token)
-below. Step 2 is where the two meet: passing `DUCK_TOKEN` to `install.sh` is what writes the
-robot's systemd drop-in, so it outlives the shell.
-
-To provision from a branch instead of `main`, swap the `main` in each URL below, and add
-`DUCK_REF=<branch>` to the `sudo` line in step 2 — that one governs what `install.sh` itself
-fetches, not where these three files came from.
-
-**1. Prepare the board.** Idempotent, and it never reboots on its own: if it changes boot
-config it says so and stops, and running it again afterwards continues.
-
-```bash
-curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/setup-board.sh -o /tmp/setup-board.sh
-```
-
-```bash
-sudo sh /tmp/setup-board.sh
-```
-
-No token on the `sudo` line, unlike step 2: the only thing this script downloads is the ONNX
-Runtime tarball from a public `microsoft/onnxruntime` release. It needs credentials to be
-*fetched*, not to run.
-
-The first run copies itself to `/usr/local/sbin/robot-setup-board`, so after the reboot it
-asks for there is still something to run:
-
-```bash
-sudo reboot
-```
-
-```bash
-sudo /usr/local/sbin/robot-setup-board
-```
-
-`/tmp` is cleared on reboot, and a script whose whole job is *change boot config, reboot,
-confirm* should not delete itself in the middle of that.
-
-It ends with a status block — motor bus, ONNX Runtime, clock — so "is this board ready" is a
-question you can ask on its own, not only as a side effect of installing something.
-
-The one thing it fixes that is otherwise very hard to diagnose: Armbian ships
-`overlay_prefix=rk35xx`, but the RK3566 shares device-tree overlays with the RK3568 and they
-are named `rk3568-*.dtbo`. With the wrong prefix the loader finds nothing, the board boots
-happily, and there is simply no `/dev/ttyS2`. `armbian-config`'s overlay editor crashes for
-the same reason, so the file is patched directly.
+**`setup-board.sh`** is idempotent and never reboots on its own. The one thing it fixes that is
+otherwise very hard to diagnose: Armbian ships `overlay_prefix=rk35xx`, but the RK3566 shares
+device-tree overlays with the RK3568 and they are named `rk3568-*.dtbo`. With the wrong prefix
+the loader finds nothing, the board boots happily, and there is simply no `/dev/ttyS2`.
+`armbian-config`'s overlay editor crashes for the same reason, so the file is patched directly.
 
 ⚠ A kernel upgrade that repoints `/boot/{Image,dtb,uInitrd}` can undo it. A board that stops
 seeing its motors after an `apt upgrade` needs this re-run.
 
-⚠ The `kernel console` line in that status block reads `until the reboot` when the script has
-already fixed it and only the running kernel is stale — `/proc/cmdline` cannot change without
-a reboot. Anything else there is a real finding.
+⚠ Its `kernel console` status line reads `until the reboot` when the script has already fixed it
+and only the running kernel is stale — `/proc/cmdline` cannot change without a reboot. Anything
+else on that line is a real finding.
 
-**1b. Move wifi to NetworkManager** — while Armbian's stock image still ships netplan. A
-separate script because it has a different lifetime and a different risk: it disappears the day
-we build an image with NetworkManager in it, and it is the one step that can make a headless
-board unreachable. `setup-board.sh` only *checks* which stack owns wifi, and warns, because
-`configd` drives NetworkManager over D-Bus — a board still on netplan answers every `net.*`
-call with "no such device".
+**`migrate-network.sh`** must run **twice**, either side of a reboot: the first run arms a
+boot-time backstop that restores netplan if `wlan0` gets no IPv4 address, so a bad cutover costs
+a reboot instead of a serial cable, and the second retires it. Left armed, any later boot where
+wifi is merely slow reverts the board. It takes the SSID and key from netplan itself —
+`/run/netplan/wpa-wlan0.conf` if netplan generated one, otherwise the `access-points:` stanza in
+`/etc/netplan/*.yaml` — so an SSH session over that same wifi survives. If it can read neither it
+changes **nothing** and prints the `nmcli` commands to create the profile by hand.
 
-```bash
-curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/migrate-network.sh -o /tmp/migrate-network.sh
-```
-
-```bash
-sudo sh /tmp/migrate-network.sh
-```
-
-```bash
-sudo reboot
-```
-
-```bash
-sudo /usr/local/sbin/robot-migrate-network
-```
-
-Four commands, not three: it must run **twice**, either side of the reboot. The first run arms
-a boot-time backstop that reverts to netplan if `wlan0` gets no IPv4 address, so a bad cutover
-costs a reboot instead of a serial cable; the second run retires it. Leaving it armed means any
-later boot where wifi is merely slow reverts the board — `setup-board.sh` warns while it is
-still there.
-
-It takes the SSID and key from netplan itself — `/run/netplan/wpa-wlan0.conf` if netplan
-generated one, otherwise the `access-points:` stanza in `/etc/netplan/*.yaml` — so an SSH
-session over that same wifi survives. If it can read neither it changes **nothing** and prints
-the two `nmcli` commands to create the profile by hand; re-running afterwards keeps the profile
-it finds.
-
-**2. Install the daemon.**
-
-```bash
-curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh -o /tmp/install.sh
-```
-
-```bash
-sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/install.sh
-```
-
-Two commands rather than the obvious `curl … | sudo sh`, and both halves need the token while
-the repository is private: the header for the fetch, and the `DUCK_TOKEN` prefix because `sudo`
-does not pass the variable through on its own. Piping to `sudo sh` cannot carry either.
-
-Needs `curl` and coreutils and nothing else — `tar` and `zstd` are linked into `updaterd`,
-so there is no package to install first. Idempotent, and it never overwrites an existing
-`/etc/robot/updater.toml`.
-
-Everything it takes is an environment variable, because it is usually run through
-`curl | sh` where flags are awkward to pass:
+**`install.sh`** needs `curl` and coreutils and nothing else — `tar` and `zstd` are linked into
+`updaterd`. Idempotent, and it never overwrites an existing `/etc/robot/updater.toml`. It is two
+commands rather than `curl … | sudo sh` while the repo is private, because the header goes on the
+fetch and `sudo` does not pass a variable through on its own; a pipe carries neither. Everything
+it takes is an environment variable, since it is normally run through a pipe where flags are
+awkward:
 
 | | |
 |---|---|
 | `DUCK_TOKEN` | token for a private repo — the fetch *and* the release assets |
 | `DUCK_REPO` | the repository, for a fork or a test repo |
 | `DUCK_REF` | the branch config and keys are read from; pin to a tag for a reproducible run |
-| `DUCK_DEV_KEY` | path to `team.dev.pub` — makes this a **dev board** (below) |
+| `DUCK_DEV_KEY` | path to `team.dev.pub` — makes this a dev board (below) |
 | `DUCK_FORCE_REINSTALL` | reinstall over a live release using the release's own `updaterd` |
 
-**The first `robotctl health` will say `Permission denied`, and the install is fine** — see
-[the group note](#what-ends-up-where) below. `install.sh` prints the one command that fixes it.
+**How it installs itself.** An update needs the updater, and the updater arrives in an update.
+The way out is one bare `updaterd` binary, published as the `updaterd-bootstrap-aarch64` asset
+because a fresh board has no `zstd` to open a `.tar.zst` with. It then runs the *ordinary*
+engine — same verification, extraction, atomic swap, journal entry — so the store comes out in
+exactly the state the resident daemon expects and no bootstrap-only path can drift from how
+later updates behave. `on_apply` and `health` are forced off for the duration, because the units
+live inside the release being installed; `updaterd install` refuses to run once a release *is*
+live, so that can never silently disable auto-rollback on a working robot. `--from <dir>`
+installs from local files instead: the offline and factory path, and what CI uses to verify a
+release before publishing it.
 
 ### Making it a dev board, so `--ref <branch>` works
 
 A board refuses branch builds twice over: `allow_dev_keys` is false, and a trusted key only
-counts as a dev key if its filename ends `.dev.pub`. Both halves are needed, they are
-independent checks, and doing one without the other produces a board that still refuses branch
-builds — with a signature error that reads like a corrupt release. So pass the key to
-`install.sh` and let it do both:
+counts as a dev key if its filename ends `.dev.pub`. Both halves are needed, they are independent
+checks, and doing one without the other leaves a board that still refuses branch builds — with a
+signature error that reads like a corrupt release. `DUCK_DEV_KEY` does both.
 
-```bash
-scp ~/.duck-keys/team.dev.pub pierre@radxa-zero3:/tmp/
-```
-
-```bash
-sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
-```
+It validates before changing anything: the file must exist, must look like a minisign public key,
+and `updater.toml` must already have an `allow_dev_keys` line to flip — that key is top-level, so
+appending one would land it inside whichever `[table]` came last. It installs the key as
+`team.dev.pub` whatever the source was called, because the `.dev.` infix is what classifies it; a
+key landing under any other name is trusted as a *release* key, and branch builds would then be
+accepted as reviewed.
 
 `team.dev.pub` is deliberately not in the repository —
-[`trusted_keys/README.md`](trusted_keys/README.md) explains why. Get the public half from a
-team member, or regenerate it from the secret with
-`minisign -R -s ~/.duck-keys/team.dev.key -p team.dev.pub`.
-
-It validates before it changes anything: the file must exist, must look like a minisign public
-key, and `updater.toml` must already have an `allow_dev_keys` line to flip — that key is
-top-level, so appending one would land it inside whichever `[table]` came last. It also
-installs the key under the name `team.dev.pub` regardless of what the source file was called,
-because the `.dev.` infix is what classifies it; a key installed under any other name is
-trusted as a *release* key, and branch builds would then be accepted as reviewed.
+[`trusted_keys/README.md`](trusted_keys/README.md) explains why. Get it from a team member, or
+regenerate it from the secret with `minisign -R -s ~/.duck-keys/team.dev.key -p team.dev.pub`.
 
 The closing report says `DEV BOARD` when this is on, and prints the two commands to undo it.
 Never do it to a robot you ship.
 
-### The circularity, and how it is broken
-
-An update needs the updater, and the updater arrives in an update. The way out is one bare
-`updaterd` binary — published as the `updaterd-bootstrap-aarch64` release asset, because a
-fresh board has no `zstd` binary to open a `.tar.zst` with — run as:
-
-```bash
-updaterd install --config /etc/robot/updater.toml
-```
-
-That runs the **ordinary engine**: signature verification, extraction, the atomic swap,
-the journal entry. So the store and the update log come out in exactly the state the
-resident daemon expects on its first start, and there is no bootstrap-only code path that
-could drift from how every later update behaves. Two settings are forced for the duration
-— `on_apply` and `health` off — because the units live inside the release being installed
-and `robotd` cannot be running before its binary exists. `updaterd install` refuses to run
-once a release *is* live, so those overrides can never silently disable auto-rollback on a
-working robot; use `robotctl update apply` there.
-
-Applying an update never needed a daemon. Mutual exclusion is a file lock in `state_dir`,
-not a property of there being one process. What needs a resident daemon is everything
-*around* an update — a socket for the app to trigger through, progress to stream back, a
-timer so a mandatory release can pull a robot forward with nobody present, and a process
-at boot for the boot counter to recover through.
-
-`install` also takes `--from <dir>` to install from local files instead of the network,
-which is the offline and factory path, and what CI uses to verify a release before
-publishing it.
 
 ### ⚠ While the repository is private, a robot needs a token
 
@@ -359,7 +221,7 @@ artifact safe to serve, not obscurity, and the source stays private.
 
 ### The trust chain
 
-1. TLS to `raw.githubusercontent.com` for this script, `updater.toml` and the public keys.
+1. TLS to `raw.githubusercontent.com` for `install.sh`, `updater.toml` and the public keys.
    These cannot come from a release: nothing can be verified until the keys are present.
 2. TLS to `github.com` for the bootstrap `updaterd`. **Not yet verified.**
 3. That binary verifies the manifest and the artifact against the keys from (1), and
@@ -528,43 +390,24 @@ the incident are missing" long after the incident.
 
 ## Versions, for support
 
-The question is always "what was running?", and on this robot it has **two answers at
-once**: `updaterd` never restarts itself during an update (`updater-design.md` §4.1), so
-the running binary legitimately lags the installed release until the next reboot. Anything
-reporting a single version number is therefore misleading.
+The question is always "what was running?", and on this robot it has **two answers at once**:
+`updaterd` never restarts itself during an update (`updater-design.md` §4.1), so the running
+binary legitimately lags the installed release until the next reboot. Anything reporting a single
+version number is therefore misleading.
 
-`robotctl version` reports both, and flags the disagreement:
-
-```
-robotctl   0.1.0  rev unknown
-
-running
-  updaterd   0.1.0    rev a1b2c3d
-  robotd     0.1.0    rev a1b2c3d
-
-installed
-  daemon       0.3.0    rev deadbee
-
-! updaterd is running 0.1.0 but the installed daemon release is 0.3.0.
-  Expected right after an update — updaterd never restarts itself, so it keeps
-  running the old binary until the next reboot. ...
-```
-
-It deliberately works when `updaterd` is **down**, reporting that as a line in the report
-rather than exiting — that is when someone is most likely to run it. `--json` gives the
-same content for a support bundle.
+`robotctl version` reports both and flags the disagreement. It deliberately works when `updaterd`
+is **down**, reporting that as a line rather than exiting — that is when someone is most likely
+to run it. `--json` gives the same content for a support bundle.
 
 Four independent places a version is recoverable, so losing one is not fatal:
 
 1. **The startup log line**, first thing each daemon writes, at `warn` so it survives
-   `RUST_LOG=warn`: version, git revision, `exe` path, pid. The `exe` path is what tells
-   you which release directory the running process actually came from.
-2. **`robotctl version`**, over IPC, described above.
+   `RUST_LOG=warn`: version, revision, `exe` path, pid. The `exe` path is what tells you which
+   release directory the running process actually came from.
+2. **`robotctl version`**, over IPC.
 3. **`--version`** on every binary, for when nothing is running.
-4. **The release itself** — `version.toml` inside each release directory, and
-   `robotctl update list` showing each installed release with the revision it was built
-   from.
+4. **`version.toml`** inside each release directory, and `robotctl update list`.
 
-`revision` is compiled in from `DUCK_REVISION` at build time (CI sets it; a laptop build
-honestly reports `rev unknown, not a CI build`). It is read at compile time and never from
-git at runtime — a shipped robot has no repository.
+`revision` is compiled in from `DUCK_REVISION` at build time (CI sets it; a laptop build honestly
+reports `rev unknown, not a CI build`). Compile time, never git at runtime — a shipped robot has
+no repository.
