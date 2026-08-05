@@ -95,6 +95,13 @@ a dev-key path, and the boot id it uses to tell whether you have actually reboot
 provisioning logic of its own, on purpose: three scripts with different lifetimes should not
 become one script whose parts cannot be removed separately.
 
+The token is needed three times, and only the first two end with provisioning: fetching these
+scripts, fetching the release, and then permanently — `updaterd` reads `GITHUB_TOKEN` from a
+systemd drop-in on every later update check. Passing `DUCK_TOKEN` through is what makes updates
+work *after* provisioning, not just during it, and `provision.sh` ends by saying which of the two
+copies it removed and which one stayed. A board with no token installs fine and can then never
+fetch an update, which is most of what `updaterd` is for.
+
 It also creates the `robot` group in its first phase, which is the only reason the flow above
 has no `newgrp robot` in it. `install.sh` does the same thing correctly and too late — by the
 time it runs, your shell started before the group existed, and a process's groups are fixed when

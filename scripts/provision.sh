@@ -54,6 +54,12 @@ RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
 
 # For a private repository: a token with read access to contents. Carried across the reboot in
 # the state file rather than asked for twice — see `save_state` for why not `~/.profile`.
+#
+# It is needed three times, not once, which is why it is worth carrying: fetching these scripts,
+# fetching the release, and then *permanently* — `updaterd` reads `GITHUB_TOKEN` from a systemd
+# drop-in on every later update check. `install.sh` writes that drop-in when it is given a token,
+# so passing it through in phase 2 is what makes updates work after provisioning, not just
+# during it. `finish` says where it ended up.
 TOKEN="$ENV_TOKEN"
 
 # Path to `team.dev.pub`, to make this a dev board. Usually somewhere under /tmp because it
@@ -322,11 +328,39 @@ phase_two() {
     finish
 }
 
-# Take the credential back out. Provisioning is over, and a token that stays behind is one
-# nobody remembers is there — the state file's whole justification was crossing the reboot.
+# Drop the state file, and account for the token that is *supposed* to stay.
+#
+# There are two copies of that credential on this board and they have opposite lifetimes. The
+# state file existed only to cross the reboot, so it goes. The systemd drop-in `install.sh`
+# writes is the one `updaterd` reads on every check from here on — a private repository's
+# release assets are unreachable without it, so removing that one would leave a robot that is
+# installed, running, and unable to fetch a single update. Which is most of what it is for.
+#
+# Said out loud because "provisioning complete, removed the state file" reads as *the token is
+# gone from this board*, and it is not. On a developer board that is the intended outcome; it
+# is also the thing you would want to know before handing the board to anyone.
 finish() {
     rm -f "$STATE"
     say "provisioning complete; removed ${STATE}"
+
+    _dropin=/etc/systemd/system/updaterd.service.d/token.conf
+    if [ -n "$TOKEN" ]; then
+        if [ -f "$_dropin" ]; then
+            warn "this board keeps your token in ${_dropin} (mode 600). That is deliberate —
+  updaterd cannot reach a private repository's release assets without it — and it means this
+  board holds a credential that cannot be rotated without coming back to it. Fine for a
+  developer board, never for one you ship."
+        else
+            # The failure this whole path exists to prevent, and it is silent: updates fail on
+            # a timer, forever, with nothing in front of a human.
+            warn "a token was supplied but ${_dropin} does not exist, so updaterd has no
+  credential and every update check will 404 against a private repository — quietly, on a
+  timer. Re-run install.sh with DUCK_TOKEN set, and check its output for that step."
+        fi
+    else
+        say "no token on this board; updaterd can only fetch from a public repository"
+    fi
+
     cat <<'EOF'
 
   robotctl health
