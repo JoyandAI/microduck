@@ -55,6 +55,12 @@ pub enum PolicyError {
     /// the library or set `ORT_DYLIB_PATH` — and not a broken policy bundle.
     #[error("ONNX Runtime not loadable ({searched}): {detail}")]
     RuntimeMissing { searched: String, detail: String },
+    /// `ort` panicked instead of returning an error. See [`catching_ort_panics`].
+    ///
+    /// `detail` is the panic message, and carrying it is the point: the one panic we have
+    /// actually seen on a board names the two version numbers that explain it.
+    #[error("ort panicked loading the policy: {detail}")]
+    RuntimePanic { detail: String },
 }
 
 /// Where `ort` will look for the runtime, replicating its own logic.
@@ -81,9 +87,14 @@ fn dylib_name() -> String {
 /// thread dies, no tick ever lands, and `robot.health` reports "the loop has not completed a
 /// cycle" forever: the daemon looks wedged instead of saying ONNX Runtime is not installed.
 ///
-/// Probing first turns that into an ordinary error the caller can report. We use the same
-/// loader and the same search rule `ort` does, so a probe that succeeds means its load will
-/// succeed too and the panic cannot fire.
+/// Probing first turns the *missing library* case into an ordinary error the caller can
+/// report, with the operator's fix in it. That is all it does.
+///
+/// It does **not** mean `ort` cannot then panic, and an earlier version of this comment
+/// claimed it did. A board running ONNX Runtime 1.20.1 falsified that: the library loaded, so
+/// the probe passed, and `ort` panicked in `setup_api` on its own version check
+/// (`expected version >= '1.23.x', but got '1.20.1'`). The probe proves the file loads;
+/// nothing more. [`catching_ort_panics`] covers the rest, including panics we have not seen.
 fn ensure_runtime() -> Result<(), PolicyError> {
     static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
     let outcome = PROBE.get_or_init(|| {
@@ -110,6 +121,51 @@ fn ensure_runtime() -> Result<(), PolicyError> {
         })
 }
 
+/// Run the `ort` calls, turning a panic from inside them into a [`PolicyError`].
+///
+/// `ort` treats some initialisation failures as unrecoverable and panics rather than
+/// returning `Err` — the version mismatch in [`ensure_runtime`]'s comment is the one a board
+/// hit, and it fires from inside a lazy init reachable through any API call. In the control
+/// thread a panic is worse than an error: the thread dies, no tick ever lands, and
+/// `robot.health` answers "the loop has not completed a cycle yet" — the one message that
+/// names no cause — while the daemon stays up serving its socket. The updater then rolls the
+/// release back for a reason nobody can act on.
+///
+/// `robotd` already handles a policy that fails to load: hold the pose, keep ticking at rate,
+/// report why, get rolled back. This makes a panic take that same path.
+///
+/// Deliberately wraps the `ort` work only, and not all of [`Policy::load`], so a genuine bug
+/// of ours does not get relabelled "policy unavailable". Note that a caught panic has still
+/// run the panic hook, so the backtrace is in the journal either way.
+///
+/// `AssertUnwindSafe` is needed because `Session` is not `UnwindSafe`. It is sound here
+/// because nothing of ours is observed after a catch: the sessions being built are moved into
+/// the `Policy` on success and dropped on failure, and the caller's answer is the error.
+///
+/// **`panic = "abort"` would defeat this.** The root `Cargo.toml` has no `[profile.release]`,
+/// so the default unwind strategy applies; adding one would silently turn this back into a
+/// dead control thread.
+fn catching_ort_panics<T>(work: impl FnOnce() -> Result<T, PolicyError>) -> Result<T, PolicyError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|payload| {
+        Err(PolicyError::RuntimePanic {
+            detail: panic_message(payload),
+        })
+    })
+}
+
+/// The panic message, or a stand-in saying there wasn't one.
+///
+/// `panic!` with a literal produces `&'static str`; with arguments, `String`. `ort` uses both.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panicked with no message; see the journal for the backtrace".to_owned()
+    }
+}
+
 /// A loaded policy pair.
 pub struct Policy {
     walk: Session,
@@ -128,27 +184,32 @@ impl Policy {
         standing_threshold: f64,
     ) -> Result<Self, PolicyError> {
         ensure_runtime()?;
-        let mut walk_session = open(walk)?;
-        let mut stand_session = match stand {
-            Some(path) => Some(open(path)?),
-            None => None,
-        };
 
-        // Warm up before the loop ever calls this. The first inference is always an
-        // outlier — lazy initialisation, cold pages, first-touch faults — and paying that
-        // on tick one would look exactly like a control loop that missed its deadline.
-        // It also proves ONNX Runtime is actually present and usable, which with
-        // `load-dynamic` is not known until something is run.
-        let zero = Observation::zeroed();
-        run(&mut walk_session, walk, &zero)?;
-        if let (Some(session), Some(path)) = (stand_session.as_mut(), stand) {
-            run(session, path, &zero)?;
-        }
+        // Everything below calls into `ort`, and `ort` panics on failures it considers
+        // unrecoverable — so the whole of it, and nothing else, goes inside the catch.
+        catching_ort_panics(move || {
+            let mut walk_session = open(walk)?;
+            let mut stand_session = match stand {
+                Some(path) => Some(open(path)?),
+                None => None,
+            };
 
-        Ok(Self {
-            walk: walk_session,
-            stand: stand_session,
-            standing_threshold,
+            // Warm up before the loop ever calls this. The first inference is always an
+            // outlier — lazy initialisation, cold pages, first-touch faults — and paying that
+            // on tick one would look exactly like a control loop that missed its deadline.
+            // It also proves ONNX Runtime is actually present and usable, which with
+            // `load-dynamic` is not known until something is run.
+            let zero = Observation::zeroed();
+            run(&mut walk_session, walk, &zero)?;
+            if let (Some(session), Some(path)) = (stand_session.as_mut(), stand) {
+                run(session, path, &zero)?;
+            }
+
+            Ok(Self {
+                walk: walk_session,
+                stand: stand_session,
+                standing_threshold,
+            })
         })
     }
 
@@ -283,5 +344,59 @@ mod tests {
         assert!(!stands(false, 0.0), "no standing policy, zero command");
         assert!(stands(true, 0.0), "standing policy, zero command");
         assert!(!stands(true, 0.5), "standing policy, walking command");
+    }
+
+    /// **The panic contract.** A panic out of `ort` must come back as a `PolicyError`, because
+    /// the caller is the control thread: an escaping panic kills it, no tick ever lands, and
+    /// health reports "the loop has not completed a cycle" — naming no cause — instead of
+    /// holding the pose and saying the policy is unusable.
+    ///
+    /// The message must survive too. This is the panic a Radxa actually produced, and the two
+    /// version numbers in it are the whole diagnosis; a health reason without them tells an
+    /// operator nothing.
+    ///
+    /// The panic hook still runs, so this test prints a panic and a backtrace hint. That is
+    /// wanted — on a board it is what puts the detail in the journal — and is not a failure.
+    #[test]
+    fn a_panic_out_of_ort_becomes_an_error_that_keeps_its_message() {
+        let err = catching_ort_panics::<()>(|| {
+            panic!(
+                "Failed to load ONNX Runtime dylib: ort 2.0.0-rc.11 is not compatible with \
+                 the ONNX Runtime binary found at `libonnxruntime.so`; expected version >= \
+                 '1.23.x', but got '1.20.1'"
+            )
+        })
+        .expect_err("a panic in the ort work must not escape to the caller");
+
+        assert!(
+            matches!(err, PolicyError::RuntimePanic { .. }),
+            "wrong variant: {err:?}"
+        );
+        let reported = err.to_string();
+        for detail in ["1.23.x", "1.20.1"] {
+            assert!(
+                reported.contains(detail),
+                "the version detail must reach the caller, got {reported:?}"
+            );
+        }
+    }
+
+    /// Success must pass straight through — a wrapper that swallowed the value would turn
+    /// every load into "policy unavailable" on a board where everything works.
+    #[test]
+    fn the_catch_is_transparent_when_nothing_panics() {
+        assert_eq!(catching_ort_panics(|| Ok(7)).unwrap(), 7);
+    }
+
+    /// A panic payload that is neither `&str` nor `String` must still produce a reason. The
+    /// alternative is an empty health string, which reads as "no reason given".
+    #[test]
+    fn an_unprintable_panic_payload_still_reports_something() {
+        let detail = panic_message(Box::new(42u32));
+        assert!(!detail.is_empty(), "a reason is mandatory");
+        assert!(
+            detail.contains("journal"),
+            "point somewhere useful: {detail:?}"
+        );
     }
 }

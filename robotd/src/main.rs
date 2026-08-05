@@ -1648,6 +1648,15 @@ mod tests {
             reason.contains("policy"),
             "health must name the policy as the cause, got {reason:?}"
         );
+        // The detail, not just the category. The updater quotes this string as the reason it
+        // rolled a release back, so "policy unavailable" on its own is not actionable — that
+        // is the same failure as the useless "loop has not completed a cycle" this branch
+        // exists to avoid. Which detail arrives depends on the machine: the bogus path where
+        // ONNX Runtime is installed, the runtime's own diagnosis where it is not.
+        assert!(
+            reason.contains("definitely-not-a-policy.onnx") || reason.contains("ONNX Runtime"),
+            "health must carry the underlying cause, got {reason:?}"
+        );
         assert!(
             !s.moving.load(Ordering::Relaxed),
             "nothing should be reported as moving"
