@@ -111,6 +111,9 @@ jobs:
             --include "updater/systemd/updaterd.service=systemd/updaterd.service" \
             --include "updater/systemd/sysusers.d/robot.conf=systemd/sysusers.d/robot.conf" \
             --include "robotd/systemd/robotd.service=systemd/robotd.service" \
+            --include "configd/systemd/configd.service=systemd/configd.service" \
+            --include "btd/systemd/btd.service=systemd/btd.service" \
+            --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
             --include "docs/architecture.md=docs/architecture.md" \
             --include "docs/updater-design.md=docs/updater-design.md" \

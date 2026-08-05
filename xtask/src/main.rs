@@ -827,6 +827,51 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Every unit `install.sh` installs must actually be in the artifact.
+    ///
+    /// The packaging workflows name each shipped file with an explicit `--include`, and
+    /// `install.sh` reads them back out of the installed release — two lists with nothing tying
+    /// them together. They drifted the first time it mattered: `configd.service` and
+    /// `btd.service` were written, installed by `install.sh`, and not packaged, so a release
+    /// carried both binaries and no way to run them. The failure is silent at build time and
+    /// looks like a broken daemon on the board.
+    #[test]
+    fn every_unit_install_sh_expects_is_packaged() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let install = std::fs::read_to_string(root.join("scripts/install.sh"))
+            .expect("scripts/install.sh must exist");
+
+        // Every `for unit in …` loop in the script, unioned. There is more than one — units are
+        // installed, and also stopped for a forced re-install — and a unit named in any of them
+        // is a unit the board is expected to have. Trailing `;` from `; do` is stripped, which
+        // is how this test first failed to see `updaterd.service`.
+        let mut units: Vec<String> = install
+            .lines()
+            .filter(|l| l.contains("for unit in"))
+            .flat_map(|l| l.split_whitespace())
+            .map(|w| w.trim_end_matches(';').to_owned())
+            .filter(|w| w.ends_with(".service"))
+            .collect();
+        units.sort();
+        units.dedup();
+        assert!(units.len() >= 4, "expected several units, found {units:?}");
+
+        for workflow in ["dev.yml", "release.yml"] {
+            let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
+                .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+            for unit in &units {
+                let expected = format!("=systemd/{unit}");
+                assert!(
+                    text.contains(&expected),
+                    "{workflow} does not package {unit}, but install.sh installs it. \
+                     Add:  --include \"<crate>/systemd/{unit}=systemd/{unit}\""
+                );
+            }
+        }
+    }
+
     /// `scripts/setup-board.sh` is fetched standalone with `curl`, so it cannot read
     /// Cargo.toml and has to carry a literal version. This is what stops that literal
     /// drifting from the value the preinstall hook is generated with — the exact failure that
