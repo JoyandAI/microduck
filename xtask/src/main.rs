@@ -884,7 +884,12 @@ mod tests {
     #[test]
     fn printed_commands_name_absolute_paths() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        for name in ["setup-board.sh", "migrate-network.sh", "install.sh"] {
+        for name in [
+            "setup-board.sh",
+            "migrate-network.sh",
+            "install.sh",
+            "provision.sh",
+        ] {
             let script = std::fs::read_to_string(root.join("scripts").join(name)).unwrap();
             for (n, line) in script.lines().enumerate() {
                 if line.trim_start().starts_with('#') {

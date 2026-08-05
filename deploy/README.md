@@ -18,70 +18,44 @@ the reasons attached — read it when something disagrees with you, not before.
 
 ### Dev board, repository private — this is today
 
-The token is the only placeholder until the dev-key line near the end. The `~/.profile` line is
-there because this reboots in the middle and an `export` does not survive that.
+Your token is the only placeholder. `provision.sh` runs `setup-board.sh`, `migrate-network.sh`
+and `install.sh` in order, on both sides of the reboot, and carries the token across it itself.
 
 ```bash
 export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-touch ~/.profile && sed -i '/^export DUCK_TOKEN=/d' ~/.profile && printf 'export DUCK_TOKEN=%s\n' "$DUCK_TOKEN" >> ~/.profile && chmod 600 ~/.profile
-```
-
-```bash
-curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/setup-board.sh -o /tmp/setup-board.sh && sudo sh /tmp/setup-board.sh
-```
-
-```bash
-curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/migrate-network.sh -o /tmp/migrate-network.sh && sudo sh /tmp/migrate-network.sh
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/provision.sh -o /tmp/provision.sh && sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/provision.sh
 ```
 
 ```bash
 sudo reboot
 ```
 
-One reboot serves both: each staged its change and left a copy of itself behind. After it, both
-again — separately, because the second one retires a backstop that reverts this board on any
-later slow boot if it is left armed, and it must not be skipped by a chain that stopped early:
-
 ```bash
-sudo /usr/local/sbin/robot-setup-board
+sudo /usr/local/sbin/robot-provision
 ```
-
-```bash
-sudo /usr/local/sbin/robot-migrate-network
-```
-
-```bash
-curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh -o /tmp/install.sh
-```
-
-`DUCK_DEV_KEY` is what makes `robotctl update apply --ref <branch>` work; drop it for a board
-that should only take releases. `scp ~/.duck-keys/team.dev.pub board:/tmp/` first.
-
-```bash
-sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
-```
-
-```bash
-newgrp robot
-```
-
-That last one is not optional and not cosmetic: the install put you in the `robot` group, and a
-shell cannot join a group it did not start in, so without it every `robotctl` says
-`Permission denied`.
 
 ```bash
 robotctl health
 ```
+
+For a board that should accept `--ref <branch>` builds, `scp ~/.duck-keys/team.dev.pub
+board:/tmp/` first and add `DUCK_DEV_KEY=/tmp/team.dev.pub` to the `sudo` line. It is copied
+somewhere that survives the reboot, because /tmp is not.
+
+No `newgrp robot`, and that is deliberate rather than an omission: the `robot` group is created
+in the first phase, so the login session you come back to after the reboot already has it. If
+you never reboot — provisioning twice in one session, say — `robot-provision` says so and refuses
+rather than installing onto boot config that is staged and not live.
 
 ### Regular user, repository public
 
-No token, no dev key, and `curl | sudo sh` works because there is no header to carry.
+No token and no dev key — but still downloaded rather than piped, for the reason below.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/setup-board.sh -o /tmp/setup-board.sh && sudo sh /tmp/setup-board.sh
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/provision.sh -o /tmp/provision.sh && sudo sh /tmp/provision.sh
 ```
 
 ```bash
@@ -89,45 +63,49 @@ sudo reboot
 ```
 
 ```bash
-sudo /usr/local/sbin/robot-setup-board
-```
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh | sudo sh
-```
-
-```bash
-newgrp robot
+sudo /usr/local/sbin/robot-provision
 ```
 
 ```bash
 robotctl health
 ```
 
-Two blocks, not `newgrp robot && robotctl health`: `newgrp` hands you a *new shell*, so anything
-chained after it runs back in the old one — the one that is still not in the group — and reports
-`Permission denied` for reasons that have nothing to do with the robot.
+Downloaded rather than piped even here: phase 2 runs after a reboot, so there has to be a file
+left on disk for `robot-provision` to be. It refuses a pipe rather than stranding you halfway.
 
-On a robot image that already ships NetworkManager that is the whole list. On Armbian stock it
-is not: wifi still belongs to netplan, so add the two `migrate-network.sh` lines from the case
-above — without the header — before installing the daemon. `setup-board.sh` says so if it
-applies.
+### Doing it by hand
 
-## Notes on the steps above
+The three scripts stay independently runnable, and `provision.sh` is a thin orchestrator over
+them with no logic of its own. Run them one at a time when a board is misbehaving and you want
+to see each step's status block on its own — the order is `setup-board.sh`,
+`migrate-network.sh`, reboot, both again, `install.sh`, then `newgrp robot` because nothing
+created the group before the reboot in that case.
 
-Two scripts because they answer to different things. `setup-board.sh` is OS-level bring-up —
-device-tree overlays, ONNX Runtime — which changes rarely and needs a reboot. `install.sh`
-installs a signed daemon release, which happens on every update. Conflating them would mean
-every update re-litigating boot configuration. `migrate-network.sh` is a third that will not
-last: it exists only because Armbian's stock image ships netplan, and it gets deleted rather
-than maintained the day we build an image with NetworkManager in it.
+## What those commands actually do
+
+Three scripts, kept apart because they answer to different things. `setup-board.sh` is OS-level
+bring-up — device-tree overlays, ONNX Runtime — which changes rarely and needs a reboot.
+`install.sh` installs a signed daemon release, which happens on every update; conflating the two
+would mean every update re-litigating boot configuration. `migrate-network.sh` is the one that
+will not last: it exists only because Armbian's stock image ships netplan, and it gets deleted
+rather than maintained the day we build an image with NetworkManager in it.
+
+`provision.sh` runs them in order and holds the state that has to cross the reboot — the token,
+a dev-key path, and the boot id it uses to tell whether you have actually rebooted. It has no
+provisioning logic of its own, on purpose: three scripts with different lifetimes should not
+become one script whose parts cannot be removed separately.
+
+It also creates the `robot` group in its first phase, which is the only reason the flow above
+has no `newgrp robot` in it. `install.sh` does the same thing correctly and too late — by the
+time it runs, your shell started before the group existed, and a process's groups are fixed when
+it starts. Moving it ahead of the reboot means the login session you return to already has it.
 
 **The token, and why a wrong URL is the wrong diagnosis.** `raw.githubusercontent.com` answers
 **404**, not 401, for a private path with no credentials, so a missing header looks exactly like
 a typo. There are two separate tokens in play: the one in your shell, which fetches scripts, and
 the one `updaterd` needs to reach release assets — [that one](#-while-the-repository-is-private-a-robot-needs-a-token)
-is a systemd drop-in and outlives the shell. The `install.sh` line is where the two meet:
-passing `DUCK_TOKEN` to it is what writes the drop-in.
+is a systemd drop-in and outlives the shell. The two meet when `provision.sh` reaches
+`install.sh`: passing `DUCK_TOKEN` through is what writes the drop-in.
 
 **`setup-board.sh`** is idempotent and never reboots on its own. The one thing it fixes that is
 otherwise very hard to diagnose: Armbian ships `overlay_prefix=rk35xx`, but the RK3566 shares
@@ -142,7 +120,8 @@ seeing its motors after an `apt upgrade` needs this re-run.
 and only the running kernel is stale — `/proc/cmdline` cannot change without a reboot. Anything
 else on that line is a real finding.
 
-**`migrate-network.sh`** must run **twice**, either side of a reboot: the first run arms a
+**`migrate-network.sh`** runs **twice**, either side of the reboot — `provision.sh` does both,
+and it is worth knowing why the second matters. The first run arms a
 boot-time backstop that restores netplan if `wlan0` gets no IPv4 address, so a bad cutover costs
 a reboot instead of a serial cable, and the second retires it. Left armed, any later boot where
 wifi is merely slow reverts the board. It takes the SSID and key from netplan itself —
@@ -306,20 +285,20 @@ Mutating operations are root-only: `allow_uids`/`allow_gids` are deliberately em
 exists, because "may relay an update request from the app" is a narrower claim than "is in
 the robot group".
 
-⚠ **The first `robotctl health` after an install usually fails, and the install is fine.**
+⚠ **Running `install.sh` directly, the first `robotctl health` fails and the install is fine.**
 Both sockets are `root:robot` mode 0660 and `install.sh` puts the operator in `robot` — but a
 process's groups are fixed when it starts, so the shell that ran the install is not in the group
-it just gained, and both sockets refuse it. One command, in that same shell:
+it just gained. One command, in that same shell:
 
 ```bash
 newgrp robot
 ```
 
-`id -nG` confirms it, and any new login has it already. This cannot be made fully automatic:
-there is no API to add a group to a running process, not even for root, so the shell that
-launched the installer can never be fixed from inside it. What `install.sh` does instead is
-print that command in its closing report, and `robotctl` names it on the failure rather than
-sending you to `systemctl status` — which would show two perfectly healthy daemons.
+There is no API to add a group to a running process, not even for root, so nothing the installer
+does can fix the shell that launched it — which is why `provision.sh` creates the group in its
+first phase instead, and the reboot does the work. On the direct path, `install.sh` prints that
+command in its closing report and `robotctl` names it on the failure rather than sending you to
+`systemctl status`, which would show two perfectly healthy daemons.
 
 ## Where logs go, and what survives a reboot
 
