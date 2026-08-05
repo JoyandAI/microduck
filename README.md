@@ -34,7 +34,7 @@ health gate. Each drives the real engine with the fault injected rather than a m
 so than anything you could run by hand here.
 
 Using the updater for real needs a board. Provisioning one from nothing is one command from
-this clone — `./scripts/provision-board.sh <host>`, described in
+this clone — `./scripts/provision-board.sh [user@]host`, described in
 [`deploy/README.md`](deploy/README.md). Everything you do to it afterwards is
 [Working on the robot](#working-on-the-robot) below.
 
@@ -163,7 +163,7 @@ A board provisioned for this in one command, from a clone — it sends your dev 
 reboot and streams the log:
 
 ```bash
-./scripts/provision-board.sh radxa-zero3 --ref my-branch
+./scripts/provision-board.sh pierre@192.168.1.42 --ref my-branch
 ```
 
 Add `--local` to send this clone's `provision.sh` instead of fetching it, which is how to test a

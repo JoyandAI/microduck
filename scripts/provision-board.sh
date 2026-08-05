@@ -2,7 +2,11 @@
 # Provision a board from your own machine, in one command.
 #
 #   export DUCK_TOKEN=...              # only while the repository is private
-#   ./scripts/provision-board.sh radxa-zero3
+#   ./scripts/provision-board.sh pierre@192.168.1.42
+#
+# The target is `[user@]host`, and the host can be a name or an address. An address is the
+# normal case on this hardware: mDNS on the Radxa image is unreliable, so `radxa-zero3.local`
+# resolves when it feels like it and a DHCP lease is the thing you can count on.
 #
 # The only script in this directory that runs on the *operator's* machine rather than on a
 # robot. Everything it does, it does over ssh; nothing here is installed anywhere.
@@ -14,6 +18,9 @@
 # provisioning is one command with continuous output instead of three with a gap.
 #
 #   --ref BRANCH      provision from a branch instead of main
+#   --forget-host-key drop this host's key from known_hosts first. Reflashing the card
+#                     regenerates the board's host keys, so the same address then presents a
+#                     different one and ssh refuses outright — see `probe`.
 #   --local           send this clone's scripts/provision.sh instead of having the board fetch
 #                     it. What makes testing an unpushed branch possible.
 #   --no-dev-key      do not install the team dev key, for a board that should only take
@@ -27,6 +34,9 @@ set -eu
 DEV_KEY_DEFAULT="${HOME}/.duck-keys/team.dev.pub"
 
 HOST=""
+# The host without any `user@`, which is what known_hosts is keyed on.
+HOST_ONLY=""
+FORGET_KEY=""
 REF=""
 DEV_KEY="$DEV_KEY_DEFAULT"
 NO_DEV_KEY=""
@@ -54,6 +64,7 @@ usage() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --ref)        REF="${2:?--ref needs a branch}"; shift 2 ;;
+        --forget-host-key) FORGET_KEY=1; shift ;;
         --dev-key)    DEV_KEY="${2:?--dev-key needs a path}"; shift 2 ;;
         --no-dev-key) NO_DEV_KEY=1; shift ;;
         --local)      USE_LOCAL=1; shift ;;
@@ -67,6 +78,31 @@ done
 
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
 command -v scp >/dev/null 2>&1 || die "scp is required"
+
+# `[user@]host` split, because two things need the host on its own: known_hosts is keyed on it,
+# and an IPv6 literal has to be bracketed for scp while ssh wants it bare.
+case "$HOST" in
+    *@*) HOST_ONLY="${HOST#*@}" ;;
+    *)   HOST_ONLY="$HOST" ;;
+esac
+[ -n "$HOST_ONLY" ] || die "no host in '${HOST}' — expected [user@]host"
+
+# scp's target syntax is not ssh's: `host:path` is ambiguous for an IPv6 literal, which has
+# colons of its own, so that one case needs brackets. Detected by the colon rather than by
+# trying to parse an address — a hostname or an IPv4 address has none.
+scp_target() {
+    # $1 remote path
+    case "$HOST_ONLY" in
+        *:*)
+            if [ "$HOST" = "$HOST_ONLY" ]; then
+                printf '[%s]:%s' "$HOST_ONLY" "$1"
+            else
+                printf '%s@[%s]:%s' "${HOST%@*}" "$HOST_ONLY" "$1"
+            fi
+            ;;
+        *) printf '%s:%s' "$HOST" "$1" ;;
+    esac
+}
 
 # Non-interactive ssh, for the polling and the file checks. BatchMode so a board that has gone
 # away fails in seconds instead of sitting on a password prompt nobody is watching.
@@ -83,12 +119,53 @@ still_provisioning() {
 
 # ── checks that are cheaper to fail now than halfway ─────────────────────────
 
+if [ -n "$FORGET_KEY" ]; then
+    say "dropping ${HOST_ONLY} from known_hosts"
+    ssh-keygen -R "$HOST_ONLY" >/dev/null 2>&1 || true
+fi
+
 say "checking ${HOST}"
-rsh true >/dev/null 2>&1 \
-    || die "cannot ssh to ${HOST} without a prompt.
-  Set up a key first — this needs to reconnect by itself after the board reboots, which a
-  password prompt cannot survive:
-    ssh-copy-id ${HOST}"
+
+# The probe's *output* is the diagnosis, so it is captured rather than discarded. Four failures
+# are common here and they need four different answers; "cannot ssh to the board" sends you
+# looking at whichever one you thought of first.
+if ! _probe="$(rsh true 2>&1)"; then
+    case "$_probe" in
+        *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
+            die "${HOST_ONLY} is presenting a different host key than the one on record.
+  Reflashing the card regenerates the board's host keys, so this is the expected outcome of
+  provisioning the same address twice — and StrictHostKeyChecking=accept-new does not cover it,
+  because the host is not new, its key is. Drop the old one:
+    ssh-keygen -R ${HOST_ONLY}
+  Or re-run this with --forget-host-key, which does that first." ;;
+        *"Permission denied"*)
+            die "${HOST} refused the key.
+  This needs to reconnect by itself after the board reboots, which a password prompt cannot
+  survive, so key access is not optional here:
+    ssh-copy-id ${HOST}" ;;
+        *"Could not resolve"*|*"Name or service not known"*|*"nodename nor servname"*)
+            # The advice splits on what was actually passed: telling someone who gave an
+            # address to "use the address instead" is the kind of message that makes a tool
+            # feel like it is not listening.
+            case "$HOST_ONLY" in
+                *[!0-9.]*)
+                    die "cannot resolve '${HOST_ONLY}'.
+  mDNS on this image is unreliable — a .local name resolves when it feels like it — so a name
+  is not the thing to depend on here. Use the address from your router's DHCP leases, or
+  find it with:  ping -c1 ${HOST_ONLY}" ;;
+                *)
+                    die "cannot resolve '${HOST_ONLY}', which looks like an address rather than
+  a name — so this is likely a typo in it rather than a naming problem." ;;
+            esac ;;
+        *"Connection refused"*|*"timed out"*|*"No route to host"*|*"Network is unreachable"*)
+            die "no answer from ${HOST_ONLY}.
+  Either it is not up yet, or that is not its address any more — a DHCP lease moves, and on a
+  reflashed card it very often does." ;;
+        *)
+            die "cannot ssh to ${HOST}:
+${_probe}" ;;
+    esac
+fi
 
 if [ -z "${DUCK_TOKEN:-}" ]; then
     warn "DUCK_TOKEN is not set. While the repository is private every fetch on the board
@@ -111,7 +188,7 @@ fi
 
 if [ -n "$DEV_KEY" ]; then
     say "sending the dev key"
-    scp -q -o StrictHostKeyChecking=accept-new "$DEV_KEY" "${HOST}:/tmp/team.dev.pub" \
+    scp -q -o StrictHostKeyChecking=accept-new "$DEV_KEY" "$(scp_target /tmp/team.dev.pub)" \
         || die "could not copy ${DEV_KEY} to ${HOST}"
 fi
 
@@ -124,7 +201,7 @@ if [ -n "$USE_LOCAL" ]; then
     [ -f "$_local" ] || die "--local needs ${_local}, and it is not there.
   Run this from a clone, or drop --local and let the board fetch it from ${REF:-main}."
     say "sending this clone's provision.sh"
-    scp -q "$_local" "${HOST}:/tmp/provision.sh" || die "could not copy provision.sh"
+    scp -q "$_local" "$(scp_target /tmp/provision.sh)" || die "could not copy provision.sh"
 else
     _raw="https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/${REF:-main}/scripts/provision.sh"
     say "having the board fetch provision.sh from ${REF:-main}"
