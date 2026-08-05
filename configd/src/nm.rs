@@ -32,6 +32,12 @@ mod ids {
     pub const STATE_ACTIVATED: u32 = 100;
     pub const STATE_FAILED: u32 = 120;
 
+    /// `NM_ACTIVE_CONNECTION_STATE_*` — the state of one *activation attempt*, which is a different
+    /// question from the device's state. See `connect`.
+    pub const ACTIVE_ACTIVATED: u32 = 2;
+    pub const ACTIVE_DEACTIVATING: u32 = 3;
+    pub const ACTIVE_DEACTIVATED: u32 = 4;
+
     pub const REASON_NO_SECRETS: u32 = 7;
     pub const REASON_SUPPLICANT_DISCONNECT: u32 = 8;
     pub const REASON_SUPPLICANT_TIMEOUT: u32 = 11;
@@ -96,6 +102,19 @@ trait Device {
     fn ip4_config(&self) -> zbus::Result<OwnedObjectPath>;
     #[zbus(property, name = "Ip6Config")]
     fn ip6_config(&self) -> zbus::Result<OwnedObjectPath>;
+}
+
+/// One activation attempt, as opposed to the device it happens on.
+///
+/// The distinction is the whole point: a device stays `ACTIVATED` on the network it is already using
+/// while a *new* activation fails beside it.
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.Connection.Active",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+trait ActiveConnection {
+    #[zbus(property)]
+    fn state(&self) -> zbus::Result<u32>;
 }
 
 #[zbus::proxy(
@@ -525,7 +544,11 @@ impl Net for NetworkManager {
         // Refuse what we cannot do, before changing anything. An enterprise network needs a
         // username and certificate flow this API has no shape for, and half-attempting it would
         // leave a broken profile behind.
-        if let Some(found) = self
+        //
+        // A missing SSID is refused here too, and this only became trustworthy once `scan` waited
+        // for the scan to finish: against the stale cache this check would have rejected every
+        // network but the current one.
+        match self
             .scan()
             .await?
             .networks
@@ -533,16 +556,35 @@ impl Net for NetworkManager {
             .find(|n| n.ssid == ssid)
             .cloned()
         {
-            if found.security == proto::Security::Enterprise {
-                return Ok(proto::ConnectResult::Failed {
-                    reason: proto::ConnectFailure::Unsupported,
-                    detail: Some("802.1X networks need a certificate flow this API lacks".into()),
-                });
+            Some(found) => {
+                if found.security == proto::Security::Enterprise {
+                    return Ok(proto::ConnectResult::Failed {
+                        reason: proto::ConnectFailure::Unsupported,
+                        detail: Some(
+                            "802.1X networks need a certificate flow this API lacks".into(),
+                        ),
+                    });
+                }
+                if found.security != proto::Security::Open && psk.is_none() {
+                    return Ok(proto::ConnectResult::Failed {
+                        reason: proto::ConnectFailure::Unsupported,
+                        detail: Some("this network needs a passphrase".into()),
+                    });
+                }
             }
-            if found.security != proto::Security::Open && psk.is_none() {
+            None => {
+                // NM cannot activate a network the radio cannot see; it fails immediately and, until
+                // the fix below, that failure was reported as a *success* naming the network the
+                // robot was already on.
+                //
+                // A hidden SSID is refused by this too. Joining one needs `802-11-wireless.hidden`
+                // in the profile and a client that says "this network is hidden", which the API has
+                // no shape for yet — refusing beats silently leaving a profile that never connects.
                 return Ok(proto::ConnectResult::Failed {
-                    reason: proto::ConnectFailure::Unsupported,
-                    detail: Some("this network needs a passphrase".into()),
+                    reason: proto::ConnectFailure::NotFound,
+                    detail: Some(format!(
+                        "the robot cannot see {ssid}. Check the name, or move it closer"
+                    )),
                 });
             }
         }
@@ -601,19 +643,28 @@ impl Net for NetworkManager {
         let root = zbus::zvariant::ObjectPath::try_from("/").map_err(bus_err)?;
         let device = zbus::zvariant::ObjectPath::try_from(device_path.as_str()).map_err(bus_err)?;
 
-        if let Err(e) = manager
+        let (added, activation) = match manager
             .add_and_activate_connection(settings, &device, &root)
             .await
         {
-            return Ok(proto::ConnectResult::Failed {
-                reason: proto::ConnectFailure::Other,
-                detail: Some(format!("{e}")),
-            });
-        }
+            Ok(paths) => paths,
+            Err(e) => {
+                return Ok(proto::ConnectResult::Failed {
+                    reason: proto::ConnectFailure::Other,
+                    detail: Some(format!("{e}")),
+                });
+            }
+        };
 
         // NM returns as soon as activation *starts*, so the outcome has to be waited for. This
         // poll is what turns "config applied" into "associated, addressed, and here is the IP" —
         // the difference that made netplan unusable for provisioning.
+        //
+        // **Watch the activation, not the device.** This polled the *device* state, and a device
+        // stays `ACTIVATED` on the network it is already using while a new activation fails beside
+        // it — so `connect("Tehaupoo", "lol")` returned `connected` naming `SFR-e994`, the network
+        // the robot had been on all along. Reporting success for a join that never happened is the
+        // worst answer available: a phone concludes it has provisioned the robot.
         let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         let device_proxy = DeviceProxy::builder(&self.bus)
             .path(&device_path)
@@ -621,37 +672,59 @@ impl Net for NetworkManager {
             .build()
             .await
             .map_err(bus_err)?;
+        let active = ActiveConnectionProxy::builder(&self.bus)
+            .path(&activation)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
 
         loop {
-            match device_proxy.state().await.unwrap_or(ids::STATE_UNAVAILABLE) {
-                ids::STATE_ACTIVATED => {
-                    let status = self.status().await?;
-                    return Ok(proto::ConnectResult::Connected {
-                        ssid: status.ssid.unwrap_or_else(|| ssid.to_owned()),
-                        ip4: status.ip4,
-                    });
-                }
-                ids::STATE_FAILED => {
-                    let (_, reason) = device_proxy.state_reason().await.unwrap_or((0, 0));
-                    let (failure, detail) = failure_of(ids::STATE_FAILED, reason);
-                    return Ok(proto::ConnectResult::Failed {
-                        reason: failure,
-                        detail,
-                    });
-                }
-                _ => {}
+            // An unreadable state means the object is gone, which NM does when an activation is
+            // torn down — a failure, not a reason to keep waiting.
+            let state = active.state().await.unwrap_or(ids::ACTIVE_DEACTIVATED);
+
+            if state == ids::ACTIVE_ACTIVATED {
+                let status = self.status().await?;
+                return Ok(proto::ConnectResult::Connected {
+                    // The requested SSID, not whatever `status` reports. They agree here by
+                    // construction, and preferring `status` is what let the old code answer with
+                    // the wrong network's name.
+                    ssid: ssid.to_owned(),
+                    ip4: status.ip4,
+                });
             }
 
-            if tokio::time::Instant::now() >= deadline {
+            let timed_out = tokio::time::Instant::now() >= deadline;
+            if state == ids::ACTIVE_DEACTIVATED || state == ids::ACTIVE_DEACTIVATING || timed_out {
                 let (_, reason) = device_proxy.state_reason().await.unwrap_or((0, 0));
-                // A timeout still carries NM's reason: "still authenticating after 45s" and
+                // NM's reason survives a timeout too: "still authenticating after 45s" and
                 // "waiting for DHCP" are different problems.
-                let (_, detail) = failure_of(ids::STATE_FAILED, reason);
+                let (failure, detail) = failure_of(ids::STATE_FAILED, reason);
+
+                // Take the profile back out. NM keeps what `AddAndActivateConnection` added even
+                // when the activation fails, so a mistyped passphrase would otherwise leave a saved
+                // profile that autoconnect retries forever — and leave `net.status` claiming the
+                // network is `saved`.
+                if let Ok(connection) = ConnectionProxy::builder(&self.bus)
+                    .path(&added)
+                    .map_err(bus_err)?
+                    .build()
+                    .await
+                {
+                    let _ = connection.delete().await;
+                }
+
                 return Ok(proto::ConnectResult::Failed {
-                    reason: proto::ConnectFailure::Timeout,
+                    reason: if timed_out {
+                        proto::ConnectFailure::Timeout
+                    } else {
+                        failure
+                    },
                     detail,
                 });
             }
+
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }

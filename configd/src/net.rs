@@ -243,6 +243,19 @@ mod tests {
             }
         ));
 
+        // Nothing saved by the failure. NM keeps what `AddAndActivateConnection` added even when
+        // the activation fails, so the real implementation has to delete it explicitly or
+        // autoconnect retries a known-bad key forever.
+        assert!(
+            !net.scan()
+                .await
+                .unwrap()
+                .networks
+                .iter()
+                .any(|n| n.ssid == "Pollen" && n.saved),
+            "a failed attempt must not leave a saved profile"
+        );
+
         assert!(matches!(
             net.connect("Pollen", Some("correct-key")).await.unwrap(),
             proto::ConnectResult::Connected { .. }

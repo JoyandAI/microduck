@@ -103,6 +103,20 @@ fixing.
   10s, and treats a rate-limited request as "the cache is already fresh" rather than an error. For a
   client whose whole job is choosing a network in an unfamiliar place, "ask twice" was not a contract
   worth shipping.
+- **The outcome is read from the activation, not the device.**  · **measured** The worst bug on this
+  path. `connect` polled the *device* state, and a device stays `ACTIVATED` on the network it is
+  already using while a new activation fails beside it — so `connect("Tehaupoo", psk: "lol")` for a
+  network that was not even in range returned `{"outcome":"connected","ssid":"SFR-e994"}`, naming the
+  network the robot had been on all along. Reporting success for a join that never happened is the
+  worst answer available: a phone concludes the robot is provisioned and moves on.
+
+  Now `AddAndActivateConnection`'s returned active-connection object is polled instead, the requested
+  SSID is what gets reported back rather than whatever `status` says, an SSID the radio cannot see is
+  refused up front as `NotFound`, and a failed activation deletes the profile NM added — otherwise
+  autoconnect retries a known-bad key forever and `net.status` claims the network is `saved`.
+
+  A hidden SSID is refused by that preflight too. Joining one needs `802-11-wireless.hidden` and a
+  client that can say "this one is hidden", which the API has no shape for yet.
 - **Re-provisioning replaces, it does not accumulate.**  · **measured** `AddAndActivateConnection`
   always adds, and NM tolerates two profiles carrying the same id. So the ordinary path — a
   passphrase mistyped on a phone, `BadKey`, then the right one — left the robot holding both, with no
@@ -363,6 +377,27 @@ bystander is not a robot you can hand to a stranger.
   counts across reconnects, so a determined peer can retry indefinitely at the cost of a bond per
   three guesses. A per-address backoff in `btd` is the obvious next step and needs somewhere to keep
   that state across sessions.
+
+### 2.3 The fake is the specification, and nothing checks NM against it
+
+Worth stating plainly, because it now describes three bugs rather than one. In every wifi bug found on
+the board, **`FakeNet` already had the correct behaviour and the NetworkManager implementation had
+drifted from it**:
+
+| behaviour | `FakeNet` | NM path, as shipped |
+|---|---|---|
+| an SSID the radio cannot see | `NotFound` | reported `connected`, naming a different network |
+| a failed attempt | saves nothing | left a saved profile with the bad key |
+| re-provisioning an SSID | replaces | stacked a second profile |
+
+So the trait is not merely a testing seam; it is the only written form of the contract. The problem is
+the direction of the check — the suite verifies the fake against the contract, and nothing verifies NM
+against either. Both implement `Net`, so the same assertions *could* run against both; what stops it
+is that the NM side needs a real NetworkManager and a real radio, which means a board
+(`install-path-gap.md`, option D) rather than CI.
+
+Until that exists, the honest summary is: `configd`'s wifi behaviour is tested, and the code that runs
+on the robot is not. Every bug above was found by hand, on hardware, in the space of one session.
 
 ## 6. Testing without a radio  · **measured**
 
