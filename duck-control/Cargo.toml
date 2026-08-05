@@ -6,6 +6,12 @@ license.workspace = true
 description = "Robot control core: model, bus, sensing"
 
 [dependencies]
+# For `JOINT_NAMES` alone. The joint *order* is protocol — the state stream carries
+# `joints` and `targets` as bare arrays — so the table lives in the crate every client
+# already links, and this crate re-exports it rather than keeping a second copy in step by
+# hand. Not a door onto IPC: nothing here speaks to a socket, and `robotd` already links
+# both crates, so no binary gains a dependency from this edge.
+duck-ipc-proto = { path = "../duck-ipc-proto" }
 serde = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true

@@ -134,6 +134,19 @@ that:
 robotctl monitor
 ```
 
+On a terminal that is a single frame repainting in place: the policy driving the tick, the
+fall verdict and the gravity vector it came from, every joint measured against what it was
+commanded, and the achieved loop rate as a trace so a stutter that has already recovered is
+still visible. `q` quits; `↑`/`↓` scroll the joint list on a window too short for all of it.
+
+Redirected or piped it prints one line per tick instead — `robotctl monitor > run.log` and
+`| grep FALLEN` behave as before. The joint vectors are in `--json`, which carries the whole
+state, one object per line:
+
+```bash
+robotctl monitor --json --hz 50 > run.jsonl
+```
+
 The update history is separate from the journal on purpose — `fsync`ed per entry under
 `/var/lib/robot/updater/` — so it survives a robot whose logs were volatile:
 
