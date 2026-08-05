@@ -373,9 +373,6 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
   auto-rollback gate on something real. **None of it has met a robot**: the tests prove the
   logic is self-consistent, not that it walks. Needs ONNX Runtime on the board, which
   `install.sh` now installs.
-- **`robotd` holds a pose.** A real 50 Hz loop on the Dynamixel bus, and `robot.health`
-  now means *the loop is meeting its deadline* rather than *it ticked once* — which is what
-  makes the updater's auto-rollback gate on something real. Walking is slice 2.
 - **The app path exists, untested against hardware.** `btd` serves a GATT pipe and `configd`
   serves `net.*`/`system.*` — wifi scan and join, robot name, pairing PIN, reboot — with
   `robotctl net`/`robotctl system` on the robot and `btctl` as a laptop-side BLE client. Neither
