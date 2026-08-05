@@ -2,7 +2,7 @@
 
 Status: open · Date: 2026-08-05 · Owner: pierre
 
-Three bugs in a row reached a board, all in the install path, none caught by 418 tests or by
+Four bugs in a row reached a board, all in the install path, none caught by 418 tests or by
 `board-test.sh`. This records why, and what would actually close it. Written the same day, while
 the reasons are still concrete.
 
@@ -44,6 +44,47 @@ artifact.
 Bug 3 is the same class as bug 2, in the same file, **two commits after a test was added to stop
 bug 2 recurring** — that test checked units and not the binaries they exec. Each fix was correct
 and each was too narrow, which is the pattern worth attacking rather than the bugs.
+
+**4. `on_apply`'s restart list lives on the board, so a new daemon is never restarted.**  ·
+**measured** The most expensive one, and the one already written down here as "latent rather than
+fatal".
+
+`[component.daemon.on_apply].units` is read from `/etc/robot/updater.toml` — the *operator's* file,
+which `install.sh` deliberately preserves. `configd` was added to the shipped `deploy/updater.toml`
+in the branch that introduced it, so a board set up before that keeps `units = ["robotd"]` forever.
+Every `configd` release therefore swapped the binary and left the old process running.
+
+What made it cost two hours rather than two minutes is the shape of the failure:
+
+- the update reports **success** — the swap happened, the health gate passed, nothing failed;
+- `robotctl update apply` then reports **`already_current`** and does nothing, so the obvious
+  recovery command is a no-op;
+- the daemon keeps answering, on old code, so it looks like the fix was wrong rather than absent.
+  Four wifi fixes were verified as broken against binaries that were never running.
+
+`robotctl version` *does* diagnose this, in as many words: "configd is running X but the installed
+daemon release is Y … either the restart did not happen, or it failed". Nobody ran it. A diagnostic
+that exists and is not reached for is worth as much as one that does not exist, which is an argument
+for the update itself noticing rather than for more diagnostics.
+
+**The fix worth making: derive the restart set from the release, not from the board.** A release ships
+`systemd/*.service`, so it already states which units it provides — the same realisation that made
+`hooks/postinstall` the right answer for *installing* them. The engine can restart what the release
+ships, minus the two documented exclusions (`updaterd`, which is performing the update; `btd`, which
+may be the transport it was requested over). Then a release that adds a daemon restarts that daemon
+on every board, with no operator edit and no way for a board's config to be silently out of date.
+
+Two smaller options, worth noting because they are not alternatives to the above so much as
+companions: `apply` could gain a `--force` that re-runs the hooks and the restart on an
+already-current release (there is precedent — `install --force` exists for the same class of
+chicken-and-egg), and `already_current` could compare *running* revisions rather than only the
+installed one, so it stops being a no-op precisely when something is wrong.
+
+Note the related case that is *deliberate* and stays: `btd` is excluded from `on_apply` because
+restarting it drops the BLE connection carrying the update's own progress stream. So a `btd` fix needs
+a manual restart or a reboot, and unlike the others `robotctl version` cannot even see it — `btd`
+serves no socket, so there is nothing to ask. That is a real gap in a phone-driven flow and needs its
+own answer.
 
 ## Why the existing tests could not have caught them
 
