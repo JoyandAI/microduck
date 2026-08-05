@@ -10,7 +10,14 @@ every decision in one constrains the other: `btd` owns nothing, so `configd` exi
 serves a PIN, so `btd` can pair; a method routed in `btd` is a method `configd` must answer.
 
 Sections marked **measured** were established on a Radxa Zero 3W rather than reasoned about.
-Everything else is intent, and neither service has met a radio or a real NetworkManager yet.
+
+**The path works end to end on hardware** (2026-08-05): a Mac discovered the robot, bonded,
+read the API version, passed the PIN, and got a real `system.info` back — GATT discovery, chunked
+NDJSON both ways, the PIN gate, the routing table and the hop into `configd` over its unix socket.
+`configd` answers against a real NetworkManager too, reporting the live SSID and address.
+
+What is **not** yet true: the link carries no encryption (§5.5), `net.connect` has not been driven
+over BLE, and nothing has been tested with a phone rather than a laptop.
 
 ## 1. The shape
 
@@ -236,7 +243,27 @@ visible consent moment, a recovery path for a lost PIN, and defence in depth if 
 photographed — none needed for v1, each additive later, since an enclosure with a button can gate
 `set_pairable` without changing this design.
 
-### 5.4 Open
+### 5.5 Encryption is currently off, and that is not settled  · **measured**
+
+`encrypt_read` on the characteristic makes the read **hang** on macOS: CoreBluetooth issues the Read
+Request, BlueZ refuses it for insufficient encryption, and nothing resolves it — no prompt, no
+error, no retry. The client waits out its timeout against a working robot. With the flag off the read
+answers instantly, so the requirement is the cause.
+
+So `btd` currently runs with `--insecure-no-pairing` on the test board, and **the PIN crosses an
+unencrypted link**. That is worse than §5.3 describes: it is not "encrypted but unauthenticated", it
+is neither. Anyone in radio range during the exchange can read the PIN, and thereafter do anything a
+client may do.
+
+Unresolved, and the next thing to establish is whether a bond exists at all — `bluetoothctl info
+<mac>` reporting `Paired: no` would mean no encryption can ever be established and the flag is a
+symptom rather than the cause. Until that is known, moving the requirement to the write is a guess:
+it would fail identically if there is no bond to encrypt with.
+
+This must be closed before anything ships. A robot whose provisioning secret is readable by a
+bystander is not a robot you can hand to a stranger.
+
+### 5.6 Open
 
 - **Bond revocation.** Nothing un-pairs a phone; `bluetoothctl untrust` is the manual escape. Needs
   an API and a rule about who may call it — plausibly not BLE itself.

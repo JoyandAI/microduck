@@ -373,10 +373,12 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
   auto-rollback gate on something real. **None of it has met a robot**: the tests prove the
   logic is self-consistent, not that it walks. Needs ONNX Runtime on the board, which
   `install.sh` now installs.
-- **The app path exists, untested against hardware.** `btd` serves a GATT pipe and `configd`
+- **The app path works on hardware, without encryption.** A Mac discovers the robot, bonds, passes
+  the PIN and gets real answers back over BLE — but `encrypt_read` hangs CoreBluetooth, so the link
+  currently carries no encryption and the PIN travels in clear. That must close before anything
+  ships (`docs/app-path-design.md` §5.5). `btd` serves a GATT pipe and `configd`
   serves `net.*`/`system.*` — wifi scan and join, robot name, pairing PIN, reboot — with
-  `robotctl net`/`robotctl system` on the robot and `btctl` as a laptop-side BLE client. Neither
-  has met a radio or a real NetworkManager; both type-check and run for aarch64, and
+  `robotctl net`/`robotctl system` on the robot and `btctl` as a laptop-side BLE client.
   `configd --fake-net` serves the whole surface off-board. A board must be migrated from netplan
   to NetworkManager once (`scripts/migrate-network.sh`) before wifi works.
 - **BLE pairing is a six-digit PIN**, default `000000` and therefore not a secret: out of the box
