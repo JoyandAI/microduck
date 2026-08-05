@@ -159,10 +159,23 @@ persist_self() {
   Phase 2 runs after a reboot, so there has to be something left on disk to run." ;;
     esac
 
-    if [ "$(readlink -f "$0")" = "$SELF" ]; then
+    # Both sides resolved, and the copy never fatal. Two ways this bites otherwise, and the
+    # second one is why phase 2 died on its first line during testing:
+    #
+    #   - `$0` and $SELF can name the same file by different spellings — a symlinked /tmp is
+    #     enough — so comparing one resolved path against one literal says "different" about a
+    #     file that is not.
+    #   - `install` refuses to copy a file over itself, and every resumed run is exactly that
+    #     case. Under `set -eu` that exit status ends provisioning before it starts, with
+    #     `install: ... are the same file` as the only clue.
+    _src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+    _dst="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+    if [ "$_src" = "$_dst" ]; then
         return 0
     fi
-    install -m 755 "$0" "$SELF"
+
+    install -m 755 "$_src" "$SELF" || warn "could not copy this script to ${SELF}; the
+  reboot would then have nothing to resume — finish by hand if that happens."
 }
 
 # Write what phase 2 needs to know, 0600, root-only.
@@ -369,8 +382,10 @@ EOF
 
 phase_one() {
     say "phase 1: board and network"
-    create_group
+    # Before anything is changed: a mistyped dev-key path should cost nothing at all, and this
+    # is the only argument that can be wrong in a way nothing later would catch.
     keep_dev_key
+    create_group
 
     tmp=/tmp/setup-board.sh
     fetch setup-board.sh "$tmp"

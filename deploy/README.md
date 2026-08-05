@@ -18,18 +18,35 @@ the reasons attached — read it when something disagrees with you, not before.
 
 ### Dev board, repository private — this is today
 
-Your token is the only placeholder. `provision.sh` runs `setup-board.sh`, `migrate-network.sh`
-and `install.sh` in order, reboots when it has to, and finishes on its own afterwards.
+Three commands, and the first one runs on your laptop rather than the board.
+
+`team.dev.pub` is what lets this board install `--ref <branch>` builds, and it is deliberately
+not in the repository: a robot that trusts it installs anything anyone on the team builds, so
+that has to stay a per-board decision rather than the default for every board we image
+([`trusted_keys/README.md`](trusted_keys/README.md) has the argument). Nothing can fetch it for
+you — carrying it there by hand *is* the opt-in. Substitute your board's hostname:
+
+```bash
+scp ~/.duck-keys/team.dev.pub radxa-zero3:/tmp/
+```
+
+Then on the board — your token is the only placeholder left:
 
 ```bash
 export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/provision.sh -o /tmp/provision.sh && sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/provision.sh
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/provision.sh -o /tmp/provision.sh && sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/provision.sh
 ```
 
-It warns, waits ten seconds, and reboots — your SSH session ends there. Log back in and:
+`provision.sh` runs `setup-board.sh`, `migrate-network.sh` and `install.sh` in order, warns for
+ten seconds, reboots — your SSH session ends there — and finishes on its own. It copies the dev
+key out of `/tmp` first, because `/tmp` does not survive that reboot; a key left there would
+produce a board that provisions cleanly and is silently *not* a dev board, surfacing weeks later
+as `--ref` being refused, which reads like a broken release.
+
+Log back in and:
 
 ```bash
 robotctl health
@@ -45,9 +62,14 @@ That log is the record of the half nobody watched, and it is a file rather than 
 purpose: journald persistence is configured by a drop-in inside the release being installed, so
 during this exact window the journal can still be RAM-only.
 
-For a board that should accept `--ref <branch>` builds, `scp ~/.duck-keys/team.dev.pub
-board:/tmp/` first and add `DUCK_DEV_KEY=/tmp/team.dev.pub` to the `sudo` line. It is copied
-somewhere that survives the reboot, because /tmp is not.
+Drop the `scp` and the `DUCK_DEV_KEY=` for a board that should only ever take releases. Nothing
+else changes. A mistyped path fails immediately, before anything on the board is touched, and
+the log ends with `DEV BOARD` only when the key really is installed — so which kind of board you
+ended up with is a thing you can check rather than a thing you have to remember:
+
+```bash
+grep -c 'DEV BOARD' /var/lib/robot/provision.log
+```
 
 No `newgrp robot`, and that is deliberate rather than an omission: the `robot` group is created
 before the reboot, so the session you log back into already has it.
