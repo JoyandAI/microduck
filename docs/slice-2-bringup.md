@@ -1,14 +1,17 @@
 # Slice 2 bring-up on hardware
 
-Handoff notes for finishing this branch on a real robot. Everything below was observed on a
-Radxa Zero 3W, not inferred.
+Notes from running slice 2 on a real robot. Everything below was observed on a Radxa Zero 3W,
+not inferred.
 
-## The one open problem
+## Status
 
-**`ort` panics instead of returning an error, which kills the control thread and makes
-`robot.health` blame the wrong thing.**
+Slice 2 is merged, and the one problem the board found — **`ort` panicking instead of returning
+an error, which killed the control thread and made `robot.health` blame the wrong thing** — is
+fixed: `duck-control::policy::catching_ort_panics` turns it into a `PolicyError`, so it takes
+the existing "hold the pose and report why" path.
 
-That is the whole task. Slice 2's code is otherwise complete and its tests pass.
+**Still not run on hardware:** the fix itself, and slice 2's loop rate with inference in the
+tick. The recipe for both is [Verifying on the board](#verifying-on-the-board) below.
 
 ## What already works, verified on the board
 
@@ -65,55 +68,46 @@ The floor and target live in `[workspace.metadata.onnxruntime]` in the root `Car
 #18 generates the release's `hooks/preinstall` from them so a board below the floor is healed —
 or the update aborts *before the swap* — rather than installing and then panicking.
 
-**2. `ort` panics rather than erroring — still open. This is the task.**
+**2. `ort` panics rather than erroring — fixed.**
 
-`duck-control/src/policy.rs:87`, `ensure_runtime()`, probes the dylib with `libloading` before
-letting `ort` touch it. Its doc comment claims:
+`ensure_runtime()` probes the dylib with `libloading` before letting `ort` touch it. Its doc
+comment used to claim:
 
 > a probe that succeeds means its load will succeed too and the panic cannot fire
 
 **The board falsified that.** The probe only proves the library *loads*; 1.20.1 loads fine.
 `ort`'s own compatibility check then rejects the *version* and panics inside `setup_api`, which
 `ensure_runtime` cannot see. So the guard closes the "missing" case and not the "wrong version"
-case — and by construction it cannot close every future `ort` panic either.
+case — and by construction it could not have closed every future `ort` panic either.
 
-## What to build
+The fix does not try to. `catching_ort_panics` wraps the `ort` calls inside `Policy::load` and
+converts any panic into `PolicyError::RuntimePanic`, carrying the panic message — the version
+numbers above are the whole diagnosis, so losing them would leave a health reason nobody can
+act on. That puts a panic on the path `robotd` already had for a policy that will not load: log
+`policy unavailable; holding the pose`, store the reason, leave `controller` as `None`, **keep
+ticking at rate**, and report `policy unavailable: <reason>` so the updater rolls the release
+back for a stated cause.
 
-The graceful path already exists and is well designed. `robotd/src/main.rs:688` handles a
-policy that fails to load: it logs `policy unavailable; holding the pose`, stores the reason in
-`state.policy_error`, leaves `controller` as `None`, and **the loop still ticks at rate**.
-Health then reports `policy unavailable: <reason>` (`robotd/src/main.rs:246`), which is
-accurate and actionable, and the updater rolls the release back for a stated reason.
+Two things to know about it:
 
-The panic bypasses all of that. So: make any `ort` panic take the existing path.
+- The catch wraps the `ort` work only, not all of `load`, so a genuine bug of ours is not
+  relabelled "policy unavailable". `AssertUnwindSafe` is needed because `Session` is not
+  `UnwindSafe`; the sessions are moved into the `Policy` on success and dropped on failure, so
+  nothing of ours is observed after a catch.
+- **`panic = "abort"` would defeat it.** There is no `[profile.release]` in the root
+  `Cargo.toml` today; adding one would silently restore the dead control thread.
 
-Suggested shape — `std::panic::catch_unwind` around the `ort` work inside `Policy::load`
-(`duck-control/src/policy.rs:125`), converting a caught panic into a `PolicyError`. Points to
-settle while doing it:
+### What the tests cover, and what they do not
 
-- **Catch as narrowly as possible.** Wrap the `ort` calls, not the whole function, so a genuine
-  bug in our code is not silently converted into "policy unavailable".
-- `Session` and friends may not be `UnwindSafe`; `AssertUnwindSafe` is probably needed. Justify
-  it in a comment — the argument is that a failed `ort` init leaves nothing of ours partly
-  mutated.
-- **Extract the panic message** into the `PolicyError`, or the health reason loses the version
-  numbers that make it actionable. The string above is exactly what someone needs.
-- Consider whether `ensure_runtime`'s doc comment should keep its claim. It is now known false;
-  at minimum it should say what the probe does and does not cover.
-- `panic = "abort"` would defeat `catch_unwind`. Checked: there is no custom
-  `[profile.release]` in the root `Cargo.toml`, so the default unwind strategy applies and
-  `catch_unwind` will work. Anyone adding `panic = "abort"` later would silently break this,
-  which is worth a comment where the catch happens.
+Covered offline, in `duck-control` and `robotd`: a panic on the `ort` path becomes an error and
+keeps its message, success passes through untouched, an unprintable payload still yields a
+reason, and — via `an_unloadable_policy_holds_the_pose_and_reports_why` — a policy that will not
+load leaves the loop ticking with the underlying cause in the health string.
 
-### Test it deterministically
-
-There is no need to install an old ONNX Runtime to test this. The failure is "`ort` panicked",
-so a test only needs a panic on that path — the point is that a panicking policy load becomes
-`PolicyError` and the loop keeps ticking, not which panic it was.
-
-Slice 2 already has `an_unloadable_policy_holds_the_pose_and_reports_why` in
-`robotd/src/main.rs`. The new test should assert the same outcome when the load *panics* rather
-than returns `Err`, and that the health reason still carries the detail.
+Not covered offline: a *real* `ort` panic travelling through the control loop. Reproducing it
+needs a wrong-version runtime, which is a board, and faking one inside `Policy::load` would mean
+shipping a fault-injection knob in `duck-control` to test three lines. The board check below is
+what closes it.
 
 ## Verifying on the board
 
