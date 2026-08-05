@@ -90,6 +90,26 @@ pub struct SlowSensors {
     pub temps_c: [f64; NUM_JOINTS],
 }
 
+/// IMU reads that came back byte-for-byte identical to their predecessor.
+///
+/// Two numbers, because they answer two different questions and only one of them is worth
+/// waking someone for. The *total* says how often the board has repeated itself over the whole
+/// run: sporadic hits are ordinary, since the loop and the board keep their own clocks and a
+/// tick landing inside one board refresh legitimately sees the same bytes twice. The *run* says
+/// whether orientation is frozen right now — a board that has stopped fusing repeats on every
+/// single tick, so its run climbs without bound while a total on its own looks the same as a
+/// handful of hiccups.
+///
+/// Reported together so no backend can offer one without the other; a run with no total to
+/// scale it against is how the count came to be read as an alarm in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImuStale {
+    /// Stale reads since startup, cumulative and never reset.
+    pub total: u64,
+    /// Length of the current unbroken run of stale reads. Any fresh block resets it to zero.
+    pub run: u64,
+}
+
 pub trait RobotIo {
     /// One transaction: joints and IMU together.
     fn read(&mut self) -> Result<Sensors>;
@@ -117,8 +137,8 @@ pub trait RobotIo {
     /// `sync_read` blocks identical to their predecessor: the board answered but did not
     /// refresh, which means the policy would be fed dead orientation. Invisible unless
     /// someone counts it, which is why it is counted.
-    fn imu_stale_blocks(&self) -> u64 {
-        0
+    fn imu_stale(&self) -> ImuStale {
+        ImuStale::default()
     }
 
     /// Has the orientation filter converged? False for the first moments after startup.

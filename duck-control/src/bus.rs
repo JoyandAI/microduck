@@ -18,7 +18,7 @@ use std::time::Duration;
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
 
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
-use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
+use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{BAUD_RATE, EXPECTED_REGISTERS, IMU_DXL_ID, JOINT_IDS, NUM_JOINTS};
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
@@ -48,16 +48,53 @@ const VOLTS_PER_COUNT: f64 = 0.1;
 /// costs a bounded hiccup rather than stalling the loop on the serial driver's default.
 const READ_TIMEOUT: Duration = Duration::from_millis(30);
 
+/// Run of consecutive stale reads at which the journal says something.
+///
+/// 25 reads is half a second at 50 Hz — the same span [`SflpDecoder::ready`] waits for before
+/// it will call the chip's output a measurement, and far longer than any ordinary hiccup. Below
+/// it the tracker stays quiet on purpose: warning on the very first repeated block is what
+/// taught everyone to ignore this message. Kept in step with `ImuHealth::FROZEN_RUN`, which is
+/// where the same threshold is applied to the health report — this crate is the hardware layer
+/// and deliberately does not depend on the IPC vocabulary, so the number lives in both places.
+const STALE_RUN_WARN: u64 = 25;
+
+/// Detects an IMU board that answers without refreshing, by remembering the last block.
+///
+/// Split out from the read path so it can be tested without a serial port: the fault it
+/// describes is one nothing else on the robot reports, and it would otherwise be verifiable
+/// only against broken hardware.
+#[derive(Debug, Default)]
+struct StaleImuTracker {
+    /// `None` until the first block. A fixed initial value cannot work here: it would have to
+    /// be all zeros, and an all-zero block is exactly what a board whose SFLP table is still
+    /// empty sends — scoring a stale read against a predecessor that never existed.
+    last: Option<[u8; IMU_BLOCK_LEN]>,
+    stale: ImuStale,
+}
+
+impl StaleImuTracker {
+    /// Records one block and returns the length of the run it belongs to — 0 when the block is
+    /// fresh, which is the overwhelmingly common answer.
+    fn observe(&mut self, block: &[u8; IMU_BLOCK_LEN]) -> u64 {
+        if self.last.replace(*block) == Some(*block) {
+            self.stale.total = self.stale.total.saturating_add(1);
+            self.stale.run = self.stale.run.saturating_add(1);
+        } else {
+            self.stale.run = 0;
+        }
+        self.stale.run
+    }
+}
+
 pub struct DynamixelIo {
     controller: Xl330Controller,
     /// IMU first, then the servos in [`JOINT_IDS`] order — the order blocks come back in.
     ids: Vec<u8>,
     imu: SflpDecoder,
-    last_imu_block: [u8; IMU_BLOCK_LEN],
     /// Blocks identical to their predecessor. The read succeeded but the board handed back
     /// the same sample, which means the policy is being fed dead orientation data — a
     /// failure that is invisible unless someone counts it. Known to happen.
-    stale_imu_blocks: u64,
+    stale_imu: StaleImuTracker,
 }
 
 impl DynamixelIo {
@@ -82,8 +119,7 @@ impl DynamixelIo {
             controller,
             ids,
             imu: SflpDecoder::default(),
-            last_imu_block: [0; IMU_BLOCK_LEN],
-            stale_imu_blocks: 0,
+            stale_imu: StaleImuTracker::default(),
         })
     }
 
@@ -211,20 +247,18 @@ impl RobotIo for DynamixelIo {
         if blocks[0].len() == IMU_BLOCK_LEN {
             let mut raw = [0u8; IMU_BLOCK_LEN];
             raw.copy_from_slice(&blocks[0]);
-            if raw == self.last_imu_block {
-                let n = self.stale_imu_blocks.saturating_add(1);
-                self.stale_imu_blocks = n;
-                // Say so, or the counter is a number nobody ever reads. Rate-limited
-                // because a board that has stopped refreshing produces one of these every
-                // single tick, and 50 Hz of identical warnings would evict the journal.
-                if n == 1 || n.is_multiple_of(500) {
-                    tracing::warn!(
-                        stale_blocks = n,
-                        "imu board returned the same sample as last tick — orientation may be dead"
-                    );
-                }
+            // Say so, or the counters are numbers nobody ever reads — but only once the run
+            // is long enough to mean something. Rate-limited past that because a board which
+            // has stopped refreshing produces one of these every single tick, and 50 Hz of
+            // identical warnings would evict the journal.
+            let run = self.stale_imu.observe(&raw);
+            if run == STALE_RUN_WARN || (run > STALE_RUN_WARN && run.is_multiple_of(500)) {
+                tracing::warn!(
+                    consecutive = run,
+                    total = self.stale_imu.stale.total,
+                    "imu board has returned the same sample {run} reads running — orientation is frozen"
+                );
             }
-            self.last_imu_block = raw;
             sensors.imu = self.imu.decode(&raw);
         } else {
             return Err(IoError::ShortRead {
@@ -326,8 +360,8 @@ impl RobotIo for DynamixelIo {
         })
     }
 
-    fn imu_stale_blocks(&self) -> u64 {
-        self.stale_imu_blocks
+    fn imu_stale(&self) -> ImuStale {
+        self.stale_imu.stale
     }
 
     fn imu_ready(&self) -> bool {
@@ -369,5 +403,71 @@ mod tests {
         let one_count = RAD_PER_SEC_PER_COUNT;
         let expected_rpm = 0.229;
         assert!((one_count * 60.0 / (2.0 * PI) - expected_rpm).abs() < 1e-12);
+    }
+
+    fn block(n: u8) -> [u8; IMU_BLOCK_LEN] {
+        [n; IMU_BLOCK_LEN]
+    }
+
+    /// The first block has no predecessor, so it cannot be a repeat of one. This is not a
+    /// hypothetical: the natural initial value is all zeros, and an all-zero block is what a
+    /// board sends before SFLP has written its table — which used to score a stale read on the
+    /// very first tick of every boot, and put a permanent 1 in a counter rendered as an alarm.
+    #[test]
+    fn the_first_block_is_never_stale() {
+        let mut t = StaleImuTracker::default();
+        assert_eq!(t.observe(&block(0)), 0);
+        assert_eq!(t.stale.total, 0);
+    }
+
+    /// Fresh blocks must leave both counters alone. The whole point of the run is that it means
+    /// "right now", so anything that does not repeat has to clear it.
+    #[test]
+    fn fresh_blocks_count_for_nothing() {
+        let mut t = StaleImuTracker::default();
+        for n in 0..10 {
+            assert_eq!(t.observe(&block(n)), 0);
+        }
+        assert_eq!(t.stale, ImuStale { total: 0, run: 0 });
+    }
+
+    /// A hiccup: two identical blocks, then the board recovers. The total remembers it — that
+    /// is what makes "9 over 40 minutes" sayable — while the run goes back to zero, because
+    /// orientation is live again and nothing should be shouting.
+    #[test]
+    fn a_hiccup_is_remembered_in_the_total_but_not_the_run() {
+        let mut t = StaleImuTracker::default();
+        t.observe(&block(1));
+        assert_eq!(t.observe(&block(1)), 1, "the repeat is the first of a run");
+        assert_eq!(t.observe(&block(2)), 0, "a fresh block ends the run");
+        assert_eq!(t.stale, ImuStale { total: 1, run: 0 });
+    }
+
+    /// A board that has stopped refreshing repeats forever, and the run is what separates that
+    /// from the hiccup above. It has to reach the threshold the journal and the health report
+    /// both key off, or a genuinely dead IMU is never reported at all.
+    #[test]
+    fn a_dead_board_runs_past_the_warning_threshold() {
+        let mut t = StaleImuTracker::default();
+        t.observe(&block(7));
+        for _ in 0..STALE_RUN_WARN {
+            t.observe(&block(7));
+        }
+        assert_eq!(t.stale.run, STALE_RUN_WARN);
+        assert_eq!(t.stale.total, STALE_RUN_WARN);
+    }
+
+    /// Runs accumulate into the same total across separate episodes: the total is "how often
+    /// has this ever happened", not "how bad is it now".
+    #[test]
+    fn separate_episodes_add_up() {
+        let mut t = StaleImuTracker::default();
+        for n in 0..3u8 {
+            t.observe(&block(n));
+            t.observe(&block(n));
+            t.observe(&block(n));
+        }
+        assert_eq!(t.stale.total, 6, "two repeats in each of three episodes");
+        assert_eq!(t.stale.run, 2, "the last episode was still going");
     }
 }

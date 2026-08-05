@@ -1051,10 +1051,40 @@ pub struct BusHealth {
 pub struct ImuHealth {
     /// Has the orientation filter converged?
     pub ready: bool,
-    /// Reads that returned the previous sample unchanged. Non-zero means the board is
-    /// answering without refreshing: the reads succeed, nothing reports an error, and the
-    /// orientation is frozen.
+    /// Reads that returned the previous sample unchanged, cumulative since startup.
+    ///
+    /// Sporadic hits are ordinary and say nothing about whether orientation is live *now*: the
+    /// control loop and the board keep their own clocks, so a tick landing inside one board
+    /// refresh legitimately sees the same bytes twice. Useful for scale — a handful over an
+    /// hour is a healthy board — and misleading on its own, which is why it travels with the
+    /// run below rather than being reported alone.
     pub stale_blocks: u64,
+    /// Length of the current unbroken run of stale reads; any fresh block resets it to zero.
+    ///
+    /// This is the one worth alarming on. A board that has stopped fusing keeps answering the
+    /// `sync_read` — so the bus reports no error and `ready` stays true — and repeats itself on
+    /// every tick, which makes the run climb without bound. See [`ImuHealth::frozen`].
+    pub consecutive_stale_blocks: u64,
+}
+
+impl ImuHealth {
+    /// Run length at which orientation is called frozen rather than hiccuping.
+    ///
+    /// 25 reads is half a second at 50 Hz: long enough that no ordinary hiccup reaches it, short
+    /// enough to be prompt, and the same span `SflpDecoder::ready` waits for before it will
+    /// treat the chip's output as a measurement. `duck-control`'s journal warning uses the same
+    /// number — deliberately, so the log and the report agree about what "frozen" means — but
+    /// keeps its own copy, because the hardware layer does not depend on this IPC vocabulary.
+    pub const FROZEN_RUN: u64 = 25;
+
+    /// Is orientation frozen *now*, as opposed to having hiccuped at some point?
+    ///
+    /// The distinction is the whole reason both counters exist: reporting any non-zero total as
+    /// a possible dead IMU meant a healthy robot wore an alarm for its entire uptime, and a
+    /// warning that fires on a healthy robot is a warning nobody reads.
+    pub fn frozen(&self) -> bool {
+        self.consecutive_stale_blocks >= Self::FROZEN_RUN
+    }
 }
 
 /// Servo case temperature, reduced to the part worth acting on.

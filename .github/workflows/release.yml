@@ -204,6 +204,29 @@ jobs:
           health = { probe = "socket", timeout = "30s" }
           EOF
 
+          # The release ships a `preinstall` hook asserting the machine can run it, and
+          # `updaterd install` runs hooks on a bootstrap install too — correctly, since a
+          # fresh board is exactly when a missing ONNX Runtime has to be installed. This
+          # runner is not a board: it is x86_64, so the aarch64 dylib the hook would fetch
+          # could never be loaded here, and /usr/local/lib is not writable by the runner
+          # user — which is how this first failed, with the hook aborting the install.
+          #
+          # So declare the precondition satisfied and let the hook take its "already fine"
+          # branch, touching nothing. Faking the *file* rather than skipping the hook keeps
+          # this step's claim honest: hooks still run, and a hook that started failing for
+          # any other reason would still fail the release. The hook's own logic — accepting
+          # a runtime at the floor, refusing one it cannot replace — is covered on emulated
+          # aarch64, as root, in scripts/board-test.sh.
+          #
+          # The version comes from [workspace.metadata.onnxruntime], never a literal: that
+          # table is the single source of truth the hook itself is generated from, and a
+          # second copy here would be free to drift below the floor and turn this step red
+          # for a reason that has nothing to do with the release.
+          onnx_target="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.metadata.onnxruntime.target')"
+          sudo touch "/usr/local/lib/libonnxruntime.so.${onnx_target}"
+          sudo ln -sfn "libonnxruntime.so.${onnx_target}" /usr/local/lib/libonnxruntime.so
+
           # The same command `scripts/install.sh` runs on a fresh robot, against the same
           # files it would download. A host-native build, because the packaged binaries are
           # aarch64 and this runner is x86_64 — what is under test is the bootstrap logic,
