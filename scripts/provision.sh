@@ -4,10 +4,13 @@
 #   export DUCK_TOKEN=...                      # only while the repository is private
 #   curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" .../provision.sh -o /tmp/provision.sh
 #   sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/provision.sh
-#   sudo reboot
-#   sudo /usr/local/sbin/robot-provision
 #
-# Four commands, and `robotctl health` works when the last one finishes.
+# It stages the board, reboots, and finishes on its own. `robotctl health` works when you log
+# back in. Everything the second half does goes to /var/lib/robot/provision.log, because there
+# is nobody watching a terminal by then — and because journald persistence is configured by the
+# release this is installing, so on a first boot the journal may be RAM-only.
+#
+# `DUCK_NO_REBOOT=1` keeps the old four-command shape: it stops and tells you what to run.
 #
 # This orchestrates `setup-board.sh`, `migrate-network.sh` and `install.sh`; it does not
 # duplicate them. They stay separately runnable, and they stay separate for the reasons each
@@ -27,12 +30,24 @@
 #   - Your shell after the reboot is a *new login session*, which is what makes the `robot`
 #     group live without `newgrp`. See `create_group`.
 #
-# ## Why it does not reboot on its own
+# ## Why it takes the reboot, when the scripts it calls will not
 #
-# `setup-board.sh` and `migrate-network.sh` both state that they never do, and this keeps
-# their rule. The reboot after a wifi cutover is the one moment a headless board can become
-# unreachable — the backstop in `migrate-network.sh` exists for exactly that — and it belongs
-# to whoever is in a position to go and find the board, not to a script.
+# `setup-board.sh` and `migrate-network.sh` each state they never reboot on their own, and that
+# is right for them: they are single-purpose, they can be run on a robot that is doing something
+# else, and neither can know what the reboot would interrupt. This script knows — it is only ever
+# run on a board being provisioned, where the reboot is not an interruption but the next step.
+#
+# What that costs is that the second half runs with nobody watching. Two guards, because the
+# thing that can go wrong here is a loop rather than a failure:
+#
+#   1. The resume unit disables itself *before* doing any work, so there is at most one
+#      automatic attempt ever. A phase 2 that dies leaves a board to look at, not a board
+#      retrying forever.
+#   2. `migrate-network.sh` is only re-run when NetworkManager already owns wifi — i.e. the
+#      cutover took and the run is just to retire the backstop. If the backstop fired and
+#      restored netplan, re-cutting over is exactly what must not happen unattended: it would
+#      re-arm the backstop, fail the same way, reboot, and go round again. It says so in the log
+#      and leaves wifi alone.
 set -eu
 
 # ── knobs ────────────────────────────────────────────────────────────────────
@@ -74,6 +89,24 @@ FORCE_REINSTALL="$ENV_FORCE"
 SELF=/usr/local/sbin/robot-provision
 STATE_DIR=/var/lib/robot
 STATE="${STATE_DIR}/provision.env"
+
+# Where the unattended half writes what it did. A file, not just the journal: journald
+# persistence arrives with the drop-in in the release being installed, so on a board's first
+# boot the journal can still be RAM-only — and this is the one record of a step nobody watched.
+LOG="${STATE_DIR}/provision.log"
+
+# The unit that resumes after the reboot. Left on disk, disabled, once provisioning is done:
+# it is a record of what ran, and `ConditionPathExists` on the state file means re-enabling it
+# by accident cannot re-run anything.
+UNIT=/etc/systemd/system/robot-provision.service
+UNIT_NAME=robot-provision.service
+
+# Set when systemd resumed us rather than a human. Changes two things: output goes to $LOG, and
+# a failed wifi cutover is reported rather than retried. See the header.
+RESUMED=0
+
+# Stop before the reboot instead of taking it, for anyone who wants the steps one at a time.
+NO_REBOOT="${DUCK_NO_REBOOT:-}"
 # Where a dev key is parked across the reboot. A public key, so 0644 is right; the point of
 # moving it is only that /tmp does not survive the reboot this asks for.
 DEV_KEY_KEPT="${STATE_DIR}/team.dev.pub"
@@ -254,6 +287,84 @@ keep_dev_key() {
     say "kept the dev key at ${DEV_KEY_KEPT} — /tmp does not survive the reboot"
 }
 
+# Install and enable the unit that finishes this after the reboot.
+#
+# `ConditionPathExists` on the state file rather than only `disable`, so the two ways this could
+# run again — a stale enablement, someone re-enabling it by hand — both stop at a board that has
+# already finished. Belt and braces on a unit whose failure mode is a reboot loop.
+#
+# Output goes to a file rather than the journal, which is deliberate and slightly unusual: the
+# thing that configures journald persistence is the drop-in inside the release being installed,
+# so during this exact window the journal can still be RAM-only. A log that a power cut erases
+# is not much of a record of the one step nobody watched.
+install_resume_unit() {
+    cat > "$UNIT" <<EOF
+[Unit]
+Description=Finish robot provisioning after the reboot
+Documentation=https://github.com/${REPO}/blob/${REF}/deploy/README.md
+# Never run on a board that has already finished: \`finish\` removes this file.
+ConditionPathExists=${STATE}
+# install.sh downloads a release, so this needs a network that is actually up — not merely
+# configured. After the wifi cutover that means NetworkManager-wait-online.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${SELF} --resumed
+StandardOutput=append:${LOG}
+StandardError=append:${LOG}
+# Long enough for an apt install, a release download and a health gate on a slow board.
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$UNIT"
+    systemctl daemon-reload
+    systemctl enable "$UNIT_NAME" >/dev/null 2>&1 \
+        || die "could not enable ${UNIT_NAME}; nothing would finish this after the reboot"
+}
+
+# Disabled *before* phase 2 does anything, so there is at most one automatic attempt ever.
+#
+# The unit file stays on disk as a record of what ran. What must not survive is the enablement:
+# if phase 2 dies halfway, the next boot has to leave the board alone for someone to look at,
+# rather than trying again into the same wall.
+disable_resume_unit() {
+    systemctl disable "$UNIT_NAME" >/dev/null 2>&1 || true
+}
+
+# Does NetworkManager own wlan0? Three lines of nmcli rather than a call into
+# migrate-network.sh, because the question here is *whether to invoke it at all*.
+nm_owns_wifi() {
+    command -v nmcli >/dev/null 2>&1 || return 1
+    case "$(nmcli -t -f DEVICE,STATE device status 2>/dev/null | sed -n 's/^wlan0://p')" in
+        ''|unmanaged) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# Take the reboot, having said so first.
+#
+# The delay is the whole courtesy: an SSH session is about to end, and ten seconds is enough to
+# read why and press Ctrl-C. It is not a prompt — this has to work when stdin is not a terminal,
+# which it is not under `sudo sh` from anything scripted.
+reboot_now() {
+    cat <<EOF
+
+  Rebooting in 10 seconds. Ctrl-C now to stop, then finish by hand with:
+      sudo ${SELF}
+
+  After the reboot this continues on its own and logs to:
+      ${LOG}
+  Watch it with:  sudo tail -f ${LOG}
+EOF
+    sleep 10
+    say "rebooting"
+    systemctl reboot
+}
+
 # ── phases ───────────────────────────────────────────────────────────────────
 
 phase_one() {
@@ -275,17 +386,23 @@ phase_one() {
         save_state ""
     fi
 
-    cat <<EOF
+    say "phase 1 done — both changes are staged, and a device-tree overlay and a network stack"
+    say "cannot swap under a running kernel, so the rest happens after a reboot"
 
-$(printf '\033[1m==>\033[0m') phase 1 done. Reboot, then finish:
+    if [ -n "$NO_REBOOT" ]; then
+        cat <<EOF
 
-  sudo reboot
-  sudo ${SELF}
+  DUCK_NO_REBOOT is set, so this stops here:
 
-Both changes above are staged rather than live — a device-tree overlay and a network stack
-cannot swap under a running kernel. The reboot also refreshes your login session, which is
-what makes the robot group work without \`newgrp\`.
+      sudo reboot
+      sudo ${SELF}
+
 EOF
+        return 0
+    fi
+
+    install_resume_unit
+    reboot_now
 }
 
 phase_two() {
@@ -301,14 +418,36 @@ phase_two() {
         sh "$tmp"
     fi
 
-    # Separately, and unconditionally: this run is what retires the wifi backstop. Left armed,
-    # any later boot where wifi is merely slow reverts this board to netplan.
-    if [ -x "$MIGRATE_SELF" ]; then
-        "$MIGRATE_SELF"
+    # This run is what retires the wifi backstop. Left armed, any later boot where wifi is
+    # merely slow reverts this board to netplan.
+    #
+    # Conditional on the cutover having *worked*, and only when nobody is watching. If the
+    # backstop fired and put netplan back, re-running the migration would re-arm it, fail the
+    # same way, reboot, and go round again — a loop, unattended, on a board that is at least
+    # reachable. Reported instead, and wifi left alone.
+    if nm_owns_wifi; then
+        if [ -x "$MIGRATE_SELF" ]; then
+            "$MIGRATE_SELF"
+        else
+            tmp=/tmp/migrate-network.sh
+            fetch migrate-network.sh "$tmp"
+            sh "$tmp"
+        fi
+    elif [ "$RESUMED" = 1 ]; then
+        warn "wifi is not NetworkManager's, so the cutover did not take — most likely the
+  backstop restored netplan and rebooted. Not retrying it unattended: that would re-arm the
+  backstop and loop. The board is reachable on netplan and the install below continues.
+  When you can watch it:  sudo ${MIGRATE_SELF}"
     else
-        tmp=/tmp/migrate-network.sh
-        fetch migrate-network.sh "$tmp"
-        sh "$tmp"
+        # A human is here, so let the migration decide for itself — it is idempotent, and
+        # retrying in front of someone is exactly the right time to retry.
+        if [ -x "$MIGRATE_SELF" ]; then
+            "$MIGRATE_SELF"
+        else
+            tmp=/tmp/migrate-network.sh
+            fetch migrate-network.sh "$tmp"
+            sh "$tmp"
+        fi
     fi
 
     tmp=/tmp/install.sh
@@ -361,6 +500,13 @@ finish() {
         say "no token on this board; updaterd can only fetch from a public repository"
     fi
 
+    if [ "$RESUMED" = 1 ]; then
+        # Nobody is reading this as it happens; it is being written to $LOG for whoever logs in
+        # next. So the closing line is addressed to them, not to a terminal.
+        say "nothing left to do — log in and run: robotctl health"
+        return 0
+    fi
+
     cat <<'EOF'
 
   robotctl health
@@ -374,6 +520,19 @@ main() {
     [ "$(id -u)" = 0 ] || die "run as root — re-run that same command with sudo"
     command -v curl >/dev/null 2>&1 || die "curl is required"
 
+    case "${1:-}" in
+        --resumed) RESUMED=1 ;;
+        '') ;;
+        *) die "unknown argument: $1 (only --resumed, which systemd passes)" ;;
+    esac
+
+    if [ "$RESUMED" = 1 ]; then
+        # Before the work, not after: one automatic attempt, whatever happens next.
+        disable_resume_unit
+        mkdir -p "$STATE_DIR"
+        say "resumed by systemd after the reboot; logging to ${LOG}"
+    fi
+
     if load_state; then
         if same_boot_as_phase_one; then
             die "phase 1 has run but this board has not rebooted since.
@@ -381,6 +540,7 @@ main() {
   so there is no /dev/ttyS2, and robotd would start and report a hardware fault that is
   really a missing reboot.
     sudo reboot
+  Then this finishes on its own, unless DUCK_NO_REBOOT was set — in which case:
     sudo ${SELF}"
         fi
         persist_self

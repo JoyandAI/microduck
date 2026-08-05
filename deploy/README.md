@@ -19,7 +19,7 @@ the reasons attached — read it when something disagrees with you, not before.
 ### Dev board, repository private — this is today
 
 Your token is the only placeholder. `provision.sh` runs `setup-board.sh`, `migrate-network.sh`
-and `install.sh` in order, on both sides of the reboot, and carries the token across it itself.
+and `install.sh` in order, reboots when it has to, and finishes on its own afterwards.
 
 ```bash
 export DUCK_TOKEN=github_pat_replace_with_your_token
@@ -29,33 +29,51 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/provision.sh -o /tmp/provision.sh && sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/provision.sh
 ```
 
-```bash
-sudo reboot
-```
-
-```bash
-sudo /usr/local/sbin/robot-provision
-```
+It warns, waits ten seconds, and reboots — your SSH session ends there. Log back in and:
 
 ```bash
 robotctl health
 ```
+
+If it is still working when you get back, watch it:
+
+```bash
+sudo tail -f /var/lib/robot/provision.log
+```
+
+That log is the record of the half nobody watched, and it is a file rather than the journal on
+purpose: journald persistence is configured by a drop-in inside the release being installed, so
+during this exact window the journal can still be RAM-only.
 
 For a board that should accept `--ref <branch>` builds, `scp ~/.duck-keys/team.dev.pub
 board:/tmp/` first and add `DUCK_DEV_KEY=/tmp/team.dev.pub` to the `sudo` line. It is copied
 somewhere that survives the reboot, because /tmp is not.
 
 No `newgrp robot`, and that is deliberate rather than an omission: the `robot` group is created
-in the first phase, so the login session you come back to after the reboot already has it. If
-you never reboot — provisioning twice in one session, say — `robot-provision` says so and refuses
-rather than installing onto boot config that is staged and not live.
+before the reboot, so the session you log back into already has it.
 
 ### Regular user, repository public
 
-No token and no dev key — but still downloaded rather than piped, for the reason below.
+No token and no dev key.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/provision.sh -o /tmp/provision.sh && sudo sh /tmp/provision.sh
+```
+
+```bash
+robotctl health
+```
+
+Downloaded rather than piped even here: the second half runs after a reboot, so there has to be
+a file left on disk for it to be. It refuses a pipe rather than stranding you halfway.
+
+### Doing it by hand
+
+`DUCK_NO_REBOOT=1` makes `provision.sh` stop before the reboot and tell you what to run, which
+is the shape to use when you want to see each step's status block go past:
+
+```bash
+sudo DUCK_NO_REBOOT=1 DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/provision.sh
 ```
 
 ```bash
@@ -66,20 +84,10 @@ sudo reboot
 sudo /usr/local/sbin/robot-provision
 ```
 
-```bash
-robotctl health
-```
-
-Downloaded rather than piped even here: phase 2 runs after a reboot, so there has to be a file
-left on disk for `robot-provision` to be. It refuses a pipe rather than stranding you halfway.
-
-### Doing it by hand
-
-The three scripts stay independently runnable, and `provision.sh` is a thin orchestrator over
-them with no logic of its own. Run them one at a time when a board is misbehaving and you want
-to see each step's status block on its own — the order is `setup-board.sh`,
-`migrate-network.sh`, reboot, both again, `install.sh`, then `newgrp robot` because nothing
-created the group before the reboot in that case.
+The three scripts also stay independently runnable, and `provision.sh` is a thin orchestrator
+with no logic of its own. One at a time the order is `setup-board.sh`, `migrate-network.sh`,
+reboot, both again, `install.sh` — and then `newgrp robot`, because on that path nothing created
+the group before the reboot.
 
 ## What those commands actually do
 
@@ -94,6 +102,20 @@ rather than maintained the day we build an image with NetworkManager in it.
 a dev-key path, and the boot id it uses to tell whether you have actually rebooted. It has no
 provisioning logic of its own, on purpose: three scripts with different lifetimes should not
 become one script whose parts cannot be removed separately.
+
+It does take the reboot, which the scripts it calls deliberately never do. That is not a
+contradiction: they are single-purpose and can be run on a robot that is doing something else,
+so neither can know what a reboot would interrupt. This one is only ever run on a board being
+provisioned, where the reboot is the next step rather than an interruption.
+
+The cost is that the second half runs unattended, and the thing that can go wrong there is a
+loop rather than a failure — so two guards. The resume unit disables itself *before* doing any
+work, so there is at most one automatic attempt: a phase 2 that dies leaves a board to look at
+rather than a board retrying into the same wall. And `migrate-network.sh` is only re-run when
+NetworkManager already owns wifi, meaning the cutover took and the run is just to retire the
+backstop. If the backstop fired and restored netplan, re-cutting over unattended would re-arm
+it, fail the same way, reboot, and go round again; it says so in the log and leaves wifi alone.
+The unit file stays on disk, disabled, as a record of what ran.
 
 The token is needed three times, and only the first two end with provisioning: fetching these
 scripts, fetching the release, and then permanently — `updaterd` reads `GITHUB_TOKEN` from a
@@ -278,6 +300,9 @@ bad time" than a clock.
 /usr/lib/sysusers.d/robot.conf          creates the `robot` group
 /var/lib/robot/updater/                 lock, update log, boot counter
 /usr/local/bin/robotctl -> current/bin/robotctl
+/usr/local/sbin/robot-provision         provisioning, resumed after its reboot
+/var/lib/robot/provision.log            what the unattended half did
+/etc/systemd/system/robot-provision.service   disabled once provisioning finished
 ```
 
 Unit files are **copied** rather than symlinked through `current`: read through the
