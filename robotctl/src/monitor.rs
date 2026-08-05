@@ -52,6 +52,11 @@ const TRACE_SAMPLES: usize = 600;
 /// stalled — the age in the header has to keep counting up.
 const IDLE_REDRAW: Duration = Duration::from_millis(250);
 
+/// Rows the robot block occupies: two borders, a four-row half for the command and the IMU
+/// side by side, then the limits and the head. Fixed, because a header that grows when a
+/// limit appears would shift every joint row down at the moment the reader is staring at one.
+const HEADER_HEIGHT: u16 = 8;
+
 /// What the reader thread has to say.
 enum Update {
     State(Box<proto::RobotState>),
@@ -363,9 +368,12 @@ impl View {
         // scrolled off the bottom is still reachable, whereas a missing loop rate is the one
         // number that says whether the others can be trusted at all. Capped at six because a
         // mostly-flat rate drawn twenty rows tall is a wall of ink, not more information.
-        let trace_height = area.height.saturating_sub(6 + rows as u16 + 3).clamp(3, 6);
+        let trace_height = area
+            .height
+            .saturating_sub(HEADER_HEIGHT + rows as u16 + 3)
+            .clamp(3, 6);
         let [header, joints, trace] = Layout::vertical([
-            Constraint::Length(6),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(4),
             Constraint::Length(trace_height),
         ])
@@ -378,7 +386,7 @@ impl View {
         let (scroll, visible) = (self.scroll, self.visible);
         let state = self.latest.as_ref().expect("a state, checked above");
 
-        frame.render_widget(self.header(state), header);
+        self.render_header(frame, header, state);
         frame.render_stateful_widget(
             self.joints(state, rows, visible),
             joints,
@@ -387,22 +395,59 @@ impl View {
         frame.render_widget(self.trace(), trace);
     }
 
-    /// The whole-robot line block: who is driving, whether it is upright, what was asked
-    /// for, and what actually went out.
-    fn header(&self, state: &proto::RobotState) -> Paragraph<'_> {
+    /// The whole-robot block: what was asked of it, what it did, and what it can feel.
+    ///
+    /// Everything is spelled out — axis names, units, the sense of each direction — because
+    /// the previous version wrote `req [+0.30 +0.00 +0.10]` and a reader had to already know
+    /// that a velocity twist is `vx, vy, vyaw`, that the numbers are m/s and rad/s, and which
+    /// way positive turns. That convention is written down in `duck-ipc-proto`, and a display
+    /// that omits it makes every reader re-derive it — which is the exact failure the protocol
+    /// docs name as the reason the prototype grew five sign-flip flags.
+    fn render_header(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        state: &proto::RobotState,
+    ) {
+        let block = Block::bordered()
+            .title(Line::from(self.title(state)))
+            .title_top(
+                Line::from(" q quits · ↑↓ scrolls joints ")
+                    .dim()
+                    .right_aligned(),
+            );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // Command on the left, sensing on the right: two four-row columns rather than eight
+        // stacked rows, because every row here is a row the joints table does not get.
+        let [top, bottom] =
+            Layout::vertical([Constraint::Length(4), Constraint::Length(2)]).areas::<2>(inner);
+        let [asked, felt] =
+            Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+                .areas::<2>(top);
+
+        frame.render_widget(self.movement(state), asked);
+        frame.render_widget(self.imu(state), felt);
+        frame.render_widget(self.limits_and_head(state), bottom);
+    }
+
+    /// The block's own title: who is driving, how fast the loop is going, and whether the
+    /// frame on screen is still arriving.
+    fn title(&self, state: &proto::RobotState) -> Vec<Span<'static>> {
         let missed = state.control_loop.missed;
-        let mut top = vec![
-            Span::raw("policy "),
+        let mut title = vec![
+            Span::raw(" policy "),
             Span::styled(
                 state.policy.clone(),
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!("   t {:.2} s   ", state.t)),
+            Span::raw(format!(" · t {:.2} s · ", state.t)),
             Span::styled(
                 format!("{:.1} Hz", state.control_loop.hz),
                 Style::new().fg(Color::Cyan),
             ),
-            Span::raw("   missed "),
+            Span::raw(" · missed "),
             Span::styled(
                 missed.to_string(),
                 if missed > 0 {
@@ -411,59 +456,111 @@ impl View {
                     Style::new().dim()
                 },
             ),
+            Span::raw(" "),
         ];
         if let Some(age) = self.stalled_for() {
-            top.push(Span::styled(
-                format!("   STALLED {:.1}s", age.as_secs_f64()),
+            title.push(Span::styled(
+                format!("· STALLED {:.1}s ", age.as_secs_f64()),
                 Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             ));
         }
+        title
+    }
 
-        // `fallen` overrides the requested gain, and `limp` is how that override shows up at
-        // the servos. Kept on one line with the gravity vector it was decided from: the
-        // verdict alone cannot distinguish a robot on its side from an IMU mounted the way
-        // this build does not expect.
-        let mut safety = vec![Span::raw("safety "), fall_verdict(&state.safety)];
-        if state.safety.limp {
-            safety.push(Span::styled(" limp", Style::new().fg(Color::Yellow)));
-        }
-        safety.push(Span::raw(format!(
-            "   g [{:+.2} {:+.2} {:+.2}]   kp {}",
-            state.safety.gravity[0],
-            state.safety.gravity[1],
-            state.safety.gravity[2],
+    /// The velocity twist, one labelled row per axis: what a client asked for, and what
+    /// actually reached the policy after safety had its say.
+    fn movement(&self, state: &proto::RobotState) -> Paragraph<'static> {
+        let axis = |name: &str, sense: &str, unit: &str, i: usize| {
+            let (asked, applied) = (state.movement.requested[i], state.movement.applied[i]);
+            // Highlight the difference, not the pair: "asked for 0.3, got 0.15" is the whole
+            // reason this command exists, and it is invisible when both numbers look alike.
+            let style = if (asked - applied).abs() > 1e-6 {
+                Style::new().fg(Color::Yellow)
+            } else {
+                Style::new()
+            };
+            Line::from(vec![
+                Span::raw(format!(" {name:<5}{sense:<10}{asked:>+7.2}")),
+                Span::styled(format!("{applied:>+8.2}"), style),
+                Span::raw(format!("  {unit}")).dim(),
+            ])
+        };
+
+        Paragraph::new(vec![
+            Line::from(" move                asked applied").dim(),
+            axis("vx", "forward", "m/s", 0),
+            axis("vy", "left", "m/s", 1),
+            axis("vyaw", "turn left", "rad/s", 2),
+        ])
+    }
+
+    /// What the IMU is telling the robot, and the verdict drawn from it.
+    ///
+    /// Projected gravity is the only IMU quantity on this stream — `robot.health` has the
+    /// stale-read counters — and it is here rather than reduced to `fallen` because the
+    /// verdict alone cannot tell a robot lying on its side from an IMU mounted the way this
+    /// build does not expect. Upright is about `[0, 0, -1]`.
+    fn imu(&self, state: &proto::RobotState) -> Paragraph<'static> {
+        let axis = |name: &str, i: usize| {
+            Line::from(format!(" {name:<11}{:>+6.2}", state.safety.gravity[i]))
+        };
+        let mut down = axis("z up", 2).spans;
+        down.push(Span::raw("   "));
+        down.push(fall_verdict(&state.safety));
+
+        Paragraph::new(vec![
+            Line::from(" imu · gravity in the trunk frame").dim(),
+            axis("x forward", 0),
+            axis("y left", 1),
+            Line::from(down),
+        ])
+    }
+
+    /// Two rows that are always present whether or not they have anything to report, because
+    /// a header that changes height moves the joints table under the reader's eyes.
+    fn limits_and_head(&self, state: &proto::RobotState) -> Paragraph<'static> {
+        let limits = if state.movement.limited_by.is_empty() {
+            Line::from(" limits  none — the command went through untouched").dim()
+        } else {
+            // Explained, not just named: `deadman` is a token the reader has to look up, and
+            // the sentence is the thing they were looking it up for.
+            Line::from(vec![
+                Span::raw(" limits  "),
+                Span::styled(
+                    state
+                        .movement
+                        .limited_by
+                        .iter()
+                        .map(|l| explain_limit(l))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    Style::new().fg(Color::Yellow),
+                ),
+            ])
+        };
+
+        let mut head = vec![Span::raw(format!(
+            " head    neck_pitch {:+.2}  head_pitch {:+.2}  head_yaw {:+.2}  head_roll {:+.2}",
+            state.head[0], state.head[1], state.head[2], state.head[3]
+        ))];
+        head.push(Span::raw(" rad   ").dim());
+        // The gain the servos are actually running at, next to `limp`, which is what a gain
+        // that safety has overridden looks like from the outside.
+        head.push(Span::raw(format!(
+            "kp {}",
             state
                 .safety
                 .gain
-                .map_or_else(|| "-".to_owned(), |g| g.to_string()),
+                .map_or_else(|| "-".to_owned(), |g| g.to_string())
         )));
-
-        let mut movement = vec![Span::raw(format!(
-            "move   req [{}]  →  app [{}]",
-            triple(&state.movement.requested),
-            triple(&state.movement.applied),
-        ))];
-        if !state.movement.limited_by.is_empty() {
-            movement.push(Span::styled(
-                format!("   limited by {}", state.movement.limited_by.join(", ")),
+        if state.safety.limp {
+            head.push(Span::styled(
+                " limp — gains dropped so the robot yields",
                 Style::new().fg(Color::Yellow),
             ));
         }
 
-        Paragraph::new(vec![
-            Line::from(top),
-            Line::from(movement),
-            Line::from(safety),
-            Line::from(format!(
-                "head   [{:+.2} {:+.2} {:+.2} {:+.2}]",
-                state.head[0], state.head[1], state.head[2], state.head[3]
-            )),
-        ])
-        .block(
-            Block::bordered()
-                .title(" robot ")
-                .title_top(Line::from(" q quits ").dim().right_aligned()),
-        )
+        Paragraph::new(vec![limits, Line::from(head)])
     }
 
     /// Measured against commanded, per joint, with the difference as a bar.
@@ -502,14 +599,17 @@ impl View {
             rows,
             [
                 Constraint::Length(15),
-                Constraint::Length(8),
-                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(9),
                 Constraint::Length(8),
                 Constraint::Min(BAR_HALF as u16 * 2 + 1),
             ],
         )
         .header(
-            Row::new(vec!["joint", "measured", "target", "error", "deviation"]).style(
+            // "commanded", not "target": the wire calls it `targets`, but next to a *measured*
+            // angle the word target reads as a goal the robot is working towards rather than
+            // the number that was written to the servo on this very tick.
+            Row::new(vec!["joint", "measured", "commanded", "error", "deviation"]).style(
                 Style::new()
                     .add_modifier(Modifier::BOLD)
                     .add_modifier(Modifier::DIM),
@@ -531,11 +631,11 @@ impl View {
     /// display that lies.
     fn window_note(&self, count: usize, visible: usize) -> String {
         if visible >= count {
-            return format!(" ±{BAR_FULL_SCALE:.2} rad full scale ");
+            return format!(" radians · bar reaches ±{BAR_FULL_SCALE:.2} rad ");
         }
         let last = (self.scroll + visible).min(count);
         format!(
-            " ±{BAR_FULL_SCALE:.2} rad · {}–{last} of {count} · ↑↓ scrolls ",
+            " radians · bar ±{BAR_FULL_SCALE:.2} · {}–{last} of {count} · ↑↓ scrolls ",
             self.scroll + 1
         )
     }
@@ -581,6 +681,23 @@ fn joint_rows(state: &proto::RobotState) -> usize {
         .max(proto::JOINT_NAMES.len())
 }
 
+/// Say what a limit *means*, not just what it is called.
+///
+/// The wire carries `duck_control::safety::Limit`'s names — `deadman`, `joint_range`,
+/// `not_finite`, `fallen` — and each one is a token whose meaning lives in a doc comment in
+/// another crate. Anything unrecognised is passed through verbatim: a `robotd` newer than this
+/// `robotctl` may have limits this build has never heard of, and printing the raw name is
+/// strictly better than hiding it.
+fn explain_limit(limit: &str) -> String {
+    match limit {
+        "deadman" => "deadman — no intent arrived recently, velocity zeroed".to_owned(),
+        "joint_range" => "joint_range — a target was outside the actuator's travel".to_owned(),
+        "not_finite" => "not_finite — a target was NaN or infinite".to_owned(),
+        "fallen" => "fallen — the robot is down, the policy is not driving".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 fn fall_verdict(safety: &proto::SafetyState) -> Span<'static> {
     if safety.fallen {
         Span::styled(
@@ -590,10 +707,6 @@ fn fall_verdict(safety: &proto::SafetyState) -> Span<'static> {
     } else {
         Span::styled("upright", Style::new().fg(Color::Green))
     }
-}
-
-fn triple(v: &[f64; 3]) -> String {
-    format!("{:+.2} {:+.2} {:+.2}", v[0], v[1], v[2])
 }
 
 fn radians(v: Option<f64>) -> Span<'static> {
@@ -772,8 +885,13 @@ mod tests {
         for name in proto::JOINT_NAMES {
             assert!(screen.contains(name), "{name} is missing:\n{screen}");
         }
-        assert!(screen.contains("full scale"), "{screen}");
-        assert!(!screen.contains("scrolls"), "{screen}");
+        // The columns carry a unit, and the bar carries the scale it is drawn to.
+        assert!(screen.contains("radians"), "{screen}");
+        assert!(screen.contains("bar reaches ±0.20 rad"), "{screen}");
+        assert!(
+            !screen.contains("of 15"),
+            "nothing is hidden, so nothing is counted:\n{screen}"
+        );
     }
 
     /// A terminal too short for fifteen joints says which ones it is showing. The failure this
@@ -816,8 +934,56 @@ mod tests {
         let screen = draw(96, 32, &state, 0);
         assert!(screen.contains("FALLEN"), "{screen}");
         assert!(screen.contains("limp"), "{screen}");
-        assert!(screen.contains("+0.00 +0.00 -1.00"), "{screen}");
-        assert!(screen.contains("limited by fallen"), "{screen}");
+        // The verdict sits beside the axis it was decided from, each named.
+        assert!(screen.contains("z up"), "{screen}");
+        assert!(screen.contains("-1.00"), "{screen}");
+        // And the limit is explained, not just named.
+        assert!(
+            screen.contains("fallen — the robot is down"),
+            "the limit is spelled out:\n{screen}"
+        );
+    }
+
+    /// Every number in the header names itself: the axis, which way is positive, and the unit.
+    /// A bare `req [+0.30 +0.00 +0.10]` needs the reader to already know it is a velocity twist
+    /// in m/s and rad/s, which is exactly the convention `duck-ipc-proto` documents *because*
+    /// leaving it implicit is how the prototype grew five sign-flip flags.
+    #[test]
+    fn the_header_labels_its_axes_and_units() {
+        let mut state = a_state();
+        state.movement.requested = [0.30, 0.0, 0.10];
+        state.movement.applied = [0.15, 0.0, 0.10];
+
+        let screen = draw(96, 32, &state, 0);
+        for label in [
+            "vx   forward",
+            "vy   left",
+            "vyaw turn left",
+            "m/s",
+            "rad/s",
+            "asked",
+            "applied",
+            // The IMU is named as such, not left as a bare `g[...]`.
+            "imu · gravity in the trunk frame",
+            "x forward",
+            "neck_pitch",
+            "kp 32",
+        ] {
+            assert!(screen.contains(label), "{label} is missing:\n{screen}");
+        }
+        assert!(screen.contains("+0.30"), "what was asked for:\n{screen}");
+        assert!(screen.contains("+0.15"), "what was applied:\n{screen}");
+    }
+
+    /// With nothing clamped, the limits row says so rather than going blank — a blank row reads
+    /// as "this display has nothing to tell you", which is a different claim.
+    #[test]
+    fn an_unclamped_command_says_it_was_untouched() {
+        let screen = draw(96, 32, &a_state(), 0);
+        assert!(
+            screen.contains("none — the command went through"),
+            "{screen}"
+        );
     }
 
     /// Render one frame and return it as text.

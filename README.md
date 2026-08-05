@@ -134,10 +134,17 @@ that:
 robotctl monitor
 ```
 
-On a terminal that is a single frame repainting in place: the policy driving the tick, the
-fall verdict and the gravity vector it came from, every joint measured against what it was
-commanded, and the achieved loop rate as a trace so a stutter that has already recovered is
-still visible. `q` quits; `↑`/`↓` scroll the joint list on a window too short for all of it.
+On a terminal that is a single frame repainting in place: the velocity twist a client asked
+for beside what safety applied — one labelled row per axis, with its direction and unit, so
+nothing has to be decoded — the IMU's projected gravity and the fall verdict drawn from it,
+every joint measured against what it was commanded, and the achieved loop rate as a trace so
+a stutter that has already recovered is still visible. A limit is spelled out rather than
+named: `deadman — no intent arrived recently, velocity zeroed`, not `deadman`. `q` quits;
+`↑`/`↓` scroll the joint list on a window too short for all of it.
+
+Projected gravity is the only IMU quantity on this stream, and it is what `fallen` is decided
+from — upright is about `[0, 0, -1]`. The stale-read counters and the rest of the sensing live
+in `robotctl health`.
 
 Redirected or piped it prints one line per tick instead — `robotctl monitor > run.log` and
 `| grep FALLEN` behave as before. The joint vectors are in `--json`, which carries the whole
