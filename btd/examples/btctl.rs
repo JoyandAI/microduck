@@ -179,6 +179,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (request, response) = characteristics(&peripheral)?;
 
+    // Read first, and this is load-bearing rather than a courtesy.
+    //
+    // The robot requires an authenticated encrypted link to *write*, but a subscribe needs no
+    // encryption — so without this a central subscribes happily, has its first write refused, and
+    // on macOS sees neither a prompt nor an error. A read is acknowledged, so an unpaired link
+    // fails here instead, which is what makes CoreBluetooth start pairing.
+    //
+    // The value is the robot's API version. Worth checking before sending anything: a client one
+    // version ahead can say so rather than have every call refused.
+    match peripheral.read(&response).await {
+        Ok(value) => {
+            let theirs = value.first().copied().unwrap_or(0);
+            if cli.verbose {
+                eprintln!("robot speaks API v{theirs}");
+            }
+            if u32::from(theirs) != duck_ipc_proto::API_VERSION {
+                return Err(format!(
+                    "the robot speaks API v{theirs} and this client speaks v{}; \
+                     install matching versions",
+                    duck_ipc_proto::API_VERSION
+                )
+                .into());
+            }
+        }
+        Err(e) => {
+            // The likely causes are worth naming, because "read failed" alone sends people to
+            // the wrong place.
+            return Err(format!(
+                "cannot read the robot's API version: {e}\n\
+                 If pairing was refused or cancelled, forget the robot in Bluetooth settings and \
+                 try again — the PIN is on the robot (`robotctl system pin`)."
+            )
+            .into());
+        }
+    }
+
     // Subscribe *before* writing, or a reply can arrive before there is anywhere to put it.
     // btd's session begins on the first write, so the order here is not merely defensive: the
     // notify half has to exist for the session to have somewhere to answer.

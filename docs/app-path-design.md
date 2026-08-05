@@ -78,8 +78,9 @@ because "config applied" is the answer netplan gives and the one we rejected.
 
 ## 3. The GATT surface: a pipe, not an API
 
-One service, **one characteristic**. A client writes NDJSON request bytes to it and subscribes to
-the same characteristic for answers — the same JSON-RPC lines every other transport carries.
+One service, **one characteristic**. A client reads it once for the robot's API version, writes
+NDJSON request bytes to it, and subscribes to it for answers — the same JSON-RPC lines every other
+transport carries. The read is not optional; see §5 for why it exists.
 
 **No framing header.** The newline that already separates NDJSON messages is the frame delimiter in
 both directions. That is safe rather than lucky: `serde_json` escapes a newline inside a string as
@@ -178,6 +179,14 @@ as `12345`.
 The PIN is fetched **per pairing request** rather than cached, so changing it takes effect on the
 next pairing rather than the next reboot. A `configd` that cannot answer means the bond is
 **refused**: falling back to the default would let anyone pair whenever `configd` hiccuped.
+
+**A read triggers the bond.** The characteristic requires an authenticated encrypted link to
+*write*, but `bluer` 0.17 offers no encryption flag for a subscribe — so a central would subscribe
+without encryption, write, be refused, and on macOS see neither a prompt nor an error: a client
+timing out against a working robot. A read *is* acknowledged, so the characteristic carries one that
+requires the bond, and clients read it first. It returns `API_VERSION`, which makes it useful as
+well as necessary — a mismatched client can say so before sending anything. Any client, phone app
+included, must read before it writes.
 
 **No pairing window, and that is decided rather than deferred.** A per-robot PIN already carries
 what a window would add: if it is unique and printed under the robot, knowing it requires physical

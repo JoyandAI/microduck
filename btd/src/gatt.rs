@@ -25,10 +25,17 @@
 /// The robot's service. What a client scans for.
 pub const SERVICE_UUID: uuid::Uuid = uuid::uuid!("6f5d2a10-3b47-4c8e-9a1f-2d7e8c4b6019");
 
-/// The RPC pipe: write NDJSON request bytes here, subscribe here for the answers.
+/// The RPC pipe: **read** it once for the API version, write NDJSON request bytes to it, and
+/// subscribe to it for the answers.
 ///
 /// Chunked in both directions, delimited by the newline that already separates NDJSON messages —
 /// see [`crate::framing`], which is the module both the robot and `btctl` use.
+///
+/// The read is part of the contract, not an optional nicety. It requires an authenticated
+/// encrypted link, so it is what makes a central pair *before* it writes — a subscribe needs no
+/// encryption, so without the read a client subscribes, has its first write silently refused, and
+/// (on macOS) sees neither a prompt nor an error. It also returns the robot's `API_VERSION`, so a
+/// mismatched client can say so before sending anything.
 pub const RPC_UUID: uuid::Uuid = uuid::uuid!("6f5d2a11-3b47-4c8e-9a1f-2d7e8c4b6019");
 
 #[cfg(test)]

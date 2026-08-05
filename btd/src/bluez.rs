@@ -33,7 +33,7 @@ use bluer::agent::{Agent, ReqError as AgentError};
 use bluer::gatt::local::ReqError as GattError;
 use bluer::gatt::local::{
     Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod,
-    CharacteristicWrite, CharacteristicWriteMethod, Service,
+    CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod, Service,
 };
 use futures::FutureExt;
 use tokio::sync::{Mutex, mpsc};
@@ -159,6 +159,31 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
             primary: true,
             characteristics: vec![Characteristic {
                 uuid: RPC_UUID,
+                // A read whose only job is to force a bond before anything is written.
+                //
+                // §7 requires the characteristic carrying wifi credentials to be paired and
+                // encrypted, and `encrypt_authenticated_write` below does require that — but
+                // nothing *triggers* the pairing. A central subscribes (which needs no
+                // encryption, because bluer 0.17 has no flag for it), then writes, and the write
+                // is refused on an unpaired link. On macOS the refusal produced no prompt and no
+                // error: the client simply waited out its timeout against a working robot.
+                //
+                // A read is acknowledged, so an unpaired central gets "insufficient
+                // authentication" and CoreBluetooth starts pairing there and then. Requiring it
+                // on the read is the only encryption trigger bluer exposes for a subscribe-then-
+                // write flow: `CharacteristicNotify` carries no encryption flags.
+                //
+                // The value returned matters far less than the fact that reading it needs a bond;
+                // the API version is simply the most useful byte available, and a client that
+                // finds a version it does not know can say so before writing anything.
+                read: Some(CharacteristicRead {
+                    read: true,
+                    encrypt_authenticated_read: require_pairing,
+                    fun: Box::new(|_req| {
+                        async move { Ok(vec![duck_ipc_proto::API_VERSION as u8]) }.boxed()
+                    }),
+                    ..Default::default()
+                }),
                 write: Some(CharacteristicWrite {
                     write: true,
                     // Write-without-response as well: a chunked request needs no ATT
