@@ -130,8 +130,8 @@ impl<T: RobotIo> Safety<T> {
         self.io.slow_sensors()
     }
 
-    pub fn imu_stale_blocks(&self) -> u64 {
-        self.io.imu_stale_blocks()
+    pub fn imu_stale(&self) -> crate::io::ImuStale {
+        self.io.imu_stale()
     }
 
     pub fn imu_ready(&self) -> bool {
