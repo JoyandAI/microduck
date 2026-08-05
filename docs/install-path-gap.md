@@ -18,11 +18,19 @@ All three landed within a day, all while installing `btd` and `configd` onto a d
 **1. `on_apply` restarts several units in one command.** `systemctl restart robotd configd` fails as
 a whole if *either* unit is unknown — and fails without restarting the one that exists. A release
 introducing a new daemon therefore could not restart anything, because the unit file arrives *with*
-that release and is not installed when `on_apply` runs. The rollback reason was
+that release and nothing installed it. The rollback reason was
 `not healthy within 30s: unreachable`, which names neither the unit nor the command.
 
-Latent rather than fatal, since a board keeps its own `/etc/robot/updater.toml`. Fixed by
-restarting one unit at a time and skipping a unit systemd does not know.
+Latent rather than fatal, since a board keeps its own `/etc/robot/updater.toml`.
+
+Fixed twice, and the second one is the real fix. First, defensively: units are restarted one at a
+time and a unit systemd does not know is skipped. Then properly: **`hooks/postinstall` installs the
+release's units.** The engine has always had a post-install hook point — `extract → [pre_install] →
+swap → [post_install] → apply → health gate` — which runs after `current` moves, so `ExecStart`
+resolves, and before the restart, so `on_apply` finds a unit that exists. Nothing used it; only
+`scripts/install.sh` ever copied units out of a release, so every new service needed a manual step on
+every board, forever. That the mechanism existed and was unused was pointed out in review, not found
+by me.
 
 **2. The artifact did not contain the new units.** The packaging workflows name every shipped file
 with an explicit `--include`, and the units were added to `install.sh` without being added there.
@@ -63,10 +71,15 @@ and strictly stronger than the two current tests because it observes the artifac
 YAML that builds it. **Would have caught bugs 2 and 3.**
 
 **B. Install the artifact in a container, with `systemctl` stubbed.** Extend `board-test.sh`: unpack
-into a fake root, run `install.sh` against it, and assert what landed where —
-`/etc/systemd/system/*.service`, `/usr/lib/sysusers.d/`, the `robotctl` symlink, the state
+into a fake root, run `install.sh` *and* `hooks/postinstall` against it, and assert what landed
+where — `/etc/systemd/system/*.service`, `/usr/lib/sysusers.d/`, the `robotctl` symlink, the state
 directory. `setup-board.sh` is already tested this way, so the pattern and the stub exist. Catches
 bugs 2 and 3 *and* file-placement regressions in `install.sh`, which nothing tests today.
+
+The postinstall hook makes this more valuable, not less: it is now a second thing that places files
+on a board, it runs unattended on every update rather than once by hand, and its failures are inside
+the update gate. A hook that installs a unit wrongly is worse than an installer that does, because
+nobody is watching when it runs.
 
 **C. Real systemd in a container.** `systemd-nspawn`, or a privileged container with systemd as
 pid 1. Full fidelity: units actually start, `on_apply` actually restarts, the health gate actually
@@ -82,8 +95,9 @@ motor bus, the radio and the timings. Ops cost, and a single point of failure fo
 other" weakness, for a fraction of C's cost. B is the better value of the two because it exercises
 `install.sh`, which is 500 lines that nothing currently runs.
 
-C is worth revisiting when `on_apply` grows again — it is the only option that tests the restart
-and the gate, and bug 1 will have siblings.
+C is worth revisiting when `on_apply` grows again — it is the only option that tests the restart and
+the gate, and it is now also the only way to observe the postinstall hook doing its real job
+(enabling and starting a unit), which no stub can show.
 
 D is a separate conversation, and probably follows M4 rather than preceding it.
 
