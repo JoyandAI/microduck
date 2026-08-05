@@ -1134,19 +1134,27 @@ fn version_warnings(
 
     // configd joined on_apply's restart set with robotd, so the same reasoning applies: a
     // mismatch means the restart did not take, not an expected lag.
-    let configd_running = report
-        .services
-        .iter()
-        .find(|s| s.name == "configd")
+    //
+    // Compared by *revision* via `is_behind`, exactly as robotd is. Comparing versions instead
+    // warns on every dev-channel install and is how this first shipped: a daemon reports its
+    // crate version (`0.2.0`) while the release is named `0.2.0-dev.121.de58259`, so the two
+    // strings differ while the binary is precisely the one installed. A diagnostic that cries
+    // wolf on the ordinary path is worse than none.
+    let configd = report.services.iter().find(|s| s.name == "configd");
+    let configd_running = configd
         .and_then(|s| s.version.as_deref())
         .and_then(|v| semver::Version::parse(v).ok());
-    if let (Some(running), Some(installed)) = (configd_running, daemon_installed.as_ref())
-        && &running != installed
+    let configd_revision = configd.and_then(|s| s.revision.as_deref());
+    if let (Some(running), Some(installed)) = (configd_running.as_ref(), daemon_installed.as_ref())
+        && is_behind(running, configd_revision, installed, daemon_revision)
     {
         warnings.push(format!(
-            "configd is running {running} but the installed daemon release is {installed}.\n  \
+            "configd is running {} but the installed daemon release is {}.\n  \
              configd is in on_apply's restart set, so it should already be on the installed\n  \
-             release. Check `systemctl status configd` and the update log."
+             release: either the restart did not happen, or it failed and systemd restarted\n  \
+             the old binary. Check `systemctl status configd` and the update log.",
+            identify(running, configd_revision),
+            identify(installed, daemon_revision)
         ));
     }
 
@@ -2423,6 +2431,69 @@ mod tests {
         );
         let warnings = version_warnings(&r, Some(&semver::Version::new(0, 2, 0)));
         assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// The false positive this shipped with, found on a board within a minute of `configd`
+    /// starting correctly.
+    ///
+    /// On the dev channel a daemon reports its crate version (`0.2.0`) while the installed
+    /// release is named `0.2.0-dev.121.de58259`. Comparing those *strings* says "behind" about a
+    /// binary that is precisely the one installed, so `robotctl version` warned every single
+    /// dev-channel install. Comparing the revision — which `is_behind` does when both are known —
+    /// is the answer, and it is what updaterd and robotd already did.
+    #[test]
+    fn a_dev_release_does_not_make_configd_look_behind() {
+        let mut r = report(
+            vec![
+                service_at("updaterd", "0.2.0", "de58259"),
+                service_at("robotd", "0.2.0", "de58259"),
+                service_at("configd", "0.2.0", "de58259"),
+            ],
+            Some("0.2.0-dev.121.de58259"),
+        );
+        // The installed release carries the same revision the daemons report, which is the whole
+        // point: same commit, differently spelled version.
+        r.components[0].revision = Some("de58259".into());
+
+        let warnings = version_warnings(
+            &r,
+            Some(&semver::Version::parse("0.2.0-dev.121.de58259").unwrap()),
+        );
+        assert!(
+            warnings.is_empty(),
+            "a dev release must not read as every daemon being behind: {warnings:?}"
+        );
+    }
+
+    /// And the real case still warns: same version string, different commit, which is exactly
+    /// what "the restart did not take effect" looks like on the dev channel.
+    #[test]
+    fn a_configd_on_another_revision_still_warns() {
+        let mut r = report(
+            vec![
+                service_at("updaterd", "0.2.0", "de58259"),
+                service_at("robotd", "0.2.0", "de58259"),
+                service_at("configd", "0.2.0", "cfe436a"),
+            ],
+            Some("0.2.0-dev.121.de58259"),
+        );
+        r.components[0].revision = Some("de58259".into());
+
+        let warnings = version_warnings(
+            &r,
+            Some(&semver::Version::parse("0.2.0-dev.121.de58259").unwrap()),
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("configd is running"),
+            "{:?}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("restart set"),
+            "must diagnose a failed restart, not an expected lag: {:?}",
+            warnings[0]
+        );
     }
 
     /// robotd lagging is a *different* problem from updaterd lagging: it is in on_apply's
