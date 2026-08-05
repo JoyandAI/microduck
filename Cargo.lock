@@ -603,6 +603,7 @@ dependencies = [
  "async-trait",
  "clap",
  "duck-ipc-proto",
+ "futures",
  "libc",
  "serde",
  "serde_json",

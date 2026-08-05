@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use duck_ipc_proto as proto;
+use futures::StreamExt;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::net::{Net, NetResult};
@@ -38,6 +39,9 @@ mod ids {
     pub const ACTIVE_DEACTIVATING: u32 = 3;
     pub const ACTIVE_DEACTIVATED: u32 = 4;
 
+    /// The device is asking for a key. NM passes through this on a rejected passphrase before it
+    /// gives up, and the transition carries the reason the property no longer holds.
+    pub const STATE_NEED_AUTH: u32 = 60;
     pub const REASON_NO_SECRETS: u32 = 7;
     pub const REASON_SUPPLICANT_DISCONNECT: u32 = 8;
     pub const REASON_SUPPLICANT_TIMEOUT: u32 = 11;
@@ -98,6 +102,19 @@ trait Device {
     fn state(&self) -> zbus::Result<u32>;
     #[zbus(property)]
     fn state_reason(&self) -> zbus::Result<(u32, u32)>;
+    /// Every state transition, with the reason for it.
+    ///
+    /// The only reliable source of "the passphrase was rejected". Reading the `StateReason`
+    /// *property* after an activation fails gives reason 0: by then NM has moved the device on —
+    /// usually back to autoconnecting the previous profile — and the reason for the failure is gone.
+    /// A wrong key reported as `other` tells a phone nothing, when it is the one failure the user
+    /// can actually fix.
+    ///
+    /// Named `device_state_changed` because the `state` property already generates a
+    /// `receive_state_changed` for property changes, and the two would collide.
+    #[zbus(signal, name = "StateChanged")]
+    fn device_state_changed(&self, new_state: u32, old_state: u32, reason: u32)
+    -> zbus::Result<()>;
     #[zbus(property, name = "Ip4Config")]
     fn ip4_config(&self) -> zbus::Result<OwnedObjectPath>;
     #[zbus(property, name = "Ip6Config")]
@@ -643,6 +660,19 @@ impl Net for NetworkManager {
         let root = zbus::zvariant::ObjectPath::try_from("/").map_err(bus_err)?;
         let device = zbus::zvariant::ObjectPath::try_from(device_path.as_str()).map_err(bus_err)?;
 
+        // Subscribed *before* the activation starts, or the transition that carries the reason has
+        // already happened by the time anyone is listening.
+        let device_proxy = DeviceProxy::builder(&self.bus)
+            .path(&device_path)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
+        let mut transitions = device_proxy
+            .receive_device_state_changed()
+            .await
+            .map_err(bus_err)?;
+
         let (added, activation) = match manager
             .add_and_activate_connection(settings, &device, &root)
             .await
@@ -666,18 +696,14 @@ impl Net for NetworkManager {
         // the robot had been on all along. Reporting success for a join that never happened is the
         // worst answer available: a phone concludes it has provisioned the robot.
         let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
-        let device_proxy = DeviceProxy::builder(&self.bus)
-            .path(&device_path)
-            .map_err(bus_err)?
-            .build()
-            .await
-            .map_err(bus_err)?;
         let active = ActiveConnectionProxy::builder(&self.bus)
             .path(&activation)
             .map_err(bus_err)?
             .build()
             .await
             .map_err(bus_err)?;
+
+        let mut observed_reason: Option<u32> = None;
 
         loop {
             // An unreadable state means the object is gone, which NM does when an activation is
@@ -697,7 +723,15 @@ impl Net for NetworkManager {
 
             let timed_out = tokio::time::Instant::now() >= deadline;
             if state == ids::ACTIVE_DEACTIVATED || state == ids::ACTIVE_DEACTIVATING || timed_out {
-                let (_, reason) = device_proxy.state_reason().await.unwrap_or((0, 0));
+                // The reason seen as it happened, falling back to the property. The property is
+                // usually 0 here, which is what made a rejected passphrase report `other`.
+                let reason = match observed_reason {
+                    Some(reason) => reason,
+                    None => {
+                        let (_, reason) = device_proxy.state_reason().await.unwrap_or((0, 0));
+                        reason
+                    }
+                };
                 // NM's reason survives a timeout too: "still authenticating after 45s" and
                 // "waiting for DHCP" are different problems.
                 let (failure, detail) = failure_of(ids::STATE_FAILED, reason);
@@ -725,7 +759,26 @@ impl Net for NetworkManager {
                 });
             }
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Wait for either a transition or the next poll tick, so a reason that appears between
+            // ticks is still recorded. `NEED_AUTH` counts: on a rejected key NM passes through it
+            // with `NO_SECRETS` and only later reaches `FAILED`, sometimes with the reason cleared.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                Some(transition) = transitions.next() => {
+                    if let Ok(args) = transition.args()
+                        && (*args.new_state() == ids::STATE_FAILED
+                            || *args.new_state() == ids::STATE_NEED_AUTH)
+                        && *args.reason() != 0
+                    {
+                        tracing::debug!(
+                            new_state = *args.new_state(),
+                            reason = *args.reason(),
+                            "device transition"
+                        );
+                        observed_reason = Some(*args.reason());
+                    }
+                }
+            }
         }
     }
 

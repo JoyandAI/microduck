@@ -32,6 +32,10 @@ libc = "0.2"
 # revisiting if bluer ever grows a zbus backend.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
+# For `StreamExt` over zbus's signal streams. zbus 5 re-exports `futures_core` (the `Stream` trait)
+# but not `futures_util` (the combinators), and the connect path has to consume NM's `StateChanged`
+# signal to learn *why* an activation failed. Already in the graph via btd.
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
