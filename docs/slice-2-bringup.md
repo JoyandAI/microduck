@@ -111,20 +111,17 @@ what closes it.
 
 ## Verifying on the board
 
-The board needs the dev key once, or `--ref` is refused:
+The board needs the dev key once, or `--ref` is refused. `install.sh` does both halves —
+installing the key and flipping `allow_dev_keys` — given the path to the public half:
 
 ```bash
-sudo cp team.dev.pub /etc/robot/trusted_keys/
-```
-```bash
-sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updater.toml
-sudo systemctl restart updaterd
+sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
 ```
 
 `team.dev.pub` is deliberately not in the repository — `deploy/trusted_keys/README.md` explains
 why. Get the public half from Pierre, or regenerate it from the secret with
-`minisign -R -s <secret> -p team.dev.pub`. Once #18 is merged, `install.sh` does both steps
-given `DUCK_DEV_KEY=/path/to/team.dev.pub`.
+`minisign -R -s <secret> -p team.dev.pub`. The by-hand equivalent is in
+[`../deploy/README.md`](../deploy/README.md).
 
 Then:
 

@@ -184,14 +184,31 @@ customer robots — they refuse a dev key twice over (`allow_dev_keys = false`, 
 key only counts as a dev key if its filename ends `.dev.pub`).
 
 **A board has to opt in once**, which is also what stops this working on a robot that
-shouldn't take dev builds:
+shouldn't take dev builds. `install.sh` does it, given the public half of the dev key:
 
 ```bash
-sudo cp team.dev.pub /etc/robot/trusted_keys/
+sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
+```
+
+It validates the key and flips `allow_dev_keys` in one step, and installs the key under the
+name `team.dev.pub` whatever the source file was called — the `.dev.` infix is what classifies
+it, and a key landing under any other name is trusted as a *release* key. `team.dev.pub` is not
+in the repository on purpose; get it from a team member or regenerate it with
+`minisign -R -s ~/.duck-keys/team.dev.key -p team.dev.pub`.
+
+By hand, for a board provisioned some other way — both halves, because either alone leaves a
+board that still refuses branch builds with an error that reads like a corrupt release:
+
+```bash
+sudo cp team.dev.pub /etc/robot/trusted_keys/team.dev.pub
 ```
 
 ```bash
 sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updater.toml
+```
+
+```bash
+sudo systemctl restart updaterd
 ```
 
 While this repository is **private**, the board also needs a GitHub token — a private repo's

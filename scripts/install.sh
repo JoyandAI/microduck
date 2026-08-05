@@ -97,6 +97,11 @@ BOOTSTRAP_ASSET="updaterd-bootstrap-aarch64"
 # `die` in the caller's shell instead of exiting a subshell and returning an empty string.
 BOOTSTRAP_URL=""
 
+# Set by `add_operator_to_group` when it added the operator to `robot` on this run, which means
+# their current shell still cannot reach the sockets. Read by `report`, so the closing
+# instructions gate on it rather than listing commands that are going to fail.
+group_pending=0
+
 CONFIG_DIR=/etc/robot
 KEYS_DIR="${CONFIG_DIR}/trusted_keys"
 INSTALL_DIR=/opt/robot/daemon
@@ -434,8 +439,13 @@ add_operator_to_group() {
 
     if usermod -aG robot "$operator"; then
         say "added ${operator} to the robot group"
-        warn "${operator} must log out and back in before that takes effect. Until then,
-  read-only commands need sudo:  sudo robotctl health"
+        # Deliberately not a `warn`, and it does not say "log out". A process's group set is
+        # fixed at exec and there is no API to add to another process's — not even for root —
+        # so the shell that launched this install can never be fixed from inside it. What can
+        # be fixed is the size of the remaining step: `newgrp` is one command in that same
+        # shell instead of dropping an SSH session and coming back. `report` repeats it,
+        # because by then this line has scrolled past a release download.
+        group_pending=1
     else
         warn "could not add ${operator} to the robot group; robotctl will need sudo"
     fi
@@ -607,6 +617,25 @@ verify_install() {
 report() {
     version="$(readlink "${INSTALL_DIR}/current" | sed 's|releases/||')"
     say "installed daemon ${version}"
+
+    # Before the command list, not after: every command below fails with "Permission denied"
+    # in the shell reading this, and that is what a first-time operator reasonably reads as a
+    # broken install. Naming the one step between them and a working robot is worth more than
+    # keeping the happy path uncluttered.
+    if [ "$group_pending" = 1 ]; then
+        cat <<'EOF'
+
+FIRST, in this same shell:
+
+  newgrp robot
+
+You were just added to the `robot` group, and a process's groups are fixed when it starts —
+so this shell is not in it yet and both sockets will refuse it. `newgrp` starts a shell that
+is, which is one command instead of a logout. Any new login has it already, and
+`sudo robotctl …` works either way.
+EOF
+    fi
+
     cat <<'EOF'
 
   robotctl health                     the whole robot: hardware and software

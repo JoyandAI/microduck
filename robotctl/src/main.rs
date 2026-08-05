@@ -252,10 +252,12 @@ fn unreachable_hint(service: &str, path: &std::path::Path, e: &std::io::Error) -
         ErrorKind::PermissionDenied => format!(
             "{head}\n\
              The socket refused this user rather than being absent, so {service} is running\n\
-             and this is group membership, not a crash. It is root:robot mode 0660, and\n\
-             installing adds the operator to `robot` — but a new group only takes effect in a\n\
-             new login session. Log out and back in, then check with:  id -nG\n\
-             Until then, read-only commands work under sudo:  sudo robotctl health"
+             and this is group membership, not a crash. It is root:robot mode 0660, and a\n\
+             process's groups are fixed when it starts — so a group added since this shell\n\
+             began is not in it. Installing adds the operator to `robot`, so usually:\n\
+             \x20 newgrp robot\n\
+             Check with `id -nG`; a new login has it already. If `robot` is not there at all,\n\
+             `sudo usermod -aG robot $USER` and log out. `sudo robotctl …` works regardless."
         ),
         // ENOENT: nothing at that path. Either the daemon never started, or it is listening
         // somewhere else — which is worth naming, because `--socket` and the `robot_socket`

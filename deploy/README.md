@@ -146,8 +146,52 @@ does not pass the variable through on its own. Piping to `sudo sh` cannot carry 
 
 Needs `curl` and coreutils and nothing else — `tar` and `zstd` are linked into `updaterd`,
 so there is no package to install first. Idempotent, and it never overwrites an existing
-`/etc/robot/updater.toml`. `DUCK_REPO`, `DUCK_REF` and `DUCK_TOKEN` override the
-repository, the branch config is read from, and the token for a private repo.
+`/etc/robot/updater.toml`.
+
+Everything it takes is an environment variable, because it is usually run through
+`curl | sh` where flags are awkward to pass:
+
+| | |
+|---|---|
+| `DUCK_TOKEN` | token for a private repo — the fetch *and* the release assets |
+| `DUCK_REPO` | the repository, for a fork or a test repo |
+| `DUCK_REF` | the branch config and keys are read from; pin to a tag for a reproducible run |
+| `DUCK_DEV_KEY` | path to `team.dev.pub` — makes this a **dev board** (below) |
+| `DUCK_FORCE_REINSTALL` | reinstall over a live release using the release's own `updaterd` |
+
+**The first `robotctl health` will say `Permission denied`, and the install is fine** — see
+[the group note](#what-ends-up-where) below. `install.sh` prints the one command that fixes it.
+
+### Making it a dev board, so `--ref <branch>` works
+
+A board refuses branch builds twice over: `allow_dev_keys` is false, and a trusted key only
+counts as a dev key if its filename ends `.dev.pub`. Both halves are needed, they are
+independent checks, and doing one without the other produces a board that still refuses branch
+builds — with a signature error that reads like a corrupt release. So pass the key to
+`install.sh` and let it do both:
+
+```bash
+scp ~/.duck-keys/team.dev.pub pierre@radxa-zero3:/tmp/
+```
+
+```bash
+sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
+```
+
+`team.dev.pub` is deliberately not in the repository —
+[`trusted_keys/README.md`](trusted_keys/README.md) explains why. Get the public half from a
+team member, or regenerate it from the secret with
+`minisign -R -s ~/.duck-keys/team.dev.key -p team.dev.pub`.
+
+It validates before it changes anything: the file must exist, must look like a minisign public
+key, and `updater.toml` must already have an `allow_dev_keys` line to flip — that key is
+top-level, so appending one would land it inside whichever `[table]` came last. It also
+installs the key under the name `team.dev.pub` regardless of what the source file was called,
+because the `.dev.` infix is what classifies it; a key installed under any other name is
+trusted as a *release* key, and branch builds would then be accepted as reviewed.
+
+The closing report says `DEV BOARD` when this is on, and prints the two commands to undo it.
+Never do it to a robot you ship.
 
 ### The circularity, and how it is broken
 
@@ -287,11 +331,19 @@ exists, because "may relay an update request from the app" is a narrower claim t
 the robot group".
 
 ⚠ **The first `robotctl health` after an install usually fails, and the install is fine.**
-Both sockets are `root:robot` mode 0660, `install.sh` puts the operator in `robot` — and a new
-group only takes effect in a **new login session**. So the shell that ran the install still
-gets `Permission denied` from both sockets. Log out and back in; `id -nG` confirms it. Until
-then `sudo robotctl health` works. `robotctl` says this itself now rather than sending you to
-`systemctl status`, which would show two perfectly healthy daemons.
+Both sockets are `root:robot` mode 0660 and `install.sh` puts the operator in `robot` — but a
+process's groups are fixed when it starts, so the shell that ran the install is not in the group
+it just gained, and both sockets refuse it. One command, in that same shell:
+
+```bash
+newgrp robot
+```
+
+`id -nG` confirms it, and any new login has it already. This cannot be made fully automatic:
+there is no API to add a group to a running process, not even for root, so the shell that
+launched the installer can never be fixed from inside it. What `install.sh` does instead is
+print that command in its closing report, and `robotctl` names it on the failure rather than
+sending you to `systemctl status` — which would show two perfectly healthy daemons.
 
 ## Where logs go, and what survives a reboot
 
