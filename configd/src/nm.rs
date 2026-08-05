@@ -9,8 +9,8 @@
 //! **Untested against a real NetworkManager.** It type-checks for aarch64; every claim here is
 //! intent until it runs on the board.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use duck_ipc_proto as proto;
@@ -54,6 +54,13 @@ mod ids {
 /// slow one, short enough that a phone gets an answer instead of a spinner — and a `Timeout` is
 /// a reportable outcome rather than a hang, which is the point.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long to wait for a requested scan to complete before answering with what NM already has.
+///
+/// A sweep of both bands takes a few seconds on this radio. The cap matters because a client is
+/// blocked on the reply: `btctl` allows 60s for a scan, so this must stay well inside that.
+const SCAN_WAIT: Duration = Duration::from_secs(10);
+/// How often `LastScan` is re-read while waiting.
+const SCAN_POLL: Duration = Duration::from_millis(250);
 
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager",
@@ -102,6 +109,12 @@ trait Wireless {
     fn hw_address(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn active_access_point(&self) -> zbus::Result<OwnedObjectPath>;
+    /// Milliseconds (CLOCK_BOOTTIME) at which the last scan finished; -1 if none ever has.
+    ///
+    /// The only way to know a `RequestScan` has *completed*, which the method itself does not tell
+    /// you — see `scan`.
+    #[zbus(property)]
+    fn last_scan(&self) -> zbus::Result<i64>;
 }
 
 #[zbus::proxy(
@@ -230,6 +243,36 @@ impl NetworkManager {
             }
         }
         Ok(matches)
+    }
+
+    /// Every SSID that has a saved profile, as a set.
+    ///
+    /// `scan` used to ask `saved_connections` once per access point, which re-enumerated every NM
+    /// profile and fetched each one's settings — N times over. One pass instead, because a scan is
+    /// already the slowest call in this API and it is answered while a client waits.
+    async fn saved_ssids(&self) -> NetResult<HashSet<String>> {
+        let settings = SettingsProxy::new(&self.bus).await.map_err(bus_err)?;
+        let mut ssids = HashSet::new();
+        for path in settings.list_connections().await.map_err(bus_err)? {
+            let connection = ConnectionProxy::builder(&self.bus)
+                .path(&path)
+                .map_err(bus_err)?
+                .build()
+                .await
+                .map_err(bus_err)?;
+            let Ok(config) = connection.get_settings().await else {
+                continue;
+            };
+            if let Some(ssid) = config
+                .get("802-11-wireless")
+                .and_then(|section| section.get("ssid"))
+                .and_then(|value| Vec::<u8>::try_from(value.clone()).ok())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+            {
+                ssids.insert(ssid);
+            }
+        }
+        Ok(ssids)
     }
 
     /// Delete every saved profile for `ssid`. Returns how many went.
@@ -394,11 +437,33 @@ impl Net for NetworkManager {
             .await
             .map_err(bus_err)?;
 
-        // A scan request is a hint, not a command: NM rate-limits it and refuses while one is in
-        // flight. Either way the cached access-point list below is what we return, which is why
-        // the error is dropped rather than reported — a client asking twice in a second should
-        // get the previous results, not a failure.
-        let _ = wireless.request_scan(HashMap::new()).await;
+        // Wait for the scan to *finish* before reading the list.
+        //
+        // `RequestScan` returns as soon as NM has accepted the request, not when the radio has swept
+        // the channels — and NM prunes access points it has not seen recently, so while associated
+        // the cached list often holds nothing but the AP we are on. Reading it on the next line
+        // therefore answered with the *previous* scan: the first call listed one network, and an
+        // identical second call listed eight. For a client whose whole purpose is picking a network
+        // in a new place, "ask twice" is not an acceptable contract.
+        //
+        // `LastScan` is the completion signal. A rate-limited or refused request is not an error
+        // here: NM refuses when a scan just happened, which is precisely when the cache is already
+        // fresh, so there is nothing to wait for and the list below is the right answer.
+        let before = wireless.last_scan().await.unwrap_or(-1);
+        if wireless.request_scan(HashMap::new()).await.is_ok() {
+            let deadline = Instant::now() + SCAN_WAIT;
+            while Instant::now() < deadline {
+                match wireless.last_scan().await {
+                    Ok(now) if now != before => break,
+                    // The property is gone or unreadable — a device disappearing mid-scan. Return
+                    // what the cache has rather than failing a read-only call.
+                    Err(_) => break,
+                    Ok(_) => tokio::time::sleep(SCAN_POLL).await,
+                }
+            }
+        }
+
+        let saved_ssids = self.saved_ssids().await?;
 
         let mut networks: Vec<proto::Network> = Vec::new();
         for ap_path in wireless.get_all_access_points().await.map_err(bus_err)? {
@@ -425,7 +490,7 @@ impl Net for NetworkManager {
                 ap.wpa_flags().await.unwrap_or(0),
             );
             let signal = ap.strength().await.unwrap_or(0);
-            let saved = !self.saved_connections(&ssid).await?.is_empty();
+            let saved = saved_ssids.contains(&ssid);
 
             // One entry per SSID, strongest wins. A mesh or a dual-band router presents several
             // access points for one network, and a list with "Pollen" five times is a worse

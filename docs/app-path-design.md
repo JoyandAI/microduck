@@ -95,6 +95,14 @@ fixing.
 - **A provisioned profile survives a reboot.** `AddAndActivateConnection` leaves a saved profile with
   `autoconnect` defaulting on, so rejoining is NM's business and `configd` stays out of the reconnect
   loop entirely.
+- **A scan waits for the scan.**  · **measured** `RequestScan` returns when NM *accepts* the
+  request, not when the radio has swept the channels, and NM prunes access points it has not seen
+  recently — so while associated, the cached list often holds nothing but the AP the robot is already
+  on. Reading it immediately answered with the *previous* scan: one network on the first call, eight
+  on an identical second call. `configd` now waits for the `LastScan` property to advance, capped at
+  10s, and treats a rate-limited request as "the cache is already fresh" rather than an error. For a
+  client whose whole job is choosing a network in an unfamiliar place, "ask twice" was not a contract
+  worth shipping.
 - **Re-provisioning replaces, it does not accumulate.**  · **measured** `AddAndActivateConnection`
   always adds, and NM tolerates two profiles carrying the same id. So the ordinary path — a
   passphrase mistyped on a phone, `BadKey`, then the right one — left the robot holding both, with no
