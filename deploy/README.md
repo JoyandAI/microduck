@@ -286,6 +286,13 @@ Mutating operations are root-only: `allow_uids`/`allow_gids` are deliberately em
 exists, because "may relay an update request from the app" is a narrower claim than "is in
 the robot group".
 
+⚠ **The first `robotctl health` after an install usually fails, and the install is fine.**
+Both sockets are `root:robot` mode 0660, `install.sh` puts the operator in `robot` — and a new
+group only takes effect in a **new login session**. So the shell that ran the install still
+gets `Permission denied` from both sockets. Log out and back in; `id -nG` confirms it. Until
+then `sudo robotctl health` works. `robotctl` says this itself now rather than sending you to
+`systemctl status`, which would show two perfectly healthy daemons.
+
 ## Where logs go, and what survives a reboot
 
 Every daemon logs to **stderr**, which systemd captures into the journal. Level is
