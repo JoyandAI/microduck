@@ -36,7 +36,7 @@ use bluer::gatt::local::{
     CharacteristicWrite, CharacteristicWriteMethod, Service,
 };
 use futures::FutureExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::gatt::{RPC_UUID, SERVICE_UUID};
 use crate::link::Link;
@@ -171,22 +171,42 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                     // made with passkey entry rather than just-works, which is what makes the PIN
                     // mean something — see `crate::pairing`.
                     encrypt_authenticated_write: require_pairing,
+                    // **No `.await` between receiving a chunk and enqueueing it.** BlueZ
+                    // dispatches each `WriteValue` as its own task, so a yield point here lets
+                    // two chunks swap places — and a reordered chunk corrupts a request silently.
+                    // Chunk 2 of 3 arriving last produced
+                    // `{"id":1,"jsonrpc":"2.info","params":{}}`: valid JSON, missing a field, and
+                    // a parse error that blamed the client. `try_send` is synchronous, so arrival
+                    // order is preserved.
                     method: CharacteristicWriteMethod::Fun(Box::new(move |value, req| {
                         let inbound = inbound.clone();
+                        let bytes = value.len();
+                        let result = match inbound.try_send(value) {
+                            Ok(()) => Ok(()),
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Refusing the write is recoverable — the client can send the
+                                // whole request again. Dropping the chunk would not be: the line
+                                // would reassemble into something that parses as the wrong thing.
+                                tracing::warn!(
+                                    peer = %req.device_address,
+                                    "inbound queue full; refusing the write"
+                                );
+                                Err(GattError::Failed)
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::error!("the session task has ended; refusing writes");
+                                Err(GattError::Failed)
+                            }
+                        };
                         async move {
                             tracing::debug!(
                                 peer = %req.device_address,
                                 mtu = req.mtu,
-                                bytes = value.len(),
+                                bytes,
+                                ok = result.is_ok(),
                                 "write"
                             );
-                            if inbound.send(value).await.is_err() {
-                                // The session task is gone, so this daemon can serve nothing.
-                                // Refusing is honest; systemd restarts us.
-                                tracing::error!("the session task has ended; refusing writes");
-                                return Err(GattError::Failed);
-                            }
-                            Ok(())
+                            result
                         }
                         .boxed()
                     })),

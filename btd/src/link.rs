@@ -13,12 +13,21 @@
 
 use tokio::sync::mpsc;
 
-/// How many chunks may queue in either direction before a backend has to slow down.
+/// How many chunks may queue in either direction.
 ///
-/// Small on purpose. BLE is slow, so a deep buffer would mostly serve to hide a stalled peer
-/// and delay noticing it; the update progress stream is advisory anyway — `updaterd` already
-/// drops a subscriber that cannot keep up rather than applying backpressure to an update.
-pub const QUEUE: usize = 32;
+/// Sized so that a **maximal inbound line never has to block**, which is a correctness
+/// requirement rather than a tuning choice. The radio backend must hand chunks over without
+/// awaiting: BlueZ dispatches each write as its own task, so any yield point between receiving a
+/// chunk and enqueueing it is a chance for two chunks to swap places — and a reordered chunk
+/// silently corrupts a request. Chunk 2 of 3 arriving last once produced
+/// `{"id":1,"jsonrpc":"2.info","params":{}}`, which is valid JSON missing a field, and a parse
+/// error blaming the client.
+///
+/// So the queue has to be deep enough that a synchronous `try_send` cannot fail on legitimate
+/// traffic: `QUEUE * 20 >= framing::MAX_LINE`, where 20 is the smallest payload BLE guarantees.
+/// A test asserts that relationship. Beyond it, a flood gets a clean ATT error rather than a
+/// dropped chunk, because failing a write is recoverable and corrupting one is not.
+pub const QUEUE: usize = 512;
 
 /// One connected central.
 pub struct Link {
@@ -55,5 +64,30 @@ impl Link {
             to_robot,
             from_robot,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The queue must be deep enough that a maximal line never needs a blocking send.
+    ///
+    /// This is the invariant behind the radio backend using a synchronous `try_send`: it may not
+    /// await, because a yield point between receiving a chunk and enqueueing it lets two chunks
+    /// swap places, and a reordered chunk corrupts a request rather than failing it. If `MAX_LINE`
+    /// grows or `QUEUE` shrinks, this fails here rather than as an occasional mangled request on a
+    /// robot.
+    #[test]
+    fn the_queue_holds_a_maximal_line_at_the_ble_floor() {
+        // 20 bytes is the payload every BLE link is required to support, and therefore the
+        // smallest chunk size a client may use.
+        const FLOOR: usize = 20;
+        assert!(
+            QUEUE * FLOOR >= crate::framing::MAX_LINE,
+            "QUEUE ({QUEUE}) * {FLOOR} must be at least MAX_LINE ({}), or a full-length request \
+             can fill the queue and be refused",
+            crate::framing::MAX_LINE
+        );
     }
 }
