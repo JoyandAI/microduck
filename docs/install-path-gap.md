@@ -2,9 +2,14 @@
 
 Status: open · Date: 2026-08-05 · Owner: pierre
 
-Three bugs in a row reached a board, all in the install path, none caught by 416 tests or by
-`board-test.sh`. This records why, and what would actually close it. Written after the third one,
-while the reasons are still concrete.
+Three bugs in a row reached a board, all in the install path, none caught by 418 tests or by
+`board-test.sh`. This records why, and what would actually close it. Written the same day, while
+the reasons are still concrete.
+
+A second section covers two findings that *look* like the same thing and are not: version skew
+between a daemon that is already running and a release that has just been installed. Neither would
+be caught by any amount of install testing, and they need their own fixes — kept here rather than in
+their own document because anyone investigating one will arrive believing it is the other.
 
 ## What got through
 
@@ -82,21 +87,67 @@ and the gate, and bug 1 will have siblings.
 
 D is a separate conversation, and probably follows M4 rather than preceding it.
 
-## Not the same problem
+## A second, separate problem: version skew on the dev channel
 
-Worth separating, because it was found in the same session and looks similar.
+Found in the same session and easily confused with the above, but no amount of install testing
+would catch either — in both cases the artifact was complete and correct.
 
-The branch was also un-installable for a while because `main` added a **required** field to
-`HealthResult` after the branch had merged it. `robotd` came up perfectly and `updaterd` rejected
-its reply, so the gate reported `unreachable` about a healthy robot. That is **version skew between
-a resident daemon and an installed one**, not a packaging gap, and no amount of install testing
-would catch it — the artifact was complete and correct.
+The shape is always the same. **`updaterd` never restarts itself during an update** (§4.1), so it
+keeps running the old binary until the next reboot, while everything else on the box moves to the
+new release immediately. Any change to a shared contract therefore has a window where a *resident*
+daemon and an *installed* one disagree. On the dev channel, where branches are installed over each
+other in any order, that window is the normal case rather than a rare one.
 
-Its own fixes, both small:
+Two instances, both real, both cost about an hour.
 
-- `#[serde(default)]` on new `HealthResult` fields, so a newer `updaterd` can still parse an older
-  `robotd`. Every `--ref` install of a branch predating a health-field addition hits this
+### 1. A required field added to `HealthResult`
+
+`main` added `consecutive_stale_blocks` to the IMU section and released 0.2.0 from it. A branch that
+had merged `main` *before* that did not send the field. `robotd` came up perfectly — served the
+socket, loaded both policies, ran the loop at 50 Hz — and the resident 0.2.0 `updaterd` rejected its
+reply for a missing field. `RobotIo::health` maps an unparseable answer to `Health::Unreachable`, so
+the gate reported `not healthy within 30s: unreachable` about a robot that was entirely healthy, and
+reverted a good release.
+
+Fixes, both small:
+
+- **`#[serde(default)]` on new `HealthResult` fields**, so a newer `updaterd` can still parse an
+  older `robotd`. Every `--ref` install of a branch predating a health-field addition hits this
   otherwise, which is the entire dev workflow.
-- A distinct `Health::Incompatible` instead of reusing `Unreachable`, so the rollback reason says
-  "answered in a shape this updaterd does not understand" rather than implying the robot is down.
-  This one is pure diagnostics and would have saved an hour.
+- **A distinct `Health::Incompatible`** rather than reusing `Unreachable`, so the reason reads
+  "answered in a shape this updaterd does not understand" instead of implying the robot is down.
+  Pure diagnostics, and it would have found the above in a minute.
+
+### 2. `API_VERSION` skew between `robotctl` and `updaterd`
+
+`robotctl` is a symlink into `current`, so it follows the installed release. `updaterd` does not. So
+the moment a release changes `API_VERSION`, the two are **guaranteed** to disagree until `updaterd`
+restarts — and the command that stops working is `robotctl update apply`, which is exactly the one
+you would use to get out of it.
+
+Demonstrated by ordinary use rather than by contrivance: install branch A, install branch B while
+waiting for CI, and every `robotctl` call fails with `client speaks API v2, daemon speaks v3`. The
+escape is to invoke a `robotctl` from a release directory whose version matches the running daemon,
+or to restart `updaterd` — neither of which is discoverable from the error.
+
+The handshake at least *caught* it and named both versions, which is more than case 1 managed.
+
+Proposed fix, and the reason it is not already done is that it is a protocol-policy decision rather
+than a bug:
+
+- **`hello` should refuse only when the client is *newer* than the daemon.** A v3 daemon can serve a
+  v2 client perfectly, because v3 only *added* methods — refusing that direction costs the ability
+  to recover and buys nothing. Client-newer-than-daemon must stay a hard failure: there the client
+  may ask for something that genuinely is not there.
+
+That change would also make `API_VERSION` mean what it should — "the newest contract I understand"
+rather than "the only contract I will speak" — and additive protocol growth would stop being a
+breaking change for every client on the box.
+
+### Why these are not install-path bugs
+
+Nothing in options A–D above would have caught either. The artifact was correct both times; what was
+wrong was the *pair* of versions running at one moment, which only exists on a machine that has been
+updated. Option C (real systemd in a container) would catch the *health-gate* consequence of case 1
+if the container also ran an older `updaterd`, but constructing that skew deliberately is a different
+kind of test — closer to a compatibility matrix than to an install test, and worth keeping separate.
