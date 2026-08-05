@@ -225,6 +225,37 @@ mod tests {
 
     /// The whole provisioning arc: scan, join, see it stored and connected, forget it.
     #[tokio::test]
+    /// The flow a phone actually produces: a passphrase typed wrong, then typed right.
+    ///
+    /// Worth pinning because the NM implementation got it wrong in a way no fake could show —
+    /// `AddAndActivateConnection` always adds, and NM tolerates two profiles with the same id, so
+    /// the corrected attempt left the bad one behind for a later boot to autoconnect with. The
+    /// contract asserted here is the one that fix implements: **re-provisioning an SSID replaces
+    /// its configuration; it does not accumulate.**
+    async fn a_corrected_passphrase_replaces_the_bad_attempt() {
+        let net = FakeNet::new();
+
+        assert!(matches!(
+            net.connect("Pollen", Some("wrong")).await.unwrap(),
+            proto::ConnectResult::Failed {
+                reason: proto::ConnectFailure::BadKey,
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            net.connect("Pollen", Some("correct-key")).await.unwrap(),
+            proto::ConnectResult::Connected { .. }
+        ));
+
+        // One profile, not two: a single forget leaves nothing behind. Were a stale duplicate kept,
+        // the second forget would also report `removed` — which is precisely the symptom that made
+        // this worth a test.
+        assert!(net.forget("Pollen").await.unwrap().removed);
+        assert!(!net.forget("Pollen").await.unwrap().removed);
+    }
+
+    #[tokio::test]
     async fn connecting_stores_the_network_and_forgetting_removes_it() {
         let net = FakeNet::new();
         assert!(net.scan().await.unwrap().networks.iter().all(|n| !n.saved));

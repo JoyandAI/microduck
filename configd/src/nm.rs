@@ -197,8 +197,15 @@ impl NetworkManager {
     }
 
     /// Which stored profile, if any, is for this SSID.
-    async fn saved_connection(&self, ssid: &str) -> NetResult<Option<OwnedObjectPath>> {
+    /// Every saved profile for `ssid` — plural, deliberately.
+    ///
+    /// NetworkManager permits duplicate connection ids, so "the profile for this SSID" is not a
+    /// thing that exists. Returning `Option` was wrong in a way that mattered: `net.forget` removed
+    /// one of two profiles and reported success, leaving a stale one with an outdated key that NM
+    /// would happily autoconnect with later.
+    async fn saved_connections(&self, ssid: &str) -> NetResult<Vec<OwnedObjectPath>> {
         let settings = SettingsProxy::new(&self.bus).await.map_err(bus_err)?;
+        let mut matches = Vec::new();
         for path in settings.list_connections().await.map_err(bus_err)? {
             let connection = ConnectionProxy::builder(&self.bus)
                 .path(&path)
@@ -219,10 +226,27 @@ impl NetworkManager {
                 .and_then(|bytes| String::from_utf8(bytes).ok());
 
             if stored.as_deref() == Some(ssid) {
-                return Ok(Some(path));
+                matches.push(path);
             }
         }
-        Ok(None)
+        Ok(matches)
+    }
+
+    /// Delete every saved profile for `ssid`. Returns how many went.
+    async fn delete_saved(&self, ssid: &str) -> NetResult<usize> {
+        let paths = self.saved_connections(ssid).await?;
+        let mut deleted = 0;
+        for path in &paths {
+            let connection = ConnectionProxy::builder(&self.bus)
+                .path(path)
+                .map_err(bus_err)?
+                .build()
+                .await
+                .map_err(bus_err)?;
+            connection.delete().await.map_err(bus_err)?;
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 }
 
@@ -401,7 +425,7 @@ impl Net for NetworkManager {
                 ap.wpa_flags().await.unwrap_or(0),
             );
             let signal = ap.strength().await.unwrap_or(0);
-            let saved = self.saved_connection(&ssid).await?.is_some();
+            let saved = !self.saved_connections(&ssid).await?.is_empty();
 
             // One entry per SSID, strongest wins. A mesh or a dual-band router presents several
             // access points for one network, and a list with "Pollen" five times is a worse
@@ -456,6 +480,30 @@ impl Net for NetworkManager {
                     detail: Some("this network needs a passphrase".into()),
                 });
             }
+        }
+
+        // Replace any profile this SSID already has, rather than adding a second one.
+        //
+        // `AddAndActivateConnection` always *adds*, and NM allows two profiles with the same id. The
+        // path that makes this matter is the ordinary one: a passphrase mistyped on a phone fails
+        // with `BadKey`, the user re-sends the right one, and the robot is left carrying both — with
+        // no guarantee about which NM autoconnects with after the next reboot. Re-provisioning is
+        // how this API is *expected* to be used, so it has to be idempotent in the profile it
+        // leaves behind.
+        //
+        // Deleted before adding, not after: the alternative leaves duplicates behind whenever the
+        // add succeeds and the cleanup does not. If the add then fails, the SSID is left with no
+        // profile — which is the correct outcome for "this configuration is being replaced" and is
+        // reported to the client, rather than a silent half-state.
+        //
+        // This disconnects the robot if that profile is the active one. Unavoidable: changing a key
+        // means re-associating, and a client on BLE is unaffected by design.
+        match self.delete_saved(ssid).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(ssid, replaced = n, "replacing saved profile(s)"),
+            // Not fatal. A stale profile is a problem for the *next* boot; refusing to connect at
+            // all is a problem right now, and a robot in a new place needs to get online.
+            Err(e) => tracing::warn!(ssid, error = %e, "could not remove the saved profile(s)"),
         }
 
         let manager = ManagerProxy::new(&self.bus).await.map_err(bus_err)?;
@@ -544,17 +592,10 @@ impl Net for NetworkManager {
     }
 
     async fn forget(&self, ssid: &str) -> NetResult<proto::ForgetResult> {
-        let Some(path) = self.saved_connection(ssid).await? else {
-            return Ok(proto::ForgetResult { removed: false });
-        };
-        let connection = ConnectionProxy::builder(&self.bus)
-            .path(&path)
-            .map_err(bus_err)?
-            .build()
-            .await
-            .map_err(bus_err)?;
-        connection.delete().await.map_err(bus_err)?;
-        Ok(proto::ForgetResult { removed: true })
+        let deleted = self.delete_saved(ssid).await?;
+        Ok(proto::ForgetResult {
+            removed: deleted > 0,
+        })
     }
 }
 

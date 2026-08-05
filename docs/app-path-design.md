@@ -83,6 +83,33 @@ would send someone round a loop retyping a key that was already correct.
 `configd` polls NM after `AddAndActivateConnection` rather than returning when activation *starts*,
 because "config applied" is the answer netplan gives and the one we rejected.
 
+### 2.2 Provisioning a new network, which is the point of the whole path
+
+The scenario that justifies BLE: a board arrives somewhere new, the wifi it knows is not there, and
+nothing on the network can reach it. Three properties make that work, and only the third needed
+fixing.
+
+- **The daemons do not wait for a network.** `btd` is `After=dbus.service bluetooth.service` and
+  `configd` is `After=NetworkManager.service`, neither with `network-online.target`. A board with no
+  reachable AP still comes up serving BLE.
+- **A provisioned profile survives a reboot.** `AddAndActivateConnection` leaves a saved profile with
+  `autoconnect` defaulting on, so rejoining is NM's business and `configd` stays out of the reconnect
+  loop entirely.
+- **Re-provisioning replaces, it does not accumulate.**  · **measured** `AddAndActivateConnection`
+  always adds, and NM tolerates two profiles carrying the same id. So the ordinary path — a
+  passphrase mistyped on a phone, `BadKey`, then the right one — left the robot holding both, with no
+  guarantee which NM would autoconnect with after the next reboot. `net.forget` made it worse by
+  removing one of the two and reporting success. Saved profiles for an SSID are now enumerated as a
+  *set* and deleted before a connect, and `net.forget` deletes all of them.
+
+  Deleted before adding rather than after, because the alternative leaves duplicates whenever the add
+  succeeds and the cleanup does not. If the add then fails, the SSID is left with no profile, which
+  is the honest outcome for a configuration being replaced and is reported to the client.
+
+  Note this disconnects the robot when the profile being replaced is the active one. Unavoidable —
+  changing a key means re-associating — and a client on BLE is unaffected, which is the property the
+  whole design rests on.
+
 ## 3. The GATT surface: a pipe, not an API
 
 One service, **one characteristic**. A client reads it once for the robot's API version, writes
