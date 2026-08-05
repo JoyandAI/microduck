@@ -163,29 +163,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("no Bluetooth adapter on this machine")?;
 
     eprintln!("scanning for up to {SCAN_TIME:?}…");
-    // Filter by our service UUID so a busy office does not drown the robot in headphones. Note
-    // some platforms ignore the filter and return everything, which is why the name check below
-    // still happens.
-    adapter
-        .start_scan(ScanFilter {
-            services: vec![SERVICE_UUID],
-        })
-        .await?;
+    // **Unfiltered on purpose.** This used to pass `ScanFilter { services: [SERVICE_UUID] }`, on the
+    // theory that a busy office would otherwise drown the robot in headphones. But CoreBluetooth
+    // honours that filter *strictly*: a peripheral whose current advertisement does not carry the
+    // UUID is never reported at all. A bonded robot frequently reports with an empty service list —
+    // so the `--name` fallback below could only ever match something the filtered scan had already
+    // returned, which made it dead weight in exactly the case it exists for. That is the whole
+    // explanation for `no robot found` on one run and success on the next.
+    //
+    // So: report everything, and discriminate here, where the rules are ours.
+    adapter.start_scan(ScanFilter::default()).await?;
 
-    // Candidates, most likely first.
+    // Candidates, strongest evidence first.
     //
     // The advertised service UUID is an *optimisation*, not the identity check — and treating it as
-    // the latter broke as soon as the Mac bonded with the robot. CoreBluetooth does not reliably
-    // return a paired peripheral from a scan, and for a cached one the advertised service list is
-    // often empty, so a robot that had been found every time became invisible. The authoritative
-    // test is whether it serves our characteristic, which is only knowable after connecting.
-    let mut found: Vec<(Peripheral, String)> = Vec::new();
-    let mut fallback: Vec<(Peripheral, String)> = Vec::new();
+    // the latter broke as soon as the Mac bonded with the robot. The authoritative test is whether
+    // it serves our characteristic, which is only knowable after connecting.
+    let mut advertised: Vec<(Peripheral, String)> = Vec::new();
+    let mut named: Vec<(Peripheral, String)> = Vec::new();
+    let mut connected: Vec<(Peripheral, String)> = Vec::new();
     let deadline = Instant::now() + SCAN_TIME;
 
     loop {
-        found.clear();
-        fallback.clear();
+        advertised.clear();
+        named.clear();
+        connected.clear();
 
         for peripheral in adapter.peripherals().await? {
             let Some(properties) = peripheral.properties().await? else {
@@ -197,35 +199,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| properties.address.to_string());
 
             if properties.services.contains(&SERVICE_UUID) {
-                found.push((peripheral, name));
-            } else if cli.name.as_deref() == Some(name.as_str())
-                || peripheral.is_connected().await?
-            {
-                // Named explicitly, or already connected — both are strong enough hints to be worth
-                // a connection attempt, which will reject it soon enough if it is something else.
-                fallback.push((peripheral, name));
+                advertised.push((peripheral, name));
+            } else if cli.name.as_deref() == Some(name.as_str()) {
+                named.push((peripheral, name));
+            } else if cli.name.is_none() && peripheral.is_connected().await? {
+                // Last resort, and only without `--name`: an unfiltered scan sees every connected
+                // peripheral on the Mac, so this tier is full of keyboards and earbuds. Each one
+                // costs a connect and a service discovery before it can be ruled out, which is why
+                // an explicit name suppresses the tier entirely rather than being merged into it.
+                connected.push((peripheral, name));
             }
         }
 
-        // Stop as soon as there is anything worth connecting to, including a fallback: a bonded
-        // robot may never re-advertise the service to this Mac, so waiting out the deadline for a
-        // better candidate would just be eight seconds of nothing.
-        if !found.is_empty() || !fallback.is_empty() || Instant::now() >= deadline {
+        // Stop as soon as there is anything worth connecting to: a bonded robot may never
+        // re-advertise the service to this Mac, so waiting out the deadline for a better candidate
+        // would just be eight seconds of nothing.
+        if !advertised.is_empty()
+            || !named.is_empty()
+            || !connected.is_empty()
+            || Instant::now() >= deadline
+        {
             break;
         }
         tokio::time::sleep(SCAN_POLL).await;
     }
     let _ = adapter.stop_scan().await;
 
-    if found.is_empty() && !fallback.is_empty() {
+    let mut found = advertised;
+    if found.is_empty() && !named.is_empty() {
         if cli.verbose {
             eprintln!(
-                "no robot advertised the service; trying {} known peripheral(s) — a bonded robot \
-                 often stops advertising it to a Mac that has already paired",
-                fallback.len()
+                "nothing advertised the service; trying {} peripheral(s) matching the name — a \
+                 bonded robot often stops advertising it to a Mac that has already paired",
+                named.len()
             );
         }
-        found = fallback;
+        found = named;
+    } else if found.is_empty() && !connected.is_empty() {
+        if cli.verbose {
+            eprintln!(
+                "nothing advertised the service; trying {} already-connected peripheral(s), which \
+                 may well be earbuds. `--name <robot hostname>` skips this guesswork",
+                connected.len()
+            );
+        }
+        found = connected;
     }
 
     if found.is_empty() {

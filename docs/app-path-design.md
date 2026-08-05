@@ -203,6 +203,30 @@ already claimed. Two details are load-bearing and both were wrong first:
 The write path still refuses a write with no live subscription. Accepting one would be a lie: there
 is nowhere to send the answer.
 
+### 3.3 One thing the mobile app will hit: do not scan with a service filter  · **measured**
+
+`btctl` is a test tool and deliberately not much more — the real client is a phone app. But one of its
+bugs is a property of CoreBluetooth rather than of the tool, so it is worth writing down before
+someone rediscovers it on iOS.
+
+`btd` advertises the service UUID and the hostname. Scanning with a service filter still finds the
+robot only *sometimes*: **CoreBluetooth honours the filter strictly, and a bonded peripheral
+frequently advertises with an empty service list.** Filtered, it is then never reported at all — not
+"reported without services", absent. That presented as `no robot found` on one run and success on the
+next, with nothing changed in between, and it survived a first fix because the name-based fallback
+could only match peripherals the filtered scan had already returned.
+
+The app should scan unfiltered and discriminate its own candidates, strongest evidence first:
+advertised UUID, then a known name or a stored peripheral identifier, and treat "serves our
+characteristic" as the only authoritative identity test — it is knowable solely after connecting. An
+iOS app has a better third tier than `btctl` does, `retrievePeripherals(withIdentifiers:)`, which
+`btleplug` does not expose; storing the identifier after a first successful connection is the right
+move there and removes the guesswork entirely.
+
+Also worth knowing: a single snapshot taken after a fixed sleep is not enough. Advertising is
+periodic and the adapter's view of a bonded peripheral comes and goes, so poll until a candidate
+appears.
+
 ## 5. Pairing: just-works, and a PIN the transport checks
 
 A six-digit PIN, stored by `configd`, checked by `btd` before it serves anything. **Not** by the
