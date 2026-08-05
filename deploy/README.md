@@ -11,6 +11,108 @@ next to their service (`updater/systemd/`, `robotd/systemd/`); anything robot-wi
 | `trusted_keys/` | release public keys — the trust anchor, installed to `/etc/robot/trusted_keys/` |
 | `journald.conf.d/10-robot.conf` | journal persistence and size caps |
 
+## Quickstart
+
+Two cases. Pick one, paste down the list. Everything after this section is the same thing with
+the reasons attached — read it when something disagrees with you, not before.
+
+### Dev board, repository private — this is today
+
+The token is the only placeholder until the dev-key line near the end. The `~/.profile` line is
+there because this reboots in the middle and an `export` does not survive that.
+
+```bash
+export DUCK_TOKEN=github_pat_replace_with_your_token
+```
+
+```bash
+touch ~/.profile && sed -i '/^export DUCK_TOKEN=/d' ~/.profile && printf 'export DUCK_TOKEN=%s\n' "$DUCK_TOKEN" >> ~/.profile && chmod 600 ~/.profile
+```
+
+```bash
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/setup-board.sh -o /tmp/setup-board.sh && sudo sh /tmp/setup-board.sh
+```
+
+```bash
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/migrate-network.sh -o /tmp/migrate-network.sh && sudo sh /tmp/migrate-network.sh
+```
+
+```bash
+sudo reboot
+```
+
+One reboot serves both: each staged its change and left a copy of itself behind. After it, both
+again — separately, because the second one retires a backstop that reverts this board on any
+later slow boot if it is left armed, and it must not be skipped by a chain that stopped early:
+
+```bash
+sudo /usr/local/sbin/robot-setup-board
+```
+
+```bash
+sudo /usr/local/sbin/robot-migrate-network
+```
+
+```bash
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh -o /tmp/install.sh
+```
+
+`DUCK_DEV_KEY` is what makes `robotctl update apply --ref <branch>` work; drop it for a board
+that should only take releases. `scp ~/.duck-keys/team.dev.pub board:/tmp/` first.
+
+```bash
+sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
+```
+
+```bash
+newgrp robot
+```
+
+That last one is not optional and not cosmetic: the install put you in the `robot` group, and a
+shell cannot join a group it did not start in, so without it every `robotctl` says
+`Permission denied`.
+
+```bash
+robotctl health
+```
+
+### Regular user, repository public
+
+No token, no dev key, and `curl | sudo sh` works because there is no header to carry.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/setup-board.sh -o /tmp/setup-board.sh && sudo sh /tmp/setup-board.sh
+```
+
+```bash
+sudo reboot
+```
+
+```bash
+sudo /usr/local/sbin/robot-setup-board
+```
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh | sudo sh
+```
+
+```bash
+newgrp robot
+```
+
+```bash
+robotctl health
+```
+
+Two blocks, not `newgrp robot && robotctl health`: `newgrp` hands you a *new shell*, so anything
+chained after it runs back in the old one — the one that is still not in the group — and reports
+`Permission denied` for reasons that have nothing to do with the robot.
+
+On a robot image that already ships NetworkManager that is the whole list. On Armbian stock it
+is not: wifi still belongs to netplan, so add the two `migrate-network.sh` lines from the case
+above — without the header — before installing the daemon. `setup-board.sh` says so if it
+applies.
+
 ## Installing a robot from scratch
 
 Two steps, because they answer to different things. `setup-board.sh` is OS-level bring-up —
