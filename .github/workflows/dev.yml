@@ -92,6 +92,11 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/updaterd staged/
           cp target/aarch64-unknown-linux-gnu/release/robotctl staged/
           cp target/aarch64-unknown-linux-gnu/release/robotd staged/
+          # configd (wifi, identity) and btd (the BLE front door). Their units are packaged
+          # alongside; a unit whose ExecStart binary is missing fails with 203/EXEC, which
+          # reads as a broken daemon rather than an incomplete artifact.
+          cp target/aarch64-unknown-linux-gnu/release/configd staged/
+          cp target/aarch64-unknown-linux-gnu/release/btd staged/
           # padd is the gamepad intent client. Shipped because a dev board is where
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.

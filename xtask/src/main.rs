@@ -872,6 +872,65 @@ mod tests {
         }
     }
 
+    /// Every binary a packaged unit tries to exec must be staged into the artifact.
+    ///
+    /// The sibling of the test above, and the case it missed. The units were packaged and the
+    /// binaries were not, so `btd.service` failed with `203/EXEC` — systemd could not execute
+    /// `/opt/robot/daemon/current/bin/btd` because the release did not contain it. That reads on
+    /// the board as a broken daemon rather than as an incomplete artifact, and it cost a second
+    /// install cycle to find.
+    ///
+    /// Derived from the units rather than from a list kept by hand: each unit names its binary in
+    /// `ExecStart`, so adding a service and forgetting to stage it fails here. A hand-kept list
+    /// would have exactly the drift this exists to catch.
+    #[test]
+    fn every_binary_a_packaged_unit_execs_is_staged() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+
+        for workflow in ["dev.yml", "release.yml"] {
+            let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
+                .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+
+            // The units this workflow packages, as `<crate>/systemd/<unit>=systemd/<unit>`.
+            for line in text.lines().filter(|l| l.contains("=systemd/")) {
+                let Some(src) = line
+                    .split('"')
+                    .nth(1)
+                    .and_then(|pair| pair.split('=').next())
+                else {
+                    continue;
+                };
+                if !src.ends_with(".service") {
+                    continue;
+                }
+
+                let unit = std::fs::read_to_string(root.join(src)).unwrap_or_else(|e| {
+                    panic!("{workflow} packages {src}, which does not exist: {e}")
+                });
+
+                // `ExecStart=/opt/robot/daemon/current/bin/<name> [args]`
+                let Some(exec) = unit
+                    .lines()
+                    .find(|l| l.starts_with("ExecStart="))
+                    .and_then(|l| l.split_whitespace().next())
+                    .and_then(|l| l.rsplit('/').next())
+                else {
+                    panic!("{src} has no ExecStart naming a binary");
+                };
+
+                let staged = format!("release/{exec} staged/");
+                assert!(
+                    text.contains(&staged),
+                    "{workflow} packages {src}, whose ExecStart is {exec:?}, but never stages \
+                     that binary. Without it the unit fails on the board with 203/EXEC. Add:  \
+                     cp target/aarch64-unknown-linux-gnu/release/{exec} staged/"
+                );
+            }
+        }
+    }
+
     /// `scripts/setup-board.sh` is fetched standalone with `curl`, so it cannot read
     /// Cargo.toml and has to carry a literal version. This is what stops that literal
     /// drifting from the value the preinstall hook is generated with — the exact failure that
