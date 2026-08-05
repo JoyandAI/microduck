@@ -88,8 +88,11 @@ impl PeerPolicy {
             return Ok(());
         }
         Err(format!(
-            "uid {} / gid {} may not change this robot's configuration; add it to --allow-uid \
-             or --allow-gid, or run as uid {}",
+            // The flags are `--allow-user`/`--allow-group` and take *names*, not numbers — see the
+            // arg docs above for why. Naming `--allow-uid` here sent anyone following the advice
+            // straight into "unexpected argument", which is a worse failure than the original.
+            "uid {} / gid {} may not change this robot's configuration; add its user or group to \
+             --allow-user or --allow-group (in configd.service), or run as uid {}",
             peer.uid(),
             peer.gid(),
             self.owner_uid
