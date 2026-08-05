@@ -1,15 +1,34 @@
-//! Pairing: who is allowed to talk to this robot over BLE.
+//! Who is allowed to talk to this robot over BLE.
 //!
 //! §4.2 says BLE authorisation is "physical presence + pairing", and §7 requires the
-//! characteristic carrying wifi credentials to be paired and encrypted. This is the mechanism
-//! for both — and it is deliberately a **process rather than a security guarantee** at this
-//! stage.
+//! characteristic carrying wifi credentials to be paired and encrypted. Both hold — but the PIN
+//! check lives **above** the link layer, and that is forced rather than chosen.
 //!
-//! The robot answers BlueZ's passkey request with a six-digit PIN held by `configd`. A phone is
-//! prompted for it, and BlueZ refuses the bond if it does not match. Because the pairing is
-//! *authenticated* (passkey entry, not just-works), the link is then encrypted and MITM-resistant
-//! — which is what makes `encrypt_authenticated_write` on the request characteristic mean
-//! something.
+//! ## Why BLE could not do this
+//!
+//! The first design had the robot answer BlueZ's passkey request with its stored PIN. That cannot
+//! work on a headless robot. In LE passkey entry one side *displays* a passkey and the other
+//! *inputs* it, and the roles follow from the IO capabilities each side declares. Implementing
+//! `request_passkey` declares "this device can input", so macOS took the display role, generated a
+//! random six-digit code, and waited for someone to type it into a robot with no keyboard.
+//!
+//! The reverse fails too: with `DisplayPasskey` the robot takes the display role, but **BlueZ
+//! generates the passkey** — the spec has the displaying side choose it at random. A fixed PIN
+//! printed on a sticker is simply not expressible in BLE passkey entry.
+//!
+//! ## So: just-works pairing, plus a PIN the transport checks
+//!
+//! Pairing is just-works (all agent handlers `None`, which BlueZ reads as `NoInputNoOutput`), so
+//! the link is encrypted but **not** authenticated. The read on the RPC characteristic requires
+//! encryption, which is what triggers the bond. Then `btd` serves nothing until the client proves
+//! the PIN via `system.authenticate`, which is why that call is answered by the transport rather
+//! than forwarded.
+//!
+//! The cost, stated plainly: the PIN crosses an encrypted-but-unauthenticated link, so an attacker
+//! present *at the moment of pairing* could capture it. The alternatives were no authentication at
+//! all, or an out-of-band QR flow that BlueZ barely supports and no phone app exists to drive. For
+//! a robot in a home this is the better trade, and it is revisitable without touching the
+//! transport, because the check is ours now rather than the spec's.
 //!
 //! **The factory PIN is `000000` and everyone can read it in this repository.** So out of the box
 //! this proves physical presence and nothing more, which is the same guarantee just-works pairing
@@ -58,22 +77,16 @@ const PIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// takes effect on the next pairing rather than the next reboot. One socket round-trip during an
 /// exchange that already takes a human several seconds.
 ///
+/// Returned whole rather than parsed: the comparison is on the string, because `000042` and `42`
+/// are different PINs and a numeric parse would make them the same. `is_default` comes with it so
+/// the caller can say out loud that a factory PIN authenticates anyone who read this repository.
+///
 /// The PIN is never logged. It is barely a secret today, but a per-robot one is meant to be, and
 /// the journal is the wrong place for it.
-pub async fn pin(config_socket: &std::path::Path) -> Result<u32, String> {
-    let result = tokio::time::timeout(PIN_TIMEOUT, fetch(config_socket))
+pub async fn pin(config_socket: &std::path::Path) -> Result<proto::PairingPinResult, String> {
+    tokio::time::timeout(PIN_TIMEOUT, fetch(config_socket))
         .await
-        .map_err(|_| "configd did not answer in time".to_owned())??;
-
-    // BlueZ wants the passkey as a number. Parsing loses the leading zeros, which is correct
-    // here and exactly why the stored form is a string: `000000` is passkey 0, and the phone
-    // displays six digits because the *spec* says six, not because we sent them.
-    result.pin.parse::<u32>().map_err(|_| {
-        format!(
-            "configd returned a PIN that is not a number: {} chars",
-            result.pin.len()
-        )
-    })
+        .map_err(|_| "configd did not answer in time".to_owned())?
 }
 
 async fn fetch(config_socket: &std::path::Path) -> Result<proto::PairingPinResult, String> {
@@ -160,7 +173,11 @@ mod tests {
             write.flush().await.unwrap();
         });
 
-        assert_eq!(pin(&path).await.unwrap(), 42);
+        let result = pin(&path).await.unwrap();
+        // Compared as a *string*, so a leading zero is part of the secret rather than lost to a
+        // numeric parse. `000042` and `42` must not be the same PIN.
+        assert_eq!(result.pin, "000042");
+        assert!(!result.is_default);
     }
 
     /// A refusal from `configd` is reported, not swallowed into a default passkey — which would

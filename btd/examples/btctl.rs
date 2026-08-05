@@ -64,6 +64,14 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
+    /// The robot's pairing PIN.
+    ///
+    /// Six digits, shown by `robotctl system pin` on the robot. The factory default is `000000`
+    /// and authenticates anyone who has read this repository, which is why a shipped robot needs a
+    /// per-robot one.
+    #[arg(long, global = true, default_value = "000000")]
+    pin: String,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -221,6 +229,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     peripheral.subscribe(&response).await?;
     let mut notifications = peripheral.notifications().await?;
 
+    // Prove the PIN before anything else. The bond is just-works, so it encrypts the link and
+    // authenticates nobody; the robot serves nothing until this succeeds. See
+    // `btd/src/pairing.rs` for why the check is here rather than in the pairing.
+    let auth = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "system.authenticate",
+        "params": { "pin": cli.pin },
+    });
+    let auth = serde_json::to_string(&auth)?;
+    if cli.verbose {
+        // The PIN is deliberately not printed, even here: a terminal is a log too.
+        eprintln!("→ system.authenticate (pin redacted)");
+    }
+    write_line(&peripheral, &request, &auth).await?;
+
+    let reply = read_line(&mut notifications, REPLY_TIMEOUT).await?;
+    if cli.verbose {
+        eprintln!("← {reply}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&reply)?;
+    if parsed["result"]["authenticated"] != serde_json::json!(true) {
+        let left = parsed["result"]["attempts_remaining"].as_u64();
+        return Err(match left {
+            Some(0) => "wrong PIN, and no attempts left — the robot closed the session. \
+                        Check it with `robotctl system pin` on the robot."
+                .to_owned()
+                .into(),
+            Some(n) => format!(
+                "wrong PIN ({n} attempt(s) left). Check it with `robotctl system pin` on the robot."
+            )
+            .into(),
+            None => format!("authentication failed: {reply}").into(),
+        });
+    }
+
     let (line, timeout) = request_line(&cli.command)?;
     if cli.verbose {
         eprintln!("→ {line}");
@@ -269,6 +313,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(())
                 };
             }
+        }
+    }
+}
+
+/// Write one NDJSON line, chunked.
+///
+/// Chunked by the same code the robot uses. btleplug does not expose the negotiated MTU, so 20
+/// bytes — the floor every BLE link guarantees — is the safe assumption: slower than necessary on a
+/// good link, correct on every link.
+///
+/// **Acknowledged writes**, and that is not a detail. An ATT Write *Command* (`WithoutResponse`)
+/// carries no reply, so a refusal — for insufficient encryption, say — is invisible: the request
+/// silently never arrives and the client waits out its timeout with no idea why. That is exactly
+/// how this first behaved, against a robot that was working perfectly.
+async fn write_line(
+    peripheral: &Peripheral,
+    characteristic: &Characteristic,
+    line: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for chunk in framing::chunks(line, 20) {
+        peripheral
+            .write(characteristic, &chunk, WriteType::WithResponse)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Read one complete NDJSON line from the notification stream.
+async fn read_line(
+    notifications: &mut (impl futures::Stream<Item = btleplug::api::ValueNotification> + Unpin),
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut reassembler = Reassembler::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("no reply within {timeout:?}").into());
+        }
+        let Ok(Some(notification)) = tokio::time::timeout(remaining, notifications.next()).await
+        else {
+            return Err(format!("no reply within {timeout:?}").into());
+        };
+        if let Some(line) = reassembler.push(&notification.value)?.into_iter().next() {
+            return Ok(line);
         }
     }
 }

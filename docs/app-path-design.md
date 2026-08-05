@@ -163,54 +163,87 @@ logind performs the reboot and `configd` only asks, so a capability there would 
 
 If polkit ever arrives for another reason, `configd` should drop to a dedicated user plus two rules.
 
-## 5. Pairing: a PIN, and no button
+## 5. Pairing: just-works, and a PIN the transport checks
 
-A six-digit PIN, stored by `configd`, answered to BlueZ by an agent in `btd`. Because the bond uses
-**passkey entry** rather than just-works, the link is authenticated and MITM-resistant — which is
-what makes `encrypt_authenticated_write` on the characteristic mean something, and satisfies §7's
-requirement that anything carrying wifi credentials be paired and encrypted.
+A six-digit PIN, stored by `configd`, checked by `btd` before it serves anything. **Not** by the
+Bluetooth bond — and that is forced by the spec rather than chosen.
 
-**Six digits, not five.** Bluetooth's passkey entry is defined as a six-digit value, 000000–999999,
-and BlueZ hands an agent exactly that. Five would have to be padded somewhere, and the two sides
-would then disagree about whether the PIN is `12345` or `012345` — a support call nobody can
-diagnose. Stored as a *string*, because leading zeros are significant and a `u32` renders `012345`
-as `12345`.
+### 5.1 Why BLE cannot carry a printed PIN  · **measured**
 
-The PIN is fetched **per pairing request** rather than cached, so changing it takes effect on the
-next pairing rather than the next reboot. A `configd` that cannot answer means the bond is
-**refused**: falling back to the default would let anyone pair whenever `configd` hiccuped.
+The first design had the robot answer BlueZ's passkey request with its stored PIN. On hardware, macOS
+displayed *its own* random six-digit code and waited for someone to type it into the robot.
 
-**A read triggers the bond.** The characteristic requires an authenticated encrypted link to
-*write*, but `bluer` 0.17 offers no encryption flag for a subscribe — so a central would subscribe
-without encryption, write, be refused, and on macOS see neither a prompt nor an error: a client
-timing out against a working robot. A read *is* acknowledged, so the characteristic carries one that
-requires the bond, and clients read it first. It returns `API_VERSION`, which makes it useful as
-well as necessary — a mismatched client can say so before sending anything. Any client, phone app
-included, must read before it writes.
+In LE passkey entry one side **displays** a passkey and the other **inputs** it, and the roles follow
+from the IO capabilities each side declares. Implementing `request_passkey` declares "this device can
+input", so macOS took the display role. A robot with no keyboard cannot fill that role.
 
-**No pairing window, and that is decided rather than deferred.** A per-robot PIN already carries
-what a window would add: if it is unique and printed under the robot, knowing it requires physical
-access, and anyone who can read the sticker can pick the robot up. A window would defend only
-against someone in range while the factory default is still in place, and the answer to that is a
-real PIN. A button would add a visible consent moment, a recovery path for a lost PIN, and defence
-in depth if a sticker is photographed — none needed for v1, each additive later, since an enclosure
-with a button can gate `set_pairable` without changing this design.
+The reverse is no better. With `DisplayPasskey` the robot takes the display role, but the **spec has
+the displaying side generate the passkey at random** — BlueZ chooses it and hands it to the agent.
+There is no way to make it present a value we stored, and a headless robot has nothing to display it
+on anyway.
 
-**So the security rests entirely on the PIN being per-robot, which makes it a provisioning
-obligation rather than a software one.** The factory default is `000000` and public in this
-repository: out of the box, pairing proves physical presence and nothing more. Something must
-generate a PIN, print it, and record what was printed — `updater-design.md` §5.7's per-device
-state, the same slot that owes us a serial number.
+So a fixed, printed-on-the-robot PIN is not expressible in BLE passkey entry. Three options remained:
 
-### 5.1 Open
+| | |
+|---|---|
+| Just-works only | Encrypted, unauthenticated, no PIN. Security is physical presence. What most headless BLE devices do |
+| Out-of-band (QR) | Genuinely authenticated and genuinely per-robot. BlueZ's OOB support is thin and no phone app exists to drive it. A large lift for v1 |
+| **Just-works plus an app-layer PIN** | **Chosen.** Pair for encryption; check the PIN in the session, where we define the rules |
+
+### 5.2 How it works
+
+Pairing is just-works: every agent handler is `None`, which `bluer` publishes as `NoInputNoOutput`.
+The read on the RPC characteristic requires `encrypt_read`, which is what makes a central bond at
+all — plain encryption, not `encrypt_authenticated_*`, because a just-works bond can never satisfy
+the authenticated variants and demanding them would refuse every client.
+
+Then `btd` serves nothing until the client sends `system.authenticate`. That call is answered by the
+transport rather than forwarded, which is why the routing table has a third outcome (`Route::Local`)
+alongside "forward" and "refuse". `hello` is the one other call allowed through unauthenticated,
+because it reports only versions — the same thing the GATT read already tells an unauthenticated
+client — and refusing it would leave a mismatched client unable to learn why nothing works.
+
+Three details that are load-bearing rather than incidental:
+
+- **The PIN is fetched from `configd` per attempt**, not cached, so `robotctl system set-pin` takes
+  effect on the next try rather than the next reboot. A `configd` that cannot answer means the
+  session is refused rather than admitted.
+- **Compared as a string.** `042042` and `42042` are different secrets; a numeric parse would make
+  them the same. There is a test for exactly that.
+- **Three attempts, then the session closes.** A six-digit PIN is a million guesses over a link that
+  is encrypted but not authenticated, so rationing is the only thing making brute force expensive:
+  reconnecting costs a full BLE connect and bond. `attempts_remaining` comes back to the client so it
+  can say "two left" rather than silently losing its connection.
+
+### 5.3 What this is and is not worth
+
+**The PIN crosses an encrypted-but-unauthenticated link**, so an attacker present *at the moment of
+pairing* could capture it. That is the price of the trade, and it is the reason to prefer OOB later
+if the threat model ever justifies it. What it buys over just-works alone is that a device which
+merely bonds — trivial for anyone in range — still cannot do anything.
+
+**The factory PIN is `000000` and is public in this repository.** Out of the box, therefore, this
+proves physical presence and nothing more. `btd` logs a warning on every authentication with the
+default, and `robotctl system pin` says so too. Security rests entirely on the PIN being per-robot,
+which makes it a **provisioning obligation**: something must generate it, print it, and record what
+was printed. That is `updater-design.md` §5.7's per-device state, the same slot that owes us a serial
+number.
+
+**No pairing window, and that is decided rather than deferred.** The robot is pairable whenever it
+advertises. A per-robot PIN already carries what a window would add: knowing a printed PIN requires
+physical access, and anyone who can read the sticker can pick the robot up. A button would add a
+visible consent moment, a recovery path for a lost PIN, and defence in depth if a sticker is
+photographed — none needed for v1, each additive later, since an enclosure with a button can gate
+`set_pairable` without changing this design.
+
+### 5.4 Open
 
 - **Bond revocation.** Nothing un-pairs a phone; `bluetoothctl untrust` is the manual escape. Needs
   an API and a rule about who may call it — plausibly not BLE itself.
-- **Whether `btd`'s user may reach `org.bluez`.** The image's policy allows any user to send method
-  calls to `org.bluez`, and replies and signals are allowed by default, so serving GATT objects
-  should work. The narrow risk is `RequestDefaultAgent`, which BlueZ may restrict to root — and
-  `btd` needs it, because incoming pairing is routed to the *default* agent. If it is refused, the
-  fix is a policy drop-in for the `btd` user, not running as root.
+- **Rate limiting survives only within a session.** Three wrong PINs close the session, but nothing
+  counts across reconnects, so a determined peer can retry indefinitely at the cost of a bond per
+  three guesses. A per-address backoff in `btd` is the obvious next step and needs somewhere to keep
+  that state across sessions.
 
 ## 6. Testing without a radio  · **measured**
 

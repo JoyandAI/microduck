@@ -29,6 +29,19 @@ pub enum Upstream {
     Config,
 }
 
+/// What happens to a call that arrives over BLE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Forwarded verbatim to a service.
+    To(Upstream),
+    /// Answered by `btd` itself. Only `system.authenticate`: the PIN check belongs to the
+    /// transport, because BLE cannot express a fixed printed passkey and the check therefore had
+    /// to move up a layer (`docs/app-path-design.md` §5).
+    Local,
+    /// Not available over this transport.
+    Refused,
+}
+
 /// Where this call goes, or `None` if BLE may not make it.
 ///
 /// Read the `None` arms as the security boundary: each one is a deliberate decision that a
@@ -81,6 +94,9 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // Unlike `resetToGolden` it discards nothing.
         SystemReboot => Some(Upstream::Config),
 
+        // Answered by `btd`, so it has no upstream. See `route_for`.
+        SystemAuthenticate(_) => None,
+
         // The pairing PIN, and the one refusal in this file that is load-bearing rather than
         // conservative: a PIN readable by an unpaired peer authorises nothing at all. `btd`
         // reads it over the unix socket to answer BlueZ's passkey request, and BLE never can.
@@ -130,6 +146,17 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // unpredictably-lagged view it could not reason about. `robot.health` is the question an
         // app actually has.
         RobotSubscribe(_) => None,
+    }
+}
+
+/// The full routing decision, including the one call the transport answers itself.
+pub fn route_for(call: &proto::Call) -> Route {
+    match call {
+        proto::Call::SystemAuthenticate(_) => Route::Local,
+        other => match upstream_for(other) {
+            Some(upstream) => Route::To(upstream),
+            None => Route::Refused,
+        },
     }
 }
 

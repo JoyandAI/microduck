@@ -632,6 +632,19 @@ impl Server {
                     "net.* and system.* are served by configd, not updaterd",
                 ),
             ),
+
+            // Answered by the transport that received it — `btd` checks the PIN itself and never
+            // forwards this. Reaching updaterd means a client sent it to the wrong socket, or over
+            // a transport that has no PIN gate: on a unix socket, `SO_PEERCRED` already decided who
+            // may talk, so there is nothing here for a PIN to add.
+            Call::SystemAuthenticate(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "system.authenticate is answered by the BLE transport, not by updaterd; \
+                     access over a unix socket is decided by the socket's own peer credentials",
+                ),
+            ),
         }
     }
 

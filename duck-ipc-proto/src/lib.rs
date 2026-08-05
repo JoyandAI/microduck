@@ -39,10 +39,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Bumped on any incompatible change. A peer speaking a different version is refused
 /// rather than misparsed — a stale `robotctl` in someone's shell is normal.
 ///
-/// v2 added `HelloResult::revision`. v3 added the `net.*` and `system.*` namespaces. During
+/// v2 added `HelloResult::revision`. v3 added the `net.*` and `system.*` namespaces. v4 added
+/// `system.authenticate`, which a BLE client must now pass before anything else is served — a v3
+/// client would otherwise have every call refused with no idea why. During
 /// prototyping the wire shape simply changes and this bumps; no accommodation is made for
 /// peers that predate a field, because there are none in the field yet.
-pub const API_VERSION: u32 = 3;
+pub const API_VERSION: u32 = 4;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -155,6 +157,8 @@ pub mod method {
     pub const SYSTEM_PAIRING_PIN: &str = "system.pairingPin";
     /// Set the Bluetooth pairing PIN.
     pub const SYSTEM_SET_PAIRING_PIN: &str = "system.setPairingPin";
+    /// Prove knowledge of the pairing PIN. Answered by the transport, not by a service.
+    pub const SYSTEM_AUTHENTICATE: &str = "system.authenticate";
 }
 
 /// JSON-RPC error codes.
@@ -258,6 +262,14 @@ pub enum Call {
     /// table has a test saying so.
     SystemPairingPin,
     SystemSetPairingPin(SetPairingPinParams),
+    /// Prove knowledge of the robot's pairing PIN.
+    ///
+    /// Answered by the **transport** rather than by any service, which makes it unlike every
+    /// other call here. BLE cannot express a fixed, printed-on-the-robot passkey — the spec has
+    /// the *displaying* side generate a random one, and a headless robot can display nothing — so
+    /// the PIN check moved from the link layer to this one, where we define the rules. See
+    /// `docs/app-path-design.md` §5.
+    SystemAuthenticate(AuthenticateParams),
 }
 
 impl Call {
@@ -293,6 +305,7 @@ impl Call {
             Call::SystemReboot => method::SYSTEM_REBOOT,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
             Call::SystemSetPairingPin(_) => method::SYSTEM_SET_PAIRING_PIN,
+            Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
         }
     }
 
@@ -357,6 +370,7 @@ impl Call {
             Call::NetForget(p) => encode(p),
             Call::SystemSetName(p) => encode(p),
             Call::SystemSetPairingPin(p) => encode(p),
+            Call::SystemAuthenticate(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -413,6 +427,7 @@ impl Call {
             method::SYSTEM_REBOOT => Call::SystemReboot,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
             method::SYSTEM_SET_PAIRING_PIN => Call::SystemSetPairingPin(decode(params)?),
+            method::SYSTEM_AUTHENTICATE => Call::SystemAuthenticate(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -787,6 +802,35 @@ pub struct NetForgetParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetNameParams {
     pub name: String,
+}
+
+/// Prove knowledge of the pairing PIN.
+///
+/// [`Debug`] is hand-written to redact the PIN, for the same reason [`NetConnectParams`] is: this
+/// is the only thing standing between a paired-but-unauthenticated peer and the robot, and a
+/// journal is the wrong place for it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticateParams {
+    pub pin: String,
+}
+
+impl std::fmt::Debug for AuthenticateParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticateParams")
+            .field("pin", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Answer to [`Call::SystemAuthenticate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticateResult {
+    pub authenticated: bool,
+    /// Tries left before the transport closes the session. Zero means this was the last one.
+    ///
+    /// Reported so a client can say "two attempts left" rather than silently losing its
+    /// connection — and so a brute-force attempt is visibly rationed.
+    pub attempts_remaining: u32,
 }
 
 /// Set the Bluetooth pairing PIN.
@@ -1510,6 +1554,9 @@ mod tests {
             Call::SystemSetPairingPin(SetPairingPinParams {
                 pin: "042042".into(),
             }),
+            Call::SystemAuthenticate(AuthenticateParams {
+                pin: "000000".into(),
+            }),
         ]
     }
 
@@ -1521,7 +1568,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            29,
+            30,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -1886,6 +1933,23 @@ mod tests {
             psk: None,
         };
         assert!(format!("{open:?}").contains("none"), "{open:?}");
+    }
+
+    /// The PIN must be redacted for the same reason a wifi key is: it is the only thing standing
+    /// between a paired peer and the robot.
+    #[test]
+    fn a_pairing_pin_is_redacted_from_debug_output() {
+        let params = AuthenticateParams {
+            pin: "482913".into(),
+        };
+        let debug = format!("{params:?}");
+        assert!(
+            !debug.contains("482913"),
+            "the PIN reached Debug output: {debug}"
+        );
+        assert!(debug.contains("redacted"), "{debug}");
+        // And still reaches the wire, or nothing could check it.
+        assert!(serde_json::to_string(&params).unwrap().contains("482913"));
     }
 
     /// Redaction must not extend to the wire, or `configd` would receive no key at all.

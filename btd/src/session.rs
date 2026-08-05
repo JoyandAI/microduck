@@ -15,8 +15,18 @@ use tokio::sync::mpsc;
 
 use crate::framing::{self, Reassembler};
 use crate::link::{Link, QUEUE};
-use crate::route;
+use crate::pairing;
+use crate::route::{self, Route};
 use crate::upstream::{Pool, Sockets};
+
+/// How many wrong PINs a session may offer before it is closed.
+///
+/// A six-digit PIN is a million guesses, and the link is encrypted but not authenticated, so
+/// rationing attempts is the only thing standing between a peer in radio range and brute force.
+/// Three, then the session ends: reconnecting costs a full BLE connect and bond, which turns an
+/// afternoon of guessing into something far longer while staying invisible to a legitimate client
+/// that mistypes twice.
+const PIN_ATTEMPTS: u32 = 3;
 
 /// Serve one central until it disconnects or breaks framing.
 pub async fn run(mut link: Link, sockets: Sockets) {
@@ -24,8 +34,14 @@ pub async fn run(mut link: Link, sockets: Sockets) {
     tracing::info!(peer = %peer, mtu = link.mtu, "session opened");
 
     let (replies_tx, mut replies) = mpsc::channel::<String>(QUEUE);
+    let config_socket = sockets.config.clone();
     let mut pool = Pool::new(sockets, replies_tx);
     let mut inbound = Reassembler::new();
+
+    // Nothing but `hello` and `system.authenticate` is served until the client proves the PIN.
+    // See `crate::pairing` for why this is here rather than in the bond.
+    let mut authenticated = false;
+    let mut attempts_left = PIN_ATTEMPTS;
 
     loop {
         tokio::select! {
@@ -46,9 +62,22 @@ pub async fn run(mut link: Link, sockets: Sockets) {
                 };
 
                 for line in lines {
-                    if let Some(response) = dispatch(&mut pool, &line).await
+                    let outcome = dispatch(
+                        &mut pool,
+                        &config_socket,
+                        &line,
+                        &mut authenticated,
+                        &mut attempts_left,
+                    )
+                    .await;
+
+                    if let Some(response) = outcome.response
                         && send_line(&link, &response).await.is_err()
                     {
+                        return;
+                    }
+                    if outcome.close {
+                        tracing::warn!(peer = %peer, "closing the session: too many bad PINs");
                         return;
                     }
                 }
@@ -74,16 +103,43 @@ pub async fn run(mut link: Link, sockets: Sockets) {
     tracing::info!(peer = %peer, "session closed");
 }
 
-/// Handle one complete line. Returns a response `btd` must answer itself, if any.
-///
-/// `None` means the line was forwarded and the upstream will answer — the ordinary path.
-async fn dispatch(pool: &mut Pool, line: &str) -> Option<String> {
+/// What handling one line produced.
+struct Outcome {
+    /// A response `btd` must send itself. `None` means an upstream will answer — the ordinary path.
+    response: Option<String>,
+    /// End the session after sending. Only ever set by exhausting the PIN attempts.
+    close: bool,
+}
+
+impl Outcome {
+    fn nothing() -> Self {
+        Self {
+            response: None,
+            close: false,
+        }
+    }
+    fn reply(response: String) -> Self {
+        Self {
+            response: Some(response),
+            close: false,
+        }
+    }
+}
+
+/// Handle one complete line.
+async fn dispatch(
+    pool: &mut Pool,
+    config_socket: &std::path::Path,
+    line: &str,
+    authenticated: &mut bool,
+    attempts_left: &mut u32,
+) -> Outcome {
     let request: proto::Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
             // No id is recoverable from an unparseable line, so the response carries `null` —
             // which the spec requires and every client already handles.
-            return Some(encode(&proto::Response::err(
+            return Outcome::reply(encode(&proto::Response::err(
                 None,
                 proto::Error::new(proto::code::PARSE_ERROR, e.to_string()),
             )));
@@ -96,29 +152,155 @@ async fn dispatch(pool: &mut Pool, line: &str) -> Option<String> {
 
     let call = match request.as_call() {
         Ok(call) => call,
-        Err(e) => return id.map(|id| encode(&proto::Response::err(Some(id), e))),
+        Err(e) => {
+            return match id.map(|id| encode(&proto::Response::err(Some(id), e))) {
+                Some(r) => Outcome::reply(r),
+                None => Outcome::nothing(),
+            };
+        }
     };
 
-    let Some(upstream) = route::upstream_for(&call) else {
-        tracing::info!(method = call.method(), "refused over BLE");
-        return id.map(|id| encode(&proto::Response::err(Some(id), route::refusal(&call))));
+    // The PIN gate. `hello` is allowed through because it only reports versions — the same
+    // information the GATT read already gives an unauthenticated client — and refusing it would
+    // leave a mismatched client unable to learn why nothing works.
+    if !*authenticated
+        && !matches!(
+            call,
+            proto::Call::SystemAuthenticate(_) | proto::Call::Hello(_)
+        )
+    {
+        tracing::info!(method = call.method(), "refused: not authenticated");
+        let error = proto::Error::new(
+            proto::code::PERMISSION_DENIED,
+            format!(
+                "{} needs authentication first: send system.authenticate with the robot's PIN \
+                 (`robotctl system pin` on the robot)",
+                call.method()
+            ),
+        );
+        return match id.map(|id| encode(&proto::Response::err(Some(id), error))) {
+            Some(r) => Outcome::reply(r),
+            None => Outcome::nothing(),
+        };
+    }
+
+    let upstream = match route::route_for(&call) {
+        Route::To(upstream) => upstream,
+        Route::Local => {
+            let proto::Call::SystemAuthenticate(params) = &call else {
+                // `route_for` returns `Local` for exactly one variant; anything else here is a
+                // routing table that grew a local method without teaching this function about it.
+                tracing::error!(method = call.method(), "routed locally with no handler");
+                let error = proto::Error::new(
+                    proto::code::INTERNAL_ERROR,
+                    "routed locally with no handler",
+                );
+                return match id.map(|id| encode(&proto::Response::err(Some(id), error))) {
+                    Some(r) => Outcome::reply(r),
+                    None => Outcome::nothing(),
+                };
+            };
+            return authenticate(config_socket, params, authenticated, attempts_left, id).await;
+        }
+        Route::Refused => {
+            tracing::info!(method = call.method(), "refused over BLE");
+            return match id.map(|id| encode(&proto::Response::err(Some(id), route::refusal(&call))))
+            {
+                Some(r) => Outcome::reply(r),
+                None => Outcome::nothing(),
+            };
+        }
     };
 
     if let Err(e) = pool.send(upstream, line).await {
         tracing::warn!(method = call.method(), upstream = ?upstream, error = %e, "upstream unreachable");
         // Naming the service is what makes this diagnosable from a phone screenshot: "robotd
         // is not answering" is a different problem from "the robot refused".
-        return id.map(|id| {
-            encode(&proto::Response::err(
-                Some(id),
-                proto::Error::new(
-                    proto::code::INTERNAL_ERROR,
-                    format!("{upstream:?} is not answering: {e}"),
-                ),
-            ))
-        });
+        let error = proto::Error::new(
+            proto::code::INTERNAL_ERROR,
+            format!("{upstream:?} is not answering: {e}"),
+        );
+        return match id.map(|id| encode(&proto::Response::err(Some(id), error))) {
+            Some(r) => Outcome::reply(r),
+            None => Outcome::nothing(),
+        };
     }
-    None
+    Outcome::nothing()
+}
+
+/// Check the PIN, and ration the attempts.
+///
+/// Fetched from `configd` per attempt rather than cached, so `robotctl system set-pin` takes effect
+/// on the next try rather than the next reboot — and so a `configd` that cannot answer means the
+/// session is refused rather than admitted.
+///
+/// The comparison is on the string, not a number: `000042` and `42` are different PINs, and a
+/// numeric parse would make them the same.
+async fn authenticate(
+    config_socket: &std::path::Path,
+    params: &proto::AuthenticateParams,
+    authenticated: &mut bool,
+    attempts_left: &mut u32,
+    id: Option<proto::Id>,
+) -> Outcome {
+    let expected = match pairing::pin(config_socket).await {
+        Ok(expected) => expected,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the PIN; refusing to authenticate");
+            let error = proto::Error::new(
+                proto::code::INTERNAL_ERROR,
+                "cannot check the PIN: configd is not answering",
+            );
+            return match id.map(|id| encode(&proto::Response::err(Some(id), error))) {
+                Some(r) => Outcome::reply(r),
+                None => Outcome::nothing(),
+            };
+        }
+    };
+
+    // Constant-time-ish: compare whole strings of equal length rather than returning early on the
+    // first differing digit. Over BLE the timing signal is buried in milliseconds of radio, so this
+    // is hygiene rather than a defence — but it costs nothing.
+    let ok = expected.pin.len() == params.pin.len()
+        && expected
+            .pin
+            .bytes()
+            .zip(params.pin.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+
+    if ok {
+        *authenticated = true;
+        tracing::info!(default_pin = expected.is_default, "authenticated");
+        if expected.is_default {
+            // Worth saying every time: a factory PIN authenticates anyone who read this repository.
+            tracing::warn!(
+                "authenticated with the FACTORY PIN, which is public. Set a per-robot one: \
+                 robotctl system set-pin <6 digits>"
+            );
+        }
+        let result = proto::AuthenticateResult {
+            authenticated: true,
+            attempts_remaining: PIN_ATTEMPTS,
+        };
+        return match id.map(|id| encode(&proto::Response::ok(Some(id), &result))) {
+            Some(r) => Outcome::reply(r),
+            None => Outcome::nothing(),
+        };
+    }
+
+    *attempts_left = attempts_left.saturating_sub(1);
+    tracing::warn!(attempts_left = *attempts_left, "wrong PIN");
+
+    let result = proto::AuthenticateResult {
+        authenticated: false,
+        attempts_remaining: *attempts_left,
+    };
+    let response = id.map(|id| encode(&proto::Response::ok(Some(id), &result)));
+    Outcome {
+        response,
+        close: *attempts_left == 0,
+    }
 }
 
 /// Chunk one line out to the central.
@@ -210,6 +392,36 @@ mod tests {
         }
     }
 
+    /// The reply a fake `configd` gives to `system.pairingPin`.
+    fn pin_reply(pin: &str) -> String {
+        serde_json::to_string(&proto::Response::ok(
+            Some(proto::Id::Number(1)),
+            &proto::PairingPinResult {
+                pin: pin.to_owned(),
+                is_default: false,
+            },
+        ))
+        .unwrap()
+    }
+
+    /// Do what a real client must now do first: prove the PIN.
+    ///
+    /// Every test goes through this, which means every test also exercises the gate — a session
+    /// that stopped authenticating would fail all of them rather than silently serve everything.
+    async fn authenticate(to_robot: &Sender<Vec<u8>>, from_robot: &mut Receiver<Vec<u8>>) {
+        let request =
+            r#"{"jsonrpc":"2.0","id":99,"method":"system.authenticate","params":{"pin":"424242"}}"#;
+        to_robot
+            .send(format!("{request}\n").into_bytes())
+            .await
+            .unwrap();
+        let reply = read_reply(from_robot).await;
+        assert!(
+            reply.contains(r#""authenticated":true"#),
+            "the handshake failed: {reply}"
+        );
+    }
+
     fn sockets(dir: &std::path::Path, updater: &str, robot: &str) -> Sockets {
         Sockets {
             updater: dir.join(updater),
@@ -224,6 +436,7 @@ mod tests {
     #[tokio::test]
     async fn an_allowed_call_is_forwarded_verbatim_and_answered() {
         let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
         let (_, mut seen) = FakeDaemon::spawn(dir.path(), "updaterd.sock",
             vec![r#"{"jsonrpc":"2.0","id":1,"result":{"api_version":2,"daemon_version":"0.1.4","revision":null}}"#.into()]);
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
@@ -233,6 +446,7 @@ mod tests {
             link,
             sockets(dir.path(), "updaterd.sock", "robotd.sock"),
         ));
+        authenticate(&to_robot, &mut from_robot).await;
 
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"api_version":2}}"#;
         to_robot.send(request.as_bytes().to_vec()).await.unwrap();
@@ -255,6 +469,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_call_never_reaches_the_daemon() {
         let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
         let (_, mut seen) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
 
@@ -263,6 +478,7 @@ mod tests {
             link,
             sockets(dir.path(), "updaterd.sock", "robotd.sock"),
         ));
+        authenticate(&to_robot, &mut from_robot).await;
 
         to_robot.send(
             format!("{}\n", r#"{"jsonrpc":"2.0","id":9,"method":"update.resetToGolden","params":{"component":"daemon"}}"#)
@@ -285,6 +501,7 @@ mod tests {
     #[tokio::test]
     async fn robot_calls_go_to_robotd() {
         let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
         let (_, mut updater_seen) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
         let (_, mut robot_seen) = FakeDaemon::spawn(
             dir.path(),
@@ -297,6 +514,7 @@ mod tests {
             link,
             sockets(dir.path(), "updaterd.sock", "robotd.sock"),
         ));
+        authenticate(&to_robot, &mut from_robot).await;
 
         to_robot
             .send(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"robot.health\"}\n".to_vec())
@@ -321,6 +539,7 @@ mod tests {
     #[tokio::test]
     async fn every_notification_in_a_stream_reaches_the_client() {
         let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
         let progress: Vec<String> = (0..3)
             .map(|i| format!(
                 r#"{{"jsonrpc":"2.0","method":"update.progress","params":{{"component":"daemon","phase":"downloading","percent":{},"detail":null}}}}"#,
@@ -335,6 +554,7 @@ mod tests {
             link,
             sockets(dir.path(), "updaterd.sock", "robotd.sock"),
         ));
+        authenticate(&to_robot, &mut from_robot).await;
 
         to_robot
             .send(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"update.subscribe\"}\n".to_vec())
@@ -354,6 +574,7 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_line_is_answered_and_the_session_survives() {
         let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
         let (_, _) = FakeDaemon::spawn(dir.path(), "updaterd.sock",
             vec![r#"{"jsonrpc":"2.0","id":1,"result":{"api_version":2,"daemon_version":null,"revision":null}}"#.into()]);
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
@@ -363,6 +584,7 @@ mod tests {
             link,
             sockets(dir.path(), "updaterd.sock", "robotd.sock"),
         ));
+        authenticate(&to_robot, &mut from_robot).await;
 
         to_robot.send(b"not json at all\n".to_vec()).await.unwrap();
         let reply = read_reply(&mut from_robot).await;
@@ -387,6 +609,7 @@ mod tests {
     #[tokio::test]
     async fn a_dead_daemon_is_reported_rather_than_hanging() {
         let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
         let (_, _) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
         // No robotd socket at all.
 
@@ -395,6 +618,7 @@ mod tests {
             link,
             sockets(dir.path(), "updaterd.sock", "absent.sock"),
         ));
+        authenticate(&to_robot, &mut from_robot).await;
 
         to_robot
             .send(b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"robot.health\"}\n".to_vec())
@@ -410,6 +634,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_notification_is_answered_with_silence() {
         let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
         let (_, mut seen) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
         let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
 
@@ -418,6 +643,7 @@ mod tests {
             link,
             sockets(dir.path(), "updaterd.sock", "robotd.sock"),
         ));
+        authenticate(&to_robot, &mut from_robot).await;
 
         to_robot.send(
             format!("{}\n", r#"{"jsonrpc":"2.0","method":"update.resetToGolden","params":{"component":"daemon"}}"#)
@@ -432,6 +658,144 @@ mod tests {
         assert!(
             seen.try_recv().is_err(),
             "a refused notification was forwarded"
+        );
+    }
+
+    /// The gate. An unauthenticated call is refused, and the message says what to do about it —
+    /// this is the first thing a phone app author will hit.
+    #[tokio::test]
+    async fn nothing_is_served_before_the_pin() {
+        let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
+        let (_, mut seen) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
+        let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
+
+        let (link, to_robot, mut from_robot) = Link::pair(185, "AA:BB");
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
+        // Deliberately NOT authenticated.
+
+        to_robot
+            .send(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"update.status\"}\n".to_vec())
+            .await
+            .unwrap();
+
+        let reply = read_reply(&mut from_robot).await;
+        assert!(
+            reply.contains(&proto::code::PERMISSION_DENIED.to_string()),
+            "{reply}"
+        );
+        assert!(
+            reply.contains("system.authenticate"),
+            "the refusal must say how to proceed: {reply}"
+        );
+
+        // And it never reached the daemon: the gate is not advisory.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            seen.try_recv().is_err(),
+            "an unauthenticated call was forwarded"
+        );
+    }
+
+    /// `hello` is the one exception, because it reports only versions — the same thing the GATT
+    /// read already tells an unauthenticated client — and refusing it would leave a mismatched
+    /// client unable to learn why nothing works.
+    #[tokio::test]
+    async fn hello_is_allowed_before_the_pin() {
+        let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
+        let (_, _) = FakeDaemon::spawn(
+            dir.path(),
+            "updaterd.sock",
+            vec![r#"{"jsonrpc":"2.0","id":1,"result":{"api_version":4,"daemon_version":null,"revision":null}}"#.into()],
+        );
+        let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
+
+        let (link, to_robot, mut from_robot) = Link::pair(185, "AA:BB");
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
+
+        to_robot
+            .send(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"hello\",\"params\":{\"api_version\":4}}\n".to_vec())
+            .await
+            .unwrap();
+        assert!(read_reply(&mut from_robot).await.contains("api_version"));
+    }
+
+    /// A wrong PIN counts down and then closes the session. A six-digit PIN is a million guesses
+    /// over a link that is encrypted but not authenticated, so rationing the attempts is the only
+    /// thing making brute force expensive.
+    #[tokio::test]
+    async fn wrong_pins_are_rationed_and_then_the_session_closes() {
+        let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
+        let (_, _) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
+        let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
+
+        let (link, to_robot, mut from_robot) = Link::pair(185, "AA:BB");
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
+
+        let wrong =
+            r#"{"jsonrpc":"2.0","id":1,"method":"system.authenticate","params":{"pin":"000000"}}"#;
+        for expected_left in [2, 1, 0] {
+            to_robot
+                .send(format!("{wrong}\n").into_bytes())
+                .await
+                .unwrap();
+            let reply = read_reply(&mut from_robot).await;
+            assert!(reply.contains(r#""authenticated":false"#), "{reply}");
+            assert!(
+                reply.contains(&format!(r#""attempts_remaining":{expected_left}"#)),
+                "a client must be able to say how many tries are left: {reply}"
+            );
+        }
+
+        // The third failure ends the session, so the link closes rather than accepting a fourth.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            to_robot
+                .send(format!("{wrong}\n").into_bytes())
+                .await
+                .is_err()
+                || from_robot.try_recv().is_err(),
+            "the session should have closed after exhausting the attempts"
+        );
+    }
+
+    /// A PIN differing only in a leading zero must not authenticate. The stored form is a string
+    /// precisely so that `042042` and `42042` are different secrets.
+    #[tokio::test]
+    async fn a_leading_zero_is_part_of_the_pin() {
+        let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("042042")]);
+        let (_, _) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
+        let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
+
+        let (link, to_robot, mut from_robot) = Link::pair(185, "AA:BB");
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
+
+        let without =
+            r#"{"jsonrpc":"2.0","id":1,"method":"system.authenticate","params":{"pin":"42042"}}"#;
+        to_robot
+            .send(format!("{without}\n").into_bytes())
+            .await
+            .unwrap();
+        assert!(
+            read_reply(&mut from_robot)
+                .await
+                .contains(r#""authenticated":false"#),
+            "a PIN missing its leading zero must not authenticate"
         );
     }
 

@@ -86,37 +86,31 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
         adapter.set_pairable(true).await?;
     }
 
-    // The agent answers BlueZ's passkey request with the PIN configd holds. Registered before
-    // advertising, or a phone quick off the mark could reach pairing before there is anything to
-    // answer it.
+    // A **just-works** agent: every handler left `None`, which bluer publishes as
+    // `NoInputNoOutput`. So the bond needs no interaction and is encrypted but *not*
+    // authenticated.
+    //
+    // This is not the design that was intended. The first version answered BlueZ's passkey request
+    // with the stored PIN, which cannot work on a headless robot: in LE passkey entry the roles
+    // follow from the declared IO capabilities, so implementing `request_passkey` told macOS "this
+    // device can input", and macOS displayed a random code for someone to type into a robot with no
+    // keyboard. The reverse is no better — with `DisplayPasskey` the *spec* has BlueZ generate the
+    // passkey, so a PIN printed on a sticker cannot be presented at all.
+    //
+    // The PIN check therefore moved above the link layer: `crate::session` serves nothing until a
+    // client passes `system.authenticate`. See `crate::pairing` for the trade that involves.
     let _agent = if require_pairing {
-        let config_socket = sockets.config.clone();
         Some(
             bt.register_agent(Agent {
                 request_default: true,
-                request_passkey: Some(Box::new(move |request| {
-                    let config_socket = config_socket.clone();
-                    Box::pin(async move {
-                        tracing::info!(peer = %request.device, "pairing requested");
-                        match pairing::pin(&config_socket).await {
-                            Ok(passkey) => Ok(passkey),
-                            Err(e) => {
-                                // Refusing is the only safe answer. Falling back to a default
-                                // would let anyone pair whenever configd was briefly unreachable.
-                                tracing::warn!(error = %e, "cannot read the pairing PIN; refusing to pair");
-                                Err(AgentError::Rejected)
-                            }
-                        }
-                    })
-                })),
                 ..Default::default()
             })
             .await?,
         )
     } else {
         tracing::warn!(
-            "pairing NOT required: any device in range can write requests, including wifi \
-             credentials. Bench use only."
+            "pairing NOT required: any device in range can reach the RPC characteristic. The PIN \
+             is still enforced by the session. Bench use only."
         );
         None
     };
@@ -178,7 +172,11 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                 // finds a version it does not know can say so before writing anything.
                 read: Some(CharacteristicRead {
                     read: true,
-                    encrypt_authenticated_read: require_pairing,
+                    // `encrypt_read`, not `encrypt_authenticated_read`: a just-works bond is
+                    // encrypted but unauthenticated, so demanding authentication here would
+                    // refuse every client that ever pairs with this robot. The read still forces
+                    // the bond, which is its job.
+                    encrypt_read: require_pairing,
                     fun: Box::new(|_req| {
                         async move { Ok(vec![duck_ipc_proto::API_VERSION as u8]) }.boxed()
                     }),
@@ -192,10 +190,11 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                     // acknowledged form, which is why `btctl` does.
                     write_without_response: true,
                     // §7: anything carrying wifi credentials must travel over a paired, encrypted
-                    // link, and `net.connect` does. `encrypt_authenticated_write` demands a bond
-                    // made with passkey entry rather than just-works, which is what makes the PIN
-                    // mean something — see `crate::pairing`.
-                    encrypt_authenticated_write: require_pairing,
+                    // link, and `net.connect` does. Encryption comes from the bond; the
+                    // *authentication* §7 also wants comes from `system.authenticate` rather than
+                    // from the pairing, because BLE cannot carry a fixed printed passkey — see
+                    // `crate::pairing`.
+                    encrypt_write: require_pairing,
                     // **No `.await` between receiving a chunk and enqueueing it.** BlueZ
                     // dispatches each `WriteValue` as its own task, so a yield point here lets
                     // two chunks swap places — and a reordered chunk corrupts a request silently.
