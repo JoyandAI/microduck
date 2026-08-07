@@ -112,8 +112,30 @@ robotctl update log
 robotctl update watch
 ```
 
-The component is `daemon` — one component covering every binary. `--ref` installs what a branch last
-built on CI, which is the dev-channel workflow; `--version` pins an exact release instead.
+The component is `daemon` — one component covering every binary.
+
+**`apply daemon` with no `--ref` installs the latest *stable* release, which on a dev board is
+usually a downgrade.** It is not "install the newest thing"; it is "install what the stable channel
+offers". Right after a branch merges, that stable release is still older than everything you have been
+testing — and if it predates a daemon that now has a unit file on the board, its `ExecStart` points at
+a binary the older release does not contain, the restart fails, and the update rolls back. That is the
+gate working, but the command that caused it looked like the obvious one.
+
+So on a dev board, name what you want:
+
+```
+sudo robotctl update apply --ref main daemon
+```
+
+```
+sudo robotctl update apply --ref <branch> daemon
+```
+
+`--ref` installs what that branch last built on CI, which is the whole dev workflow. `--version` pins
+an exact release. Give one of them unless you genuinely mean "go to stable".
+
+A merge does not publish instantly: CI has to build `main` before `--ref main` resolves to it.
+`gh run list --branch main` says whether it is done.
 
 ## After an update — the part that bites
 

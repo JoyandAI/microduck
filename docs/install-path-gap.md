@@ -86,6 +86,27 @@ a manual restart or a reboot, and unlike the others `robotctl version` cannot ev
 serves no socket, so there is nothing to ask. That is a real gap in a phone-driven flow and needs its
 own answer.
 
+### A consequence worth knowing: units outlive the release that installed them
+
+`hooks/postinstall` installs the units a release ships and, by design, leaves them behind on a
+rollback — the alternative is recording what was added so a revert can undo it, and the hook's own
+comment argues that is not worth it because the next successful update reinstalls whatever it ships.
+
+That reasoning holds for a rollback. It does not hold for a **downgrade to a release that predates a
+daemon**: the unit stays, its `ExecStart` names a binary the older release does not contain, and the
+daemon fails with `203/EXEC`. Once that daemon is also in `on_apply`'s restart set, the failed restart
+fails the *update*, which reverts.
+
+Observed exactly this way: `robotctl update apply daemon` on a board running a dev build resolved to
+stable `0.2.0`, which predates `configd`; `configd.service` could not start; the engine rolled back
+and said so. The outcome is right — a board should not silently downgrade below the release that
+introduced a daemon it is now running — but nothing states the rule, and the error names a systemd
+failure rather than the cause.
+
+Worth deciding rather than leaving as emergent behaviour: whether preflight should refuse a target
+that lacks a binary some installed unit execs, so the refusal arrives before the swap and names the
+real reason.
+
 ## Why the existing tests could not have caught them
 
 Not an accusation of the tests; they cover what they claim. The point is what nothing covers.
