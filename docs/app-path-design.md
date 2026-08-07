@@ -474,3 +474,65 @@ itself.
   the next reboot. It may be the *transport the update was requested over*: restarting it drops the
   connection carrying `update.subscribe`, and the phone that started the update never learns the
   outcome. Same reason `updaterd` does not restart itself (§8.3).
+
+## 8. Next
+
+Ordered by what blocks what, not by size.
+
+### 8.1 Encryption — the blocker
+
+§5.5 in full. The link is unencrypted, so the PIN and every wifi passphrase cross it in clear. One
+fact decides the fix and is not yet known: whether a bond exists at all (`bluetoothctl info <mac>` on
+the robot). *Bonded but not encrypting* and *never bonded* need opposite repairs, and shipping the
+wrong one leaves the problem in place while looking solved.
+
+### 8.2 Telling robots apart — three people, three robots, one room
+
+Not a refinement of the above; a second gap that happens to be discovered by the same scenario. Three
+friends with three robots must each reach *theirs*, and today they cannot.
+
+What the radio actually offers a phone right now:
+
+- **The advertised name is the hostname.** `configd`'s `Store` falls back to `hostname()` when no name
+  has been set, and `btd` advertises that as `local_name`. Every board flashed from one image
+  advertises `radxa-zero3`.
+- **There is no serial.** `system.info` returns `serial: null` — no per-device identity exists
+  (`updater-design.md` §5.7 owns that gap).
+- **The PIN is `000000` on all of them** (§5.3).
+
+The three compound into something worse than a bad UX: a phone cannot merely *pick* the wrong robot,
+it can **authenticate to it and reconfigure it**. Choosing your friend's robot from a list is a
+mistake; being able to put your wifi credentials into it is a security failure. So this is a
+prerequisite for shipping alongside encryption, not a nicety after it.
+
+Directions, roughly in dependency order:
+
+- **A per-device identity, assigned at provisioning.** Everything else hangs off this. The default
+  advertised name should derive from it — `duck-7f3a` rather than `radxa-zero3` — so robots are
+  distinguishable straight out of the box, before anyone has renamed anything.
+- **Print it on the robot**, with the PIN. A sticker carrying name and PIN is what makes "connect to
+  the one in front of me" a *check* rather than a guess, and it composes with §5.3's requirement that
+  a shipped robot have a per-robot PIN rather than `000000`.
+- **An `identify` action** — make *this* robot nod, blink or chirp — so a human confirms the right one
+  before configuring it. Two decisions this needs, neither of them plumbing: motor control is refused
+  over BLE by design (§3.1), so `identify` cannot simply be a move and needs its own narrowly-scoped
+  action; and it has to work **before** authentication, because requiring the PIN first is circular
+  when aiming the PIN at the right robot is the whole problem. Allowing an unauthenticated stranger in
+  BLE range to make robots chirp is a real cost, and probably an acceptable one.
+- **RSSI as a sort key, never as identity.** Useful for putting the nearest robot first in a list.
+  Not evidence: signal strength through a body or a table reorders robots freely.
+
+### 8.3 `API_VERSION` skew
+
+`hello` should refuse only when the client is *newer* than the daemon —
+`install-path-gap.md` covers it. Small, self-contained, and it has already cost an hour twice.
+
+### 8.4 Derive the restart set from the release
+
+`on_apply`'s unit list lives in the board's own `updater.toml`, so a release that adds a daemon never
+restarts it and reports success anyway. `install-path-gap.md` §4 has the full account and the fix.
+
+### 8.5 PIN attempts across reconnects
+
+§5.6. Three wrong PINs close the session; nothing counts across reconnects, so a peer retries
+indefinitely at the cost of a bond per three guesses. Needs somewhere to keep per-address state.
