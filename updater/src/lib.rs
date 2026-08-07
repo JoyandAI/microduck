@@ -101,6 +101,14 @@ pub enum Error {
     #[error("hook {hook} failed: {detail}")]
     Hook { hook: String, detail: String },
 
+    /// The replacement `updaterd` could not start.
+    ///
+    /// Distinct from `HealthCheck` on purpose: the robot is fine, the *release* cannot run the
+    /// process that would install the next one. Naming it is the whole value — a rollback reason of
+    /// "unreachable" sent three separate investigations down the wrong path.
+    #[error("the new updaterd failed its self-test: {0}")]
+    SelfTest(String),
+
     #[error("health check failed: {0}")]
     Health(String),
 
@@ -138,6 +146,10 @@ impl Error {
             Error::Preflight(_) => code::PREFLIGHT_FAILED,
             Error::Hook { .. } => code::HOOK_FAILED,
             Error::Health(_) => code::HEALTH_CHECK_FAILED,
+            // Shares the health code rather than adding one: to a client this is the same class of
+            // answer — "the new release did not pass its checks and was reverted" — and the
+            // distinction that matters is in the message, which names the binary and the reason.
+            Error::SelfTest(_) => code::HEALTH_CHECK_FAILED,
             Error::RollbackFailed(_) => code::ROLLBACK_FAILED,
             Error::Config(_) | Error::Io { .. } | Error::Corrupt(_) | Error::Internal(_) => {
                 code::INTERNAL_ERROR

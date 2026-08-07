@@ -288,7 +288,7 @@ impl Engine {
         progress: ProgressTx,
     ) -> Result<ApplyResult, Error> {
         // Single-flight. Busy is a normal answer, not a failure.
-        let _lock = UpdateLock::try_acquire(&self.config.state_dir)?.ok_or(Error::Busy)?;
+        let lock = UpdateLock::try_acquire(&self.config.state_dir)?.ok_or(Error::Busy)?;
 
         let cfg = self.config.component(component)?.clone();
         let store = self.store(component)?;
@@ -309,6 +309,14 @@ impl Engine {
 
         // Every operation logs through `record`, which owns what `to` means per outcome.
         self.record(component, installed, &outcome);
+
+        // The lock is released before anything is spawned, and that ordering is load-bearing: a
+        // fork duplicates every open descriptor in the process, so spawning while holding the
+        // update lock hands a copy of it to the child — and in a test binary running engines in
+        // parallel, copies of *other* engines' locks too. It surfaced as unrelated operations
+        // failing with `Busy`. Nothing below this point touches the store.
+        drop(lock);
+        schedule_restarts_if_applied(&outcome).await;
         outcome
     }
 
@@ -653,6 +661,13 @@ impl Engine {
         emit(Phase::Applying, None);
         self.run_apply_action(&cfg.on_apply, release_dir).await?;
 
+        // Only where daemons are actually being replaced. `ApplyAction::None` means this component
+        // has none to restart — a model, or the bootstrap install, which forces it precisely
+        // because nothing is installed yet and there is no running daemon to make stale.
+        if matches!(cfg.on_apply, ApplyAction::Restart { .. }) {
+            self_test_updaterd(release_dir).await?;
+        }
+
         emit(Phase::HealthGate, None);
         self.health_gate(cfg).await
     }
@@ -787,7 +802,7 @@ impl Engine {
         component: &str,
         version: &semver::Version,
     ) -> Result<ApplyResult, Error> {
-        let _lock = UpdateLock::try_acquire(&self.config.state_dir)?.ok_or(Error::Busy)?;
+        let lock = UpdateLock::try_acquire(&self.config.state_dir)?.ok_or(Error::Busy)?;
         let cfg = self.config.component(component)?.clone();
         let store = self.store(component)?;
 
@@ -820,8 +835,14 @@ impl Engine {
             });
         }
 
-        self.transition_to(component, &cfg, &store, version, current)
-            .await
+        // `select` can move to a release carrying newer binaries, so the deferred units are as
+        // stale afterwards as they are after an `apply`. Lock released first, as above.
+        let outcome = self
+            .transition_to(component, &cfg, &store, version, current)
+            .await;
+        drop(lock);
+        schedule_restarts_if_applied(&outcome).await;
+        outcome
     }
 
     /// Shared tail of rollback / reset-to-golden / select: swap, apply, gate, and
@@ -1408,6 +1429,138 @@ const SYSTEMCTL: &str = "systemctl";
 ///
 /// `systemctl` is a parameter rather than hardcoded so a test can hand it a stub. That is the
 /// only reason: nothing should ever pass anything else in production.
+/// How long the replacement `updaterd` gets to load its config and exit.
+///
+/// It parses a file and builds an engine; a second would do. Ten leaves room for a board under load
+/// mid-update without making a hung binary cost the health gate's whole budget.
+const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Units restarted *after* the outcome has been reported, not during the update.
+///
+/// The pair from [`NEVER_RESTART`]. Excluding them from the in-flight restart is right and
+/// insufficient: it left both running the old binary until someone rebooted, which is how a resident
+/// `updaterd` came to reject a newer `robotctl` with "client speaks API v4, daemon speaks v3", and
+/// how `btd` fixes were tested against binaries that were never running.
+///
+/// Deferred rather than skipped, because the reason each is excluded expires the moment the answer
+/// is out: `updaterd` has finished performing the update, and the reply `btd` was carrying has been
+/// delivered. A client sees its outcome and then a dropped connection, which for BLE is an ordinary
+/// reconnect.
+const RESTART_AFTER_REPLYING: [&str; 2] = ["updaterd", "btd"];
+
+/// How long to wait before those restarts, so the reply is on the wire first.
+///
+/// The engine runs *inside* the `update.apply` call, so restarting `updaterd` synchronously would
+/// hand the client a broken pipe instead of the outcome it waited minutes for. A response is a
+/// single write; five seconds is far more than it needs and still faster than any human reaction.
+const DEFERRED_RESTART_DELAY: &str = "5s";
+
+/// Prove the release's `updaterd` can start, before committing to it.
+///
+/// `updaterd` does not restart itself during an update, so without this a replacement binary that
+/// cannot start is discovered at the *next boot* — after the commit, with nobody watching, and with
+/// recovery living inside the very process failing to start. systemd retries it a few times and
+/// gives up, leaving a robot that cannot update its way out. Here, a failure is just a rollback: the
+/// old release is still on disk and nothing has rebooted.
+///
+/// `--self-test` and not `--check-only`: the latter runs boot recovery for real, which would have a
+/// second engine advancing this update's trial against the same store.
+///
+/// A release with no `updaterd` — a model component, or one predating the flag — passes. The point
+/// is to catch a broken replacement, not to require every artifact to contain one.
+async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
+    let binary = release_dir.join("bin").join("updaterd");
+    if !binary.is_file() {
+        return Ok(());
+    }
+
+    let mut command = tokio::process::Command::new(&binary);
+    command.arg("--self-test");
+
+    let output = match tokio::time::timeout(SELF_TEST_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        // Could not be executed at all: the wrong architecture, a missing interpreter, a corrupt
+        // file. Exactly what this exists to catch.
+        Ok(Err(e)) => {
+            return Err(Error::SelfTest(format!(
+                "could not run {}: {e}",
+                binary.display()
+            )));
+        }
+        Err(_) => {
+            return Err(Error::SelfTest(format!(
+                "{} did not finish within {SELF_TEST_TIMEOUT:?}",
+                binary.display()
+            )));
+        }
+    };
+
+    if output.status.success() {
+        tracing::info!("the new updaterd passed its self-test");
+        return Ok(());
+    }
+
+    // stderr, trimmed, because that is where the reason is — "config error: unknown field
+    // `foo`" is the difference between a fixable release and a mystery.
+    let reason = String::from_utf8_lossy(&output.stderr);
+    let reason = reason.lines().last().unwrap_or("no output").trim();
+    Err(Error::SelfTest(format!("{}: {reason}", output.status)))
+}
+
+/// Schedule the deferred restarts when an operation actually moved to a new release.
+///
+/// Only on `Applied`. A rollback leaves the resident `updaterd` already matching `current` — it was
+/// never restarted, so it is still the binary belonging to the release being returned to — and
+/// restarting there would be churn with nothing to fix.
+async fn schedule_restarts_if_applied(outcome: &Result<ApplyResult, Error>) {
+    if matches!(outcome, Ok(ApplyResult::Applied { .. })) {
+        schedule_deferred_restarts().await;
+    }
+}
+
+/// Restart the deferred units, detached, a few seconds from now.
+///
+/// `systemd-run` rather than a child process, and this is the load-bearing detail: `systemctl
+/// restart updaterd` kills `updaterd`'s whole cgroup, and a child of `updaterd` is *in* that cgroup —
+/// so it would be killed partway through restarting its own parent. A transient unit lives outside
+/// it and survives.
+///
+/// Failures are logged, never returned. This runs after the update is committed and journalled; an
+/// update that succeeded must not be reported as failed because a restart could not be scheduled.
+/// The cost of that is the situation we already have today — a daemon running an old binary until
+/// the next boot — which `robotctl version` reports.
+async fn schedule_deferred_restarts() {
+    for unit in RESTART_AFTER_REPLYING {
+        let mut command = tokio::process::Command::new("systemd-run");
+        command
+            .arg(format!("--on-active={DEFERRED_RESTART_DELAY}"))
+            .arg("--timer-property=AccuracySec=100ms")
+            .arg("--")
+            .arg(SYSTEMCTL)
+            .arg("restart")
+            .arg(unit);
+
+        // `tokio::process`, not `std::process`: this runs inside the async engine, and a blocking
+        // `status()` here stalls the runtime — which showed up as unrelated operations later
+        // failing with `Busy`, because the update lock had not been released yet.
+        match command.status().await {
+            Ok(status) if status.success() => {
+                tracing::info!(unit, delay = DEFERRED_RESTART_DELAY, "restart scheduled");
+            }
+            Ok(status) => tracing::warn!(
+                unit,
+                %status,
+                "could not schedule the restart; it keeps the old binary until the next boot"
+            ),
+            Err(e) => tracing::warn!(
+                unit,
+                error = %e,
+                "could not run systemd-run; the unit keeps the old binary until the next boot"
+            ),
+        }
+    }
+}
+
 /// Units this update must not touch, whatever a release ships.
 ///
 /// `updaterd` is the process performing the update: restarting it kills the operation mid-flight.
@@ -1580,6 +1733,66 @@ esac
 
     fn calls(dir: &std::path::Path) -> String {
         std::fs::read_to_string(dir.join("calls")).unwrap_or_default()
+    }
+
+    /// A release directory whose `bin/updaterd` is a script behaving as given.
+    fn release_with_updaterd(script: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("updaterd");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    /// The failure this exists to catch, and the reason it must be reported rather than counted:
+    /// a rollback reason of "unreachable" sent three investigations down the wrong path.
+    #[tokio::test]
+    async fn a_replacement_updaterd_that_cannot_start_fails_the_update() {
+        let release = release_with_updaterd(
+            "#!/bin/sh\necho 'config error: unknown field `nope`' >&2\nexit 1\n",
+        );
+
+        let err = self_test_updaterd(release.path()).await.unwrap_err();
+
+        assert!(
+            matches!(err, Error::SelfTest(_)),
+            "expected a self-test failure, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("unknown field"),
+            "the reason must survive into the message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replacement_updaterd_that_starts_passes() {
+        let release = release_with_updaterd("#!/bin/sh\nexit 0\n");
+        assert!(self_test_updaterd(release.path()).await.is_ok());
+    }
+
+    /// Model components ship no `updaterd`, and neither do releases predating the flag. Requiring
+    /// one would make this a compatibility break rather than a safety net.
+    #[tokio::test]
+    async fn a_release_without_an_updaterd_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(self_test_updaterd(dir.path()).await.is_ok());
+    }
+
+    /// The two lists are one decision, and splitting them is how a daemon gets excluded from the
+    /// restart and then forgotten. Everything held back during the update is restarted after it.
+    #[test]
+    fn every_unit_held_back_is_restarted_once_the_answer_is_out() {
+        let mut held: Vec<&str> = NEVER_RESTART.to_vec();
+        let mut deferred: Vec<&str> = RESTART_AFTER_REPLYING.to_vec();
+        held.sort_unstable();
+        deferred.sort_unstable();
+        assert_eq!(held, deferred);
     }
 
     /// Write a release directory that ships these units.
