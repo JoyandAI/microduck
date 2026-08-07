@@ -102,6 +102,13 @@ manifest_asset = "manifest.json"
 # if it somehow resolved the tag.
 # ref_tag_prefix = "daemon-dev-"
 
+# Where `--staging` looks: the tags `release.yml` pushes for release candidates. Shown for
+# completeness — this is the default, and a robot needs no configuration to reach a candidate.
+#
+# Reaching one still takes a person with root typing `--staging`. A candidate is flagged as a
+# prerelease, which `latest` skips, so nothing here makes this robot *track* candidates.
+# staging_tag_prefix = "daemon-staging-v"
+
 # `updaterd` restarts neither itself nor `btd`, both of which ship in this same artifact:
 # restarting itself would kill the executor mid-update, and restarting `btd` would drop
 # the connection reporting progress to the app. Both pick up the new binary at the next

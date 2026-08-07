@@ -53,6 +53,28 @@ pub trait Source: Send + Sync {
         )))
     }
 
+    /// Fetch the newest release candidate. Backs `robotctl update apply --staging`.
+    ///
+    /// Defaulted for the same reason as [`Source::manifest_at_ref`]: a channel split is a
+    /// property of how a source publishes, and a local directory has no candidates to offer.
+    async fn staging_manifest(&self) -> Result<SignedBytes<Manifest>, Error> {
+        Err(Error::Incompatible(
+            "this source has no staging channel; \
+             only a github_releases source publishes release candidates"
+                .to_owned(),
+        ))
+    }
+
+    /// Fetch one named candidate. Backs `--staging --version X`.
+    async fn staging_manifest_for(
+        &self,
+        version: &semver::Version,
+    ) -> Result<SignedBytes<Manifest>, Error> {
+        Err(Error::Incompatible(format!(
+            "this source has no staging channel, so it cannot resolve the candidate {version}"
+        )))
+    }
+
     /// Download the artifact and its detached signature into `dest_dir`.
     ///
     /// Streams to disk — must not assume the artifact fits in memory — and is
@@ -92,11 +114,13 @@ pub fn from_config(config: &SourceConfig) -> Box<dyn Source> {
             tag_prefix,
             manifest_asset,
             ref_tag_prefix,
+            staging_tag_prefix,
         } => Box::new(GithubReleases::new(
             repo.clone(),
             tag_prefix.clone(),
             manifest_asset.clone(),
             ref_tag_prefix.clone(),
+            staging_tag_prefix.clone(),
         )),
         SourceConfig::HfHub {
             repo,

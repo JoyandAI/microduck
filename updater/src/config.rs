@@ -220,6 +220,15 @@ pub enum SourceConfig {
         /// resolving `latest` for the fleet.
         #[serde(default = "default_ref_tag_prefix")]
         ref_tag_prefix: String,
+        /// Tag prefix for release candidates, so `--staging` resolves to
+        /// `daemon-staging-v<version>`.
+        ///
+        /// A third prefix rather than a flag on `tag_prefix`, for the reason the second one
+        /// exists: the streams must not be confusable. A candidate is flagged as a prerelease
+        /// on GitHub precisely so `newest_version` cannot reach it, and giving that scan an
+        /// "unless…" would put the fleet one config typo away from tracking candidates.
+        #[serde(default = "default_staging_tag_prefix")]
+        staging_tag_prefix: String,
     },
     HfHub {
         /// `ORG/MODEL`.
@@ -241,6 +250,11 @@ pub enum SourceConfig {
 /// with a differently-named channel sets it explicitly, the same as `tag_prefix`.
 fn default_ref_tag_prefix() -> String {
     "daemon-dev-".to_owned()
+}
+
+/// Default prefix for release-candidate tags, matching what `release.yml` pushes.
+fn default_staging_tag_prefix() -> String {
+    "daemon-staging-v".to_owned()
 }
 
 fn default_manifest_asset() -> String {
@@ -609,7 +623,12 @@ mod tests {
 
         // The stable channel, not staging. A robot on `daemon-staging-v` would install
         // every candidate build.
-        let SourceConfig::GithubReleases { tag_prefix, .. } = &daemon.source else {
+        let SourceConfig::GithubReleases {
+            tag_prefix,
+            staging_tag_prefix,
+            ..
+        } = &daemon.source
+        else {
             panic!(
                 "the shipped daemon source must be github_releases, got {:?}",
                 daemon.source
@@ -618,6 +637,14 @@ mod tests {
         assert_eq!(
             tag_prefix, "daemon-v",
             "the shipped config must track the stable channel"
+        );
+        // The shipped config names no staging prefix, so `--staging` on a customer robot
+        // depends on this default matching what `release.yml` actually pushes. A wrong
+        // default would fail with "no releases with tag prefix", which reads as "there is no
+        // candidate" rather than "this board is looking in the wrong place".
+        assert_eq!(
+            staging_tag_prefix, "daemon-staging-v",
+            "the default candidate prefix must match the tag release.yml pushes"
         );
 
         // Only components that have somewhere real to fetch from. A component whose
