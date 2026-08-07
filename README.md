@@ -11,6 +11,10 @@ This repo is the daemons plus the update system. Start with
 [`docs/architecture.md`](docs/architecture.md) for how the services fit together, and
 [`docs/roadmap.md`](docs/roadmap.md) for what exists today versus what is designed.
 
+If you have a board in front of you and want the commands,
+[`docs/cheatsheet.md`](docs/cheatsheet.md) is `robotctl` and `btctl` on one page — including the
+three things about restarts after an update that otherwise cost an afternoon.
+
 For the control side specifically, [`docs/robotd-design.md`](docs/robotd-design.md) §3.1 is
 the fastest way in — who talks to `robotd` and where the crate boundary sits — with the
 per-tick dataflow in §5.10 and the thread-to-thread channels in §7.1. Those three diagrams
@@ -65,7 +69,7 @@ robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
 scripts/        install.sh · setup-board.sh · migrate-network.sh · board-test.sh
-docs/           architecture · update design · robotd design · app path · roadmap · CI setup
+docs/           architecture · update design · robotd design · app path · roadmap · CI setup · cheat sheet
 ```
 
 ## Working on the robot
