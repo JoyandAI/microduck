@@ -365,7 +365,11 @@ resolve_bootstrap_asset() {
 # acceptable and is the price of the escape hatch.
 stop_for_reinstall() {
     say "stopping the daemons for a clean re-install"
+    # Absent units are not a problem to report: a board running an older release simply has no
+    # configd or btd, and warning about them on every forced re-install trains people to ignore
+    # the warnings that matter.
     for unit in btd.service configd.service robotd.service updaterd.service; do
+        [ -f "${UNIT_DIR}/${unit}" ] || continue
         systemctl stop "$unit" 2>/dev/null || warn "could not stop ${unit}"
     done
 }
@@ -475,7 +479,12 @@ create_group() {
     fi
     # btd runs unprivileged because it is the process parsing bytes from anyone in radio range.
     # Without this user its unit fails to start, and the failure reads as a broken radio.
-    if ! getent passwd btd >/dev/null; then
+    #
+    # Only when the release actually ships btd. Creating a system account for a service that
+    # does not exist on this board is not harmful, but it is a lie about what is installed, and
+    # the next person reading /etc/passwd should not have to work out which.
+    if [ -f "${INSTALL_DIR}/current/systemd/btd.service" ] \
+        && ! getent passwd btd >/dev/null; then
         useradd --system --no-create-home --shell /usr/sbin/nologin btd \
             || warn "could not create the btd user; btd.service will not start"
     fi
@@ -579,13 +588,33 @@ install_dev_key() {
 # last daemon-reload.
 install_units() {
     say "installing systemd units"
-    for unit in updaterd.service robotd.service configd.service btd.service; do
-        src="${INSTALL_DIR}/current/systemd/${unit}"
-        if [ ! -f "$src" ]; then
-            die "the installed release has no systemd/${unit}"
+    unit_src="${INSTALL_DIR}/current/systemd"
+
+    # Two are required, because without them the board is neither a robot nor able to become
+    # one. Everything else is whatever the release happens to ship.
+    for unit in updaterd.service robotd.service; do
+        if [ ! -f "${unit_src}/${unit}" ]; then
+            die "the installed release has no systemd/${unit}.
+  That is the release, not this script: $(readlink "${INSTALL_DIR}/current" 2>/dev/null)
+  carries no such unit, and a robot without it has nothing to run."
         fi
-        install -m 644 "$src" "${UNIT_DIR}/${unit}"
     done
+
+    # Read the directory rather than assert a list. A hardcoded set makes this script fail on
+    # any release that is not exactly its contemporary — which is every fresh install, because
+    # the scripts come from a branch and the release is the last stable one. `configd.service`
+    # was the case that proved it: added on main, absent from 0.2.0, and provisioning died at
+    # "the installed release has no systemd/configd.service" on a board that was fine.
+    #
+    # The release is the authority on what it contains. This script's job is to install it.
+    shipped=""
+    for src in "${unit_src}"/*.service; do
+        [ -f "$src" ] || continue
+        unit="$(basename "$src")"
+        install -m 644 "$src" "${UNIT_DIR}/${unit}"
+        shipped="${shipped} ${unit}"
+    done
+    say "units from the release:${shipped}"
 
     # journald persistence, so the logs from an incident outlive the reboot that followed
     # it. See docs/deploy.md in the release for the Armbian tmpfs caveat this does not
@@ -612,12 +641,32 @@ install_units() {
     # configd before btd: btd asks configd for the pairing PIN, and a btd that starts first
     # simply refuses to pair until configd answers. Ordering here saves a confusing first boot
     # rather than being required — btd retries.
-    systemctl enable --now configd.service
+    #
+    # Both `if`-guarded, because a release older than this script does not carry them and the
+    # right response to that is to install what there is, not to refuse.
+    if [ -f "${UNIT_DIR}/configd.service" ]; then
+        systemctl enable --now configd.service
+    fi
     # btd is allowed to fail without failing the install. It needs a Bluetooth adapter, and on
     # this board hci0 does not exist until ~73s after boot; a robot with no working radio is
     # still a robot that updates and walks.
-    systemctl enable --now btd.service || warn "btd did not start; check:  journalctl -u btd -b
+    if [ -f "${UNIT_DIR}/btd.service" ]; then
+        systemctl enable --now btd.service || warn "btd did not start; check:
+    journalctl -u btd -b
   The robot works without it — only the phone path is unavailable."
+    fi
+
+    # Anything the release ships that this script does not know how to start. Reported rather
+    # than started blindly: a unit may be a template, or something another unit pulls in, and
+    # guessing is how a robot ends up running a service nobody chose. Named, so adding a daemon
+    # is one line here and never a silent omission.
+    for unit in $shipped; do
+        case "$unit" in
+            updaterd.service|robotd.service|configd.service|btd.service) ;;
+            *) warn "${unit} was installed but not enabled — this script does not know where
+  it belongs in the start order. Add it to install_units, or start it by hand." ;;
+        esac
+    done
 }
 
 # Tab-completion for `robotctl`, so an operator on a board they are debugging over a flaky
