@@ -214,8 +214,8 @@ jobs:
           # `updaterd install` runs hooks on a bootstrap install too — correctly, since a
           # fresh board is exactly when a missing ONNX Runtime has to be installed. This
           # runner is not a board: it is x86_64, so the aarch64 dylib the hook would fetch
-          # could never be loaded here, and /usr/local/lib is not writable by the runner
-          # user — which is how this first failed, with the hook aborting the install.
+          # could never be loaded here, and fetching ~100 MB to prove that would only make
+          # every release slower.
           #
           # So declare the precondition satisfied and let the hook take its "already fine"
           # branch, touching nothing. Faking the *file* rather than skipping the hook keeps
@@ -241,7 +241,25 @@ jobs:
           # Note this reaches `--from`, never the `github_releases` source above: an
           # install that silently fell back to the network would be publishing a release
           # by fetching some *other* release, and would pass while proving nothing.
-          cargo run -p updater --bin updaterd -- install \
+          #
+          # As root, because that is what a robot's `updaterd` is. The release now carries a
+          # `postinstall` hook that installs unit files into /etc/systemd/system and sysusers
+          # files into /usr/lib/sysusers.d, and it fails the update when it cannot — correctly,
+          # since a release whose units never arrive is a release that does not work. Running
+          # the engine unprivileged made this step reject a perfectly good release, which is
+          # the same mismatch the preinstall hook exposed one release earlier: a step claiming
+          # to verify "the way a robot would" has to have the privilege a robot has.
+          #
+          # Built first and then run under sudo, rather than `sudo cargo run`: cargo as root
+          # would write root-owned files into the cached target directory and poison it for
+          # every later step and every later run.
+          #
+          # The hook then enables the units it installed, and they fail to start here — they
+          # are aarch64 and this is x86_64. Expected, and only a warning by design: a unit that
+          # cannot start must not fail an otherwise good update. Failure lines from
+          # btd/configd/robotd in this step's log are the runner being a runner.
+          cargo build -p updater --bin updaterd
+          sudo ./target/debug/updaterd install \
             --config verify/updater.toml \
             --from verify/published
 
