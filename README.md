@@ -11,6 +11,10 @@ This repo is the daemons plus the update system. Start with
 [`docs/architecture.md`](docs/architecture.md) for how the services fit together, and
 [`docs/roadmap.md`](docs/roadmap.md) for what exists today versus what is designed.
 
+If you have a board in front of you and want the commands,
+[`docs/cheatsheet.md`](docs/cheatsheet.md) is `robotctl` and `btctl` on one page — including the
+three things about restarts after an update that otherwise cost an afternoon.
+
 For the control side specifically, [`docs/robotd-design.md`](docs/robotd-design.md) §3.1 is
 the fastest way in — who talks to `robotd` and where the crate boundary sits — with the
 per-tick dataflow in §5.10 and the thread-to-thread channels in §7.1. Those three diagrams
@@ -47,7 +51,8 @@ this clone — `./scripts/provision-board.sh [user@]host`, described in
 | `padd` | a gamepad, as an ordinary intent client. No privileged access; it sends what the app and SDK will send. |
 | `updaterd` | the update engine. Resident, and deliberately independent of `robotd` — it is the recovery path, so it must work when the robot does not. |
 | `mediad` | camera, audio, WebRTC gateway. **Not built yet.** |
-| `btd` | BLE: wifi provisioning, naming, update trigger from the phone. **Not built yet.** |
+| `btd` | BLE: the phone's front door. A pipe carrying the same JSON-RPC lines as every other transport, over one GATT characteristic. Owns no state. **Works on hardware**: a Mac discovers the robot, pairs, authenticates with the PIN and provisions wifi over BLE. **Unencrypted by default** — deliberate while requiring pairing makes every client hang, and the blocker before anything ships: [`docs/app-path-design.md`](docs/app-path-design.md) §5.5. |
+| `configd` | wifi (via NetworkManager), robot name, pairing PIN, reboot. Its own service because config must be reachable when `robotd` is dead, and because `btd` owns nothing. **Drives a real NetworkManager on a board**: a network provisioned over BLE is joined and survives a reboot. |
 
 They talk over unix sockets, JSON-RPC 2.0 one object per line. The contract lives in
 `duck-ipc-proto`, which depends on serde and semver and nothing else — so `btd` and `robotd`
@@ -59,12 +64,14 @@ duck-control/   the control core: model · bus · IMU · observations · policy 
 padd/           gamepad → intents — an ordinary socket client, no privileged access
 updater/        engine + updaterd
 robotd/         control daemon
+configd/        wifi · robot name · pairing PIN · reboot
+btd/            the BLE front door, plus btctl (a laptop client, never shipped)
 robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
 scripts/        provision-board.sh (from your machine) · provision.sh → setup-board.sh ·
                 migrate-network.sh · install.sh (on the board) · board-test.sh (CI)
-docs/           architecture · update design · robotd design · roadmap · CI setup
+docs/           architecture · update design · robotd design · app path · roadmap · CI setup · cheat sheet
 ```
 
 ## Working on the robot
@@ -399,7 +406,18 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
   auto-rollback gate on something real. **None of it has met a robot**: the tests prove the
   logic is self-consistent, not that it walks. Needs ONNX Runtime on the board, which
   `install.sh` now installs.
-- **Not started:** `mediad`, `btd`, the phone app, the SDK, safety authority.
+- **The app path works on hardware, without encryption.** A Mac discovers the robot, bonds, passes
+  the PIN and gets real answers back over BLE — but `encrypt_read` hangs CoreBluetooth, so the link
+  currently carries no encryption and the PIN travels in clear. That must close before anything
+  ships (`docs/app-path-design.md` §5.5). `btd` serves a GATT pipe and `configd`
+  serves `net.*`/`system.*` — wifi scan and join, robot name, pairing PIN, reboot — with
+  `robotctl net`/`robotctl system` on the robot and `btctl` as a laptop-side BLE client.
+  `configd --fake-net` serves the whole surface off-board. A board must be migrated from netplan
+  to NetworkManager once (`scripts/migrate-network.sh`) before wifi works.
+- **BLE pairing is a six-digit PIN**, default `000000` and therefore not a secret: out of the box
+  it proves physical presence and nothing more. Per-robot PINs are a provisioning step that does
+  not exist yet, and the security of the app path rests on it.
+- **Not started:** `mediad`, the phone app, the SDK, safety authority.
 - **Runs on aarch64 Linux, emulated.** `scripts/board-test.sh` runs in CI: it
   cross-compiles for the board and executes 13 checks — rollback, tampered-artifact
   refusal, boot-counter recovery, socket modes, peer-credential authorization — on

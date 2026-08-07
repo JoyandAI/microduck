@@ -11,6 +11,12 @@ next to their service (`updater/systemd/`, `robotd/systemd/`); anything robot-wi
 | `trusted_keys/` | release public keys — the trust anchor, installed to `/etc/robot/trusted_keys/` |
 | `journald.conf.d/10-robot.conf` | journal persistence and size caps |
 
+Note on that last one, now **measured** rather than assumed: `/var/log` on this image is a zram
+device, so `Storage=persistent` really is a directory in memory. It survives a clean reboot and
+loses recent logs on a power cut, which is how a robot is actually switched off. The update history
+under `/var/lib` is therefore the only durable record — which is what `architecture.md` §8.2
+designed it to be.
+
 ## Quickstart
 
 Three ways in, in order of how much you have to type. Everything after this section is the same
@@ -148,6 +154,12 @@ bring-up — device-tree overlays, ONNX Runtime — which changes rarely and nee
 would mean every update re-litigating boot configuration. `migrate-network.sh` is the one that
 will not last: it exists only because Armbian's stock image ships netplan, and it gets deleted
 rather than maintained the day we build an image with NetworkManager in it.
+
+**A board does not arrive with NetworkManager**, and that is why the middle one is not optional.
+Armbian's headless image runs netplan + `systemd-networkd` + `wpa_supplicant`, while `configd`
+drives NM over D-Bus — so until the migration runs, `robotctl net status` reports `Unavailable`
+and nothing over Bluetooth can configure wifi. Why NM rather than what the image ships is in
+[`../docs/app-path-design.md`](../docs/app-path-design.md) §2.
 
 `provision.sh` runs them in order and holds the state that has to cross the reboot — the token,
 a dev-key path, and the boot id it uses to tell whether you have actually rebooted. It has no
@@ -398,7 +410,7 @@ Two records, with deliberately different durability:
 
 | | where | survives reboot | survives power loss | capped by |
 |---|---|---|---|---|
-| service logs | journald | only if configured (below) | see the tmpfs caveat | `SystemMaxUse=200M` |
+| service logs | journald | only if configured (below) | **no** — `/var/log` is zram, below | `SystemMaxUse=200M` |
 | **update history** | `/var/lib/robot/updater/update-log.jsonl` | **yes** | **yes** | 200 entries |
 
 The update history is not in the journal on purpose. It lives in the engine's `state_dir`
@@ -431,30 +443,31 @@ Read a specific service, previous boot:
 journalctl -u robotd -b -1
 ```
 
-### ⚠ The tmpfs caveat — unverified, needs the board
+### The RAM-log caveat — measured, and decided against durability
 
-Armbian images have shipped a RAM-log mechanism (`armbian-ramlog`, similar to `log2ram`)
-that mounts `/var/log` as tmpfs to spare the SD card, syncing to disk periodically and on
-clean shutdown. If that is active on our Radxa image, `Storage=persistent` gets journald a
-directory that is *itself* in RAM: it survives a `reboot` (clean shutdown syncs) but loses
-recent logs on a power cut — and a robot is switched off at the wall constantly.
-
-I have not verified this on the target image; there is no hardware yet. Check first:
+`/var/log` on this image is a **zram device**, so `Storage=persistent` gets journald a directory
+that is itself in memory. Confirmed on the board rather than inferred:
 
 ```bash
 findmnt /var/log
 ```
 
-If it reports `tmpfs`, pick one deliberately:
+It survives a clean `reboot`, because shutdown writes back, and loses recent logs on a power cut
+— which is how a robot is actually switched off. So service logs are best-effort by
+construction, and the durable record is the update history under `/var/lib`, which is `fsync`ed
+per entry and never goes through `/var/log` at all.
 
-- **Disable the RAM log** (`systemctl disable --now armbian-ramlog`). Logs become genuinely
-  durable; the cost is eMMC write wear. With `info` levels and the caps above the write
-  volume is small — the reason those levels were chosen.
-- **Keep it** and accept that a power cut loses up to the sync interval. Defensible only if
-  the update history — which does not go through `/var/log` — is enough for support.
+That is the intended arrangement rather than a gap — `architecture.md` §8.2 designed the update
+log to be the thing that survives. The alternative, if a board ever needs durable service logs,
+is one command and a known cost:
 
-Do not leave it undecided: the failure mode is silent, and only shows up as "the logs from
-the incident are missing" long after the incident.
+```bash
+sudo systemctl disable --now armbian-zram-config
+```
+
+Logs then land on the eMMC and wear it. With `info` levels and the size caps above the volume is
+small, which is why those levels were chosen — but it is a per-board decision, not a default to
+change fleet-wide.
 
 ## Versions, for support
 

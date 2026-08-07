@@ -1,0 +1,92 @@
+#!/bin/sh
+# Install the release's systemd units, so a release that adds a service works without anyone
+# touching the board.
+#
+# Not a template — nothing here needs substituting — so unlike `preinstall.in` this ships as-is.
+#
+# Runs AFTER the symlink swap and BEFORE `on_apply`'s restart (see `updater/src/hooks.rs`), which
+# is the only window where this can work: `current` already points at this release, so a unit's
+# `ExecStart` resolves; and the restart that follows finds a unit that exists.
+#
+# Why it exists. Units ship *inside* the artifact, and until now only `scripts/install.sh` copied
+# them out. So a release introducing a daemon installed its binary and left the unit in the release
+# directory, where systemd never looks — `btd.service` failed with `203/EXEC` on a board where the
+# release was complete and correct. Worse, `on_apply` could not restart a unit that was not there
+# yet, so the release which first carries a daemon could not restart anything at all. Both cost an
+# afternoon; see `docs/install-path-gap.md`.
+#
+# A non-zero exit from a hook FAILS THE UPDATE and triggers rollback, so the rule here is: fail
+# only for things that mean the release is not installable, and warn for everything else. Copying a
+# unit is the first kind. A service refusing to start is the second — `btd` legitimately fails on a
+# board whose Bluetooth adapter has not appeared yet, and a robot that cannot update because its
+# radio is missing would be a poor trade.
+#
+# On rollback, units installed here stay behind, pointing at `current` — which by then is the older
+# release that may not contain their binaries, so they fail to start. Deliberate: the alternative is
+# recording what was added so a revert can undo it, and "this release did not take, and one service
+# is failing until the next one does" is the same situation either way. It is also self-correcting,
+# because the next successful update reinstalls whatever it ships.
+set -eu
+
+UNIT_DIR=/etc/systemd/system
+SYSUSERS_DIR=/usr/lib/sysusers.d
+
+# Hooks run with the release directory as their working directory.
+[ -d systemd ] || exit 0
+
+# Users and groups before units: a unit naming a `User=` that does not exist fails to start, and
+# that failure reads as a broken daemon rather than a missing account.
+if [ -d systemd/sysusers.d ]; then
+    for conf in systemd/sysusers.d/*.conf; do
+        [ -f "$conf" ] || continue
+        mkdir -p "$SYSUSERS_DIR"
+        install -m 644 "$conf" "${SYSUSERS_DIR}/$(basename "$conf")" \
+            || { echo "postinstall: cannot install $(basename "$conf")" >&2; exit 1; }
+    done
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+        # A warning, not fatal: the accounts may already exist, which is the common case.
+        systemd-sysusers \
+            || echo "postinstall: systemd-sysusers failed; a unit may not start" >&2
+    fi
+fi
+
+# The unit files themselves.
+#
+# Overwritten rather than merged, matching what `install.sh` does: the unit file belongs to the
+# release, and the supported way to customise one is a drop-in under
+# /etc/systemd/system/<unit>.d/, which this does not touch.
+units=""
+for unit in systemd/*.service; do
+    [ -f "$unit" ] || continue
+    name="$(basename "$unit")"
+    install -m 644 "$unit" "${UNIT_DIR}/${name}" \
+        || { echo "postinstall: cannot install ${name}" >&2; exit 1; }
+    units="${units} ${name}"
+done
+
+[ -n "$units" ] || exit 0
+
+if ! command -v systemctl >/dev/null 2>&1; then
+    # No systemd here (a container, a test). The files are in place, which is all this hook
+    # promises; whatever runs them will find them.
+    echo "postinstall: installed${units}; no systemctl to reload" >&2
+    exit 0
+fi
+
+systemctl daemon-reload || echo "postinstall: daemon-reload failed" >&2
+
+# Enable — and start — every unit the release ships.
+#
+# `install.sh` does the same on a first install, so this only differs in *when*. Enabling is what
+# makes a newly added service arrive working rather than at the next manual step, which is the
+# whole point of this hook.
+#
+# Every failure is a warning. `on_apply` restarts the units in its own list moments after this, so
+# a unit that is merely slow is not a problem; and a unit that genuinely cannot start must not fail
+# an otherwise good update.
+for name in $units; do
+    systemctl enable --now "$name" \
+        || echo "postinstall: ${name} did not start; check: journalctl -u ${name} -b" >&2
+done
+
+echo "postinstall: installed and enabled${units}" >&2

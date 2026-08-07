@@ -21,8 +21,10 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
-| tests | **350 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process |
-| missing | `mediad`, `btd`, `robot-config`, app, SDK |
+| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](app-path-design.md) §5.5 |
+| `configd/` | wifi over NetworkManager, robot name, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
+| tests | **403 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
+| missing | `mediad`, app, SDK |
 | never run on hardware | every claim above is from CI and a laptop. Slice 1's whole purpose is to change that |
 
 ## The framing
@@ -188,6 +190,15 @@ fetch a frame and send an intent in a few dozen lines.
 installation), recovery mode (§8.2's last link), manifest staleness reporting (§8.4.2),
 and the authority arbitration finished.
 
+**`btd` and `configd` landed early**, out of this order. The trigger was wanting to configure a
+robot — wifi, name, reboot — from something other than an SSH session, and the work turned out to
+be mostly *not* Bluetooth: an API surface and a service to own it, which the phone app, the SDK,
+`robotctl` and `mediad`'s gateway all need identically. `btd` is a thin pipe over it.
+
+What that leaves for M6 proper: recovery mode, manifest staleness, authority arbitration, and the
+provisioning step the pairing PIN now depends on (below). It also means the app has something to
+talk to before the app exists, which is the right order for finding out that an API is wrong.
+
 **Done when:** a non-developer updates the robot from the phone, and a deliberately
 bricked release recovers without a laptop.
 
@@ -202,12 +213,12 @@ models version separately already.
 ```
 duck-ipc-proto/ wire types — serde/serde_json/semver only; btd/robotd/robotctl depend
                 on this, never on updater
-robot-config/   config store: file + flock + inotify        (not built yet)
+configd/        wifi (NetworkManager), robot name, pairing PIN, reboot
 updater/        engine + updaterd
 robotctl/       CLI
 robotd/         control, kinematics, gait, safety           (skeleton)
 mediad/         camera, encode, perception, WebRTC gateway  (not built yet)
-btd/            BLE transport adapter                       (not built yet)
+btd/            BLE transport adapter + btctl (dev client)
 xtask/          build/publish tooling — never ships
 ```
 
@@ -226,9 +237,12 @@ That's the whole onboarding path, and M1+M2 are exactly what make it true.
    CI behind an approval gate; only `release-1` goes into secrets. See
    [`ci-setup.md`](ci-setup.md).
 2. **Safety authority** (§6) — pulled into M3 for the reason above.
-3. **Provisioning** — deciding nothing now is fine, but §5.7's per-device state
-   (calibration, identity) needs a home before the first robot ships, and it constrains
-   M6.
+3. **Provisioning** — no longer safe to defer, and now has two claimants rather than one.
+   §5.7's per-device state (calibration, identity) needs a home before the first robot ships,
+   and BLE pairing security *rests* on a per-robot PIN: the factory default is `000000` and
+   public in this repository, so out of the box pairing proves physical presence and nothing
+   more. Something has to generate a PIN, print it, and record what was printed. Defining that
+   slot once — serial and PIN together — is cheaper than twice.
 4. **Privacy** — consent + indicator in M5, not M6.
 
 ## Not doing, on purpose

@@ -1166,34 +1166,37 @@ impl Engine {
     /// (`docs/updater-design.md` §5.5). Note what is *absent* from a daemon
     /// restart list: `updaterd` never restarts itself, and shouldn't restart
     /// `btd` either — see `docs/updater-design.md` §4.
+    ///
+    /// **One unit per invocation**, and a unit that does not exist on this board is skipped
+    /// rather than failing the update. Both halves of that were learned the hard way.
+    ///
+    /// `systemctl restart a b` fails as a whole if *either* unit is unknown — and it fails
+    /// without restarting the one that does exist. So the release which first introduces a
+    /// daemon could not be installed at all: its unit file arrives *with* that release and is
+    /// therefore not installed when `on_apply` runs, systemd refuses the whole command, and
+    /// `robotd` is left running from a release directory the swap has already moved. The health
+    /// gate then reports it unreachable and reverts, with nothing in the outcome naming the
+    /// unit that was missing.
+    ///
+    /// A missing unit is tolerated; a unit that exists and *fails to restart* is not. That
+    /// distinction is the point, and it is why this asks systemd for `LoadState` rather than
+    /// reading an exit code: `systemctl` does not reliably distinguish the two, and swallowing
+    /// both would turn "the daemon is broken" into a silent success.
     async fn run_apply_action(&self, action: &ApplyAction) -> Result<(), Error> {
-        let mut command = match action {
-            ApplyAction::None => return Ok(()),
+        match action {
+            ApplyAction::None => Ok(()),
             ApplyAction::Restart { units } => {
-                let mut c = tokio::process::Command::new("systemctl");
-                c.arg("restart").args(units);
-                c
+                for unit in units {
+                    restart_one(SYSTEMCTL, unit).await?;
+                }
+                Ok(())
             }
             ApplyAction::Reload { unit, signal } => {
-                let mut c = tokio::process::Command::new("systemctl");
+                let mut c = tokio::process::Command::new(SYSTEMCTL);
                 c.arg("kill").arg(format!("--signal={signal}")).arg(unit);
-                c
+                run_systemctl(c, "apply action").await
             }
-        };
-        command.kill_on_drop(true);
-
-        let output = tokio::time::timeout(APPLY_ACTION_TIMEOUT, command.output())
-            .await
-            .map_err(|_| Error::Internal("apply action timed out".into()))?
-            .map_err(|e| Error::Internal(format!("running systemctl: {e}")))?;
-
-        if !output.status.success() {
-            return Err(Error::Internal(format!(
-                "apply action failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
         }
-        Ok(())
     }
 
     /// Wait for the new release to report healthy.
@@ -1388,5 +1391,181 @@ impl Engine {
                 manifest.channel
             )))
         }
+    }
+}
+
+/// The program that drives units. A constant so tests can substitute a stub for it.
+const SYSTEMCTL: &str = "systemctl";
+
+/// Restart one unit, skipping it if this board does not have it installed.
+///
+/// `systemctl` is a parameter rather than hardcoded so a test can hand it a stub. That is the
+/// only reason: nothing should ever pass anything else in production.
+async fn restart_one(systemctl: &str, unit: &str) -> Result<(), Error> {
+    let mut c = tokio::process::Command::new(systemctl);
+    c.arg("restart").arg(unit);
+
+    match run_systemctl(c, "restart").await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if unit_is_absent(systemctl, unit).await {
+                // Expected exactly once per new daemon: the first update that carries it.
+                // Whatever installs unit files picks it up, and the next update restarts it.
+                tracing::warn!(
+                    unit,
+                    "not installed on this board, so it was not restarted. This is normal for a \
+                     release that introduces a new daemon; install its unit file and it will \
+                     restart on the next update."
+                );
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Does systemd know this unit at all?
+///
+/// `LoadState=not-found` is the authoritative answer, and deliberately not inferred from an exit
+/// code — `systemctl` does not reliably distinguish "no such unit" from "that unit would not
+/// start". If the query itself fails we answer "present", so an unrelated systemd problem cannot
+/// silently excuse a restart that should have worked.
+async fn unit_is_absent(systemctl: &str, unit: &str) -> bool {
+    let mut c = tokio::process::Command::new(systemctl);
+    c.arg("show")
+        .arg("--property=LoadState")
+        .arg("--value")
+        .arg(unit);
+    c.kill_on_drop(true);
+
+    match tokio::time::timeout(APPLY_ACTION_TIMEOUT, c.output()).await {
+        Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).trim() == "not-found",
+        _ => false,
+    }
+}
+
+async fn run_systemctl(mut command: tokio::process::Command, what: &str) -> Result<(), Error> {
+    command.kill_on_drop(true);
+
+    let output = tokio::time::timeout(APPLY_ACTION_TIMEOUT, command.output())
+        .await
+        .map_err(|_| Error::Internal(format!("{what} timed out")))?
+        .map_err(|e| Error::Internal(format!("running systemctl: {e}")))?;
+
+    if !output.status.success() {
+        return Err(Error::Internal(format!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    /// A stub `systemctl` that knows about some units and not others, and records what it was
+    /// asked to do. A script rather than a mock because the thing under test is a subprocess
+    /// invocation — the bug this exists for was a shell command shape, not a Rust one.
+    fn stub_systemctl(dir: &std::path::Path, known: &[&str]) -> std::path::PathBuf {
+        let path = dir.join("systemctl");
+        let cases = known
+            .iter()
+            .map(|u| format!("    {u}) exit 0 ;;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let script = format!(
+            r#"#!/bin/sh
+# $1 is the verb. Record every call so the test can assert one invocation per unit.
+echo "$@" >> "$(dirname "$0")/calls"
+if [ "$1" = show ]; then
+    case "$4" in
+{cases}
+    *) echo not-found; exit 0 ;;
+    esac
+    echo loaded
+    exit 0
+fi
+case "$2" in
+{cases}
+    *) echo "Unit $2 not found." >&2; exit 5 ;;
+esac
+"#
+        );
+        std::fs::write(&path, script).expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn calls(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join("calls")).unwrap_or_default()
+    }
+
+    /// The bug this whole change exists for: the release that first carries a new daemon has no
+    /// unit file for it yet, and failing the update over that left `robotd` unrestarted from a
+    /// swapped-away directory — reported only as "not healthy within 30s: unreachable".
+    #[tokio::test]
+    async fn a_unit_this_board_does_not_have_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = stub_systemctl(dir.path(), &["robotd"]);
+
+        assert!(
+            restart_one(systemctl.to_str().unwrap(), "configd")
+                .await
+                .is_ok(),
+            "a missing unit must not fail the update"
+        );
+    }
+
+    /// The other half, and the reason this is not just "ignore failures": a unit that exists and
+    /// will not start is a real problem, and swallowing it would turn a broken daemon into a
+    /// silent success.
+    #[tokio::test]
+    async fn a_unit_that_exists_but_fails_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // `broken` is known to `show` (so LoadState is not not-found) but restart fails, which is
+        // what a daemon that cannot start looks like.
+        let path = dir.path().join("systemctl");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nif [ \"$1\" = show ]; then echo loaded; exit 0; fi\necho 'job failed' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let err = restart_one(path.to_str().unwrap(), "robotd")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("restart failed"), "{err:?}");
+    }
+
+    /// One invocation per unit, which is the fix. `systemctl restart a b` fails as a whole when
+    /// either unit is unknown — and fails *without* restarting the one that exists.
+    #[tokio::test]
+    async fn units_are_restarted_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = stub_systemctl(dir.path(), &["robotd", "configd"]);
+
+        for unit in ["robotd", "configd"] {
+            restart_one(systemctl.to_str().unwrap(), unit)
+                .await
+                .unwrap();
+        }
+
+        let log = calls(dir.path());
+        assert!(log.contains("restart robotd"), "{log}");
+        assert!(log.contains("restart configd"), "{log}");
+        // Never both in one command, which is what broke.
+        assert!(!log.contains("restart robotd configd"), "{log}");
     }
 }

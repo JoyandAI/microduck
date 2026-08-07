@@ -21,7 +21,8 @@ rewritten). v1 targets a **single, well-specified hardware configuration**.
 |---|---|---|
 | `robotd` | motor control, kinematics, gait policies, sensor loop, safety | RT-ish core; authoritative on anything that can hurt the robot |
 | `mediad` | camera/mic, encode, perception, WebRTC + remote gateway | Heaviest service; also the remote API front door (§5.2) |
-| `btd` | BLE GATT server | **Transport adapter only** — owns no state (§4.1) |
+| `btd` | BLE GATT server | **Transport adapter only** — owns no state (§4.1). See [`app-path-design.md`](app-path-design.md) |
+| `configd` | wifi, robot identity, power | Config must be reachable when `robotd` is dead (§3.1), and `btd` must own nothing (§4.1) — so it is neither's business but its own |
 | `updaterd` | update engine | See `updater-design.md` |
 
 Splitting `mediad` from `robotd` is deliberate: a media/perception crash must not
@@ -29,11 +30,15 @@ take out motor control.
 
 ### 1.1 Invariants
 
-1. **`btd` and `updaterd` survive a dead `robotd`.** They are the recovery path;
-   they must work in precisely the situation where something is broken. No
+1. **`btd`, `configd` and `updaterd` survive a dead `robotd`.** They are the recovery
+   path; they must work in precisely the situation where something is broken. No
    systemd dependency on `robotd`, all IPC optional and timeout-bounded, minimal
    dependency surface (no ML runtime, no media stack). Detailed in
    `updater-design.md` §4.1.
+
+   `configd` is here for a concrete reason rather than symmetry: provisioning wifi is
+   exactly what someone needs when the robot is broken, so putting config in `robotd`
+   would make it unreachable in the one case that matters.
 2. **`robotd` is authoritative on safety.** No remote or local client can bypass
    fall detection, joint/thermal limits, or safe-pose logic. Clients send
    *intents*; `robotd` decides what is executable.
@@ -178,13 +183,21 @@ implications.
 
 | State | Owner | Mechanism |
 |---|---|---|
-| Wifi credentials | **NetworkManager** | We never store them; clients drive NM via its DBus API. NM persists profiles root-only and handles reconnect. |
-| Robot identity, user prefs, tunables | **config store** (§3.1) | File + shared crate |
+| Wifi credentials | **NetworkManager** | We never store them. `configd` drives NM over D-Bus; NM persists profiles root-only and reconnects on its own. |
+| Robot identity, user prefs, tunables | **config store** (§3.1) | File + `flock` + `rename(2)`, owned by `configd` |
 | Calibration, learned state, generated per-device assets | owning service | Outside release dirs; survives update *and* rollback |
 | Shipped defaults, binaries, policy bundles | update system | Under `releases/<ver>/`, swapped atomically |
 
 Letting NetworkManager own wifi credentials is less code, better security, and
 one less thing to migrate.
+
+**A board does not arrive with NetworkManager**, which this row originally assumed. Armbian's
+headless image runs netplan + `systemd-networkd` + `wpa_supplicant`, and netplan is a config
+*generator*: it has no scan API, and `netplan apply` reports "config applied" rather than whether
+association succeeded. Those are the two things a phone provisioning a robot needs most — "show
+me the networks" and "that password was wrong" — so the decision stands and
+`scripts/migrate-network.sh` moves a board onto NM once. The reasoning, and what was measured on
+the board, is in [`app-path-design.md`](app-path-design.md) §2.
 
 ### 3.1 Config store
 
@@ -194,6 +207,10 @@ A plain file plus a small shared crate — **deliberately not a service**:
 - `inotify` for change notification.
 - No single point of failure, readable when any service is down, and the updater
   never touches it (`updater-design.md` §5.7).
+
+Implemented in `configd/src/store.rs`, holding the robot's name and its Bluetooth pairing PIN.
+`inotify` is **not** there yet, deliberately: it earns its place when a *second* process reads the
+file, and today `configd` is the only one. Watching a file you are the sole writer of is ceremony.
 
 Config **must** be reachable when `robotd` is dead — wifi provisioning is exactly
 what a client needs when things are broken — which is why it cannot live in
@@ -430,6 +447,12 @@ only thing separating them.
 5. **Behaviour/brain layer** (drives, mood, habits): part of `robotd`, or its own
    service and update channel? Its learned state is `updater-design.md` §5.7
    material either way.
+6. **Bond revocation over BLE.** Nothing un-pairs a phone; `bluetoothctl untrust` is the
+   manual escape. Needs an API and a rule about who may call it
+   ([`app-path-design.md`](app-path-design.md) §5).
+7. **Per-device provisioning state**, which now has two claimants rather than one: the robot's
+   serial (§5.7) and its per-robot pairing PIN. Both need generating, recording and printing at
+   manufacture, and defining that once is cheaper than twice.
 
 ## 10. Build order
 
