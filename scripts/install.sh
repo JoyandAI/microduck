@@ -53,12 +53,23 @@ REPO="${DUCK_REPO:-pollen-robotics/microduck_daemon}"
 
 # Branch the trusted keys are read from. Pin to a tag for a reproducible provisioning run.
 #
-# Deliberately *not* where the config comes from unless it was asked for explicitly — see
-# `CONFIG_REF` and `install_config`. Keys and config age differently: the key set only ever
-# grows, so the newest is the safest, while a config field is only understood by binaries from
-# its own version onwards.
+# Deliberately *not* where the config comes from — see `CONFIG_REF` below. Keys and config age
+# differently: the key set only ever grows, so the newest is the safest, while a config field is
+# only understood by binaries from its own version onwards.
 ENV_REF="${DUCK_REF:-}"
 REF="${ENV_REF:-main}"
+
+# Where `updater.toml` and `robotd.toml` come from. Defaults to the tag of the release being
+# installed, and `DUCK_REF` deliberately does *not* change it.
+#
+# That looked wrong at first — surely naming a ref should name it for everything — and it is
+# not. `--ref my-branch` means "run my branch's scripts", which is how the provisioning scripts
+# get tested at all; it does not mean "hand the last stable binary a config from a branch it
+# predates". Making DUCK_REF govern this put the `allow_users` failure straight back, on the
+# very command an operator would use to test the fix for it.
+#
+# Set this only to test a config change together with a build that understands it.
+CONFIG_REF="${DUCK_CONFIG_REF:-}"
 
 # Set by `resolve_bootstrap_asset` to the tag of the release actually being installed, and used
 # by `install_config` when the operator did not name a ref. Empty until then.
@@ -224,12 +235,16 @@ wait_for_clock() {
 install_config() {
     say "installing config and trusted keys"
 
-    # Where the *config* comes from, as opposed to the keys.
-    if [ -n "$ENV_REF" ] || [ -z "$RELEASE_TAG" ]; then
-        config_raw="$RAW"
-    else
+    # Where the *config* comes from, as opposed to the keys and the scripts.
+    if [ -n "$CONFIG_REF" ]; then
+        config_raw="https://raw.githubusercontent.com/${REPO}/${CONFIG_REF}"
+        warn "config from ${CONFIG_REF} because DUCK_CONFIG_REF asked for it. If that ref has
+  fields the release being installed does not know, updaterd will refuse to start."
+    elif [ -n "$RELEASE_TAG" ]; then
         config_raw="https://raw.githubusercontent.com/${REPO}/${RELEASE_TAG}"
         say "config from ${RELEASE_TAG}, matching the release being installed"
+    else
+        config_raw="$RAW"
     fi
 
     mkdir -p "$KEYS_DIR"

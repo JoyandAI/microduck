@@ -246,7 +246,8 @@ awkward:
 |---|---|
 | `DUCK_TOKEN` | token for a private repo — the fetch *and* the release assets |
 | `DUCK_REPO` | the repository, for a fork or a test repo |
-| `DUCK_REF` | the branch config and keys are read from; pin to a tag for a reproducible run |
+| `DUCK_REF` | the branch the scripts and trusted keys are read from; pin to a tag for a reproducible run |
+| `DUCK_CONFIG_REF` | where `updater.toml` comes from. Defaults to the tag of the release being installed, and `DUCK_REF` does not change it — a config field is only understood by binaries from its own version onwards, so pairing a branch's config with the last stable binary is how `updaterd` ends up refusing to start. Set this only to test a config change with a build that understands it. |
 | `DUCK_DEV_KEY` | path to `team.dev.pub` — makes this a dev board (below) |
 | `DUCK_FORCE_REINSTALL` | reinstall over a live release using the release's own `updaterd` |
 
