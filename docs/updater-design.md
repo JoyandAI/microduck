@@ -122,7 +122,8 @@ to the next boot — by which time the update is committed, nobody is watching, 
 then crash-loops a few times and gives up, leaving a robot with no update daemon and no way to update
 out of it. That contradicts the promise that recovery works when the robot is already broken.
 
-Two layers close it, and they catch different things:
+Two layers close it, and they catch different things. **The first is implemented**; the second is
+its own PR.
 
 1. **Self-test the new binary before committing**, and restart `updaterd` after the reply is sent.
    A read-only mode — config loaded, engine constructed, exiting *before* recovery — catches a wrong
@@ -136,6 +137,19 @@ Two layers close it, and they catch different things:
    the flag, so it increments every armed trial's boot count and can revert an update. It is an
    operator tool, not a probe, and using it mid-update would have a second engine mutating the store
    the first one is working on.
+
+   As built: `self_test_updaterd` runs after the shipped units restart and before the health gate,
+   only where `on_apply` is a restart — a model component has no `updaterd`, and the bootstrap
+   install forces `on_apply=none` precisely because nothing is installed yet. `Error::SelfTest`
+   carries the binary's last line of stderr, so "config error: unknown field `foo`" reaches the
+   rollback reason rather than being flattened into "unreachable".
+
+   The restarts go through `systemd-run --on-active=5s`, and two details there are load-bearing. A
+   *child process* would sit in `updaterd`'s cgroup and be killed partway through restarting its own
+   parent; a transient unit is not. And the update lock is dropped **before** anything is spawned,
+   because a fork duplicates every open descriptor in the process — including locks held by other
+   engines in the same process, which surfaced as unrelated operations failing with `Busy` in the
+   test suite.
 
 2. **A boot-time net outside `updaterd`**, for what slips through. `OnFailure=` on a curated set of
    units fires exactly when one exhausts its restarts, and a tiny oneshot swaps `current` to golden and
