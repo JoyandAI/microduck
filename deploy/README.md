@@ -44,7 +44,7 @@ resumes at boot, so the board finishes whether or not this is still watching. If
 of the board — a lease that moved, an ssh session that wedges — Ctrl-C costs you nothing:
 
 ```bash
-ssh radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
+ssh -t radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
 ```
 It needs ssh key access, because it has to reconnect by itself after the board reboots — a
 password prompt cannot survive that. `--no-dev-key` for a board that should only take releases,

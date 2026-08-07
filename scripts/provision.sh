@@ -311,6 +311,23 @@ keep_dev_key() {
 # so during this exact window the journal can still be RAM-only. A log that a power cut erases
 # is not much of a record of the one step nobody watched.
 install_resume_unit() {
+    # Create the log before systemd does, so it exists with a mode chosen here rather than
+    # whatever the unit's umask produces. `append:` opens an existing file and leaves its
+    # permissions alone, which is what makes this work.
+    #
+    # root:robot 0640, not 0600: the operator is in `robot` by the time they log back in, so
+    # they can read it without sudo — and needing sudo is not a small inconvenience here. The
+    # watcher on their laptop reads this over a non-interactive ssh, where sudo cannot prompt,
+    # so a root-only log meant that watcher silently displayed nothing at all while the board
+    # provisioned perfectly well behind it.
+    #
+    # Not world-readable either. Nothing deliberately writes the token here, but this captures
+    # the whole of install.sh, and "no secret has ever appeared in this output" is a claim about
+    # every line of a program that keeps changing.
+    : > "$LOG"
+    chmod 640 "$LOG"
+    chgrp robot "$LOG" 2>/dev/null || warn "no robot group yet; ${LOG} stays root-only"
+
     cat > "$UNIT" <<EOF
 [Unit]
 Description=Finish robot provisioning after the reboot

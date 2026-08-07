@@ -134,7 +134,10 @@ rsh() {
 # it — DNS, an authentication step, a sluggish sshd on a booting board — and the one thing this
 # loop must never do is stop counting. `timeout(1)` would be the obvious tool and is not on
 # macOS, so the watchdog is written out.
-alive() {
+# A subshell body with its stderr closed, because the kill below makes the shell announce
+# `Terminated: 15  rsh true` on the terminal — a job-control notice that reads like a failure
+# in the middle of a wait that is working exactly as intended.
+alive() (
     rsh true >/dev/null 2>&1 &
     _probe_pid=$!
     _probe_n=0
@@ -150,7 +153,7 @@ alive() {
         _probe_n=$((_probe_n + 1))
     done
     wait "$_probe_pid"
-}
+) 2>/dev/null
 
 # True while the board still has provisioning left to do. `provision.sh` removes the state file
 # when it finishes, which makes "are we done" a question with a file for an answer rather than
@@ -295,7 +298,7 @@ until alive 10; do
         die "no answer from ${HOST} after ${_elapsed}s.
   That does not mean provisioning failed. The board resumes by itself at boot, so this is a
   viewer that lost sight of it — the board may well be finishing right now. Look directly:
-    ssh ${HOST} 'sudo tail -f ${LOG}'
+    ssh -t ${HOST} 'sudo tail -f ${LOG}'
   If it is genuinely unreachable: a failed wifi cutover makes the backstop restore netplan and
   reboot, which costs a second boot, and NetworkManager may come back on a different DHCP lease
   than netplan had — so check for a new address before concluding the board is down."
@@ -314,22 +317,53 @@ say "back after ~$(( $(date +%s) - _start ))s"
 _seen=0
 _quiet=0
 
+# How the log gets read. Plain, or through a non-interactive sudo for a board provisioned before
+# the log became group-readable. Decided once, on the first read, rather than guessed every time.
+LOG_READ=""
+
+# Work out whether this log is readable at all, and how. Its own step because the failure it
+# replaces was silence: an unreadable log made the watcher print nothing, forever, next to a
+# board that was provisioning perfectly well.
+choose_log_reader() {
+    if rsh "test -r ${LOG}" >/dev/null 2>&1; then
+        LOG_READ=""
+        return 0
+    fi
+    # `sudo -n`, never bare sudo: over BatchMode ssh there is no terminal to prompt on, so a
+    # sudo that wants a password hangs or fails with its error swallowed. This is the exact
+    # shape of the original bug.
+    if rsh "sudo -n test -r ${LOG}" >/dev/null 2>&1; then
+        LOG_READ="sudo -n "
+        return 0
+    fi
+    return 1
+}
+
 # Print whatever has been appended since the last call. Returns 1 when there was nothing, which
 # is what the stall detection counts.
 drain_log() {
-    _size="$(rsh "sudo sh -c 'test -f ${LOG} && wc -c < ${LOG} || echo 0'" 2>/dev/null || echo "$_seen")"
+    _size="$(rsh "${LOG_READ}sh -c 'test -f ${LOG} && wc -c < ${LOG} || echo 0'" 2>/dev/null || echo "$_seen")"
     # Digits only: a stray line from ssh or sudo in that output would otherwise reach the
     # arithmetic below and abort the script for a cosmetic reason.
     _size="$(printf '%s' "$_size" | tr -dc '0-9')"
     [ -n "$_size" ] || _size=$_seen
 
     if [ "$_size" -gt "$_seen" ]; then
-        rsh "sudo tail -c +$((_seen + 1)) ${LOG}" 2>/dev/null || true
+        rsh "${LOG_READ}tail -c +$((_seen + 1)) ${LOG}" 2>/dev/null || true
         _seen=$_size
         return 0
     fi
     return 1
 }
+
+if ! choose_log_reader; then
+    warn "cannot read ${LOG} on ${HOST}, so there is nothing to stream here — not because
+  provisioning failed, but because this account cannot read that file and sudo cannot prompt
+  over a non-interactive connection. The board carries on regardless. Watch it yourself:
+    ssh -t ${HOST} 'sudo tail -f ${LOG}'
+  A board provisioned by a current provision.sh makes that log readable by the robot group,
+  which you are in after the reboot; an older one left it root-only."
+fi
 
 while :; do
     if drain_log; then
@@ -364,4 +398,4 @@ say "provisioning finished"
 # something to say — a bench board with no servos powered reports unhealthy, correctly.
 rsh "robotctl health" || warn "robotctl health did not report cleanly. On a board with no
   servos powered that is the honest answer, not a failed install. The full log is at:
-    ssh ${HOST} 'sudo cat ${LOG}'"
+    ssh -t ${HOST} 'sudo cat ${LOG}'"
