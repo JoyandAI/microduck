@@ -413,9 +413,12 @@ reboot** — which is the scenario the whole path exists for. A rejected passphr
 `BadKey` carrying NM's reason 7, which is the answer a phone acts on: re-prompt for the password
 rather than show a generic failure.
 
-Not yet run on hardware: `net.forget` deleting several profiles for one SSID.
+`net.forget` clears every profile for an SSID: five duplicate `kek` profiles, left behind by the
+pre-fix binaries, went in one call. The whole `net.*` surface has now run against a real
+NetworkManager.
 
-Still false on a board: the link is unencrypted (§5.5).
+Still false on a board: the link is unencrypted (§5.5). That is the only thing left between this path
+and something that can be handed to someone.
 
 ## 6. Testing without a radio  · **measured**
 
