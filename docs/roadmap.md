@@ -23,7 +23,7 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
 | `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](app-path-design.md) §5.5 |
 | `configd/` | wifi over NetworkManager, robot name, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
-| tests | **425 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
+| tests | **458 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | missing | `mediad`, app, SDK |
 | on hardware | walking through the intent API, the update path (install · health gate · commit · auto-rollback), a signed release installed from the stable channel, BLE provisioning of wifi. The loop held 50.0 Hz with `missed=3` in 15022 ticks before inference |
 | not on hardware | the numbers M4 exists for: thermals, eMMC write timing, battery under load, and whether logs survive a power cut. The 30s health-gate timeout is still a guess |
