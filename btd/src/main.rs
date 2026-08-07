@@ -30,11 +30,29 @@ struct Args {
     #[arg(long, default_value = duck_ipc_proto::socket::CONFIG)]
     config_socket: PathBuf,
 
-    /// Serve without requiring a paired, encrypted link.
+    /// Require a paired, encrypted link.
     ///
-    /// Bench use only. Without pairing, anyone in radio range can write requests — including
-    /// `net.connect`, which carries a wifi passphrase.
+    /// **Off by default, and that is not where this ends up.** Requiring pairing makes the version
+    /// read hang on macOS — CoreBluetooth issues the Read Request, BlueZ refuses it for insufficient
+    /// encryption, and nothing resolves it — so a robot serving the secure configuration cannot be
+    /// talked to at all (`docs/app-path-design.md` §5.5).
+    ///
+    /// Between a default that is secure and unusable and one that works and is insecure, this is
+    /// pre-shipping development tooling and the usable one wins. The cost is real and unhedged:
+    /// with pairing off, anyone in radio range can read the PIN as it crosses and write any allowed
+    /// request — including `net.connect`, which carries a wifi passphrase. Every robot running this
+    /// is a robot whose wifi credentials are readable by a bystander.
+    ///
+    /// This must flip before anything is handed to anyone. §8.1 is the blocker.
     #[arg(long)]
+    require_pairing: bool,
+
+    /// Accepted and ignored: not requiring pairing is now the default.
+    ///
+    /// Kept only so a board carrying a `--insecure-no-pairing` drop-in — which is how the flag was
+    /// used while it existed — does not fail to start on the update that removes it. An unknown
+    /// argument would take BLE down on exactly the boards that were using it.
+    #[arg(long, hide = true)]
     insecure_no_pairing: bool,
 
     /// Name to advertise. Defaults to the hostname.
@@ -111,7 +129,21 @@ async fn main() -> ExitCode {
     };
     let name = args.name.unwrap_or_else(hostname);
 
-    run(sockets, name, !args.insecure_no_pairing).await
+    if args.insecure_no_pairing {
+        tracing::warn!(
+            "--insecure-no-pairing is now the default and does nothing; remove it from the unit"
+        );
+    }
+    if !args.require_pairing {
+        // Loud, every start, because the whole point of choosing the usable default is that the
+        // insecurity stays visible rather than becoming the thing nobody remembers.
+        tracing::warn!(
+            "serving WITHOUT pairing: the PIN and any wifi passphrase cross this link in clear, \
+             readable by anyone in range. Development only — see app-path-design.md §5.5"
+        );
+    }
+
+    run(sockets, name, args.require_pairing).await
 }
 
 #[cfg(target_os = "linux")]
