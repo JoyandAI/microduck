@@ -409,10 +409,11 @@ read, PIN authentication, `system.info`, `net.status`, `net.scan`, the refusal b
 (`robot.move`, `system.pairingPin`, `update.select` all refused with code 14 by `btd` itself),
 `update.check` routed through to `updaterd`, an SSID the radio cannot see refused as `NotFound`, and
 **a network the robot had never seen provisioned over BLE, joined, and rejoined by itself after a
-reboot** — which is the scenario the whole path exists for.
+reboot** — which is the scenario the whole path exists for. A rejected passphrase comes back as
+`BadKey` carrying NM's reason 7, which is the answer a phone acts on: re-prompt for the password
+rather than show a generic failure.
 
-Not yet run on hardware: a rejected passphrase reported as `BadKey` (the fix is in, the test is not),
-and `net.forget` deleting several profiles for one SSID.
+Not yet run on hardware: `net.forget` deleting several profiles for one SSID.
 
 Still false on a board: the link is unencrypted (§5.5).
 
