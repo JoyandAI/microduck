@@ -51,9 +51,18 @@ set -eu
 # The repository releases are published from. Override for a fork or a test repo.
 REPO="${DUCK_REPO:-pollen-robotics/microduck_daemon}"
 
-# Branch the config and trusted keys are read from. Pin to a tag for a reproducible
-# provisioning run.
-REF="${DUCK_REF:-main}"
+# Branch the trusted keys are read from. Pin to a tag for a reproducible provisioning run.
+#
+# Deliberately *not* where the config comes from unless it was asked for explicitly — see
+# `CONFIG_REF` and `install_config`. Keys and config age differently: the key set only ever
+# grows, so the newest is the safest, while a config field is only understood by binaries from
+# its own version onwards.
+ENV_REF="${DUCK_REF:-}"
+REF="${ENV_REF:-main}"
+
+# Set by `resolve_bootstrap_asset` to the tag of the release actually being installed, and used
+# by `install_config` when the operator did not name a ref. Empty until then.
+RELEASE_TAG=""
 
 # For a private repository: a token with read access to contents. Also used for the
 # release download, which needs auth on a private repo.
@@ -194,11 +203,35 @@ wait_for_clock() {
   certificate error. Check the network and systemd-timesyncd."
 }
 
-# The trust anchor and the one file an operator is expected to edit. Both have to come
-# from the repository rather than from a release, because nothing can be verified until
-# the keys are here.
+# The trust anchor and the one file an operator is expected to edit. Both come from the
+# repository over raw rather than from a release, because nothing can be verified until the keys
+# are here.
+#
+# But from *different refs*, and that distinction cost a board. The keys come from `REF`
+# (`main` by default) because the trusted set only ever grows, so the newest is the safest. The
+# config comes from the tag of the release actually being installed, because a config field is
+# only understood by binaries from its own version onwards — and pairing a config off `main`
+# with the last stable binary means every field added since that release breaks provisioning:
+#
+#   ERROR updaterd: invalid config error=TOML parse error at line 70
+#   unknown field `allow_users`, expected one of ...
+#
+# on a fresh board, from a clean checkout, with nothing an operator could have done wrong.
+# `deny_unknown_fields` is right — a typo in a robot's config should not be ignored — so the
+# fix belongs here, in what gets paired with what.
+#
+# An explicit `DUCK_REF` still wins for both: someone naming a ref is asking for that ref.
 install_config() {
     say "installing config and trusted keys"
+
+    # Where the *config* comes from, as opposed to the keys.
+    if [ -n "$ENV_REF" ] || [ -z "$RELEASE_TAG" ]; then
+        config_raw="$RAW"
+    else
+        config_raw="https://raw.githubusercontent.com/${REPO}/${RELEASE_TAG}"
+        say "config from ${RELEASE_TAG}, matching the release being installed"
+    fi
+
     mkdir -p "$KEYS_DIR"
     chmod 755 "$CONFIG_DIR" "$KEYS_DIR"
 
@@ -223,7 +256,7 @@ install_config() {
     if [ -f "${CONFIG_DIR}/updater.toml" ]; then
         warn "keeping the existing ${CONFIG_DIR}/updater.toml"
     else
-        fetch "${RAW}/deploy/updater.toml" "${CONFIG_DIR}/updater.toml"
+        fetch "${config_raw}/deploy/updater.toml" "${CONFIG_DIR}/updater.toml"
         sed -i "s|\"ORG/duck-daemon\"|\"${REPO}\"|" "${CONFIG_DIR}/updater.toml"
         chmod 644 "${CONFIG_DIR}/updater.toml"
     fi
@@ -238,7 +271,7 @@ install_config() {
     if [ -f "${CONFIG_DIR}/robotd.toml" ]; then
         warn "keeping the existing ${CONFIG_DIR}/robotd.toml"
     else
-        fetch "${RAW}/deploy/robotd.toml" "${CONFIG_DIR}/robotd.toml"
+        fetch "${config_raw}/deploy/robotd.toml" "${CONFIG_DIR}/robotd.toml"
         chmod 644 "${CONFIG_DIR}/robotd.toml"
     fi
 }
@@ -256,6 +289,12 @@ install_config() {
 # `source/github.rs`); this script was the one place that had not caught up, because until a
 # release was promoted there was nothing here to exercise.
 resolve_bootstrap_asset() {
+    # Idempotent: `main` resolves early so `install_config` knows the tag, and
+    # `bootstrap_first_release` still asks for itself so it stands alone. One API call either
+    # way — and, more usefully, one answer, so the config and the binary cannot come from two
+    # different "latest" releases if one is published mid-install.
+    [ -z "$BOOTSTRAP_URL" ] || return 0
+
     api="https://api.github.com/repos/${REPO}/releases/latest"
     json="$(mktemp)"
 
@@ -275,20 +314,31 @@ resolve_bootstrap_asset() {
     # asset does not carry its id, and the search silently finds nothing. Compacting makes
     # one line per JSON object, and an asset's `id` and `name` both precede its nested
     # `uploader` object, so the line naming the asset carries its id too.
+    json_compact="$(mktemp)"
+    tr -d ' \n' < "$json" | tr '{' '\n' > "$json_compact"
+    rm -f "$json"
+
     id="$(
-        tr -d ' \n' < "$json" \
-        | tr '{' '\n' \
-        | grep "\"name\":\"${BOOTSTRAP_ASSET}\"" \
+        grep "\"name\":\"${BOOTSTRAP_ASSET}\"" "$json_compact" \
         | grep -o '"id":[0-9][0-9]*' \
         | grep -o '[0-9][0-9]*' \
         | head -1
     )"
-    rm -f "$json"
 
     if [ -z "$id" ]; then
+        rm -f "$json_compact"
         die "the latest release has no asset named ${BOOTSTRAP_ASSET}.
   A promoted release must carry it — release.yml attaches it, promote.yml copies it across."
     fi
+
+    # The tag as well, because the config has to come from the same version as the binary.
+    # Same grep-not-jq reasoning as above.
+    RELEASE_TAG="$(
+        grep -o '"tag_name":"[^"]*"' "$json_compact" \
+        | head -1 \
+        | sed 's/.*"tag_name":"//; s/"$//'
+    )"
+    rm -f "$json_compact"
 
     BOOTSTRAP_URL="https://api.github.com/repos/${REPO}/releases/assets/${id}"
 }
@@ -760,6 +810,8 @@ main() {
     check_environment
     check_board
     wait_for_clock
+    # Before install_config, which needs to know which release it is pairing a config with.
+    resolve_bootstrap_asset
     install_config
     install_dev_key
     bootstrap_first_release
