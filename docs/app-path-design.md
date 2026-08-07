@@ -366,6 +366,18 @@ Unresolved, and the next thing to establish is whether a bond exists at all — 
 symptom rather than the cause. Until that is known, moving the requirement to the write is a guess:
 it would fail identically if there is no bond to encrypt with.
 
+**What this means for a fresh install.** `--insecure-no-pairing` defaults to off and `btd.service`
+does not pass it, so a board installed from a release *requires* pairing — the configuration that
+hangs the macOS client. The test board works only because of a local
+`/etc/systemd/system/btd.service.d/` drop-in that is not in this repository. The BLE path therefore
+ships **secure and non-functional**: a phone or `btctl` will hang on the version read until this is
+resolved.
+
+That is deliberate. The alternative — shipping the flag on by default so the path works — would put
+robots in the world handing their PIN and wifi passphrase to anyone in radio range, and a default that
+is insecure but convenient is the one nobody revisits. A path that visibly does not work is a problem
+that gets fixed.
+
 This must be closed before anything ships. A robot whose provisioning secret is readable by a
 bystander is not a robot you can hand to a stranger.
 
