@@ -50,14 +50,24 @@ check_interval = "6h"
 # so a release that does not come up is rolled back.
 auto_apply = "mandatory"
 
-# `allow_uids` / `allow_gids` are deliberately absent, which means only root may apply,
-# roll back, select or pin. Support and scripts run `robotctl` under sudo.
+# Who may apply, roll back, select or pin. Read-only calls — status, log, listInstalled,
+# check, subscribe — are never gated by this: reaching the socket already requires its group
+# (mode 0660), and support must be able to inspect a robot it may not change.
 #
-# Membership of the `robot` group gets a process as far as *talking* to updaterd (the
-# socket is 0660) and no further — status and logs, not changes. Listing the group here
-# would collapse those two layers into one. `btd`'s own uid belongs here once it exists,
-# because "may relay an update request from the app" is a narrower claim than "is in the
-# robot group".
+# `btd` is listed because an owner updating the robot from their phone is what M6 exists to
+# deliver, and without this `update.apply` over Bluetooth returns PERMISSION_DENIED. Note how
+# narrow the claim is: "btd may relay an update request from the app", not "anything in the
+# robot group may replace the firmware".
+#
+# By NAME, not by uid: systemd-sysusers allocates dynamically, so a number written here would
+# be right on one board and wrong on the next. `allow_uids`/`allow_gids` still exist for a
+# bench override, and a test asserts the shipped config uses neither.
+#
+# What must never appear here is `allow_groups = ["robot"]`. Membership of `robot` is what gets
+# a process as far as *talking* to updaterd; granting it change authority too would collapse
+# the two layers into one, and anything that could read status could replace the firmware.
+# There is a test for that as well.
+allow_users = ["btd"]
 
 
 # ── daemon ────────────────────────────────────────────────────────────────────
@@ -99,7 +109,26 @@ manifest_asset = "manifest.json"
 # that does not exist makes `systemctl restart` fail, which rolls the update back.
 [component.daemon.on_apply]
 action = "restart"
-units  = ["robotd"]
+# The daemons whose binaries an update replaces and which are safe to interrupt while it runs.
+# Without this an update swaps the binaries and the board keeps running the old ones until
+# somebody reboots, which looks like an update that did nothing.
+#
+# TWO deliberate absences, both for the same reason — a service must not be restarted by the
+# operation it is carrying:
+#
+#   updaterd, because it is the process performing the update (updater-design.md §4.1).
+#   btd, because it may be the *transport* the update was requested over. Restarting it drops
+#     the BLE connection carrying `update.subscribe`, so the phone that started the update loses
+#     the progress stream and never learns the outcome. That is the whole app-driven flow, and
+#     it is why `updater/src/config.rs` has a test refusing to let btd appear here.
+#
+# Both therefore keep running the old binary until the next reboot. That is expected rather than
+# a fault, exactly as §8.3 describes for updaterd.
+#
+# configd *is* restarted: it holds no long-lived session state, the progress stream a client
+# watches comes from updaterd rather than from it, and a config change that never takes effect
+# until reboot would be its own kind of surprise.
+units  = ["robotd", "configd"]
 
 # The gate that makes auto-rollback real. 30s is still the placeholder M4 is meant to
 # replace with a measured boot time plus margin; too short reverts a healthy release that

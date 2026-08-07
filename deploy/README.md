@@ -11,12 +11,25 @@ next to their service (`updater/systemd/`, `robotd/systemd/`); anything robot-wi
 | `trusted_keys/` | release public keys — the trust anchor, installed to `/etc/robot/trusted_keys/` |
 | `journald.conf.d/10-robot.conf` | journal persistence and size caps |
 
+Note on that last one, now **measured** rather than assumed: `/var/log` on this image is a zram
+device, so `Storage=persistent` really is a directory in memory. It survives a clean reboot and
+loses recent logs on a power cut, which is how a robot is actually switched off. The update history
+under `/var/lib` is therefore the only durable record — which is what `architecture.md` §8.2
+designed it to be.
+
 ## Installing a robot from scratch
 
-Two steps, because they answer to different things. `setup-board.sh` is OS-level bring-up —
-device-tree overlays, ONNX Runtime — which changes rarely and needs a reboot. `install.sh`
-installs a signed daemon release, which happens on every update. Conflating them would mean
-every update re-litigating boot configuration.
+Three steps, because they answer to different things. `setup-board.sh` is OS-level bring-up —
+device-tree overlays, ONNX Runtime — which changes rarely and needs a reboot.
+`migrate-network.sh` moves wifi onto NetworkManager, which happens **once per board** and is the
+only step that can make a headless board unreachable. `install.sh` installs a signed daemon
+release, which happens on every update. Conflating them would mean every update re-litigating
+boot configuration.
+
+**A board does not arrive with NetworkManager.** Armbian's headless image runs netplan +
+`systemd-networkd` + `wpa_supplicant`, and `configd` drives NM over D-Bus — so until the migration
+runs, `robotctl net status` reports `Unavailable` and nothing over Bluetooth can configure wifi.
+Why NM rather than what the image ships is in [`../docs/app-path-design.md`](../docs/app-path-design.md) §2.
 
 **1. Prepare the board.** Idempotent, and it never reboots on its own: if it changes boot
 config it says so and stops, and running it again afterwards continues.
@@ -40,6 +53,33 @@ sudo reboot
 sudo /usr/local/sbin/robot-setup-board
 ```
 
+It reports which stack owns wifi. If that says the board is still on netplan, migrate before
+installing the daemon — `configd` cannot manage wifi otherwise.
+
+**2. Move wifi to NetworkManager.** Once per board. It migrates the credentials the board is
+already using into an NM profile and refuses to cut over if it cannot read them, because a
+headless board that loses wifi has no way back. A boot-time backstop restores netplan and reboots
+if `wlan0` has no address 90s after boot.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/migrate-network.sh -o /tmp/migrate-network.sh
+```
+
+```bash
+sudo sh /tmp/migrate-network.sh
+```
+
+```bash
+sudo reboot
+```
+
+Re-run it afterwards to confirm and retire the backstop. Do not skip that: left armed, any later
+boot where wifi is merely slow reverts the board.
+
+```bash
+sudo /usr/local/sbin/robot-migrate-network
+```
+
 `/tmp` is cleared on reboot, and a script whose whole job is *change boot config, reboot,
 confirm* should not delete itself in the middle of that.
 
@@ -55,7 +95,7 @@ the same reason, so the file is patched directly.
 ⚠ A kernel upgrade that repoints `/boot/{Image,dtb,uInitrd}` can undo it. A board that stops
 seeing its motors after an `apt upgrade` needs this re-run.
 
-**2. Install the daemon.**
+**3. Install the daemon.**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh | sudo sh

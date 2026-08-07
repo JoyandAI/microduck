@@ -295,7 +295,7 @@ resolve_bootstrap_asset() {
 # acceptable and is the price of the escape hatch.
 stop_for_reinstall() {
     say "stopping the daemons for a clean re-install"
-    for unit in robotd.service updaterd.service; do
+    for unit in btd.service configd.service robotd.service updaterd.service; do
         systemctl stop "$unit" 2>/dev/null || warn "could not stop ${unit}"
     done
 }
@@ -396,6 +396,20 @@ create_group() {
             systemd-sysusers
         fi
     fi
+    src="${INSTALL_DIR}/current/systemd/sysusers.d/btd.conf"
+    if [ -f "$src" ]; then
+        install -m 644 "$src" /usr/lib/sysusers.d/btd.conf
+        if command -v systemd-sysusers >/dev/null 2>&1; then
+            systemd-sysusers
+        fi
+    fi
+    # btd runs unprivileged because it is the process parsing bytes from anyone in radio range.
+    # Without this user its unit fails to start, and the failure reads as a broken radio.
+    if ! getent passwd btd >/dev/null; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin btd \
+            || warn "could not create the btd user; btd.service will not start"
+    fi
+
     if ! getent group robot >/dev/null; then
         groupadd --system robot
     fi
@@ -490,7 +504,7 @@ install_dev_key() {
 # last daemon-reload.
 install_units() {
     say "installing systemd units"
-    for unit in updaterd.service robotd.service; do
+    for unit in updaterd.service robotd.service configd.service btd.service; do
         src="${INSTALL_DIR}/current/systemd/${unit}"
         if [ ! -f "$src" ]; then
             die "the installed release has no systemd/${unit}"
@@ -519,6 +533,16 @@ install_units() {
     systemctl daemon-reload
     systemctl enable --now updaterd.service
     systemctl enable --now robotd.service
+
+    # configd before btd: btd asks configd for the pairing PIN, and a btd that starts first
+    # simply refuses to pair until configd answers. Ordering here saves a confusing first boot
+    # rather than being required — btd retries.
+    systemctl enable --now configd.service
+    # btd is allowed to fail without failing the install. It needs a Bluetooth adapter, and on
+    # this board hci0 does not exist until ~73s after boot; a robot with no working radio is
+    # still a robot that updates and walks.
+    systemctl enable --now btd.service || warn "btd did not start; check:  journalctl -u btd -b
+  The robot works without it — only the phone path is unavailable."
 }
 
 # Tab-completion for `robotctl`, so an operator on a board they are debugging over a flaky
