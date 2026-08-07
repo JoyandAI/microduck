@@ -39,12 +39,27 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Bumped on any incompatible change. A peer speaking a different version is refused
 /// rather than misparsed — a stale `robotctl` in someone's shell is normal.
 ///
-/// v2 added `HelloResult::revision`. During prototyping the wire shape simply changes and
-/// this bumps; no accommodation is made for peers that predate a field, because there are
-/// none in the field yet.
-pub const API_VERSION: u32 = 2;
+/// v2 added `HelloResult::revision`. v3 added the `net.*` and `system.*` namespaces. v4 added
+/// `system.authenticate`, which a BLE client must now pass before anything else is served — a v3
+/// client would otherwise have every call refused with no idea why. During
+/// prototyping the wire shape simply changes and this bumps; no accommodation is made for
+/// peers that predate a field, because there are none in the field yet.
+pub const API_VERSION: u32 = 4;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
+
+/// Where each service listens by default.
+///
+/// These are defaults matching the shipped units, not a contract the daemons are bound by —
+/// every one takes a `--socket` override, and `updaterd` reads `robot_socket` from its config.
+/// They live here because more than one client needs them: `robotctl` and `btd` both connect
+/// to all three, and a path duplicated per client is a path that drifts per client.
+pub mod socket {
+    /// `updaterd`. Same value as [`super::DEFAULT_SOCKET`], which predates this module.
+    pub const UPDATER: &str = super::DEFAULT_SOCKET;
+    pub const ROBOT: &str = "/run/robotd.sock";
+    pub const CONFIG: &str = "/run/configd.sock";
+}
 
 /// Method names, as they go on the wire. Namespaced so a new namespace cannot collide
 /// with `update.*`. [`Call`] is the typed form.
@@ -115,6 +130,35 @@ pub mod method {
     /// places that could silently disagree; here it is one struct, and older clients ignore
     /// what they do not recognise.
     pub const ROBOT_STATE: &str = "robot.state";
+    // ── configd's side ───────────────────────────────────────────────────────
+    //
+    // Wifi and the robot's identity. Served by `configd` rather than `robotd` because config
+    // must be reachable when the robot is dead — provisioning wifi is exactly what a client
+    // needs when things are broken (`architecture.md` §3.1).
+    //
+    // NetworkManager owns the credentials; these methods drive it. We never store a PSK.
+
+    /// What is the wifi doing — SSID, signal, addresses.
+    pub const NET_STATUS: &str = "net.status";
+    /// Which networks can this robot see?
+    pub const NET_SCAN: &str = "net.scan";
+    /// Join a network, storing it for next time.
+    pub const NET_CONNECT: &str = "net.connect";
+    /// Forget a stored network.
+    pub const NET_FORGET: &str = "net.forget";
+
+    /// Name, serial, uptime.
+    pub const SYSTEM_INFO: &str = "system.info";
+    /// Rename the robot. This is the name a phone sees.
+    pub const SYSTEM_SET_NAME: &str = "system.setName";
+    /// Reboot, cleanly, through systemd.
+    pub const SYSTEM_REBOOT: &str = "system.reboot";
+    /// The Bluetooth pairing PIN. Never reachable over Bluetooth itself.
+    pub const SYSTEM_PAIRING_PIN: &str = "system.pairingPin";
+    /// Set the Bluetooth pairing PIN.
+    pub const SYSTEM_SET_PAIRING_PIN: &str = "system.setPairingPin";
+    /// Prove knowledge of the pairing PIN. Answered by the transport, not by a service.
+    pub const SYSTEM_AUTHENTICATE: &str = "system.authenticate";
 }
 
 /// JSON-RPC error codes.
@@ -201,6 +245,31 @@ pub enum Call {
     RobotStop,
     RobotEnable(EnableParams),
     RobotSubscribe(SubscribeParams),
+    // ── net.* ────────────────────────────────────────────────────────────────
+    NetStatus,
+    NetScan,
+    NetConnect(NetConnectParams),
+    NetForget(NetForgetParams),
+
+    // ── system.* ─────────────────────────────────────────────────────────────
+    SystemInfo,
+    SystemSetName(SetNameParams),
+    SystemReboot,
+    /// Read the pairing PIN.
+    ///
+    /// Exists so `btd` can answer a BLE passkey request without owning config. It must never be
+    /// routed to BLE — a PIN an unpaired peer can read authorises nothing — and `btd`'s routing
+    /// table has a test saying so.
+    SystemPairingPin,
+    SystemSetPairingPin(SetPairingPinParams),
+    /// Prove knowledge of the robot's pairing PIN.
+    ///
+    /// Answered by the **transport** rather than by any service, which makes it unlike every
+    /// other call here. BLE cannot express a fixed, printed-on-the-robot passkey — the spec has
+    /// the *displaying* side generate a random one, and a headless robot can display nothing — so
+    /// the PIN check moved from the link layer to this one, where we define the rules. See
+    /// `docs/app-path-design.md` §5.
+    SystemAuthenticate(AuthenticateParams),
 }
 
 impl Call {
@@ -227,6 +296,16 @@ impl Call {
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
+            Call::NetStatus => method::NET_STATUS,
+            Call::NetScan => method::NET_SCAN,
+            Call::NetConnect(_) => method::NET_CONNECT,
+            Call::NetForget(_) => method::NET_FORGET,
+            Call::SystemInfo => method::SYSTEM_INFO,
+            Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
+            Call::SystemReboot => method::SYSTEM_REBOOT,
+            Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
+            Call::SystemSetPairingPin(_) => method::SYSTEM_SET_PAIRING_PIN,
+            Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
         }
     }
 
@@ -242,6 +321,13 @@ impl Call {
                 | Call::ResetToGolden(_)
                 | Call::Select(_)
                 | Call::Pin(_)
+                // Changing the robot's *configuration* is mutating too. Joining a network is
+                // not a read, and a reboot is the most disruptive thing a client can ask for.
+                | Call::NetConnect(_)
+                | Call::NetForget(_)
+                | Call::SystemSetName(_)
+                | Call::SystemReboot
+                | Call::SystemSetPairingPin(_)
         )
     }
 
@@ -280,6 +366,11 @@ impl Call {
             Call::RobotHead(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
+            Call::NetConnect(p) => encode(p),
+            Call::NetForget(p) => encode(p),
+            Call::SystemSetName(p) => encode(p),
+            Call::SystemSetPairingPin(p) => encode(p),
+            Call::SystemAuthenticate(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -287,6 +378,11 @@ impl Call {
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
             | Call::RobotStop => Value::Object(serde_json::Map::new()),
+            Call::NetStatus
+            | Call::NetScan
+            | Call::SystemInfo
+            | Call::SystemReboot
+            | Call::SystemPairingPin => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -322,6 +418,16 @@ impl Call {
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
+            method::NET_STATUS => Call::NetStatus,
+            method::NET_SCAN => Call::NetScan,
+            method::NET_CONNECT => Call::NetConnect(decode(params)?),
+            method::NET_FORGET => Call::NetForget(decode(params)?),
+            method::SYSTEM_INFO => Call::SystemInfo,
+            method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
+            method::SYSTEM_REBOOT => Call::SystemReboot,
+            method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
+            method::SYSTEM_SET_PAIRING_PIN => Call::SystemSetPairingPin(decode(params)?),
+            method::SYSTEM_AUTHENTICATE => Call::SystemAuthenticate(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -651,6 +757,90 @@ pub struct PinParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogParams {
     pub limit: usize,
+}
+
+/// Join a wifi network.
+///
+/// [`Debug`] is hand-written to redact `psk`, and that is the point of the type. Every other
+/// params struct derives it, and a derived one here would put a customer's wifi password into
+/// the journal the first time any service logged a request it could not handle — `configd`,
+/// `btd` and `robotctl` all log calls, and the credential-carrying one must not be readable
+/// afterwards by anyone who can run `journalctl`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetConnectParams {
+    pub ssid: String,
+    /// `None` for an open network. Either a passphrase or a 64-hex pre-shared key;
+    /// NetworkManager accepts both and we pass it through unexamined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psk: Option<String>,
+}
+
+impl std::fmt::Debug for NetConnectParams {
+    /// Whether a key was supplied is diagnostically useful — "wrong password" and "no password
+    /// sent for a secured network" are different bugs — so the *presence* is shown and the
+    /// value never is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetConnectParams")
+            .field("ssid", &self.ssid)
+            .field(
+                "psk",
+                if self.psk.is_some() {
+                    &"<redacted>"
+                } else {
+                    &"<none>"
+                },
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetForgetParams {
+    pub ssid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetNameParams {
+    pub name: String,
+}
+
+/// Prove knowledge of the pairing PIN.
+///
+/// [`Debug`] is hand-written to redact the PIN, for the same reason [`NetConnectParams`] is: this
+/// is the only thing standing between a paired-but-unauthenticated peer and the robot, and a
+/// journal is the wrong place for it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticateParams {
+    pub pin: String,
+}
+
+impl std::fmt::Debug for AuthenticateParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticateParams")
+            .field("pin", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Answer to [`Call::SystemAuthenticate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticateResult {
+    pub authenticated: bool,
+    /// Tries left before the transport closes the session. Zero means this was the last one.
+    ///
+    /// Reported so a client can say "two attempts left" rather than silently losing its
+    /// connection — and so a brute-force attempt is visibly rationed.
+    pub attempts_remaining: u32,
+}
+
+/// Set the Bluetooth pairing PIN.
+///
+/// A **string, not an integer**, because leading zeros are significant: the default is `000000`,
+/// and a `u32` would store that as 0 and display it as "0". The robot and the phone must agree
+/// on six characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetPairingPinParams {
+    pub pin: String,
 }
 
 // ── results ──────────────────────────────────────────────────────────────────
@@ -1073,6 +1263,163 @@ pub struct SessionActiveResult {
     pub active: bool,
 }
 
+// ── net.* results ────────────────────────────────────────────────────────────
+
+/// What the wifi link is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetState {
+    /// Associated and addressed.
+    Connected,
+    /// Trying. A client should poll rather than conclude anything.
+    Connecting,
+    /// A wifi device exists and is idle.
+    Disconnected,
+    /// No wifi device, or nothing managing it. Distinct from `Disconnected` because it is a
+    /// provisioning problem rather than a network one — on this robot it means the board is
+    /// still on netplan (`scripts/migrate-network.sh`).
+    Unavailable,
+}
+
+/// Answer to [`Call::NetStatus`]. Every field beyond `state` is absent when not connected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetStatusResult {
+    pub state: NetState,
+    pub ssid: Option<String>,
+    /// 0-100. NetworkManager's own scale, not dBm — a percentage is what a phone shows.
+    pub signal: Option<u8>,
+    pub ip4: Option<String>,
+    pub ip6: Option<String>,
+    /// The wifi interface's hardware address. Useful as a stable robot identifier until
+    /// provisioning gives us a real serial (`updater-design.md` §5.7).
+    pub mac: Option<String>,
+    pub iface: Option<String>,
+}
+
+/// How a network is secured. What a client needs in order to know whether to ask for a
+/// password, and which kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Security {
+    Open,
+    /// WEP. Reported so a client can say "too old to join" rather than failing obscurely.
+    Wep,
+    WpaPsk,
+    Wpa3Sae,
+    /// 802.1X. Needs a username and certificate flow this API does not have, so it is
+    /// reported and refused rather than half-attempted.
+    Enterprise,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Network {
+    pub ssid: String,
+    /// 0-100.
+    pub signal: u8,
+    pub security: Security,
+    /// True when a stored profile already exists, so a client can offer "connect" rather than
+    /// asking for a password it does not need.
+    pub saved: bool,
+}
+
+/// Answer to [`Call::NetScan`], strongest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetScanResult {
+    pub networks: Vec<Network>,
+}
+
+/// Why a join failed.
+///
+/// The distinction exists because it is the whole reason NetworkManager was chosen over
+/// netplan: "you typed the password wrong" is the single most common provisioning failure, and
+/// a client that cannot say so leaves the user with nothing to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectFailure {
+    /// Authentication rejected. Ask for the password again.
+    BadKey,
+    /// The SSID was not there. Ask them to move closer or check the name.
+    NotFound,
+    /// Associated but never finished — usually DHCP. Retrying may work.
+    Timeout,
+    /// Refused before trying: enterprise security, or a PSK missing for a secured network.
+    Unsupported,
+    Other,
+}
+
+/// Answer to [`Call::NetConnect`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ConnectResult {
+    Connected {
+        ssid: String,
+        /// Present once DHCP has finished, which is what makes the robot actually reachable.
+        ip4: Option<String>,
+    },
+    Failed {
+        reason: ConnectFailure,
+        /// NetworkManager's own words, for a support ticket. Never shown as the primary
+        /// message: `reason` is what a client should act on.
+        detail: Option<String>,
+    },
+}
+
+/// Answer to [`Call::NetForget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgetResult {
+    /// False when there was no such stored network — not an error, and a client should not
+    /// present it as one.
+    pub removed: bool,
+}
+
+// ── system.* results ─────────────────────────────────────────────────────────
+
+/// Answer to [`Call::SystemInfo`].
+///
+/// Version deliberately absent: `hello` carries the running build and `update.status` the
+/// installed release, and those are different questions (`architecture.md` §8.3). Repeating
+/// one of them here would be the third place to get it wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemInfoResult {
+    /// The robot's name, as advertised over BLE and shown in an app.
+    pub name: String,
+    /// Per-device identity, once provisioning defines one. `None` until then rather than a
+    /// fabricated value.
+    pub serial: Option<String>,
+    pub uptime_seconds: u64,
+}
+
+/// Answer to [`Call::SystemSetName`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetNameResult {
+    /// The name as stored, which may be a trimmed version of what was asked for. A client
+    /// should display this rather than what it sent.
+    pub name: String,
+}
+
+/// Answer to [`Call::SystemPairingPin`] and [`Call::SystemSetPairingPin`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingPinResult {
+    /// Six digits, leading zeros included.
+    pub pin: String,
+    /// True while the robot is still on the factory PIN.
+    ///
+    /// Worth a field rather than leaving callers to compare against a constant: a default PIN
+    /// authorises nothing, because everyone in radio range knows it, and every client should be
+    /// able to say so without hardcoding the value.
+    pub is_default: bool,
+}
+
+/// Answer to [`Call::SystemReboot`].
+///
+/// The reboot is *scheduled*, not immediate, and the delay is what makes this answerable at
+/// all: a daemon that rebooted inside the call would drop the connection before responding,
+/// and every client would have to treat a broken pipe as success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebootResult {
+    pub in_seconds: u64,
+}
+
 /// Re-exported so consumers spell version types with the *same* `semver` this crate
 /// compiled against. Without it, a crate depending on `semver` separately can end up with
 /// two incompatible copies of `Version` and a type error that reads as nonsense.
@@ -1189,6 +1536,27 @@ mod tests {
             Call::RobotStop,
             Call::RobotEnable(EnableParams { on: true }),
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
+            Call::NetStatus,
+            Call::NetScan,
+            Call::NetConnect(NetConnectParams {
+                ssid: "Pollen Guest".into(),
+                psk: Some("hunter2 with spaces".into()),
+            }),
+            Call::NetForget(NetForgetParams {
+                ssid: "Old Network".into(),
+            }),
+            Call::SystemInfo,
+            Call::SystemSetName(SetNameParams {
+                name: "duck-01".into(),
+            }),
+            Call::SystemReboot,
+            Call::SystemPairingPin,
+            Call::SystemSetPairingPin(SetPairingPinParams {
+                pin: "042042".into(),
+            }),
+            Call::SystemAuthenticate(AuthenticateParams {
+                pin: "000000".into(),
+            }),
         ]
     }
 
@@ -1200,7 +1568,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            20,
+            30,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -1300,6 +1668,11 @@ mod tests {
                 method::RESET_TO_GOLDEN,
                 method::SELECT,
                 method::PIN,
+                method::NET_CONNECT,
+                method::NET_FORGET,
+                method::SYSTEM_SET_NAME,
+                method::SYSTEM_REBOOT,
+                method::SYSTEM_SET_PAIRING_PIN,
             ]
         );
     }
@@ -1533,6 +1906,73 @@ mod tests {
     #[test]
     fn build_info_macro_reports_the_calling_crate() {
         assert_eq!(build_info!().version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// A wifi passphrase must never reach a log, and this is the only params struct where that
+    /// is true — so the redaction is hand-written and therefore able to rot. `{:?}` is what
+    /// every `tracing` call site uses, so that is what is checked.
+    #[test]
+    fn a_wifi_key_is_redacted_from_debug_output() {
+        let secret = "correct horse battery staple";
+        let params = NetConnectParams {
+            ssid: "Home".into(),
+            psk: Some(secret.into()),
+        };
+
+        let debug = format!("{params:?}");
+        assert!(
+            !debug.contains(secret),
+            "the key reached Debug output: {debug}"
+        );
+        assert!(debug.contains("Home"), "{debug}");
+        // Presence still visible: "wrong password" and "no password sent" are different bugs.
+        assert!(debug.contains("redacted"), "{debug}");
+
+        let open = NetConnectParams {
+            ssid: "Cafe".into(),
+            psk: None,
+        };
+        assert!(format!("{open:?}").contains("none"), "{open:?}");
+    }
+
+    /// The PIN must be redacted for the same reason a wifi key is: it is the only thing standing
+    /// between a paired peer and the robot.
+    #[test]
+    fn a_pairing_pin_is_redacted_from_debug_output() {
+        let params = AuthenticateParams {
+            pin: "482913".into(),
+        };
+        let debug = format!("{params:?}");
+        assert!(
+            !debug.contains("482913"),
+            "the PIN reached Debug output: {debug}"
+        );
+        assert!(debug.contains("redacted"), "{debug}");
+        // And still reaches the wire, or nothing could check it.
+        assert!(serde_json::to_string(&params).unwrap().contains("482913"));
+    }
+
+    /// Redaction must not extend to the wire, or `configd` would receive no key at all.
+    #[test]
+    fn a_wifi_key_still_serialises() {
+        let params = NetConnectParams {
+            ssid: "Home".into(),
+            psk: Some("s3cret".into()),
+        };
+        let line = serde_json::to_string(&params).unwrap();
+        assert!(line.contains("s3cret"), "{line}");
+        assert_eq!(
+            serde_json::from_str::<NetConnectParams>(&line).unwrap(),
+            params
+        );
+
+        // An open network omits the field rather than sending null, so a backend can tell
+        // "no key" from "empty key".
+        let open = NetConnectParams {
+            ssid: "Cafe".into(),
+            psk: None,
+        };
+        assert!(!serde_json::to_string(&open).unwrap().contains("psk"));
     }
 
     /// `Target` must survive the wire in all three forms, and the two that carry data must

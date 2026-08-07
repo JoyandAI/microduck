@@ -90,10 +90,29 @@ pub struct Config {
     #[serde(default)]
     pub allow_uids: Vec<u32>,
 
-    /// Groups permitted to perform mutating operations. `btd`'s group belongs here
-    /// once it exists.
+    /// Groups permitted to perform mutating operations, by gid.
     #[serde(default)]
     pub allow_gids: Vec<u32>,
+
+    /// Users permitted to perform mutating operations, **by name**.
+    ///
+    /// Preferred over [`Self::allow_uids`] for anything shipped, because
+    /// `systemd-sysusers` allocates uids dynamically: a number that is correct on the
+    /// board a config was written for is wrong on the next one. `btd` is listed here so
+    /// the app can trigger an update, which is what M6 exists to deliver.
+    ///
+    /// A name that does not resolve is a warning, not a fatal error. A robot missing an
+    /// optional service must still serve status and logs.
+    #[serde(default)]
+    pub allow_users: Vec<String>,
+
+    /// Groups permitted to perform mutating operations, by name.
+    ///
+    /// Deliberately empty in the shipped config, and a test enforces that `robot` never
+    /// appears here: membership of `robot` is what gets a process as far as *talking* to
+    /// updaterd, and listing it would collapse that layer into the change-authority one.
+    #[serde(default)]
+    pub allow_groups: Vec<String>,
 
     /// Defaulted so a config with no components reaches [`Config::validate`] and
     /// gets a clear message, rather than a bare serde "missing field".
@@ -530,10 +549,32 @@ mod tests {
             "without a check interval `min_supported` is inert, so a withdrawn release \
              cannot be remediated on a robot nobody opens the app for"
         );
+        // Numeric ids never belong in a shipped config: sysusers allocates dynamically, so a
+        // number that is right on one board is wrong on the next. Names are resolved at startup.
         assert!(
             config.allow_uids.is_empty() && config.allow_gids.is_empty(),
-            "mutating access is root-only until btd exists; listing the robot group here \
-             would collapse the socket-access and change-authority layers into one"
+            "the shipped config must grant by name, not by number: {:?} / {:?}",
+            config.allow_uids,
+            config.allow_gids
+        );
+
+        // The layering this whole design rests on. Naming a specific *service* is a narrow
+        // claim — "btd may relay an update request from the app". Naming the `robot` group is
+        // not: membership of it is what gets a process as far as *talking* to updaterd, so
+        // listing it here would collapse the socket-access and change-authority layers into
+        // one, and anything that could read status could replace the firmware.
+        assert!(
+            !config.allow_groups.iter().any(|g| g == "robot"),
+            "the robot group must not have change authority: {:?}",
+            config.allow_groups
+        );
+
+        // btd is expected: an update the owner starts from their phone is M6's headline, and
+        // without this it returns PERMISSION_DENIED.
+        assert!(
+            config.allow_users.iter().any(|u| u == "btd"),
+            "btd must be able to relay an update request from the app: {:?}",
+            config.allow_users
         );
         assert_ne!(
             config.auto_apply,
