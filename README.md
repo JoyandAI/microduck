@@ -50,8 +50,8 @@ Using the updater for real needs a board. Provisioning one from nothing is two c
 | `padd` | a gamepad, as an ordinary intent client. No privileged access; it sends what the app and SDK will send. |
 | `updaterd` | the update engine. Resident, and deliberately independent of `robotd` — it is the recovery path, so it must work when the robot does not. |
 | `mediad` | camera, audio, WebRTC gateway. **Not built yet.** |
-| `btd` | BLE: the phone's front door. A pipe carrying the same JSON-RPC lines as every other transport, over one GATT characteristic. Owns no state. **Built, never met a radio** ([`docs/app-path-design.md`](docs/app-path-design.md)). |
-| `configd` | wifi (via NetworkManager), robot name, pairing PIN, reboot. Its own service because config must be reachable when `robotd` is dead, and because `btd` owns nothing. **Built, never met a real NetworkManager.** |
+| `btd` | BLE: the phone's front door. A pipe carrying the same JSON-RPC lines as every other transport, over one GATT characteristic. Owns no state. **Works on hardware**: a Mac discovers the robot, pairs, authenticates with the PIN and provisions wifi over BLE. **Ships unencrypted** — the blocker, [`docs/app-path-design.md`](docs/app-path-design.md) §5.5. |
+| `configd` | wifi (via NetworkManager), robot name, pairing PIN, reboot. Its own service because config must be reachable when `robotd` is dead, and because `btd` owns nothing. **Drives a real NetworkManager on a board**: a network provisioned over BLE is joined and survives a reboot. |
 
 They talk over unix sockets, JSON-RPC 2.0 one object per line. The contract lives in
 `duck-ipc-proto`, which depends on serde and semver and nothing else — so `btd` and `robotd`

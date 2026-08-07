@@ -399,6 +399,23 @@ is that the NM side needs a real NetworkManager and a real radio, which means a 
 Until that exists, the honest summary is: `configd`'s wifi behaviour is tested, and the code that runs
 on the robot is not. Every bug above was found by hand, on hardware, in the space of one session.
 
+### 2.4 What has actually run on a board
+
+Recorded because "built" and "works" were the same word in this document for too long, and four
+"fixes" were verified against binaries that were never running.
+
+Proven end to end, on a Radxa Zero 3 with a Mac as the client: discovery, connection, the version
+read, PIN authentication, `system.info`, `net.status`, `net.scan`, the refusal boundary
+(`robot.move`, `system.pairingPin`, `update.select` all refused with code 14 by `btd` itself),
+`update.check` routed through to `updaterd`, an SSID the radio cannot see refused as `NotFound`, and
+**a network the robot had never seen provisioned over BLE, joined, and rejoined by itself after a
+reboot** — which is the scenario the whole path exists for.
+
+Not yet run on hardware: a rejected passphrase reported as `BadKey` (the fix is in, the test is not),
+and `net.forget` deleting several profiles for one SSID.
+
+Still false on a board: the link is unencrypted (§5.5).
+
 ## 6. Testing without a radio  · **measured**
 
 The suite runs on a laptop with no hardware, no network, no D-Bus and no Docker, and that had to
