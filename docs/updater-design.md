@@ -988,7 +988,18 @@ doesn't match `Cargo.toml` (tagging without bumping), and `promote` refuses a ve
 that doesn't match the staging manifest.
 
 - Channels: `staging` → `stable`. CI publishes candidates to `staging`.
-- Canary robots auto-pull `staging`, run Tier-2, report.
+- A canary robot takes a candidate **by explicit version**, not by tracking the channel:
+
+  ```
+  sudo robotctl update apply daemon --version 0.2.0
+  ```
+
+  with `tag_prefix = "daemon-staging-v"` in its config, which resolves the tag directly. An
+  earlier draft said canaries "auto-pull staging", and that is not implementable as written:
+  `newest_version` skips anything GitHub flags as a prerelease *and* anything carrying a semver
+  prerelease component, with no opt-out — which is exactly what keeps a customer robot off
+  candidate builds, so the filter stays and the sentence goes. Discovered by a board reporting
+  `no releases in … with tag prefix "daemon-staging-v"` against a staging release that existed.
 - On green, **promote**: repoint `stable` at the *same bytes* already validated —
   re-sign the `stable` manifest to reference the identical tarball + hash. No
   rebuild, no re-flash, no hand-copying files. Promotion is one command / one

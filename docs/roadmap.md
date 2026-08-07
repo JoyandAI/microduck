@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: draft · Date: 2026-07-28 · Owner: pierre
+Status: draft · Date: 2026-08-05 · Owner: pierre
 
 Companion to [`architecture.md`](architecture.md) (what we're building) and
 [`updater-design.md`](updater-design.md) (how it ships). This is *order and sequencing*
@@ -11,21 +11,22 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | | |
 |---|---|
 | `updater/` | engine, verification, store, journal, hooks, preflight, GitHub/HF/local sources, IPC server, systemd unit — **done** |
-| `duck-control/` | robot model · bus · IMU · `RobotIo` · observations · ONNX policy · safety — **slices 1–2 done**, untested on a board. A library: no tokio, no sockets, no systemd |
+| `duck-control/` | robot model · bus · IMU · `RobotIo` · observations · ONNX policy · safety — **slices 1–2 done, and run on a robot**. A library: no tokio, no sockets, no systemd |
 | `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
-| `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done**, untested on a board; no kinematics |
+| `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done, and it walks on a board**; no kinematics |
 | `padd/` | gamepad → intents, as an ordinary socket client — **done**, ships in the release; needs libudev, installed by CI and the board cross-build |
-| `robotctl/` | CLI over the update socket — **done** for the `update` namespace; depends on `duck-ipc-proto`, not `updater` |
+| `robotctl/` | the operator CLI — `update`, `health`, `version`, `monitor`, `net`, `system`, `completions`; depends on `duck-ipc-proto`, not `updater`, so it stays on the recovery path |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
-| `.github/` | ci · release · promote — **ci passing**; release/promote still unrun (needs secrets + the `release` environment) |
+| `.github/` | ci · release · promote — **all three run for real**: `0.2.0` was tagged to staging, verified through the engine, installed on a board and promoted to stable on 2026-08-05, byte-identical (§16.3) |
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
 | `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](app-path-design.md) §5.5 |
 | `configd/` | wifi over NetworkManager, robot name, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
-| tests | **403 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
+| tests | **425 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | missing | `mediad`, app, SDK |
-| never run on hardware | every claim above is from CI and a laptop. Slice 1's whole purpose is to change that |
+| on hardware | walking through the intent API, the update path (install · health gate · commit · auto-rollback), a signed release installed from the stable channel, BLE provisioning of wifi. The loop held 50.0 Hz with `missed=3` in 15022 ticks before inference |
+| not on hardware | the numbers M4 exists for: thermals, eMMC write timing, battery under load, and whether logs survive a power cut. The 30s health-gate timeout is still a guess |
 
 ## The framing
 
@@ -35,11 +36,11 @@ hand to a stranger: app-driven updates, safety authority, privacy, provisioning,
 recovery. Porting existing capability into the new architecture is laborious but
 *known-feasible*; the unknowns are all on the productisation side.
 
-**The updater is finished and instrumentally useless.** It has nothing real to ship. So
-the first milestone is whatever gives it cargo — and, now that a team is arriving, gives
-*them* a way to share work.
+~~**The updater is finished and instrumentally useless.**~~ It had nothing real to ship, which
+was the whole argument for the ordering below. That is now over: `0.2.0` ships a robot that
+walks, and the update path is how it got onto a board.
 
-## What changed the order: the team arrives in ~2 weeks
+## What changed the order: the team arrives (written 2026-07-28)
 
 Others will work on `robotd`/`mediad` and **share builds through the updater**. That
 makes two things urgent that would otherwise have waited:
@@ -48,10 +49,11 @@ makes two things urgent that would otherwise have waited:
    cutting a release. This is now ahead of `btd`: teammates will use `robotctl`, not the
    phone app.
 2. ~~**A repo and a dev signing key**~~ — **done.** `pollen-robotics/microduck_daemon`
-   (private), CI green on first fix; `team.dev` key generated. Still outstanding before a
-   real release: the signing secrets and the `release` environment gate (`ci-setup.md`).
+   (private), CI green on first fix; `team.dev` key generated. The signing secrets and the
+   `release` environment are in place too, and `0.2.0` went out through them.
 
-`btd` and the app path slip behind both. They matter for *customers*, not for the team.
+~~`btd` and the app path slip behind both.~~ Both landed early anyway — see M6 for why the
+trigger turned out not to be the phone app.
 
 ## Milestones
 
@@ -118,7 +120,7 @@ over the network, and a customer-robot config refused the same build.
 **Open, and it blocks M4:** a private repo's release assets need a token, and a customer robot
 has none. See `updater-design.md` §6.1.
 
-### M3 — `robotd` for real  ·  hardware first, in two slices
+### M3 — `robotd` for real  ·  **done**, in two slices
 
 Designed in [`robotd-design.md`](robotd-design.md). `robotd` **replaces**
 `microduck_runtime`, by extracting its control core into `duck-control` rather than
@@ -133,7 +135,7 @@ job is a clean laptop dev environment, not a validation oracle, so it lands afte
 and never becomes a second definition of what the robot is. Tests run against a `FakeIo`
 backend — no hardware, no network, no Docker, no Python.
 
-**Slice 1 — hold the pose · done, pending a board.** A real 50 Hz loop on the Dynamixel
+**Slice 1 — hold the pose · done, on a board.** A real 50 Hz loop on the Dynamixel
 bus, holding whatever pose it starts in. No policy. It exists so `robot.health` means *the
 loop is meeting its deadline* rather than *it ticked once* — until now the updater's
 auto-rollback has been gating on a placeholder. Holding a pose is also what makes it safe to
@@ -148,16 +150,25 @@ implements it. It lands in slice 2, holding the only write handle to the bus, so
 and no client *can* command a motor around it. Joint clamp, fall → limp, and an intent
 deadman; thermal waits for a measured threshold rather than a guessed one.
 
-**Done when:** it walks on a board driven through the intent API, an update applied with
-`robotctl` restarts it cleanly with the gate passing, and a release built to come up
-unhealthy is automatically rolled back.
+**Done:** all three, on a Radxa Zero 3W. It walks driven through the intent API; an update
+applied with `robotctl` restarts it cleanly with the gate passing; and a release that comes up
+unhealthy reverts on its own. The board also produced the one bug the tests could not: `ort`
+*panics* rather than erroring on a runtime below its floor, which killed the control thread and
+made health blame the wrong thing. It now holds the pose and names the version instead.
 
-### M4 — Hardware bring-up
+### M4 — Hardware bring-up  ·  in progress
 
 M3 on the Radxa with real motors and IMU. This is where the genuinely unknown numbers
 appear: control-loop jitter on a non-RT kernel, ONNX inference rate on Cortex-A55, eMMC
 write timing, thermals, battery. Also the first real test of `systemctl restart` in
 `on_apply`, and of the health-gate timeouts — 30s is currently a guess.
+
+**Settled already**, because slices 1 and 2 could not be finished without them: the loop holds
+its rate on a non-RT kernel (50.0 Hz, `missed=3` in 15022 ticks, before inference), the bus and
+the `imu_to_dxl` board answer on `/dev/ttyS2`, `systemctl restart` in `on_apply` works against
+real systemd, and the gate commits and reverts for real. **Still open, and they are the reason
+this milestone is not closed:** thermals, eMMC write timing, battery under load, whether the 30s
+timeout has any margin on a cold boot, and the log-retention question below.
 
 Also the first chance to settle the **log retention** question, which cannot be answered
 off-board (`deploy/README.md`):
@@ -204,9 +215,9 @@ bricked release recovers without a laptop.
 
 ## Organisation
 
-**One repo, one workspace.** `robotd`, `mediad`, `btd` join as siblings. They co-version
-because they all ship in the same `daemon` artifact — one version line is correct, and
-models version separately already.
+**One repo, one workspace.** `robotd`, `btd`, `configd` and `padd` have joined as siblings;
+`mediad` is the one still outstanding. They co-version because they all ship in the same
+`daemon` artifact — one version line is correct, and models version separately already.
 
 **Crate layout as it should end up:**
 
@@ -216,7 +227,8 @@ duck-ipc-proto/ wire types — serde/serde_json/semver only; btd/robotd/robotctl
 configd/        wifi (NetworkManager), robot name, pairing PIN, reboot
 updater/        engine + updaterd
 robotctl/       CLI
-robotd/         control, kinematics, gait, safety           (skeleton)
+robotd/         control, gait, safety — no kinematics yet
+padd/           gamepad → intents; a client, with no privilege the app will not have
 mediad/         camera, encode, perception, WebRTC gateway  (not built yet)
 btd/            BLE transport adapter + btctl (dev client)
 xtask/          build/publish tooling — never ships
@@ -233,8 +245,11 @@ That's the whole onboarding path, and M1+M2 are exactly what make it true.
 ## Decisions that shape work rather than follow it
 
 1. ~~**Signing key custody**~~ — **done.** Three encrypted release keys plus an
-   unencrypted dev key in `~/.duck-keys`, all round-trip verified. Releases are signed in
-   CI behind an approval gate; only `release-1` goes into secrets. See
+   unencrypted dev key in `~/.duck-keys`, all round-trip verified; only `release-1` goes into
+   secrets. Releases are signed in CI under `environment: release`, which on this plan scopes
+   the secrets but **gates nothing** — no required reviewers, no branch policy, so anyone with
+   push access can reach the key. Accepted deliberately while no robot is in the field, and the
+   declaration is the hook that turns a real gate on with one settings change. See
    [`ci-setup.md`](ci-setup.md).
 2. **Safety authority** (§6) — pulled into M3 for the reason above.
 3. **Provisioning** — no longer safe to defer, and now has two claimants rather than one.
