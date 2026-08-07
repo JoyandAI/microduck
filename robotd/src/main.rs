@@ -198,6 +198,16 @@ struct RobotState {
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
+    /// Which policy files this process was configured with, as file names. `None` when the
+    /// policy is disabled.
+    ///
+    /// From the params rather than from the loaded network, and therefore known before the
+    /// control thread has finished loading anything — a client that subscribes during startup
+    /// gets the answer rather than a race. What *failed* to load is `policy_error`; this is
+    /// what was asked for, and the pair is what distinguishes "no policy wanted" from "the
+    /// policy this release ships would not load".
+    policy_walk: Option<String>,
+    policy_stand: Option<String>,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
     /// The policy is driving and has been asked for a non-zero velocity.
@@ -232,6 +242,16 @@ impl RobotState {
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             policy_error: ArcSwapOption::empty(),
+            policy_walk: params
+                .policy
+                .enabled
+                .then(|| file_name(&params.policy.walk))
+                .flatten(),
+            policy_stand: params
+                .policy
+                .enabled
+                .then(|| params.policy.stand.as_deref().and_then(file_name))
+                .flatten(),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
@@ -1010,6 +1030,13 @@ async fn control_loop<T: RobotIo>(
 ///
 /// Spelled out rather than `Debug`-formatted: this goes over the wire, and a client
 /// branching on it must not break because a variant was renamed in Rust.
+/// A path's file name, for reporting which policy is loaded. `None` for a path that ends in
+/// something that is not a file name — reported as unknown rather than as an empty string,
+/// which would read as "no policy".
+fn file_name(path: &std::path::Path) -> Option<String> {
+    Some(path.file_name()?.to_string_lossy().into_owned())
+}
+
 fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
     use duck_control::safety::Limit;
     match limit {
@@ -1262,9 +1289,26 @@ fn dispatch(
 
         // Handled by the caller, which owns the connection; answering here keeps the
         // request/response pairing in one place.
-        proto::Call::RobotSubscribe(_) => {
-            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
-        }
+        // The acknowledgement carries the policy identity: it is constant for the life of the
+        // process, so sending it once here costs nothing, where putting it on every frame
+        // would allocate two strings per tick on the control thread.
+        proto::Call::RobotSubscribe(_) => proto::Response::ok(
+            Some(id),
+            &proto::SubscribeResult {
+                accepted: true,
+                walk: state.policy_walk.clone(),
+                stand: state.policy_stand.clone(),
+                unavailable: state.policy_error.load_full().map_or_else(
+                    || {
+                        state
+                            .policy_walk
+                            .is_none()
+                            .then(|| "no policy configured; holding the startup pose".to_owned())
+                    },
+                    |e| Some(format!("policy would not load: {e}")),
+                ),
+            },
+        ),
 
         proto::Call::RobotStop => {
             intents.stop();
@@ -1529,6 +1573,87 @@ mod tests {
         .result_as()
         .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
         assert!(!session.active);
+    }
+
+    /// Subscribing answers with the policy this process is running.
+    ///
+    /// Sent once, in the acknowledgement, rather than on every frame: it cannot change while
+    /// the process lives, and two strings per tick on the control thread is a cost paid fifty
+    /// times a second for an answer that never differs.
+    #[test]
+    fn subscribing_names_the_policy() {
+        let mut params = Params::default();
+        params.policy.enabled = true;
+        params.policy.walk = "/opt/robot/releases/7/alpha_walking.onnx".into();
+        params.policy.stand = Some("/opt/robot/releases/7/alpha_stand.onnx".into());
+        let s = Arc::new(RobotState::new(&params, false, false));
+
+        let result: proto::SubscribeResult = dispatch(
+            &s,
+            &Intents::new(),
+            proto::Id::Number(1),
+            &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+        )
+        .result_as()
+        .expect("robot.subscribe must deserialize as SubscribeResult");
+
+        assert!(result.accepted);
+        // File names, not paths: the directory is what `robotctl version` reports, and the
+        // name is the part that differs between two builds someone is comparing.
+        assert_eq!(result.walk.as_deref(), Some("alpha_walking.onnx"));
+        assert_eq!(result.stand.as_deref(), Some("alpha_stand.onnx"));
+        assert_eq!(result.unavailable, None);
+    }
+
+    /// A policy that was wanted and would not load is a different situation from one that was
+    /// never wanted, and both end up as `policy: "held"` on the stream. The acknowledgement is
+    /// where they are told apart.
+    #[test]
+    fn subscribing_distinguishes_no_policy_from_a_broken_one() {
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let disabled = Arc::new(RobotState::new(&params, false, false));
+        let result: proto::SubscribeResult = dispatch(
+            &disabled,
+            &Intents::new(),
+            proto::Id::Number(1),
+            &proto::Call::RobotSubscribe(proto::SubscribeParams::default()),
+        )
+        .result_as()
+        .unwrap();
+        assert_eq!(result.walk, None);
+        assert!(
+            result
+                .unavailable
+                .as_deref()
+                .is_some_and(|u| u.contains("no policy configured")),
+            "{:?}",
+            result.unavailable
+        );
+
+        params.policy.enabled = true;
+        let broken = Arc::new(RobotState::new(&params, false, false));
+        broken
+            .policy_error
+            .store(Some(Arc::new("ONNX Runtime not loadable".to_owned())));
+        let result: proto::SubscribeResult = dispatch(
+            &broken,
+            &Intents::new(),
+            proto::Id::Number(1),
+            &proto::Call::RobotSubscribe(proto::SubscribeParams::default()),
+        )
+        .result_as()
+        .unwrap();
+        // The name it tried is still reported: "which policy failed" is the question.
+        assert!(result.walk.is_some(), "{result:?}");
+        assert!(
+            result
+                .unavailable
+                .as_deref()
+                .is_some_and(|u| u.contains("ONNX Runtime not loadable")),
+            "{:?}",
+            result.unavailable
+        );
     }
 
     /// `update.*` is a valid call that this daemon does not serve. It must be refused with a

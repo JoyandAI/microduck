@@ -24,3 +24,15 @@ clap_complete = "4.6.4"
 serde_json.workspace = true
 serde.workspace = true
 libc = "0.2.189"
+# `robotctl monitor`'s live view, and nothing else. Terminal only — no http, no crypto, no
+# async runtime, so the rule this file opens with still holds: none of the update engine's
+# tree comes in with it. Default features off because the widget set we do not draw (calendar,
+# canvas) is not worth compiling, and `crossterm` is the one backend that matters.
+#
+# Not hand-rolled escape codes: the parts that go wrong are the parts a crate has already
+# solved — restoring the terminal when the process panics mid-frame, a resize during a
+# redraw, and clipping a line to a width nobody checked.
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+] }

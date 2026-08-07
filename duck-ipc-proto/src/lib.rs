@@ -61,6 +61,33 @@ pub mod socket {
     pub const CONFIG: &str = "/run/configd.sock";
 }
 
+/// The robot's joint order, as every positional vector on the wire is indexed.
+///
+/// It lives here rather than in `duck_control::model` because it *is* protocol:
+/// [`RobotState::joints`] and [`RobotState::targets`] are bare arrays of numbers, and a
+/// client that cannot name index 3 cannot display them. `duck-control` re-exports this
+/// table, so the wire order and the order the servos are driven in are one list, not two
+/// that must be kept in step.
+///
+/// Left leg (5) · neck/head/mouth (5) · right leg (5).
+pub const JOINT_NAMES: [&str; 15] = [
+    "left_hip_yaw",
+    "left_hip_roll",
+    "left_hip_pitch",
+    "left_knee",
+    "left_ankle",
+    "neck_pitch",
+    "head_pitch",
+    "head_yaw",
+    "head_roll",
+    "mouth",
+    "right_hip_yaw",
+    "right_hip_roll",
+    "right_hip_pitch",
+    "right_knee",
+    "right_ankle",
+];
+
 /// Method names, as they go on the wire. Namespaced so a new namespace cannot collide
 /// with `update.*`. [`Call`] is the typed form.
 pub mod method {
@@ -693,6 +720,37 @@ pub struct SubscribeParams {
     pub hz: Option<u32>,
 }
 
+/// Answer to [`Call::RobotSubscribe`].
+///
+/// Carries what is **constant for the life of the process** — which policy this `robotd` is
+/// running — so a client can name it without the per-tick frame repeating it fifty times a
+/// second. [`RobotState::policy`] says which policy *drove this tick* (`walk`, `stand`,
+/// `held`); this says which network that is, which is the question anyone comparing two
+/// gaits is actually asking.
+///
+/// `accepted` keeps the shape [`IntentResult`] had here, so a client reading only that field
+/// is unaffected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubscribeResult {
+    pub accepted: bool,
+    /// Walking policy, as a file name rather than a path: the directory is the release
+    /// directory, which `robotctl version` already reports, and the file name is the part
+    /// that differs between two builds someone is comparing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub walk: Option<String>,
+    /// Standing policy, when one is configured. Without it the walking policy runs at every
+    /// velocity — a real configuration, and one worth being able to see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stand: Option<String>,
+    /// Why nothing is driving, when nothing is: the policy is disabled in params, or it was
+    /// wanted and could not be loaded. Those are different situations — the first is a
+    /// legitimate bench configuration, the second is a robot that should be rolled back —
+    /// and both are invisible in a stream whose `policy` field just says `held`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1138,7 +1196,7 @@ impl ImuHealth {
 /// error mask latches on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MotorThermal {
-    /// Name of the hottest joint, as `duck_control::model::JOINT_NAMES` spells it.
+    /// Name of the hottest joint, as [`JOINT_NAMES`] spells it.
     pub hottest: String,
     pub max_c: f64,
     pub mean_c: f64,
@@ -1203,7 +1261,7 @@ pub struct RobotState {
     pub safety: SafetyState,
     #[serde(rename = "loop")]
     pub control_loop: LoopState,
-    /// Measured joint angles, radians, in the model's joint order.
+    /// Measured joint angles, radians, indexed as [`JOINT_NAMES`].
     pub joints: Vec<f64>,
     /// What was commanded, so a viewer can show tracking error rather than guessing at it.
     pub targets: Vec<f64>,

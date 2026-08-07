@@ -428,6 +428,15 @@ applying backpressure — the rule the updater already uses for progress. Decima
 server-side and per-subscriber, so a 10 Hz dashboard genuinely costs the robot less than a
 50 Hz digital twin.
 
+**The acknowledgement names the policy.** `robot.subscribe` answers with `SubscribeResult`:
+which walking and standing networks this process was configured with, by file name, plus a
+sentence when nothing is driving — disabled in params, or wanted and unloadable. That belongs
+in the handshake rather than the frame because it cannot change while the process lives, and
+`policy` on the frame answers a different question: which mode drove *this tick*. Two releases
+with different gaits both report `walk`, and "which network is this?" is the first thing anyone
+comparing them asks. Putting it on the frame instead would allocate two strings per tick on the
+control thread for an answer that never differs.
+
 Two details that are easy to get wrong. **Nothing is assembled when nobody is subscribed** —
 which is the normal state of a robot — because building a frame allocates on the thread that
 should not be visiting the allocator without reason. And the limit names are **spelled out

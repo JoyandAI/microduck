@@ -18,23 +18,12 @@ pub const JOINT_IDS: [u8; NUM_JOINTS] = [
     10, 11, 12, 13, 14, // right leg
 ];
 
-pub const JOINT_NAMES: [&str; NUM_JOINTS] = [
-    "left_hip_yaw",
-    "left_hip_roll",
-    "left_hip_pitch",
-    "left_knee",
-    "left_ankle",
-    "neck_pitch",
-    "head_pitch",
-    "head_yaw",
-    "head_roll",
-    "mouth",
-    "right_hip_yaw",
-    "right_hip_roll",
-    "right_hip_pitch",
-    "right_knee",
-    "right_ankle",
-];
+/// Joint names, from the protocol crate — the wire indexes `joints` and `targets`
+/// positionally, so that order and this one cannot be allowed to drift apart. The
+/// assertion below is what makes "cannot" true.
+pub use duck_ipc_proto::JOINT_NAMES;
+
+const _: () = assert!(JOINT_NAMES.len() == NUM_JOINTS);
 
 /// The mouth is absent from every alpha policy — they are all 61-D observation, 14-action,
 /// and the action vector skips this index. Named so that omission is deliberate rather
