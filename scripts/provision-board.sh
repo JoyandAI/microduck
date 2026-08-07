@@ -42,10 +42,13 @@ DEV_KEY="$DEV_KEY_DEFAULT"
 NO_DEV_KEY=""
 USE_LOCAL=""
 
-# How long to wait for the board to come back after its reboot. Generous on purpose: a first
-# boot after an overlay change and a wifi cutover is the slowest this board will ever be, and
-# giving up early would report a failure that is really impatience.
-BOOT_TIMEOUT=180
+# How long to wait for the board to come back after its reboot. Generous on purpose, and sized
+# for the worst legitimate case rather than the normal one: a first boot after an overlay change
+# is already the slowest this board will ever be, and a wifi cutover that does not take costs a
+# further 90s of backstop grace plus a second boot. Giving up before that reports a failure that
+# is really impatience — and giving up at all is cosmetic here, since the board finishes on its
+# own either way.
+BOOT_TIMEOUT=300
 
 # Board-side paths. Duplicated from provision.sh rather than derived, because this script is
 # copied to a laptop and run from anywhere — there is nothing to source.
@@ -104,10 +107,49 @@ scp_target() {
     esac
 }
 
-# Non-interactive ssh, for the polling and the file checks. BatchMode so a board that has gone
-# away fails in seconds instead of sitting on a password prompt nobody is watching.
+# Non-interactive ssh, for the polling and the file checks.
+#
+# Every option here is load-bearing against a board that is rebooting:
+#
+#   BatchMode           a board that has gone away fails in seconds instead of sitting on a
+#                       password prompt nobody is watching.
+#   ConnectTimeout      bounds the TCP handshake — and *only* that, which is the trap below.
+#   ServerAlive*        bounds everything after it. A half-started network stack accepts the
+#                       handshake and then stops talking, and without this ssh waits for that
+#                       forever. That is not hypothetical: it is what made "waiting up to 180s"
+#                       hang indefinitely on the first real board, because the loop never got
+#                       back to its own clock to notice the time.
+#   ControlPath=none    an ssh_config with multiplexing turned on leaves a master socket
+#                       pointing at a connection the reboot killed, and every later call queues
+#                       behind it. Not our config to fix, so it is opted out of.
 rsh() {
-    ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$HOST" "$@"
+    ssh -o BatchMode=yes -o ConnectTimeout=5 \
+        -o ServerAliveInterval=3 -o ServerAliveCountMax=2 \
+        -o ControlPath=none -o StrictHostKeyChecking=accept-new "$HOST" "$@"
+}
+
+# Is the board answering? True/false within $1 seconds, whatever ssh decides to do.
+#
+# The belt to ServerAlive's braces. ssh has more ways to block than there are options to stop
+# it — DNS, an authentication step, a sluggish sshd on a booting board — and the one thing this
+# loop must never do is stop counting. `timeout(1)` would be the obvious tool and is not on
+# macOS, so the watchdog is written out.
+alive() {
+    rsh true >/dev/null 2>&1 &
+    _probe_pid=$!
+    _probe_n=0
+    while kill -0 "$_probe_pid" 2>/dev/null; do
+        if [ "$_probe_n" -ge "$1" ]; then
+            kill -TERM "$_probe_pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$_probe_pid" 2>/dev/null || true
+            wait "$_probe_pid" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+        _probe_n=$((_probe_n + 1))
+    done
+    wait "$_probe_pid"
 }
 
 # True while the board still has provisioning left to do. `provision.sh` removes the state file
@@ -232,27 +274,37 @@ ssh -t -o StrictHostKeyChecking=accept-new "$HOST" \
 echo
 say "waiting for ${HOST} to come back (up to ${BOOT_TIMEOUT}s)"
 
-# The board is mid-reboot, so it may still answer for a moment. Wait for it to go before
-# waiting for it to return, or this races and declares success against the dying session.
-_waited=0
-while [ "$_waited" -lt 20 ]; do
-    rsh true >/dev/null 2>&1 || break
+echo "  (the board finishes on its own — this is only watching)"
+
+# The board is mid-reboot, so it may still answer for a moment. Wait for it to go before waiting
+# for it to return, or this races and declares success against the dying session.
+_start="$(date +%s)"
+while [ "$(( $(date +%s) - _start ))" -lt 20 ]; do
+    alive 5 || break
     sleep 2
-    _waited=$((_waited + 2))
 done
 
-_waited=0
-while ! rsh true >/dev/null 2>&1; do
-    sleep 5
-    _waited=$((_waited + 5))
-    if [ "$_waited" -ge "$BOOT_TIMEOUT" ]; then
-        die "${HOST} did not come back within ${BOOT_TIMEOUT}s.
-  If the wifi cutover failed, the backstop restores netplan and reboots — which can take a
-  second boot. Try again, or look at the board:
-    ssh ${HOST} 'sudo cat ${LOG}'"
+# Wall clock, not a sum of sleeps. A probe that takes longer than expected must eat into the
+# budget rather than extend it — the sum-of-sleeps version could not time out at all while a
+# probe was blocked, which is precisely the failure this loop is here to survive.
+_start="$(date +%s)"
+_elapsed=0
+until alive 10; do
+    _elapsed="$(( $(date +%s) - _start ))"
+    if [ "$_elapsed" -ge "$BOOT_TIMEOUT" ]; then
+        die "no answer from ${HOST} after ${_elapsed}s.
+  That does not mean provisioning failed. The board resumes by itself at boot, so this is a
+  viewer that lost sight of it — the board may well be finishing right now. Look directly:
+    ssh ${HOST} 'sudo tail -f ${LOG}'
+  If it is genuinely unreachable: a failed wifi cutover makes the backstop restore netplan and
+  reboot, which costs a second boot, and NetworkManager may come back on a different DHCP lease
+  than netplan had — so check for a new address before concluding the board is down."
     fi
+    printf '.'
+    sleep 3
 done
-say "back after ~${_waited}s"
+echo
+say "back after ~$(( $(date +%s) - _start ))s"
 
 # ── phase 2, which is running unattended on the board ────────────────────────
 

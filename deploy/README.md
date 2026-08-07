@@ -38,6 +38,14 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 
 That sends the dev key from `~/.duck-keys/team.dev.pub` if you have one, starts provisioning,
 waits out the reboot, streams the log the unattended half writes, and ends on `robotctl health`.
+
+It is a **viewer**, not the thing doing the work: `provision.sh` installs a systemd unit that
+resumes at boot, so the board finishes whether or not this is still watching. If it loses sight
+of the board — a lease that moved, an ssh session that wedges — Ctrl-C costs you nothing:
+
+```bash
+ssh radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
+```
 It needs ssh key access, because it has to reconnect by itself after the board reboots — a
 password prompt cannot survive that. `--no-dev-key` for a board that should only take releases,
 `--ref BRANCH` to provision from a branch, `--local` to send this clone's `provision.sh` rather
