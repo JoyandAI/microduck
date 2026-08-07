@@ -115,6 +115,39 @@ wrong. The earlier design put the list in `/etc/robot/updater.toml`, which `inst
 so a board provisioned before a daemon existed never restarted it, and the update said success
 anyway (`install-path-gap.md` §4).
 
+**What this does not cover, and the shape of the answer.** Not restarting `updaterd` protects the
+*in-flight* update. It says nothing about whether the new `updaterd` works, and it defers finding out
+to the next boot — by which time the update is committed, nobody is watching, and recovery lives in
+`Engine::recover_on_start`, i.e. **inside the process that is failing to start**. `Restart=on-failure`
+then crash-loops a few times and gives up, leaving a robot with no update daemon and no way to update
+out of it. That contradicts the promise that recovery works when the robot is already broken.
+
+Two layers close it, and they catch different things:
+
+1. **Self-test the new binary before committing**, and restart `updaterd` after the reply is sent.
+   A read-only mode — config loaded, engine constructed, exiting *before* recovery — catches a wrong
+   architecture, a missing library, an immediate panic, and the likely one: a new `updaterd` that
+   rejects the board's existing `updater.toml`, which is the operator's file and preserved across
+   installs. Failing there rolls back cheaply, with no reboot. The restart must be **detached**,
+   because the engine runs inside the `update.apply` RPC and would otherwise hand the client a broken
+   pipe instead of its outcome. The same "restart after replying" reasoning extends to `btd`.
+
+   Note what the *existing* `--check-only` is not: it runs `recover_on_start` for real before honouring
+   the flag, so it increments every armed trial's boot count and can revert an update. It is an
+   operator tool, not a probe, and using it mid-update would have a second engine mutating the store
+   the first one is working on.
+
+2. **A boot-time net outside `updaterd`**, for what slips through. `OnFailure=` on a curated set of
+   units fires exactly when one exhausts its restarts, and a tiny oneshot swaps `current` to golden and
+   reboots. Four constraints make it a net rather than a footgun: the set is curated (`btd`
+   legitimately fails on a board whose radio has not appeared, and reverting a good release over that
+   is a poor trade); it reads a `golden` **symlink** rather than parsing config, because a release that
+   breaks the config parser must not also break its own rescue; it needs a loop guard and must not fire
+   when `current` is already golden; and it cannot fix hardware — a `robotd` that fails for want of
+   servo power fails identically on golden, the same distinction the health gate draws between
+   unhealthy and degraded. Golden rather than previous, deliberately: when the recovery path itself is
+   what broke, previous may be broken too.
+
 This is also why the update logic cannot live in `btd`: as a client of the
 update, `btd` cannot be the thing performing it — it would kill itself partway
 through. `btd` stays a thin transport, and the resident `updaterd` owns the state
