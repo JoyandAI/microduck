@@ -106,7 +106,7 @@ sudo robotctl update apply daemon --ref my-branch
 Two properties make this safe on every push, both enforced away from the workflow:
 
 - A dev build **cannot become `latest`** — the version is a semver prerelease, and
-  `version_from_tag` refuses to read a dev tag as a release version.
+  `version_under` refuses to read a dev tag as a release version.
 - A dev build **cannot install on a customer robot** — `allow_dev_keys` is false there, and a
   trusted key only counts as a dev key if its filename ends `.dev.pub`.
 

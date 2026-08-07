@@ -317,4 +317,20 @@ mod tests {
         assert_eq!(fetched.bytes, 13);
         assert_eq!(rx.recv().await, Some((13, Some(13))));
     }
+
+    /// A directory has no channels, so `--staging` against a sideload source must say that
+    /// rather than quietly install whatever is newest there — which is the one answer that
+    /// would look like it worked.
+    #[tokio::test]
+    async fn a_directory_has_no_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "1.0.0", "payload.tar.zst");
+        let source = LocalDir::new(dir.path().to_path_buf());
+
+        let err = source.staging_manifest().await.unwrap_err();
+        assert!(
+            format!("{err}").contains("staging"),
+            "the refusal must name the channel: {err}"
+        );
+    }
 }

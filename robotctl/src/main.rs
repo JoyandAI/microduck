@@ -281,6 +281,20 @@ enum UpdateCommand {
         #[arg(long = "ref", value_name = "REF", conflicts_with = "version")]
         git_ref: Option<String>,
 
+        /// Install the release candidate from the staging channel.
+        ///
+        /// A candidate is what `release.yml` published and nobody has promoted yet. It is
+        /// signed with the release key like any release, and carries the version it will be
+        /// promoted under — what makes it unreachable otherwise is that it is flagged as a
+        /// prerelease, which a plain `apply` skips so that no robot drifts onto a build no
+        /// one has validated.
+        ///
+        /// This is that filter's only opt-in, and it is per-command on purpose: nothing on
+        /// the board is left switched on afterwards, so the next `apply` is back on stable.
+        /// Pair it with `--version` to name one candidate rather than the newest.
+        #[arg(long, conflicts_with = "git_ref")]
+        staging: bool,
+
         /// Verify everything, then stop before the symlink swap.
         #[arg(long)]
         dry_run: bool,
@@ -1586,6 +1600,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// Which build `apply` should move to, from the three flags that can name one.
+///
+/// Its own function so the tests exercise this decision rather than a copy of it. clap already
+/// refuses `--ref` beside either of the others, so the only pair reaching here together is
+/// `--staging --version`, which names one candidate rather than the newest.
+fn apply_target(
+    staging: bool,
+    version: Option<&semver::Version>,
+    git_ref: Option<&str>,
+) -> proto::Target {
+    match (staging, version, git_ref) {
+        (true, Some(version), _) => proto::Target::StagingExact(version.clone()),
+        (true, None, _) => proto::Target::Staging,
+        (false, Some(version), _) => proto::Target::Exact(version.clone()),
+        (false, None, Some(git_ref)) => proto::Target::Ref(git_ref.to_owned()),
+        (false, None, None) => proto::Target::Latest,
+    }
+}
+
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
         Namespace::Health { json } => {
@@ -1632,17 +1665,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
             component: name,
             version,
             git_ref,
+            staging,
             dry_run,
             interrupt_sessions,
         } => proto::Call::Apply(proto::ApplyParams {
             component: proto::ComponentId::new(name),
-            // clap enforces that version and git_ref are mutually exclusive, so the order
-            // here cannot silently prefer one over the other.
-            target: match (version, git_ref) {
-                (Some(version), _) => proto::Target::Exact(version.clone()),
-                (None, Some(git_ref)) => proto::Target::Ref(git_ref.clone()),
-                (None, None) => proto::Target::Latest,
-            },
+            target: apply_target(*staging, version.as_ref(), git_ref.as_deref()),
             options: proto::ApplyOptions {
                 dry_run: *dry_run,
                 interrupt_sessions: *interrupt_sessions,
@@ -1965,6 +1993,64 @@ mod tests {
         };
         assert_eq!(git_ref.as_deref(), Some("my-branch"));
         assert!(version.is_none());
+    }
+
+    /// `--staging` alone means the newest candidate; with `--version`, that one candidate.
+    ///
+    /// The pair is the only combination clap allows through, so the match that turns these
+    /// into a `Target` has one case that cannot be reached by argument parsing — asserted
+    /// here rather than trusted, because getting it backwards would install a *stable*
+    /// release while reporting that it installed a candidate.
+    #[test]
+    fn staging_selects_the_candidate_channel() {
+        let target = |args: &[&str]| {
+            let mut argv = vec!["robotctl", "update", "apply", "daemon"];
+            argv.extend_from_slice(args);
+            let cli = Cli::try_parse_from(argv).expect("must parse");
+            let Namespace::Update {
+                command:
+                    UpdateCommand::Apply {
+                        version,
+                        git_ref,
+                        staging,
+                        ..
+                    },
+            } = cli.namespace
+            else {
+                panic!("expected update apply");
+            };
+            apply_target(staging, version.as_ref(), git_ref.as_deref())
+        };
+
+        assert_eq!(target(&["--staging"]), proto::Target::Staging);
+        assert_eq!(
+            target(&["--staging", "--version", "0.3.0"]),
+            proto::Target::StagingExact(semver::Version::new(0, 3, 0))
+        );
+        assert_eq!(target(&[]), proto::Target::Latest);
+        assert_eq!(
+            target(&["--version", "0.3.0"]),
+            proto::Target::Exact(semver::Version::new(0, 3, 0))
+        );
+    }
+
+    /// A candidate and a branch build are different streams under different keys, so asking
+    /// for both is a mistake to report rather than one to resolve by precedence.
+    #[test]
+    fn staging_and_ref_are_refused_together() {
+        assert!(
+            Cli::try_parse_from([
+                "robotctl",
+                "update",
+                "apply",
+                "daemon",
+                "--staging",
+                "--ref",
+                "my-branch",
+            ])
+            .is_err(),
+            "--staging with --ref must be refused"
+        );
     }
 
     /// A branch name with a slash must survive argument parsing untouched.

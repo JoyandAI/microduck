@@ -777,6 +777,22 @@ pub enum Target {
     /// install of one looks like a downgrade. Refusing them would make the flow useless,
     /// and an operator naming a ref is stating intent as explicitly as naming a version.
     Ref(String),
+    /// The newest **release candidate** — what `release.yml` published to `staging` and
+    /// nobody has promoted yet.
+    ///
+    /// A candidate is unreachable any other way. It is flagged as a prerelease on GitHub, so
+    /// [`Target::Latest`] skips it by design — that filter is what keeps a robot from drifting
+    /// onto a build no one has validated, and it has no opt-out. This variant is the opt-*in*:
+    /// an operator with root saying "the one being tested", once.
+    ///
+    /// The candidate carries the same version the promoted release will (`0.3.0`, not
+    /// `0.3.0-rc1`) and is signed with the same release key. What separates the two streams is
+    /// the tag it lives under, which is why resolving this needs its own prefix rather than a
+    /// flag on the existing one.
+    Staging,
+    /// A named candidate, when the newest is not the one wanted — reinstalling the candidate a
+    /// board already ran after a rollback, or comparing two of them.
+    StagingExact(semver::Version),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2033,7 +2049,7 @@ mod tests {
         assert!(!serde_json::to_string(&open).unwrap().contains("psk"));
     }
 
-    /// `Target` must survive the wire in all three forms, and the two that carry data must
+    /// `Target` must survive the wire in all five forms, and the three that carry data must
     /// not be confusable. `latest` is a bare string while the others are single-key objects,
     /// which is what an externally-tagged enum with `rename_all = "snake_case"` produces —
     /// pinned here because this JSON is a contract with `btd` and the app, not an
@@ -2047,6 +2063,11 @@ mod tests {
                 r#"{"exact":"1.2.3"}"#,
             ),
             (Target::Ref("my-branch".into()), r#"{"ref":"my-branch"}"#),
+            (Target::Staging, r#""staging""#),
+            (
+                Target::StagingExact(semver::Version::new(0, 3, 0)),
+                r#"{"staging_exact":"0.3.0"}"#,
+            ),
         ];
         for (target, expected) in cases {
             let line = serde_json::to_string(&target).unwrap();

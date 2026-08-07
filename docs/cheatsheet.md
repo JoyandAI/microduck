@@ -134,6 +134,22 @@ sudo robotctl update apply --ref <branch> daemon
 `--ref` installs what that branch last built on CI, which is the whole dev workflow. `--version` pins
 an exact release. Give one of them unless you genuinely mean "go to stable".
 
+To install a **release candidate** — what `release.yml` published to staging and nobody has promoted
+yet, which is what a canary robot should run before a promotion:
+
+```
+sudo robotctl update apply --staging daemon
+```
+
+```
+sudo robotctl update apply --staging --version 0.3.0 daemon
+```
+
+A candidate is signed with the release key like any release and carries the version it will be
+promoted under. What makes it unreachable without the flag is that it is flagged as a prerelease, and
+a plain `apply` skips those so no robot drifts onto a build nobody has validated. `--staging` is that
+filter's only opt-in, it applies to the one command, and it leaves nothing switched on afterwards.
+
 A merge does not publish instantly: CI has to build `main` before `--ref main` resolves to it.
 `gh run list --branch main` says whether it is done.
 

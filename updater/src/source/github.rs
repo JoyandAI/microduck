@@ -35,6 +35,7 @@ pub struct GithubReleases {
     tag_prefix: String,
     manifest_asset: String,
     ref_tag_prefix: String,
+    staging_tag_prefix: String,
     client: reqwest::Client,
 }
 
@@ -69,11 +70,13 @@ impl GithubReleases {
         tag_prefix: String,
         manifest_asset: String,
         ref_tag_prefix: String,
+        staging_tag_prefix: String,
     ) -> Self {
         Self {
             repo,
             tag_prefix,
             ref_tag_prefix,
+            staging_tag_prefix,
             manifest_asset,
             // A failure here means a broken TLS setup, which is fatal for every
             // request anyway; fall back to a default client so construction stays
@@ -95,9 +98,9 @@ impl GithubReleases {
         format!("{}{}", self.ref_tag_prefix, git_ref)
     }
 
-    /// Parse a version out of a tag, or `None` if the tag isn't ours.
-    fn version_from_tag(&self, tag: &str) -> Option<semver::Version> {
-        semver::Version::parse(tag.strip_prefix(&self.tag_prefix)?).ok()
+    /// The tag a release candidate lives under: `daemon-staging-v` + the version.
+    fn staging_tag_for(&self, version: &semver::Version) -> String {
+        format!("{}{}", self.staging_tag_prefix, version)
     }
 
     async fn release_for_tag(&self, tag: &str) -> Result<Release, Error> {
@@ -122,6 +125,29 @@ impl GithubReleases {
     /// never become `latest` for the fleet, and relying on someone remembering a
     /// checkbox is not a safeguard.
     async fn newest_version(&self) -> Result<semver::Version, Error> {
+        self.newest_under(&self.tag_prefix, false).await
+    }
+
+    /// The newest release candidate, which is the same scan with the prerelease flag allowed.
+    ///
+    /// Only the *GitHub* flag is allowed, never a semver prerelease: candidates carry the plain
+    /// version they will be promoted under (`0.3.0`), while dev builds carry `0.3.0-dev.17.abc`
+    /// and live under a third prefix. So the two exclusions in [`Self::newest_under`] are not
+    /// redundant here — dropping one still excludes branch builds, which is the point.
+    async fn newest_staging_version(&self) -> Result<semver::Version, Error> {
+        self.newest_under(&self.staging_tag_prefix, true).await
+    }
+
+    /// Highest version among tags carrying `prefix`.
+    ///
+    /// `allow_flagged_prerelease` is the whole difference between the stable channel and the
+    /// staging one, and it is a parameter rather than a field so that the call site — one of
+    /// exactly two — states which channel it means.
+    async fn newest_under(
+        &self,
+        prefix: &str,
+        allow_flagged_prerelease: bool,
+    ) -> Result<semver::Version, Error> {
         let mut best: Option<semver::Version> = None;
 
         for page in 1..=MAX_PAGES {
@@ -136,12 +162,11 @@ impl GithubReleases {
 
             let count = releases.len();
             for release in releases {
-                if release.draft || release.prerelease {
+                if release.draft || (release.prerelease && !allow_flagged_prerelease) {
                     continue;
                 }
-                if let Some(version) = self.version_from_tag(&release.tag_name)
-                    // A semver prerelease is a dev or candidate build, whatever the
-                    // release was flagged as.
+                if let Some(version) = version_under(prefix, &release.tag_name)
+                    // A semver prerelease is a dev build, whatever the release was flagged as.
                     && version.pre.is_empty()
                     && best.as_ref().is_none_or(|b| version > *b)
                 {
@@ -157,8 +182,8 @@ impl GithubReleases {
 
         best.ok_or_else(|| {
             Error::Network(format!(
-                "no releases in {} with tag prefix {:?}",
-                self.repo, self.tag_prefix
+                "no releases in {} with tag prefix {prefix:?}",
+                self.repo
             ))
         })
     }
@@ -253,6 +278,20 @@ impl Source for GithubReleases {
         self.signed_manifest(&tag).await
     }
 
+    async fn staging_manifest(&self) -> Result<SignedBytes<Manifest>, Error> {
+        let version = self.newest_staging_version().await?;
+        let tag = self.staging_tag_for(&version);
+        tracing::debug!(repo = %self.repo, %tag, "resolved newest candidate");
+        self.signed_manifest(&tag).await
+    }
+
+    async fn staging_manifest_for(
+        &self,
+        version: &semver::Version,
+    ) -> Result<SignedBytes<Manifest>, Error> {
+        self.signed_manifest(&self.staging_tag_for(version)).await
+    }
+
     async fn fetch_artifact(
         &self,
         manifest: &Manifest,
@@ -294,6 +333,14 @@ impl Source for GithubReleases {
     }
 }
 
+/// Parse a version out of a tag carrying `prefix`, or `None` if the tag is not one of ours.
+///
+/// Free-standing because two prefixes now feed it — stable and staging — and a method reading
+/// `self.tag_prefix` invited exactly the bug where a staging scan silently measured stable tags.
+fn version_under(prefix: &str, tag: &str) -> Option<semver::Version> {
+    semver::Version::parse(tag.strip_prefix(prefix)?).ok()
+}
+
 /// Extract a filename from a URL, refusing anything that could escape `dest_dir`.
 ///
 /// A manifest is signed, but this runs *before* verification, and a compromised
@@ -328,6 +375,7 @@ mod tests {
             "daemon-v".into(),
             "manifest.json".into(),
             "daemon-dev-".into(),
+            "daemon-staging-v".into(),
         )
     }
 
@@ -336,7 +384,37 @@ mod tests {
         let s = source();
         let v = semver::Version::new(1, 4, 2);
         assert_eq!(s.tag_for(&v), "daemon-v1.4.2");
-        assert_eq!(s.version_from_tag("daemon-v1.4.2"), Some(v));
+        assert_eq!(version_under(&s.tag_prefix, "daemon-v1.4.2"), Some(v));
+    }
+
+    #[test]
+    fn staging_tags_round_trip() {
+        let s = source();
+        let v = semver::Version::new(0, 3, 0);
+        assert_eq!(s.staging_tag_for(&v), "daemon-staging-v0.3.0");
+        assert_eq!(
+            version_under("daemon-staging-v", "daemon-staging-v0.3.0"),
+            Some(v)
+        );
+    }
+
+    /// The two channels must not read each other's tags.
+    ///
+    /// This is the failure that would matter and would not look like one: a staging scan that
+    /// silently matched `daemon-v*` would report the newest *stable* release as the candidate,
+    /// and `--staging` would install what a plain `apply` already installs while claiming to
+    /// test something. It holds because `daemon-staging-v0.3.0` does not start with `daemon-v`
+    /// — an accident of naming, so it is pinned here rather than left to be re-derived.
+    #[test]
+    fn the_two_channels_cannot_read_each_others_tags() {
+        assert_eq!(version_under("daemon-v", "daemon-staging-v0.3.0"), None);
+        assert_eq!(version_under("daemon-staging-v", "daemon-v0.3.0"), None);
+        // And neither reads a dev build, which is what keeps `--staging` from resolving to a
+        // branch someone pushed.
+        assert_eq!(
+            version_under("daemon-staging-v", "daemon-dev-my-branch"),
+            None
+        );
     }
 
     /// A ref becomes a dev tag, and the ref is appended verbatim.
@@ -351,27 +429,27 @@ mod tests {
         assert_eq!(s.ref_tag_for("feature/foo"), "daemon-dev-feature/foo");
     }
 
-    /// **A dev tag must never be mistaken for a release.** `version_from_tag` drives
+    /// **A dev tag must never be mistaken for a release.** `version_under` drives
     /// `newest_version`, which is what the fleet installs — so if a dev tag parsed as a
     /// version here, a branch build could become `latest` for every robot. That is the
     /// failure the two independent guards exist to prevent, and this is the first of them.
     #[test]
     fn a_dev_tag_is_not_a_release_version() {
         let s = source();
-        assert_eq!(s.version_from_tag("daemon-dev-my-branch"), None);
+        assert_eq!(version_under(&s.tag_prefix, "daemon-dev-my-branch"), None);
         // Even when the dev tag ends in something version-shaped.
-        assert_eq!(s.version_from_tag("daemon-dev-0.2.0"), None);
+        assert_eq!(version_under(&s.tag_prefix, "daemon-dev-0.2.0"), None);
         // And the staging stream stays separate too.
-        assert_eq!(s.version_from_tag("daemon-staging-v0.2.0"), None);
+        assert_eq!(version_under(&s.tag_prefix, "daemon-staging-v0.2.0"), None);
     }
 
     /// Another channel's tags in the same repo must be ignored, not misparsed.
     #[test]
     fn foreign_tags_are_ignored() {
         let s = source();
-        assert_eq!(s.version_from_tag("model-v3.0.0"), None);
-        assert_eq!(s.version_from_tag("v1.0.0"), None);
-        assert_eq!(s.version_from_tag("daemon-vnot-a-version"), None);
+        assert_eq!(version_under(&s.tag_prefix, "model-v3.0.0"), None);
+        assert_eq!(version_under(&s.tag_prefix, "v1.0.0"), None);
+        assert_eq!(version_under(&s.tag_prefix, "daemon-vnot-a-version"), None);
     }
 
     #[test]
@@ -450,13 +528,13 @@ mod tests {
     #[test]
     fn dev_versions_are_recognised_as_prereleases() {
         let s = source();
-        let dev = s.version_from_tag("daemon-v0.2.0-dev.5.abc1234").unwrap();
+        let dev = version_under(&s.tag_prefix, "daemon-v0.2.0-dev.5.abc1234").unwrap();
         assert!(
             !dev.pre.is_empty(),
             "dev builds must carry a semver prerelease"
         );
 
-        let stable = s.version_from_tag("daemon-v0.2.0").unwrap();
+        let stable = version_under(&s.tag_prefix, "daemon-v0.2.0").unwrap();
         assert!(stable.pre.is_empty());
         // And a dev build sorts *below* the release it precedes, so it can never look
         // like an upgrade from it.

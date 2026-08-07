@@ -347,6 +347,8 @@ impl Engine {
             crate::proto::Target::Latest => source.latest_manifest().await?,
             crate::proto::Target::Exact(v) => source.manifest_for(v).await?,
             crate::proto::Target::Ref(git_ref) => source.manifest_at_ref(git_ref).await?,
+            crate::proto::Target::Staging => source.staging_manifest().await?,
+            crate::proto::Target::StagingExact(v) => source.staging_manifest_for(v).await?,
         };
         self.verify_manifest(&signed)?;
         let manifest = signed.parsed.clone();
@@ -379,6 +381,12 @@ impl Engine {
         // a semver prerelease, so it sorts below the release it precedes — so guarding it
         // would reject every branch install. Rollback and reset-to-golden move backwards on
         // purpose without passing through here.
+        //
+        // The two `Staging` targets are unguarded for the `Exact` reason and not the `Ref`
+        // one: a candidate carries a plain version that normally sorts *above* the installed
+        // release, so the guard would rarely fire — but when it did, it would be refusing a
+        // reinstall of the candidate a board had just rolled back from, which is exactly the
+        // move someone reaches for while investigating that rollback.
         if matches!(target, crate::proto::Target::Latest)
             && let Some(installed) = &installed
             && manifest.version < *installed

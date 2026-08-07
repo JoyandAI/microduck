@@ -1042,18 +1042,24 @@ doesn't match `Cargo.toml` (tagging without bumping), and `promote` refuses a ve
 that doesn't match the staging manifest.
 
 - Channels: `staging` → `stable`. CI publishes candidates to `staging`.
-- A canary robot takes a candidate **by explicit version**, not by tracking the channel:
+- A canary robot takes a candidate with **one flag, per command**:
 
   ```
-  sudo robotctl update apply daemon --version 0.2.0
+  sudo robotctl update apply daemon --staging
   ```
 
-  with `tag_prefix = "daemon-staging-v"` in its config, which resolves the tag directly. An
-  earlier draft said canaries "auto-pull staging", and that is not implementable as written:
+  An earlier draft said canaries "auto-pull staging", and that was not implementable as written:
   `newest_version` skips anything GitHub flags as a prerelease *and* anything carrying a semver
-  prerelease component, with no opt-out — which is exactly what keeps a customer robot off
-  candidate builds, so the filter stays and the sentence goes. Discovered by a board reporting
-  `no releases in … with tag prefix "daemon-staging-v"` against a staging release that existed.
+  prerelease component. That filter is exactly what keeps a customer robot off candidate builds,
+  so it stays, and `--staging` is its only opt-in — a second scan under `staging_tag_prefix`
+  which allows the *GitHub* flag while still excluding semver prereleases, so a branch build can
+  never be mistaken for a candidate. `latest_manifest` is untouched, so `auto_apply` and the
+  periodic check keep resolving stable: nothing drifts onto a candidate without a person and
+  root.
+
+  The first attempt at this was a board pointed at staging by editing `tag_prefix`, which
+  reported `no releases in … with tag prefix "daemon-staging-v"` against a candidate sitting
+  right there — the prefix said where to look, and the prerelease filter refused to look.
 - On green, **promote**: repoint `stable` at the *same bytes* already validated —
   re-sign the `stable` manifest to reference the identical tarball + hash. No
   rebuild, no re-flash, no hand-copying files. Promotion is one command / one
