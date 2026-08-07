@@ -105,8 +105,62 @@ survive a daemon crash to perform rollback.
 **Corollary — `updaterd` must be resident, and must exclude itself from the
 restart set.** `updaterd` and `btd` both ship *inside* the daemon artifact, so a
 naive "restart everything" would kill the executor mid-swap or mid-health-gate.
-`on_apply` therefore restarts `robotd` and `mediad` only; `updaterd` and `btd`
-pick up the new binary at the next boot or an explicit later restart.
+`on_apply` therefore restarts everything the release ships **except** those two, which pick up the
+new binary at the next boot or an explicit later restart.
+
+The set is derived from the release's own `systemd/*.service` files rather than read from the
+board's config, and the two exclusions live in code (`NEVER_RESTART`) rather than in configuration:
+they are properties of what those daemons *are*, not choices an operator should be able to get
+wrong. The earlier design put the list in `/etc/robot/updater.toml`, which `install.sh` preserves —
+so a board provisioned before a daemon existed never restarted it, and the update said success
+anyway (`install-path-gap.md` §4).
+
+**What this does not cover, and the shape of the answer.** Not restarting `updaterd` protects the
+*in-flight* update. It says nothing about whether the new `updaterd` works, and it defers finding out
+to the next boot — by which time the update is committed, nobody is watching, and recovery lives in
+`Engine::recover_on_start`, i.e. **inside the process that is failing to start**. `Restart=on-failure`
+then crash-loops a few times and gives up, leaving a robot with no update daemon and no way to update
+out of it. That contradicts the promise that recovery works when the robot is already broken.
+
+Two layers close it, and they catch different things. **The first is implemented**; the second is
+its own PR.
+
+1. **Self-test the new binary before committing**, and restart `updaterd` after the reply is sent.
+   A read-only mode — config loaded, engine constructed, exiting *before* recovery — catches a wrong
+   architecture, a missing library, an immediate panic, and the likely one: a new `updaterd` that
+   rejects the board's existing `updater.toml`, which is the operator's file and preserved across
+   installs. Failing there rolls back cheaply, with no reboot. The restart must be **detached**,
+   because the engine runs inside the `update.apply` RPC and would otherwise hand the client a broken
+   pipe instead of its outcome. The same "restart after replying" reasoning extends to `btd`.
+
+   Note what the *existing* `--check-only` is not: it runs `recover_on_start` for real before honouring
+   the flag, so it increments every armed trial's boot count and can revert an update. It is an
+   operator tool, not a probe, and using it mid-update would have a second engine mutating the store
+   the first one is working on.
+
+   As built: `self_test_updaterd` runs after the shipped units restart and before the health gate,
+   only where `on_apply` is a restart — a model component has no `updaterd`, and the bootstrap
+   install forces `on_apply=none` precisely because nothing is installed yet. `Error::SelfTest`
+   carries the binary's last line of stderr, so "config error: unknown field `foo`" reaches the
+   rollback reason rather than being flattened into "unreachable".
+
+   The restarts go through `systemd-run --on-active=5s`, and two details there are load-bearing. A
+   *child process* would sit in `updaterd`'s cgroup and be killed partway through restarting its own
+   parent; a transient unit is not. And the update lock is dropped **before** anything is spawned,
+   because a fork duplicates every open descriptor in the process — including locks held by other
+   engines in the same process, which surfaced as unrelated operations failing with `Busy` in the
+   test suite.
+
+2. **A boot-time net outside `updaterd`**, for what slips through. `OnFailure=` on a curated set of
+   units fires exactly when one exhausts its restarts, and a tiny oneshot swaps `current` to golden and
+   reboots. Four constraints make it a net rather than a footgun: the set is curated (`btd`
+   legitimately fails on a board whose radio has not appeared, and reverting a good release over that
+   is a poor trade); it reads a `golden` **symlink** rather than parsing config, because a release that
+   breaks the config parser must not also break its own rescue; it needs a loop guard and must not fire
+   when `current` is already golden; and it cannot fix hardware — a `robotd` that fails for want of
+   servo power fails identically on golden, the same distinction the health gate draws between
+   unhealthy and degraded. Golden rather than previous, deliberately: when the recovery path itself is
+   what broke, previous may be broken too.
 
 This is also why the update logic cannot live in `btd`: as a client of the
 update, `btd` cannot be the thing performing it — it would kill itself partway

@@ -128,6 +128,16 @@ action = "restart"
 # configd *is* restarted: it holds no long-lived session state, the progress stream a client
 # watches comes from updaterd rather than from it, and a config change that never takes effect
 # until reboot would be its own kind of surprise.
+#
+# **The list is additive, not authoritative.** Since the restart set is derived from the units a
+# release actually ships, this only needs to name units the release does *not* ship. Both entries
+# below are therefore redundant, and kept because a config that names what it expects is easier to
+# read than an empty list that quietly means "work it out".
+#
+# It used to be authoritative, and that is the bug this replaced: the file belongs to the operator
+# and `install.sh` preserves it, so a board provisioned before `configd` existed kept
+# `units = ["robotd"]` forever and every release swapped configd's binary while leaving the old
+# process running. See `docs/install-path-gap.md` §4.
 units  = ["robotd", "configd"]
 
 # The gate that makes auto-rollback real. 30s is still the placeholder M4 is meant to

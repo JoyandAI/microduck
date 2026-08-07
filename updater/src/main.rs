@@ -46,9 +46,32 @@ struct Args {
     #[arg(long, global = true)]
     robot_socket: Option<PathBuf>,
 
-    /// Run boot recovery, report what it would do, and exit without serving.
+    /// Run boot recovery, then exit without serving.
+    ///
+    /// Note this **performs** recovery rather than reporting it: `record_boot` advances every armed
+    /// trial and reverts one that is exhausted. An operator tool, not a probe — see `--self-test`
+    /// for the read-only one, and `updater-design.md` §4 for why the distinction cost an
+    /// investigation.
     #[arg(long, global = true)]
     check_only: bool,
+
+    /// Load the config, construct the engine, and exit. Touches no state.
+    ///
+    /// The probe an update runs against the release it just swapped in, before committing to it.
+    /// `updaterd` never restarts itself during an update, so a replacement binary that cannot start
+    /// is otherwise discovered at the *next boot* — after the commit, with nobody watching, and with
+    /// recovery living inside the process that is failing to start.
+    ///
+    /// Deliberately stops short of `recover_on_start`: running that mid-update would have a second
+    /// engine advancing the in-flight trial's boot count against the same store, and reverting the
+    /// update the first one is still performing.
+    ///
+    /// What it does exercise is what actually breaks: the binary loads and is the right
+    /// architecture, its libraries resolve, it does not panic on startup, and — the likely one — it
+    /// accepts the board's existing `updater.toml`, which belongs to the operator and is preserved
+    /// across installs while a release is free to change what it expects.
+    #[arg(long, global = true)]
+    self_test: bool,
 
     /// Enable a fault injection point (repeatable). Test/bench only — refused
     /// unless the config allows it, and never set on a client robot.
@@ -544,6 +567,12 @@ async fn serve(args: Args) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Before recovery, not after: this must not touch state. See the flag's documentation.
+    if args.self_test {
+        tracing::info!("--self-test: config loaded and engine constructed; not serving");
+        return ExitCode::SUCCESS;
+    }
 
     // BEFORE serving. A robot that booted into a bad release has already begun
     // reverting by the time anything can ask it to do something else.
