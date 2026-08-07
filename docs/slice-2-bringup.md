@@ -10,8 +10,15 @@ an error, which killed the control thread and made `robot.health` blame the wron
 fixed: `duck-control::policy::catching_ort_panics` turns it into a `PolicyError`, so it takes
 the existing "hold the pose and report why" path.
 
-**Still not run on hardware:** the fix itself, and slice 2's loop rate with inference in the
-tick. The recipe for both is [Verifying on the board](#verifying-on-the-board) below.
+**Both are now closed on hardware.** The fix was exercised on the board by pointing `robotd` at
+a 1.20.1 runtime through `ORT_DYLIB_PATH`: the loop kept ticking and health named the version
+mismatch, instead of a dead control thread reporting "has not completed a cycle yet". Slice 2
+then ran with inference in the tick, and `0.2.0` — the first release containing any of it — was
+installed from the stable channel.
+
+Nothing links to this file any more. It is kept as the record of what the board actually said;
+the reusable half is the recipe below, and [`cheatsheet.md`](cheatsheet.md) is where a command
+someone needs again should end up.
 
 ## What already works, verified on the board
 

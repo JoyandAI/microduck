@@ -29,7 +29,7 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-352 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+458 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
 Those tests are also where the engine's failure paths are: a bad signature, a release that
 comes up unhealthy, a post-install hook that fails, power loss between the swap and the
@@ -46,7 +46,7 @@ this clone — `./scripts/provision-board.sh [user@]host`, described in
 
 | | |
 |---|---|
-| `robotd` | motor control, gait policy, **safety authority**. A real 50 Hz loop driving walk/stand through a safety layer that holds the only write handle, plus intents and the four `robot.*` methods the updater needs. **Never run on a robot** ([`docs/robotd-design.md`](docs/robotd-design.md)). |
+| `robotd` | motor control, gait policy, **safety authority**. A real 50 Hz loop driving walk/stand through a safety layer that holds the only write handle, plus intents and the four `robot.*` methods the updater needs. **It walks on a board**, driven through the intent API ([`docs/robotd-design.md`](docs/robotd-design.md)). |
 | `duck-control` | the control core — robot model, bus, sensing, observations, ONNX policy, safety. A library, not a service: no tokio, no sockets, no systemd. |
 | `padd` | a gamepad, as an ordinary intent client. No privileged access; it sends what the app and SDK will send. |
 | `updaterd` | the update engine. Resident, and deliberately independent of `robotd` — it is the recovery path, so it must work when the robot does not. |
@@ -426,12 +426,11 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
 - **Open:** artifact hosting. This repo is private, and a robot without a token cannot
   download from it (§6.1). Dev boards have tokens; the fleet will need a public
   artifact-only repository or an object store. Blocks hardware bring-up, not development.
-- **`robotd` walks — in principle.** A real 50 Hz loop, one 61-D observation builder, the
-  walk/stand policy pair, and a safety layer holding the only write handle. `robot.health`
-  means *the loop is meeting its deadline and the policy loaded*, which is what makes
-  auto-rollback gate on something real. **None of it has met a robot**: the tests prove the
-  logic is self-consistent, not that it walks. Needs ONNX Runtime on the board, which
-  `install.sh` now installs.
+- **`robotd` walks.** A real 50 Hz loop, one 61-D observation builder, the walk/stand policy
+  pair, and a safety layer holding the only write handle — on a Radxa Zero 3W, driven through
+  the intent API from a gamepad. `robot.health` means *the loop is meeting its deadline and
+  the policy loaded*, which is what makes auto-rollback gate on something real. The loop held
+  50.0 Hz with `missed=3` in 15022 ticks before inference joined the tick.
 - **The app path works on hardware, without encryption.** A Mac discovers the robot, bonds, passes
   the PIN and gets real answers back over BLE — but `encrypt_read` hangs CoreBluetooth, so the link
   currently carries no encryption and the PIN travels in clear. That must close before anything
@@ -443,12 +442,16 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
 - **BLE pairing is a six-digit PIN**, default `000000` and therefore not a secret: out of the box
   it proves physical presence and nothing more. Per-robot PINs are a provisioning step that does
   not exist yet, and the security of the app path rests on it.
-- **Not started:** `mediad`, the phone app, the SDK, safety authority.
+- **Not started:** `mediad`, the phone app, the SDK.
 - **Runs on aarch64 Linux, emulated.** `scripts/board-test.sh` runs in CI: it
   cross-compiles for the board and executes 13 checks — rollback, tampered-artifact
   refusal, boot-counter recovery, socket modes, peer-credential authorization — on
   Debian 13 (Trixie), the userland we ship. `BOARD_IMAGES=` runs it against another.
-- **Never run on real hardware.** No board yet, so nothing here says anything about motor
-  timing, control-loop jitter on a non-RT kernel, thermals or eMMC behaviour. Two specifics:
-  `systemctl restart` in `on_apply` has never met real systemd (containers have none), and
-  the 30s health-gate timeout is a guess until someone measures a real boot.
+- **What hardware has settled**, because slices 1 and 2 could not be finished without it: the
+  loop keeps its rate on a non-RT kernel, `systemctl restart` in `on_apply` works against real
+  systemd, and the health gate commits and reverts for real — including rolling back a release
+  whose unit named a binary it did not ship. A signed release has been installed from the
+  stable channel end to end.
+- **What it has not.** Thermals, eMMC write timing, battery under load, whether logs survive a
+  power cut, and whether the 30s health-gate timeout has any margin on a cold boot. Those are
+  measurements nobody has taken, and they are what M4 is still open for.
