@@ -64,8 +64,8 @@ No release needed — `deploy/robotd.toml` takes absolute paths:
 
 ```toml
 [policy]
-walk  = "/home/pierre/my_walk.onnx"
-stand = "/home/pierre/my_stand.onnx"
+walk  = "/home/radxa/my_walk.onnx"
+stand = "/home/radxa/my_stand.onnx"
 ```
 
 Then `sudo systemctl restart robotd`. A policy that fails to load is reported through

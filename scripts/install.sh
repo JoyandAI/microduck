@@ -51,9 +51,29 @@ set -eu
 # The repository releases are published from. Override for a fork or a test repo.
 REPO="${DUCK_REPO:-pollen-robotics/microduck_daemon}"
 
-# Branch the config and trusted keys are read from. Pin to a tag for a reproducible
-# provisioning run.
-REF="${DUCK_REF:-main}"
+# Branch the trusted keys are read from. Pin to a tag for a reproducible provisioning run.
+#
+# Deliberately *not* where the config comes from — see `CONFIG_REF` below. Keys and config age
+# differently: the key set only ever grows, so the newest is the safest, while a config field is
+# only understood by binaries from its own version onwards.
+ENV_REF="${DUCK_REF:-}"
+REF="${ENV_REF:-main}"
+
+# Where `updater.toml` and `robotd.toml` come from. Defaults to the tag of the release being
+# installed, and `DUCK_REF` deliberately does *not* change it.
+#
+# That looked wrong at first — surely naming a ref should name it for everything — and it is
+# not. `--ref my-branch` means "run my branch's scripts", which is how the provisioning scripts
+# get tested at all; it does not mean "hand the last stable binary a config from a branch it
+# predates". Making DUCK_REF govern this put the `allow_users` failure straight back, on the
+# very command an operator would use to test the fix for it.
+#
+# Set this only to test a config change together with a build that understands it.
+CONFIG_REF="${DUCK_CONFIG_REF:-}"
+
+# Set by `resolve_bootstrap_asset` to the tag of the release actually being installed, and used
+# by `install_config` when the operator did not name a ref. Empty until then.
+RELEASE_TAG=""
 
 # For a private repository: a token with read access to contents. Also used for the
 # release download, which needs auth on a private repo.
@@ -96,6 +116,11 @@ BOOTSTRAP_ASSET="updaterd-bootstrap-aarch64"
 # Set by `resolve_bootstrap_asset`. A global rather than a `$(...)` result so a failure can
 # `die` in the caller's shell instead of exiting a subshell and returning an empty string.
 BOOTSTRAP_URL=""
+
+# Set by `add_operator_to_group` when it added the operator to `robot` on this run, which means
+# their current shell still cannot reach the sockets. Read by `report`, so the closing
+# instructions gate on it rather than listing commands that are going to fail.
+group_pending=0
 
 CONFIG_DIR=/etc/robot
 KEYS_DIR="${CONFIG_DIR}/trusted_keys"
@@ -189,11 +214,39 @@ wait_for_clock() {
   certificate error. Check the network and systemd-timesyncd."
 }
 
-# The trust anchor and the one file an operator is expected to edit. Both have to come
-# from the repository rather than from a release, because nothing can be verified until
-# the keys are here.
+# The trust anchor and the one file an operator is expected to edit. Both come from the
+# repository over raw rather than from a release, because nothing can be verified until the keys
+# are here.
+#
+# But from *different refs*, and that distinction cost a board. The keys come from `REF`
+# (`main` by default) because the trusted set only ever grows, so the newest is the safest. The
+# config comes from the tag of the release actually being installed, because a config field is
+# only understood by binaries from its own version onwards — and pairing a config off `main`
+# with the last stable binary means every field added since that release breaks provisioning:
+#
+#   ERROR updaterd: invalid config error=TOML parse error at line 70
+#   unknown field `allow_users`, expected one of ...
+#
+# on a fresh board, from a clean checkout, with nothing an operator could have done wrong.
+# `deny_unknown_fields` is right — a typo in a robot's config should not be ignored — so the
+# fix belongs here, in what gets paired with what.
+#
+# An explicit `DUCK_REF` still wins for both: someone naming a ref is asking for that ref.
 install_config() {
     say "installing config and trusted keys"
+
+    # Where the *config* comes from, as opposed to the keys and the scripts.
+    if [ -n "$CONFIG_REF" ]; then
+        config_raw="https://raw.githubusercontent.com/${REPO}/${CONFIG_REF}"
+        warn "config from ${CONFIG_REF} because DUCK_CONFIG_REF asked for it. If that ref has
+  fields the release being installed does not know, updaterd will refuse to start."
+    elif [ -n "$RELEASE_TAG" ]; then
+        config_raw="https://raw.githubusercontent.com/${REPO}/${RELEASE_TAG}"
+        say "config from ${RELEASE_TAG}, matching the release being installed"
+    else
+        config_raw="$RAW"
+    fi
+
     mkdir -p "$KEYS_DIR"
     chmod 755 "$CONFIG_DIR" "$KEYS_DIR"
 
@@ -218,7 +271,7 @@ install_config() {
     if [ -f "${CONFIG_DIR}/updater.toml" ]; then
         warn "keeping the existing ${CONFIG_DIR}/updater.toml"
     else
-        fetch "${RAW}/deploy/updater.toml" "${CONFIG_DIR}/updater.toml"
+        fetch "${config_raw}/deploy/updater.toml" "${CONFIG_DIR}/updater.toml"
         sed -i "s|\"ORG/duck-daemon\"|\"${REPO}\"|" "${CONFIG_DIR}/updater.toml"
         chmod 644 "${CONFIG_DIR}/updater.toml"
     fi
@@ -233,7 +286,7 @@ install_config() {
     if [ -f "${CONFIG_DIR}/robotd.toml" ]; then
         warn "keeping the existing ${CONFIG_DIR}/robotd.toml"
     else
-        fetch "${RAW}/deploy/robotd.toml" "${CONFIG_DIR}/robotd.toml"
+        fetch "${config_raw}/deploy/robotd.toml" "${CONFIG_DIR}/robotd.toml"
         chmod 644 "${CONFIG_DIR}/robotd.toml"
     fi
 }
@@ -251,6 +304,12 @@ install_config() {
 # `source/github.rs`); this script was the one place that had not caught up, because until a
 # release was promoted there was nothing here to exercise.
 resolve_bootstrap_asset() {
+    # Idempotent: `main` resolves early so `install_config` knows the tag, and
+    # `bootstrap_first_release` still asks for itself so it stands alone. One API call either
+    # way — and, more usefully, one answer, so the config and the binary cannot come from two
+    # different "latest" releases if one is published mid-install.
+    [ -z "$BOOTSTRAP_URL" ] || return 0
+
     api="https://api.github.com/repos/${REPO}/releases/latest"
     json="$(mktemp)"
 
@@ -270,20 +329,31 @@ resolve_bootstrap_asset() {
     # asset does not carry its id, and the search silently finds nothing. Compacting makes
     # one line per JSON object, and an asset's `id` and `name` both precede its nested
     # `uploader` object, so the line naming the asset carries its id too.
+    json_compact="$(mktemp)"
+    tr -d ' \n' < "$json" | tr '{' '\n' > "$json_compact"
+    rm -f "$json"
+
     id="$(
-        tr -d ' \n' < "$json" \
-        | tr '{' '\n' \
-        | grep "\"name\":\"${BOOTSTRAP_ASSET}\"" \
+        grep "\"name\":\"${BOOTSTRAP_ASSET}\"" "$json_compact" \
         | grep -o '"id":[0-9][0-9]*' \
         | grep -o '[0-9][0-9]*' \
         | head -1
     )"
-    rm -f "$json"
 
     if [ -z "$id" ]; then
+        rm -f "$json_compact"
         die "the latest release has no asset named ${BOOTSTRAP_ASSET}.
   A promoted release must carry it — release.yml attaches it, promote.yml copies it across."
     fi
+
+    # The tag as well, because the config has to come from the same version as the binary.
+    # Same grep-not-jq reasoning as above.
+    RELEASE_TAG="$(
+        grep -o '"tag_name":"[^"]*"' "$json_compact" \
+        | head -1 \
+        | sed 's/.*"tag_name":"//; s/"$//'
+    )"
+    rm -f "$json_compact"
 
     BOOTSTRAP_URL="https://api.github.com/repos/${REPO}/releases/assets/${id}"
 }
@@ -295,7 +365,11 @@ resolve_bootstrap_asset() {
 # acceptable and is the price of the escape hatch.
 stop_for_reinstall() {
     say "stopping the daemons for a clean re-install"
+    # Absent units are not a problem to report: a board running an older release simply has no
+    # configd or btd, and warning about them on every forced re-install trains people to ignore
+    # the warnings that matter.
     for unit in btd.service configd.service robotd.service updaterd.service; do
+        [ -f "${UNIT_DIR}/${unit}" ] || continue
         systemctl stop "$unit" 2>/dev/null || warn "could not stop ${unit}"
     done
 }
@@ -405,7 +479,12 @@ create_group() {
     fi
     # btd runs unprivileged because it is the process parsing bytes from anyone in radio range.
     # Without this user its unit fails to start, and the failure reads as a broken radio.
-    if ! getent passwd btd >/dev/null; then
+    #
+    # Only when the release actually ships btd. Creating a system account for a service that
+    # does not exist on this board is not harmful, but it is a lie about what is installed, and
+    # the next person reading /etc/passwd should not have to work out which.
+    if [ -f "${INSTALL_DIR}/current/systemd/btd.service" ] \
+        && ! getent passwd btd >/dev/null; then
         useradd --system --no-create-home --shell /usr/sbin/nologin btd \
             || warn "could not create the btd user; btd.service will not start"
     fi
@@ -448,8 +527,13 @@ add_operator_to_group() {
 
     if usermod -aG robot "$operator"; then
         say "added ${operator} to the robot group"
-        warn "${operator} must log out and back in before that takes effect. Until then,
-  read-only commands need sudo:  sudo robotctl health"
+        # Deliberately not a `warn`, and it does not say "log out". A process's group set is
+        # fixed at exec and there is no API to add to another process's — not even for root —
+        # so the shell that launched this install can never be fixed from inside it. What can
+        # be fixed is the size of the remaining step: `newgrp` is one command in that same
+        # shell instead of dropping an SSH session and coming back. `report` repeats it,
+        # because by then this line has scrolled past a release download.
+        group_pending=1
     else
         warn "could not add ${operator} to the robot group; robotctl will need sudo"
     fi
@@ -504,13 +588,33 @@ install_dev_key() {
 # last daemon-reload.
 install_units() {
     say "installing systemd units"
-    for unit in updaterd.service robotd.service configd.service btd.service; do
-        src="${INSTALL_DIR}/current/systemd/${unit}"
-        if [ ! -f "$src" ]; then
-            die "the installed release has no systemd/${unit}"
+    unit_src="${INSTALL_DIR}/current/systemd"
+
+    # Two are required, because without them the board is neither a robot nor able to become
+    # one. Everything else is whatever the release happens to ship.
+    for unit in updaterd.service robotd.service; do
+        if [ ! -f "${unit_src}/${unit}" ]; then
+            die "the installed release has no systemd/${unit}.
+  That is the release, not this script: $(readlink "${INSTALL_DIR}/current" 2>/dev/null)
+  carries no such unit, and a robot without it has nothing to run."
         fi
-        install -m 644 "$src" "${UNIT_DIR}/${unit}"
     done
+
+    # Read the directory rather than assert a list. A hardcoded set makes this script fail on
+    # any release that is not exactly its contemporary — which is every fresh install, because
+    # the scripts come from a branch and the release is the last stable one. `configd.service`
+    # was the case that proved it: added on main, absent from 0.2.0, and provisioning died at
+    # "the installed release has no systemd/configd.service" on a board that was fine.
+    #
+    # The release is the authority on what it contains. This script's job is to install it.
+    shipped=""
+    for src in "${unit_src}"/*.service; do
+        [ -f "$src" ] || continue
+        unit="$(basename "$src")"
+        install -m 644 "$src" "${UNIT_DIR}/${unit}"
+        shipped="${shipped} ${unit}"
+    done
+    say "units from the release:${shipped}"
 
     # journald persistence, so the logs from an incident outlive the reboot that followed
     # it. See docs/deploy.md in the release for the Armbian tmpfs caveat this does not
@@ -537,12 +641,32 @@ install_units() {
     # configd before btd: btd asks configd for the pairing PIN, and a btd that starts first
     # simply refuses to pair until configd answers. Ordering here saves a confusing first boot
     # rather than being required — btd retries.
-    systemctl enable --now configd.service
+    #
+    # Both `if`-guarded, because a release older than this script does not carry them and the
+    # right response to that is to install what there is, not to refuse.
+    if [ -f "${UNIT_DIR}/configd.service" ]; then
+        systemctl enable --now configd.service
+    fi
     # btd is allowed to fail without failing the install. It needs a Bluetooth adapter, and on
     # this board hci0 does not exist until ~73s after boot; a robot with no working radio is
     # still a robot that updates and walks.
-    systemctl enable --now btd.service || warn "btd did not start; check:  journalctl -u btd -b
+    if [ -f "${UNIT_DIR}/btd.service" ]; then
+        systemctl enable --now btd.service || warn "btd did not start; check:
+    journalctl -u btd -b
   The robot works without it — only the phone path is unavailable."
+    fi
+
+    # Anything the release ships that this script does not know how to start. Reported rather
+    # than started blindly: a unit may be a template, or something another unit pulls in, and
+    # guessing is how a robot ends up running a service nobody chose. Named, so adding a daemon
+    # is one line here and never a silent omission.
+    for unit in $shipped; do
+        case "$unit" in
+            updaterd.service|robotd.service|configd.service|btd.service) ;;
+            *) warn "${unit} was installed but not enabled — this script does not know where
+  it belongs in the start order. Add it to install_units, or start it by hand." ;;
+        esac
+    done
 }
 
 # Tab-completion for `robotctl`, so an operator on a board they are debugging over a flaky
@@ -631,6 +755,25 @@ verify_install() {
 report() {
     version="$(readlink "${INSTALL_DIR}/current" | sed 's|releases/||')"
     say "installed daemon ${version}"
+
+    # Before the command list, not after: every command below fails with "Permission denied"
+    # in the shell reading this, and that is what a first-time operator reasonably reads as a
+    # broken install. Naming the one step between them and a working robot is worth more than
+    # keeping the happy path uncluttered.
+    if [ "$group_pending" = 1 ]; then
+        cat <<'EOF'
+
+FIRST, in this same shell:
+
+  newgrp robot
+
+You were just added to the `robot` group, and a process's groups are fixed when it starts —
+so this shell is not in it yet and both sockets will refuse it. `newgrp` starts a shell that
+is, which is one command instead of a logout. Any new login has it already, and
+`sudo robotctl …` works either way.
+EOF
+    fi
+
     cat <<'EOF'
 
   robotctl health                     the whole robot: hardware and software
@@ -731,6 +874,8 @@ main() {
     check_environment
     check_board
     wait_for_clock
+    # Before install_config, which needs to know which release it is pairing a config with.
+    resolve_bootstrap_asset
     install_config
     install_dev_key
     bootstrap_first_release

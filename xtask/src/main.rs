@@ -1007,4 +1007,48 @@ mod tests {
         assert!(rendered.contains("ONNX_FLOOR=\"1.23\""));
         assert!(rendered.contains("ONNX_TARGET=\"1.28.0\""));
     }
+
+    /// Advice the provisioning scripts print must be runnable from where the operator is
+    /// standing, which is their home directory and not wherever the file was downloaded to.
+    ///
+    /// `setup-board.sh` told people to run `sudo sh migrate-network.sh` — a bare relative name
+    /// for a sibling script that a fresh board has not fetched at all. Both halves of that were
+    /// wrong, and neither is the kind of thing anyone re-reads once their own board works.
+    /// Comment lines are exempt: explaining the trap requires quoting it.
+    ///
+    /// It catches literals only. A `sh $VAR` holding a relative path passes, because the value
+    /// is not knowable here — so this narrows the failure rather than closing it, and the
+    /// paths those variables hold are declared at the top of each script for that reason.
+    #[test]
+    fn printed_commands_name_absolute_paths() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for name in [
+            "setup-board.sh",
+            "migrate-network.sh",
+            "install.sh",
+            "provision.sh",
+            "provision-board.sh",
+        ] {
+            let script = std::fs::read_to_string(root.join("scripts").join(name)).unwrap();
+            for (n, line) in script.lines().enumerate() {
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                for after in line.split("sh ").skip(1) {
+                    let target = after.split_whitespace().next().unwrap_or_default();
+                    // Only file-looking targets matter: `sudo sh` with nothing after it is the
+                    // documented pipe form, and `$0`/`${VAR}` resolve at runtime.
+                    if !target.ends_with(".sh") && !target.ends_with(".sh\"") {
+                        continue;
+                    }
+                    assert!(
+                        target.starts_with('/') || target.starts_with('$'),
+                        "{name}:{} tells the operator to run {target:?}, which only works \
+                         from the directory that happens to hold it",
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
 }

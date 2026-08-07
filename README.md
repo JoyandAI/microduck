@@ -37,7 +37,8 @@ health gate. Each drives the real engine with the fault injected rather than a m
 `updater/tests/apply.rs` is the honest answer to "what does this actually guarantee" — more
 so than anything you could run by hand here.
 
-Using the updater for real needs a board. Provisioning one from nothing is two commands, in
+Using the updater for real needs a board. Provisioning one from nothing is one command from
+this clone — `./scripts/provision-board.sh [user@]host`, described in
 [`deploy/README.md`](deploy/README.md). Everything you do to it afterwards is
 [Working on the robot](#working-on-the-robot) below.
 
@@ -68,7 +69,8 @@ btd/            the BLE front door, plus btctl (a laptop client, never shipped)
 robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
-scripts/        install.sh · setup-board.sh · migrate-network.sh · board-test.sh
+scripts/        provision-board.sh (from your machine) · provision.sh → setup-board.sh ·
+                migrate-network.sh · install.sh (on the board) · board-test.sh (CI)
 docs/           architecture · update design · robotd design · app path · roadmap · CI setup · cheat sheet
 ```
 
@@ -190,8 +192,18 @@ Provisioning a board from scratch, and the log-retention caveats on Armbian, are
 
 ### Testing your branch on a board
 
-Push the branch. CI cross-compiles it, signs it with the team dev key, and publishes a
-prerelease at the moving tag `daemon-dev-<branch>`. Then, on the board:
+A board provisioned for this in one command, from a clone — it sends your dev key, waits out the
+reboot and streams the log:
+
+```bash
+./scripts/provision-board.sh radxa@192.168.1.42 --ref my-branch
+```
+
+Add `--local` to send this clone's `provision.sh` instead of fetching it, which is how to test a
+change to the provisioning scripts themselves without merging first.
+
+Then the ordinary loop. Push the branch; CI cross-compiles it, signs it with the team dev key,
+and publishes a prerelease at the moving tag `daemon-dev-<branch>`. On the board:
 
 ```bash
 sudo robotctl update apply daemon --ref my-branch
@@ -217,14 +229,31 @@ customer robots — they refuse a dev key twice over (`allow_dev_keys = false`, 
 key only counts as a dev key if its filename ends `.dev.pub`).
 
 **A board has to opt in once**, which is also what stops this working on a robot that
-shouldn't take dev builds:
+shouldn't take dev builds. `install.sh` does it, given the public half of the dev key:
 
 ```bash
-sudo cp team.dev.pub /etc/robot/trusted_keys/
+sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
+```
+
+It validates the key and flips `allow_dev_keys` in one step, and installs the key under the
+name `team.dev.pub` whatever the source file was called — the `.dev.` infix is what classifies
+it, and a key landing under any other name is trusted as a *release* key. `team.dev.pub` is not
+in the repository on purpose; get it from a team member or regenerate it with
+`minisign -R -s ~/.duck-keys/team.dev.key -p team.dev.pub`.
+
+By hand, for a board provisioned some other way — both halves, because either alone leaves a
+board that still refuses branch builds with an error that reads like a corrupt release:
+
+```bash
+sudo cp team.dev.pub /etc/robot/trusted_keys/team.dev.pub
 ```
 
 ```bash
 sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updater.toml
+```
+
+```bash
+sudo systemctl restart updaterd
 ```
 
 While this repository is **private**, the board also needs a GitHub token — a private repo's

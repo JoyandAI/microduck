@@ -332,6 +332,51 @@ struct StatusArgs {
     json: bool,
 }
 
+/// What to tell someone whose socket connect failed, chosen by *why* it failed.
+///
+/// Every kind used to get `Is the service running?  systemctl status …`, which is the right
+/// question for exactly one of them. On a freshly provisioned board the usual answer is
+/// `EACCES`, and there the service is running fine — the caller is simply not in the `robot`
+/// group yet, because `install.sh` adds them to it and a group only takes effect in a new
+/// login session. Sending that person to `systemctl status` shows them an active daemon and no
+/// explanation, which is the failure mode [`Client::connect_to`] already exists to avoid.
+///
+/// `EACCES` from `connect` means something was found and refused us, never that it was absent
+/// — that is `ENOENT` — so the two cases can be told apart without stat'ing anything.
+fn unreachable_hint(service: &str, path: &std::path::Path, e: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+
+    let head = format!("cannot reach {service} at {}: {e}", path.display());
+    match e.kind() {
+        ErrorKind::PermissionDenied => format!(
+            "{head}\n\
+             The socket refused this user rather than being absent, so {service} is running\n\
+             and this is group membership, not a crash. It is root:robot mode 0660, and a\n\
+             process's groups are fixed when it starts — so a group added since this shell\n\
+             began is not in it. Installing adds the operator to `robot`, so usually:\n\
+             \x20 newgrp robot\n\
+             Check with `id -nG`; a new login has it already. If `robot` is not there at all,\n\
+             `sudo usermod -aG robot $USER` and log out. `sudo robotctl …` works regardless."
+        ),
+        // ENOENT: nothing at that path. Either the daemon never started, or it is listening
+        // somewhere else — which is worth naming, because `--socket` and the `robot_socket`
+        // setting both move it and neither leaves a trace at the default path.
+        ErrorKind::NotFound => format!(
+            "{head}\n\
+             Nothing is listening at that path. Is the service running, and is this the \
+             socket it was told to use?  systemctl status {service}"
+        ),
+        // A socket file with no listener: the usual cause is a daemon that died without
+        // cleaning up, so the file outlives the process that made it.
+        ErrorKind::ConnectionRefused => format!(
+            "{head}\n\
+             The socket file is there but nothing is accepting on it, which is what a daemon \
+             that died leaves behind.  systemctl status {service}"
+        ),
+        _ => format!("{head}\nIs the service running?  systemctl status {service}"),
+    }
+}
+
 /// A blocking JSON-RPC connection to `updaterd`.
 ///
 /// Deliberately `std::os::unix::net`, not tokio: this is a short-lived CLI issuing
@@ -356,16 +401,8 @@ impl Client {
     /// `robotd` to go check the wrong service — a diagnostic that points at the wrong
     /// place is worse than none.
     fn connect_to(service: &str, path: &std::path::Path) -> Result<Self, Failure> {
-        let stream = UnixStream::connect(path).map_err(|e| {
-            Failure::new(
-                exit::UNREACHABLE,
-                format!(
-                    "cannot reach {service} at {}: {e}\n\
-                     Is the service running?  systemctl status {service}",
-                    path.display()
-                ),
-            )
-        })?;
+        let stream = UnixStream::connect(path)
+            .map_err(|e| Failure::new(exit::UNREACHABLE, unreachable_hint(service, path, &e)))?;
         let writer = stream
             .try_clone()
             .map_err(|e| Failure::new(exit::FAILED, format!("could not split the socket: {e}")))?;
@@ -1731,6 +1768,75 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// A refused socket must not be reported as a stopped daemon.
+    ///
+    /// This is the first thing a freshly provisioned board says to its operator, and it was
+    /// saying the wrong thing: `robotctl health` on a working install returns `EACCES` until
+    /// the installing user's new `robot` group reaches a new login session, and the advice was
+    /// `systemctl status`, which shows an active daemon and explains nothing.
+    #[test]
+    fn permission_denied_names_the_group_not_the_service() {
+        let out = unreachable_hint(
+            "robotd",
+            std::path::Path::new("/run/robotd.sock"),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+
+        assert!(
+            out.starts_with("cannot reach robotd at /run/robotd.sock: "),
+            "{out}"
+        );
+        assert!(out.contains("robot"), "{out}");
+        assert!(out.contains("log"), "{out}");
+        // The whole point: do not send them to check a service that is already running.
+        assert!(!out.contains("systemctl status"), "{out}");
+    }
+
+    /// The other kinds keep pointing at the service, which for them is the right question.
+    #[test]
+    fn absent_and_refused_sockets_still_point_at_the_service() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let out = unreachable_hint(
+                "updaterd",
+                std::path::Path::new("/run/updaterd.sock"),
+                &std::io::Error::from(kind),
+            );
+            assert!(
+                out.contains("systemctl status updaterd"),
+                "{kind:?} lost the service hint: {out}"
+            );
+        }
+    }
+
+    /// Every hint must keep the cause on the first line, because `health` renders that line
+    /// into a fixed-width column and pushes the rest into its warnings block. A hint that put
+    /// its detail first would be truncated into nonsense there.
+    #[test]
+    fn every_hint_leads_with_the_cause() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let out = unreachable_hint(
+                "robotd",
+                std::path::Path::new("/run/robotd.sock"),
+                &std::io::Error::from(kind),
+            );
+            let first = out.lines().next().unwrap_or_default();
+            assert!(
+                first.starts_with("cannot reach robotd at /run/robotd.sock: "),
+                "{kind:?}: {first}"
+            );
+            assert!(out.lines().count() > 1, "{kind:?} has no advice: {out}");
+        }
     }
 
     /// `completions` must name a shell rather than defaulting to one: a script that
