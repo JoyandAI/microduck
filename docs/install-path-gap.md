@@ -67,7 +67,14 @@ daemon release is Y … either the restart did not happen, or it failed". Nobody
 that exists and is not reached for is worth as much as one that does not exist, which is an argument
 for the update itself noticing rather than for more diagnostics.
 
-**The fix worth making: derive the restart set from the release, not from the board.** A release ships
+**Fixed** (`engine.rs::units_to_restart`): the restart set is derived from the release's
+`systemd/*.service` files, unioned with whatever the config names, minus `updaterd` and `btd` — which
+moved from a config convention enforced by a test into a `NEVER_RESTART` constant in code, because
+they are properties of what those daemons are rather than operator choices. A board whose
+`updater.toml` predates a daemon now restarts it anyway, and needs no edit. What follows is the
+reasoning, kept because it is the argument for where such lists belong.
+
+**Derive the restart set from the release, not from the board.** A release ships
 `systemd/*.service`, so it already states which units it provides — the same realisation that made
 `hooks/postinstall` the right answer for *installing* them. The engine can restart what the release
 ships, minus the two documented exclusions (`updaterd`, which is performing the update; `btd`, which

@@ -129,6 +129,9 @@ manifest_asset = "manifest.json"
 # `mediad` is absent because it does not exist yet: naming a unit that isn't installed
 # makes `systemctl restart` fail, which fails the update, which rolls it back. Add it in
 # the same change that first ships it.
+# The restart set is derived from the units the release ships (`systemd/*.service`), minus `updaterd`
+# and `btd`, which must never be restarted by an update they are carrying. Anything named here is
+# *added* to that set — use it only for a unit the release does not ship.
 [component.daemon.on_apply]
 action = "restart"
 units  = ["robotd"]

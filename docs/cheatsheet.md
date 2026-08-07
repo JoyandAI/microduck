@@ -121,9 +121,11 @@ Three things are true at once, and together they cost an afternoon if you do not
 
 - **`btd` is never restarted by an update.** Deliberate: restarting it drops the BLE connection
   carrying the update's own progress stream. So a `btd` fix needs a manual restart or a reboot.
-- **`configd` is restarted only if the board's `/etc/robot/updater.toml` lists it.** That file belongs
-  to the operator and is preserved across installs, so a board set up before `configd` existed still
-  says `units = ["robotd"]` and silently keeps running the old binary.
+- **`configd` used to be restarted only if the board's `/etc/robot/updater.toml` listed it** — that
+  file belongs to the operator and is preserved across installs, so a board set up before `configd`
+  existed kept `units = ["robotd"]` and silently ran the old binary. Fixed: the restart set now comes
+  from the units the release ships. A board running an older `updaterd` still has the old behaviour
+  until it restarts, because `updaterd` never restarts itself.
 - **`robotctl update apply` then reports `already_current` and does nothing**, so the obvious recovery
   command is a no-op.
 
@@ -150,18 +152,13 @@ sudo systemctl restart configd
 sudo systemctl restart btd
 ```
 
-To stop `configd` going stale on every future update, add it to the restart set on the board:
-
-```
-sudo sed -i 's|units  = \["robotd"\]|units = ["robotd", "configd"]|' /etc/robot/updater.toml
-```
+Editing the board's `updater.toml` is no longer needed — the restart set is derived from the release.
+The one thing that still requires a manual step is `updaterd` itself, which never restarts itself, so
+the fix above only takes effect once it has:
 
 ```
 sudo systemctl restart updaterd
 ```
-
-This is recorded as a real gap in `install-path-gap.md`, with the fix worth making: derive the restart
-set from the units the release ships rather than from a file on the board.
 
 ### Logs
 

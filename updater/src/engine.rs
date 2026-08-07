@@ -651,7 +651,7 @@ impl Engine {
         hooks::run(release_dir, hooks::HookKind::PostInstall, ctx, HOOK_TIMEOUT).await?;
 
         emit(Phase::Applying, None);
-        self.run_apply_action(&cfg.on_apply).await?;
+        self.run_apply_action(&cfg.on_apply, release_dir).await?;
 
         emit(Phase::HealthGate, None);
         self.health_gate(cfg).await
@@ -735,7 +735,7 @@ impl Engine {
         self.boot_counter
             .confirm(component)
             .map_err(|e| Error::RollbackFailed(e.to_string()))?;
-        self.run_apply_action(&cfg.on_apply)
+        self.run_apply_action(&cfg.on_apply, &store.release_dir(previous))
             .await
             .map_err(|e| Error::RollbackFailed(e.to_string()))?;
 
@@ -858,7 +858,10 @@ impl Engine {
             let _ = self.boot_counter.confirm(component);
             return Err(e);
         }
-        if let Err(e) = self.run_apply_action(&cfg.on_apply).await {
+        if let Err(e) = self
+            .run_apply_action(&cfg.on_apply, &store.release_dir(to))
+            .await
+        {
             let _ = self.boot_counter.confirm(component);
             return Err(e);
         }
@@ -1182,12 +1185,16 @@ impl Engine {
     /// distinction is the point, and it is why this asks systemd for `LoadState` rather than
     /// reading an exit code: `systemctl` does not reliably distinguish the two, and swallowing
     /// both would turn "the daemon is broken" into a silent success.
-    async fn run_apply_action(&self, action: &ApplyAction) -> Result<(), Error> {
+    async fn run_apply_action(
+        &self,
+        action: &ApplyAction,
+        release_dir: &Path,
+    ) -> Result<(), Error> {
         match action {
             ApplyAction::None => Ok(()),
             ApplyAction::Restart { units } => {
-                for unit in units {
-                    restart_one(SYSTEMCTL, unit).await?;
+                for unit in units_to_restart(release_dir, units) {
+                    restart_one(SYSTEMCTL, &unit).await?;
                 }
                 Ok(())
             }
@@ -1401,6 +1408,74 @@ const SYSTEMCTL: &str = "systemctl";
 ///
 /// `systemctl` is a parameter rather than hardcoded so a test can hand it a stub. That is the
 /// only reason: nothing should ever pass anything else in production.
+/// Units this update must not touch, whatever a release ships.
+///
+/// `updaterd` is the process performing the update: restarting it kills the operation mid-flight.
+/// `btd` may be the *transport the update was requested over* — restarting it drops the BLE
+/// connection carrying `update.subscribe`, so the phone that started the update never learns the
+/// outcome, which is the entire app-driven flow (`docs/updater-design.md` §4).
+///
+/// In code rather than in configuration, deliberately. These two are properties of what the daemons
+/// *are*, not choices an operator should be able to get wrong — and a board that got them wrong
+/// would break in a way nobody could see until an update was already running.
+const NEVER_RESTART: [&str; 2] = ["updaterd", "btd"];
+
+/// The units to restart: what the release ships, plus anything the config names.
+///
+/// **Derived from the release rather than read from the board**, which is the whole point.
+/// `on_apply`'s list lives in the operator's `/etc/robot/updater.toml`, and `install.sh` preserves
+/// that file — so a board provisioned before a daemon existed keeps a list that does not mention it,
+/// and every release swaps that daemon's binary while leaving the old process running. The update
+/// reports success, the daemon answers on stale code, and `apply` then says `already_current` and
+/// does nothing. Four correct fixes were diagnosed as broken that way in one afternoon; see
+/// `docs/install-path-gap.md` §4.
+///
+/// A release already states which units it provides — it ships them in `systemd/` — so it can say
+/// which to restart. Same realisation that made `hooks/postinstall` the right place to *install*
+/// them.
+///
+/// The configured list is kept as an addition rather than replaced, for a unit that is not shipped
+/// by the release but should still be restarted with it. It is no longer load-bearing: a board whose
+/// config is years out of date now gets the right behaviour anyway.
+///
+/// An unreadable or absent `systemd/` directory yields the configured list unchanged. Older releases
+/// predate the directory, and a rollback to one must still work.
+fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
+    let mut units: Vec<String> = Vec::new();
+
+    match std::fs::read_dir(release_dir.join("systemd")) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("service") {
+                    continue;
+                }
+                if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+                    units.push(name.to_owned());
+                }
+            }
+        }
+        Err(e) => {
+            // Not fatal. A release without a `systemd/` directory is simply an older one, and the
+            // configured list is what boards have always used.
+            tracing::debug!(
+                dir = %release_dir.display(),
+                error = %e,
+                "no units in the release; using the configured list"
+            );
+        }
+    }
+
+    units.extend(configured.iter().cloned());
+
+    // Sorted so the restart order is the same on every board and in every test, and deduplicated
+    // because the config and the release will usually name the same daemons.
+    units.sort();
+    units.dedup();
+    units.retain(|unit| !NEVER_RESTART.contains(&unit.as_str()));
+    units
+}
+
 async fn restart_one(systemctl: &str, unit: &str) -> Result<(), Error> {
     let mut c = tokio::process::Command::new(systemctl);
     c.arg("restart").arg(unit);
@@ -1505,6 +1580,91 @@ esac
 
     fn calls(dir: &std::path::Path) -> String {
         std::fs::read_to_string(dir.join("calls")).unwrap_or_default()
+    }
+
+    /// Write a release directory that ships these units.
+    fn release_shipping(units: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("systemd")).unwrap();
+        for unit in units {
+            std::fs::write(
+                dir.path().join("systemd").join(format!("{unit}.service")),
+                "[Unit]\n",
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    /// The point of the change: a board whose config predates a daemon still restarts it.
+    ///
+    /// `units = ["robotd"]` is what a board provisioned before `configd` existed still says, and
+    /// `install.sh` preserves that file forever. Every release then swapped configd's binary and
+    /// left the old process serving, which is how four correct fixes were diagnosed as broken.
+    #[test]
+    fn a_daemon_the_board_never_heard_of_is_restarted_anyway() {
+        let release = release_shipping(&["robotd", "configd"]);
+        let stale_config = vec!["robotd".to_owned()];
+
+        assert_eq!(
+            units_to_restart(release.path(), &stale_config),
+            vec!["configd".to_owned(), "robotd".to_owned()]
+        );
+    }
+
+    /// `updaterd` is performing the update and `btd` may be the transport it arrived over. Neither
+    /// may be restarted however they reach the list — shipped by the release, named in the config,
+    /// or both.
+    #[test]
+    fn updaterd_and_btd_are_never_restarted() {
+        let release = release_shipping(&["robotd", "configd", "updaterd", "btd"]);
+        let reckless = vec!["updaterd".to_owned(), "btd".to_owned()];
+
+        assert_eq!(
+            units_to_restart(release.path(), &reckless),
+            vec!["configd".to_owned(), "robotd".to_owned()],
+            "the exclusions must hold against both sources"
+        );
+    }
+
+    /// A rollback to a release predating the `systemd/` directory has to keep working, and the
+    /// configured list is what boards used before any of this existed.
+    #[test]
+    fn a_release_shipping_no_units_falls_back_to_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = vec!["robotd".to_owned(), "configd".to_owned()];
+
+        assert_eq!(
+            units_to_restart(dir.path(), &configured),
+            vec!["configd".to_owned(), "robotd".to_owned()]
+        );
+    }
+
+    /// Named in both places is one restart, not two — and the order is the same everywhere, so a
+    /// failure is reproducible rather than depending on directory iteration order.
+    #[test]
+    fn the_set_is_deduplicated_and_ordered() {
+        let release = release_shipping(&["robotd", "configd"]);
+        let overlapping = vec!["configd".to_owned(), "robotd".to_owned()];
+
+        assert_eq!(
+            units_to_restart(release.path(), &overlapping),
+            vec!["configd".to_owned(), "robotd".to_owned()]
+        );
+    }
+
+    /// Only `.service` files. A release ships `sysusers.d/` too, and `postinstall` reads it —
+    /// nothing there is a unit to restart.
+    #[test]
+    fn only_service_files_count() {
+        let release = release_shipping(&["robotd"]);
+        std::fs::write(release.path().join("systemd").join("robot.target"), "x").unwrap();
+        std::fs::write(release.path().join("systemd").join("notes.txt"), "x").unwrap();
+
+        assert_eq!(
+            units_to_restart(release.path(), &[]),
+            vec!["robotd".to_owned()]
+        );
     }
 
     /// The bug this whole change exists for: the release that first carries a new daemon has no

@@ -105,8 +105,15 @@ survive a daemon crash to perform rollback.
 **Corollary — `updaterd` must be resident, and must exclude itself from the
 restart set.** `updaterd` and `btd` both ship *inside* the daemon artifact, so a
 naive "restart everything" would kill the executor mid-swap or mid-health-gate.
-`on_apply` therefore restarts `robotd` and `mediad` only; `updaterd` and `btd`
-pick up the new binary at the next boot or an explicit later restart.
+`on_apply` therefore restarts everything the release ships **except** those two, which pick up the
+new binary at the next boot or an explicit later restart.
+
+The set is derived from the release's own `systemd/*.service` files rather than read from the
+board's config, and the two exclusions live in code (`NEVER_RESTART`) rather than in configuration:
+they are properties of what those daemons *are*, not choices an operator should be able to get
+wrong. The earlier design put the list in `/etc/robot/updater.toml`, which `install.sh` preserves —
+so a board provisioned before a daemon existed never restarted it, and the update said success
+anyway (`install-path-gap.md` §4).
 
 This is also why the update logic cannot live in `btd`: as a client of the
 update, `btd` cannot be the thing performing it — it would kill itself partway
