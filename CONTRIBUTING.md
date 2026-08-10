@@ -12,7 +12,7 @@ robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-478 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+508 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
 Those tests are also where the engine's failure paths are: a bad signature, a release that comes
 up unhealthy, a post-install hook that fails, power loss between the swap and the health gate.

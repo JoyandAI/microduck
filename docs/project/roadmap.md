@@ -119,7 +119,9 @@ board to the release stream, since `latest` resolves to the highest *stable* ver
   reaching GitHub for `--ref`, `--staging` and a return to the release stream. It is an ordinary
   apply: health gate, auto-rollback, dev-key verification. `API_VERSION` moved with it, because a
   daemon one version older would have parsed the option, ignored it, and installed from its
-  configured source while reporting success.
+  configured source while reporting success. v7 first ships in **0.5.0**, so each board takes one
+  `scripts/dev-push.sh --bootstrap` to get there — the binary that would gate the update is the one
+  being replaced.
 
 **Done:** verified against the real repository — `dev.yml` published, `--ref main` installed
 over the network, and a customer-robot config refused the same build.

@@ -171,11 +171,13 @@ To install what is already in that directory, or to point at one you filled your
 sudo robotctl update apply daemon --from /var/tmp/duck-sideload
 ```
 
-### The first push to a board that has never had one
+### The first push to a board below 0.5.0
 
-`apply --from` is part of the release being pushed, so a board whose installed `updaterd` predates
-it cannot be asked to use it — `robotctl` and `updaterd` report an API mismatch and refuse. Deliver
-it once the ungated way, which stops `robotd` and gives up the health gate for that one install:
+`apply --from` is part of the release being pushed: it needs API version 7, which first ships in
+0.5.0. A board running anything earlier has an `updaterd` that cannot be asked to use it, and says
+so — `robotctl` and `updaterd` report an API mismatch and refuse the call rather than quietly
+installing from the configured source instead. Deliver it once the ungated way, which stops
+`robotd` and gives up the health gate for that one install:
 
 ```bash
 scripts/dev-push.sh --bootstrap radxa@<board>
