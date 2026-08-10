@@ -104,8 +104,10 @@ that has already recovered is still visible. The bottom border names the policy 
 because `walk` is a mode two releases with different gaits both report — and "which network is
 this?" is the first question when comparing them.
 
-`q` quits, `↑`/`↓` scroll the joint list. Redirected or piped it prints one line per tick
-instead, so `> run.log` and `| grep FALLEN` behave. The joint vectors are in `--json`:
+`q` quits, `↑`/`↓` scroll the joint list, `u` switches the angles between degrees and radians.
+Angles are degrees on screen — joints, head and the yaw rate. Redirected or piped it prints one
+line per tick instead, so `> run.log` and `| grep FALLEN` behave, and those numbers stay radians
+whatever the screen is set to. The joint vectors are in `--json`:
 
 ```bash
 robotctl monitor --json --hz 50 > run.jsonl

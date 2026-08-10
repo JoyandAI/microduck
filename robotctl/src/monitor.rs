@@ -38,6 +38,9 @@ use crate::{Client, Failure, exit};
 /// A display scale, **not** a limit: nothing refuses a joint for exceeding it. Sized so the
 /// bar spends its time in the middle at rest and swings visibly while walking — a bar that
 /// is always saturated and one that never moves are equally uninformative.
+///
+/// Kept in radians whatever the display is set to: it is compared against a wire value, and a
+/// constant that changes unit with a keypress is a threshold nobody can reason about.
 const BAR_FULL_SCALE: f64 = 0.20;
 
 /// Half-width of a deviation bar, in cells. The bar is `2 * HALF + 1` wide: zero has a
@@ -60,6 +63,74 @@ const HEADER_HEIGHT: u16 = 8;
 /// Request id for the subscribe call, so its answer can be told apart from the stream that
 /// follows it on the same connection.
 const SUBSCRIBE_ID: u64 = 1;
+
+/// Which unit the angles on screen are drawn in.
+///
+/// The wire is radians and stays radians: [`proto::RobotState`] carries nothing else, and the
+/// piped rendering keeps them, because a script parsing that output must not have its numbers
+/// change under it. This is a reading aid for the live view alone — a hip at `-0.52` and a hip
+/// at `-30°` are the same joint, and only one of them can be pictured without arithmetic.
+///
+/// Radians are still one keypress away rather than gone, because they are what every other
+/// surface speaks: the protocol docs, a policy's own inputs, and the numbers a client sends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Units {
+    Degrees,
+    Radians,
+}
+
+impl Units {
+    /// The other one. There are exactly two, so this is the whole of the `u` keybinding.
+    fn toggled(self) -> Self {
+        match self {
+            Self::Degrees => Self::Radians,
+            Self::Radians => Self::Degrees,
+        }
+    }
+
+    /// One wire angle as text.
+    ///
+    /// Two decimals of a degree is finer than three of a radian, so the display resolves at
+    /// least as much either way — flipping the unit must not quietly hide a difference the
+    /// other unit was showing.
+    fn angle(self, radians: f64) -> String {
+        match self {
+            Self::Degrees => format!("{:+.2}°", radians.to_degrees()),
+            Self::Radians => format!("{radians:+.3}"),
+        }
+    }
+
+    /// The same, for a rate: the twist's yaw is per second.
+    fn rate(self, radians_per_second: f64) -> f64 {
+        match self {
+            Self::Degrees => radians_per_second.to_degrees(),
+            Self::Radians => radians_per_second,
+        }
+    }
+
+    fn rate_unit(self) -> &'static str {
+        match self {
+            Self::Degrees => "°/s",
+            Self::Radians => "rad/s",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Degrees => "degrees",
+            Self::Radians => "radians",
+        }
+    }
+
+    /// The deviation bar's full scale, said in whatever is on screen. The bar is drawn from a
+    /// ratio, so only its caption has a unit at all.
+    fn bar_scale(self) -> String {
+        match self {
+            Self::Degrees => format!("±{:.1}°", BAR_FULL_SCALE.to_degrees()),
+            Self::Radians => format!("±{BAR_FULL_SCALE:.2} rad"),
+        }
+    }
+}
 
 /// What the reader thread has to say.
 enum Update {
@@ -257,6 +328,12 @@ fn live(terminal: &mut DefaultTerminal, rx: &Receiver<Update>, hz: u32) -> Resul
                         view.scroll_home();
                         fresh = true;
                     }
+                    // Radians back, for reading a number that is about to be compared with the
+                    // wire, a policy's input, or the protocol docs.
+                    KeyCode::Char('u') => {
+                        view.toggle_units();
+                        fresh = true;
+                    }
                     _ => {}
                 },
                 // A resize changes what fits, and the next frame may be a whole period away.
@@ -324,6 +401,9 @@ struct View {
     /// Joint rows the last frame had room for. Known only at render time, and kept because
     /// clamping the scroll and sizing a page both need it.
     visible: usize,
+    /// What every angle on screen is drawn in. Degrees to start with: this view is read while
+    /// looking at the robot, and a leg is a picture in degrees and arithmetic in radians.
+    units: Units,
 }
 
 impl View {
@@ -338,7 +418,12 @@ impl View {
             frames: 0,
             scroll: 0,
             visible: 0,
+            units: Units::Degrees,
         }
+    }
+
+    fn toggle_units(&mut self) {
+        self.units = self.units.toggled();
     }
 
     /// Move the joint window. Clamped on render, where the number of rows that fit is known.
@@ -452,9 +537,14 @@ impl View {
         let block = Block::bordered()
             .title(Line::from(self.title(state)))
             .title_top(
-                Line::from(" q quits · ↑↓ scrolls joints ")
-                    .dim()
-                    .right_aligned(),
+                // The units key is named next to the others because a reader who does not know
+                // it exists has no way to discover that the numbers could be radians instead.
+                Line::from(format!(
+                    " q quits · ↑↓ scrolls · u {} ",
+                    self.units.toggled().name()
+                ))
+                .dim()
+                .right_aligned(),
             )
             .title_bottom(Line::from(self.policy_caption()));
         let inner = block.inner(area);
@@ -552,15 +642,20 @@ impl View {
     /// The velocity twist, one labelled row per axis: what a client asked for, and what
     /// actually reached the policy after safety had its say.
     fn movement(&self, state: &proto::RobotState) -> Paragraph<'static> {
-        let axis = |name: &str, sense: &str, unit: &str, i: usize| {
+        // `angular` says whether this axis is a turn rate: the two linear ones are m/s in any
+        // unit setting, and converting them would be nonsense dressed as consistency.
+        let axis = |name: &str, sense: &str, unit: &str, i: usize, angular: bool| {
             let (asked, applied) = (state.movement.requested[i], state.movement.applied[i]);
             // Highlight the difference, not the pair: "asked for 0.3, got 0.15" is the whole
             // reason this command exists, and it is invisible when both numbers look alike.
+            // Judged on the wire values, so the same clamp reads the same in either unit.
             let style = if (asked - applied).abs() > 1e-6 {
                 Style::new().fg(Color::Yellow)
             } else {
                 Style::new()
             };
+            let show = |v: f64| if angular { self.units.rate(v) } else { v };
+            let (asked, applied) = (show(asked), show(applied));
             Line::from(vec![
                 Span::raw(format!(" {name:<5}{sense:<10}{asked:>+7.2}")),
                 Span::styled(format!("{applied:>+8.2}"), style),
@@ -570,9 +665,9 @@ impl View {
 
         Paragraph::new(vec![
             Line::from(" move                asked applied").dim(),
-            axis("vx", "forward", "m/s", 0),
-            axis("vy", "left", "m/s", 1),
-            axis("vyaw", "turn left", "rad/s", 2),
+            axis("vx", "forward", "m/s", 0, false),
+            axis("vy", "left", "m/s", 1, false),
+            axis("vyaw", "turn left", self.units.rate_unit(), 2, true),
         ])
     }
 
@@ -621,11 +716,23 @@ impl View {
             ])
         };
 
+        let angle = |i: usize| self.units.angle(state.head[i]);
         let mut head = vec![Span::raw(format!(
-            " head    neck_pitch {:+.2}  head_pitch {:+.2}  head_yaw {:+.2}  head_roll {:+.2}",
-            state.head[0], state.head[1], state.head[2], state.head[3]
+            " head    neck_pitch {}  head_pitch {}  head_yaw {}  head_roll {}",
+            angle(0),
+            angle(1),
+            angle(2),
+            angle(3)
         ))];
-        head.push(Span::raw(" rad   ").dim());
+        // Degrees carry their own `°`; radians are bare, and so have to be named here or the
+        // row is four numbers in no unit at all.
+        head.push(
+            Span::raw(match self.units {
+                Units::Degrees => "   ",
+                Units::Radians => " rad   ",
+            })
+            .dim(),
+        );
         // The gain the servos are actually running at, next to `limp`, which is what a gain
         // that safety has overridden looks like from the outside.
         head.push(Span::raw(format!(
@@ -664,11 +771,11 @@ impl View {
                         .get(i)
                         .map_or_else(|| format!("joint {i}"), |name| (*name).to_owned()),
                 ),
-                Cell::from(Line::from(radians(measured)).right_aligned()),
-                Cell::from(Line::from(radians(target)).right_aligned()),
+                Cell::from(Line::from(self.angle(measured)).right_aligned()),
+                Cell::from(Line::from(self.angle(target)).right_aligned()),
                 Cell::from(
                     Line::from(match error {
-                        Some(e) => Span::styled(format!("{e:+.3}"), error_style(e)),
+                        Some(e) => Span::styled(self.units.angle(e), error_style(e)),
                         None => Span::raw("-").dim(),
                     })
                     .right_aligned(),
@@ -680,10 +787,13 @@ impl View {
         Table::new(
             rows,
             [
+                // Wide enough for a degree: `-123.45°` is two characters longer than the
+                // `-2.155` a radian needs, and a column that fits one unit but truncates the
+                // other turns the toggle into a way to lose digits.
                 Constraint::Length(15),
                 Constraint::Length(9),
                 Constraint::Length(9),
-                Constraint::Length(8),
+                Constraint::Length(9),
                 Constraint::Min(BAR_HALF as u16 * 2 + 1),
             ],
         )
@@ -707,17 +817,26 @@ impl View {
         )
     }
 
+    /// One joint angle, or a dash where the wire carried none.
+    fn angle(&self, v: Option<f64>) -> Span<'static> {
+        match v {
+            Some(v) => Span::raw(self.units.angle(v)),
+            None => Span::raw("-").dim(),
+        }
+    }
+
     /// What the joints block says about itself on the right of its border: the bar's scale
     /// when every joint is on screen, and *which* joints are on screen when they are not.
     /// Never silently truncated — a table that stops mid-leg with nothing saying so is a
     /// display that lies.
     fn window_note(&self, count: usize, visible: usize) -> String {
+        let (unit, scale) = (self.units.name(), self.units.bar_scale());
         if visible >= count {
-            return format!(" radians · bar reaches ±{BAR_FULL_SCALE:.2} rad ");
+            return format!(" {unit} · bar reaches {scale} ");
         }
         let last = (self.scroll + visible).min(count);
         format!(
-            " radians · bar ±{BAR_FULL_SCALE:.2} · {}–{last} of {count} · ↑↓ scrolls ",
+            " {unit} · bar {scale} · {}–{last} of {count} · ↑↓ scrolls ",
             self.scroll + 1
         )
     }
@@ -788,13 +907,6 @@ fn fall_verdict(safety: &proto::SafetyState) -> Span<'static> {
         )
     } else {
         Span::styled("upright", Style::new().fg(Color::Green))
-    }
-}
-
-fn radians(v: Option<f64>) -> Span<'static> {
-    match v {
-        Some(v) => Span::raw(format!("{v:+.3}")),
-        None => Span::raw("-").dim(),
     }
 }
 
@@ -968,8 +1080,8 @@ mod tests {
             assert!(screen.contains(name), "{name} is missing:\n{screen}");
         }
         // The columns carry a unit, and the bar carries the scale it is drawn to.
-        assert!(screen.contains("radians"), "{screen}");
-        assert!(screen.contains("bar reaches ±0.20 rad"), "{screen}");
+        assert!(screen.contains("degrees"), "{screen}");
+        assert!(screen.contains("bar reaches ±11.5°"), "{screen}");
         assert!(
             !screen.contains("of 15"),
             "nothing is hidden, so nothing is counted:\n{screen}"
@@ -1042,7 +1154,7 @@ mod tests {
             "vy   left",
             "vyaw turn left",
             "m/s",
-            "rad/s",
+            "°/s",
             "asked",
             "applied",
             // The IMU is named as such, not left as a bare `g[...]`.
@@ -1168,6 +1280,63 @@ mod tests {
         );
     }
 
+    /// Every angle on screen is a degree by default — joints, head and the yaw rate alike.
+    /// Radians are what the wire carries and what nobody can picture: a hip at `-0.52` says
+    /// nothing to someone looking at the leg it describes.
+    #[test]
+    fn angles_are_drawn_in_degrees() {
+        let screen = draw(110, 32, &a_bent_state(), 0);
+
+        // A joint, its command, and the error between them.
+        assert!(screen.contains("+90.00°"), "a right angle:\n{screen}");
+        assert!(screen.contains("+85.00°"), "what it was told:\n{screen}");
+        assert!(
+            screen.contains("+5.00°"),
+            "the error between them:\n{screen}"
+        );
+        // The head, and the turn rate in the twist.
+        assert!(screen.contains("neck_pitch +45.00°"), "{screen}");
+        assert!(screen.contains("+57.30"), "1 rad/s as °/s:\n{screen}");
+        // And no unit label still says radians while the numbers are degrees.
+        assert!(!screen.contains("rad/s"), "{screen}");
+        assert!(!screen.contains("±0.20 rad"), "{screen}");
+    }
+
+    /// `u` puts the radians back. They are what the protocol, the policy's own inputs and every
+    /// number a client sends are in, so a reader comparing the screen against any of those has
+    /// to be able to see the wire value rather than convert it back by hand.
+    #[test]
+    fn pressing_u_puts_the_radians_back() {
+        let mut view = View::new(20);
+        assert!(view.absorb(Update::State(Box::new(a_bent_state()))).is_ok());
+        // The key is on screen before it is pressed, or nobody knows it is there.
+        assert!(
+            render_to(&mut view, 110, 32).contains("u radians"),
+            "hinted"
+        );
+
+        view.toggle_units();
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("+1.571"), "the wire angle:\n{screen}");
+        assert!(screen.contains("+1.00"), "the wire rate:\n{screen}");
+        assert!(screen.contains("rad/s"), "{screen}");
+        assert!(screen.contains("bar reaches ±0.20 rad"), "{screen}");
+        assert!(!screen.contains('°'), "{screen}");
+        // And back again, to the unit the view opened in.
+        view.toggle_units();
+        assert!(render_to(&mut view, 110, 32).contains("+90.00°"));
+    }
+
+    /// A joint the wire did not carry stays a dash in either unit — converting an absent
+    /// reading would print `+0.00°`, which is a claim about a joint nothing measured.
+    #[test]
+    fn a_missing_angle_is_a_dash_in_either_unit() {
+        let mut view = View::new(20);
+        assert_eq!(view.angle(None).content, "-");
+        view.toggle_units();
+        assert_eq!(view.angle(None).content, "-");
+    }
+
     /// Render one frame and return it as text.
     fn draw(width: u16, height: u16, state: &proto::RobotState, scroll: usize) -> String {
         let mut view = View::new(20);
@@ -1206,6 +1375,18 @@ mod tests {
             .expect_err("ending the stream is a failure");
         assert_eq!(failure.code, exit::UNREACHABLE);
         assert_eq!(failure.message, "robotd closed the connection");
+    }
+
+    /// A state with an angle on every surface that draws one: a joint a right angle from
+    /// straight, its command five degrees off, a tilted head, and a turn rate of 1 rad/s.
+    fn a_bent_state() -> proto::RobotState {
+        let mut state = a_state();
+        state.joints[0] = std::f64::consts::FRAC_PI_2;
+        state.targets[0] = std::f64::consts::FRAC_PI_2 - 5.0_f64.to_radians();
+        state.head[0] = std::f64::consts::FRAC_PI_4;
+        state.movement.requested[2] = 1.0;
+        state.movement.applied[2] = 1.0;
+        state
     }
 
     fn a_state() -> proto::RobotState {
