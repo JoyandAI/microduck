@@ -40,10 +40,24 @@ if [ -f /etc/apt/sources.list ]; then
 fi
 
 # ...and $ARCH comes from ports, which is a different host serving a different set.
+#
+# **`-security` is load-bearing, not thoroughness.** `libudev1` is `Multi-Arch: same`, so apt must
+# hold both architectures at the identical version. The host's amd64 sources include
+# `noble-security`, so the moment a security update lands there — 255.4-1ubuntu8.17, in the case that
+# taught us this — apt intends to upgrade the amd64 copy to it, and then refuses to install any
+# ${ARCH} version that would disagree:
+#
+#   libudev-dev:arm64 : Depends: libudev1:arm64 (= 255.4-1ubuntu8.16)
+#                       but it is not going to be installed
+#
+# With only `${suite}` and `${suite}-updates` configured for ${ARCH}, 8.17 does not exist as far as
+# this side is concerned, so there is no version both architectures can agree on and the resolver
+# gives up. Nothing has drifted and no mirror is at fault: the suites were simply asymmetric, and it
+# broke the first time libudev had a security fix. It is *not* enough to omit this and hope.
 sudo tee "/etc/apt/sources.list.d/ports-${ARCH}.sources" >/dev/null <<EOF
 Types: deb
 URIs: http://ports.ubuntu.com/ubuntu-ports
-Suites: ${suite} ${suite}-updates
+Suites: ${suite} ${suite}-updates ${suite}-security
 Components: main universe
 Architectures: ${ARCH}
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
@@ -58,16 +72,12 @@ sudo apt-get update
 #   libudev-dev:arm64 : Depends: libudev1:arm64 (= 255.4-1ubuntu8.16)
 #                       but it is not going to be installed
 #
-# `libudev1` is `Multi-Arch: same`, so the ${ARCH} copy has to match the host's exactly — and every
-# guess about *why* it did not (mirrors drifting, phased updates, a runner image change) was
-# contradicted by the next piece of evidence. The resolver knows; it just does not say unless asked.
-# One screenful of `policy` and a simulated install is cheaper than another round of hypotheses.
+# Kept because it is what answered the question: the candidate versions, side by side, showed the
+# host being taken to a security version the ${ARCH} suites had never been told about. Guessing at
+# that from the refusal alone cost several rounds; a screenful of `policy` in the log costs nothing.
 echo "==> what apt believes"
 apt-cache policy libudev1 "libudev1:${ARCH}" libudev-dev "libudev-dev:${ARCH}" || true
 dpkg -l | grep -i libudev || true
-echo "==> how it would resolve the install"
-sudo apt-get -s -o Debug::pkgProblemResolver=yes install "libudev-dev:${ARCH}" || true
-
 sudo apt-get install -y "libudev-dev:${ARCH}"
 
 # Prove it landed. A silent miss here surfaces much later as a confusing link error, or —
