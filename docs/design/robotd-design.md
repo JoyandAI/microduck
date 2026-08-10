@@ -457,6 +457,61 @@ and any remote client is the one a developer exercises every day, so it cannot q
 For dev, `ssh -L /tmp/robotd.sock:/run/robotd.sock` gives pad-on-laptop, robot-on-board with
 no code.
 
+On the robot it is `padd.service`, running from boot and driving whatever pad connects — safe
+with no pad, because it sends nothing and the deadman holds the robot. It stays **unprivileged**,
+which is the load-bearing part of "the gamepad is a client": its `input` and `robot` group
+membership is all it has. Pairing a pad therefore belongs to `configd` (`architecture.md` §1),
+not here — bonding a device needs root and BlueZ, and a `padd` holding either would no longer be
+exercising the API the app will use.
+
+### 5.7.1 Enabling the policy brings the robot up
+
+`robot.enable` used to flip a flag and nothing else. Torque came from `robotd init`, a separate
+subcommand that opens the motor bus itself — so it needs the daemon stopped, it appeared in no
+documentation, and pressing Start on a fresh robot did nothing visible: the policy ran, the loop
+wrote positions, and the servos ignored them.
+
+So the loop has a bring-up state, and an explicit `robot.enable` is what advances it:
+
+```
+Limp ──enable (policy loaded, not fallen)──▶ Homing (torque on, 2s ramp) ──▶ Ready ──▶ policy drives
+```
+
+**The invariant the old rule protected is unchanged: nothing here happens because a process
+started.** A `robotd` restarted by an update finds `Limp`, asks for no torque, and leaves a standing
+robot standing — `a_restart_asks_for_no_torque` asserts exactly that, on the absence of any write
+rather than on a write of `false`. What changed is that "never touch torque" was a broader rule than
+the property it was defending, and it put a manual step in front of every drive.
+
+Three conditions gate the bring-up, each for its own reason:
+
+- **A loaded policy.** `enable` means "enable the policy"; powering the joints to run one that is
+  disabled or would not load would stand a robot up on a broken release and then hold it.
+- **Not fallen.** `Safety::apply` commands a fallen robot at limp gain and holds it, so a ramp there
+  would be writing a stand-up that cannot happen. `robot.enable` refuses in that state and says to
+  stand the robot up first; `robotd init`, with the daemon stopped, is still how.
+- **A fresh sample.** The ramp starts from where the joints are. Starting from a position nobody read
+  is the lurch the ramp exists to avoid.
+
+Torque is *not* dropped when the policy is disabled again: the robot holds its pose, which is what
+"a standing robot stays standing" means on this side too.
+
+`robot.init` and `robot.relax` are the same two transitions, asked for directly — because "stand up"
+and "let go" are decisions of their own, and until now the first was a subcommand that opens the motor
+bus itself and the second did not exist at all. Both are served by `robotd`, so neither needs the
+daemon stopped and neither can write to the bus while the control loop is doing the same. `init`
+deliberately needs no policy: standing up is reasonable to ask of a robot with no walking network, and
+it is what makes the bring-up testable at all, since CI has no ONNX Runtime.
+
+They arrive as a *request* the loop takes once per tick rather than a flag it keeps applying: one
+`set_torque` is a bus transaction per joint, so a level would put sixteen writes into every tick. The
+later request replaces an unread earlier one — asked to stand up and then to let go within 20 ms, the
+second is what was meant. And `relax` clears `enabled`, or the next tick would see a robot that was
+asked to drive and stand it straight back up.
+
+Neither is reachable over BLE. A phone button that drops the robot on the floor is not one to offer,
+and standing up moves every joint at once, which wants whoever asked to be looking at the robot.
+
 ### 5.8 `safeToRestart` becomes real
 
 False while the policy is enabled and the robot is moving. Restarting motor control
@@ -471,8 +526,9 @@ restarts it cleanly with the gate passing; and `--unhealthy` still rolls back.
 **Built, not yet run on hardware.** Nothing in slice 2 has met a robot: no policy has been
 loaded on a board, no observation has reached a real ONNX Runtime, and the fall and deadman
 paths have only been exercised against `FakeIo`. The tests establish that the logic is
-self-consistent — not that the robot walks. Note also that `padd` cannot run on the board
-yet (§11.4), so the first hardware driving will be from a laptop over a forwarded socket.
+self-consistent — not that the robot walks. (`padd` on the board was open when this was
+written and is not any more — §11.4 — so driving no longer has to come from a laptop over a
+forwarded socket.)
 
 ### 5.10 The tick, end to end
 

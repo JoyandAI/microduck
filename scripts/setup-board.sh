@@ -48,14 +48,9 @@ CMDLINE="${CMDLINE:-/proc/cmdline}"
 
 BT_CONF=/etc/bluetooth/main.conf
 
-# Optionally pair a gamepad, e.g. PAD_MAC=78:86:2E:BB:13:28 sh setup-board.sh
-#
-# An environment variable rather than a flag, matching MOTOR_PORT and ONNX_VERSION above —
-# this script is usually run through `curl | sh`, where flags are awkward to pass.
-#
-# Optional because the MAC is per-pad and most of the value here is the two settings that
-# apply to every board regardless: the BlueZ privacy mode, and the `input` group.
-PAD_MAC="${PAD_MAC:-}"
+# A gamepad is paired with `sudo robotctl pad pair` on the installed release, with the pad held in
+# pairing mode. This script's part of it is the one BlueZ setting a pad needs, which is here because
+# it takes a reboot to apply — see `configure_bluetooth`.
 
 # Where this script puts itself so it is still around after the reboot it asks for.
 SELF=/usr/local/sbin/robot-setup-board
@@ -402,14 +397,33 @@ free_motor_port() {
     fi
 }
 
-# Bluetooth settings a gamepad needs, and the group that lets a human read one.
+# The one Bluetooth setting a gamepad needs from this script.
 #
-# `Privacy = device` is the fix for an Xbox controller that pairs and then drops straight back
-# out — it presents as an endless connect/disconnect loop, or as
-# `disconnected with reason 3` / `AuthenticationCanceled` during pairing. Taken from
-# microduck_runtime, whose installer sets exactly this and whose notes record the same
-# symptom; several hours went into rediscovering it as a supposed BR/EDR or ERTM problem,
-# which it is not. BLE is fine.
+# `Privacy = off`, and it is the *opposite* of what this script used to set. The history matters,
+# because the old value is still on every board provisioned so far:
+#
+#   This script set `Privacy = device`, taken from microduck_runtime's installer, whose notes
+#   credit it with fixing an Xbox controller that pairs and then drops straight back out — an
+#   endless connect/disconnect loop, or `disconnected with reason 3` during pairing.
+#
+#   With that setting, an Xbox controller cannot bond with this board at all. `btmon` shows LE
+#   Secure Connections pairing reaching the last step and the *pad* rejecting it:
+#
+#       SMP: Pairing Public Key ×2 · Confirm · Random ×2 · DHKey Check
+#       > ACL Data RX: SMP: Pairing Failed — Reason: DHKey check failed (0x0b)
+#
+#   The DHKey check is computed over both devices' addresses, and `Privacy = device` makes the
+#   adapter pair from a resolvable private address rather than its public one. The two sides
+#   compute different values, and the pad refuses — every time, with no key on either side, and
+#   unaffected by retrying, by `JustWorksRepairing`, or by which side starts.
+#
+#   With `Privacy = off` the same pad pairs first time, is trusted, and reconnects by itself
+#   across a reboot. The drop-on-connect symptom the old value was meant to prevent has not
+#   returned.
+#
+# So this is a measurement replacing an inherited setting. If a pad ever does start dropping on
+# connect, the two are in genuine tension and the answer is to pair with privacy off and then
+# re-enable it — not to set `device` and lose the ability to pair at all.
 #
 # The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon on
 # this board left the kernel holding hci0 while bluetoothd reported "No default controller
@@ -421,72 +435,21 @@ configure_bluetooth() {
         return 0
     fi
 
-    if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
-        say "bluetooth Privacy already set to device"
+    # Written explicitly even though `off` is BlueZ's default: a board provisioned by an older
+    # copy of this script has `Privacy = device` in the file, and that line has to be *corrected*
+    # rather than left alone. An absent setting and a wrong one need different work.
+    if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*off' "$BT_CONF"; then
+        say "bluetooth Privacy already off"
     else
-        say "setting Privacy = device in ${BT_CONF}"
+        say "setting Privacy = off in ${BT_CONF} (a pad cannot bond otherwise)"
         if grep -Eq '^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF"; then
-            sed -i -E 's|^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=.*|Privacy = device|' "$BT_CONF"
+            sed -i -E 's|^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=.*|Privacy = off|' "$BT_CONF"
         elif grep -q '^\[General\]' "$BT_CONF"; then
-            sed -i '/^\[General\]/a Privacy = device' "$BT_CONF"
+            sed -i '/^\[General\]/a Privacy = off' "$BT_CONF"
         else
-            printf '\n[General]\nPrivacy = device\n' >> "$BT_CONF"
+            printf '\n[General]\nPrivacy = off\n' >> "$BT_CONF"
         fi
         needs_reboot=1
-    fi
-
-    add_operator_to_input_group
-    pair_pad
-}
-
-# A gamepad is read through /dev/input/event*, which is root:input mode 0660. Without this
-# `padd` starts, reports nothing, and silently sees no pad at all — the same shape of failure
-# as the `robot` group, and just as hard to guess from the outside.
-add_operator_to_input_group() {
-    operator="${SUDO_USER:-}"
-    if [ -z "$operator" ] || [ "$operator" = root ]; then
-        return 0
-    fi
-    if id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
-        return 0
-    fi
-    if usermod -aG input "$operator"; then
-        say "added ${operator} to the input group"
-        warn "${operator} must log out and back in before padd can read a gamepad."
-    else
-        warn "could not add ${operator} to the input group; padd will see no gamepad"
-    fi
-}
-
-# Trust and connect a known pad, when its MAC was supplied.
-#
-# Deliberately not a scan: discovery needs the pad held in pairing mode at the right moment,
-# which a provisioning script cannot arrange. Supplying the MAC of a pad already in pairing
-# mode is the part that can be automated; the rest stays a human at a keyboard.
-pair_pad() {
-    [ -n "$PAD_MAC" ] || return 0
-
-    if ! command -v bluetoothctl >/dev/null 2>&1; then
-        warn "bluetoothctl is not installed; cannot pair ${PAD_MAC}"
-        return 0
-    fi
-
-    say "pairing gamepad ${PAD_MAC} (hold it in pairing mode)"
-    # Discovery has to be running for a first-time connect to resolve the address.
-    bluetoothctl --timeout 15 scan on >/dev/null 2>&1 || true
-
-    # `connect` before `pair`, which is the order microduck_runtime's notes give and the one
-    # that works; leading with `pair` returns AuthenticationCanceled.
-    if bluetoothctl connect "$PAD_MAC" >/dev/null 2>&1; then
-        bluetoothctl trust "$PAD_MAC" >/dev/null 2>&1 || true
-        say "gamepad ${PAD_MAC} connected and trusted"
-    else
-        warn "could not connect ${PAD_MAC}. If Privacy was just changed, reboot first — it
-  does not take effect until then. Otherwise pair by hand:
-    sudo bluetoothctl
-    scan on            (hold the pad in pairing mode until it is listed by: devices)
-    connect ${PAD_MAC}
-    trust ${PAD_MAC}"
     fi
 }
 
@@ -507,20 +470,16 @@ report() {
   will not drive anything."
     fi
 
-    # Gamepad readiness, which is three separate things that each fail silently.
-    if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
-        printf '  %-22s %s\n' "bluetooth privacy" "device"
+    # Gamepad readiness. This board's part of it is one setting; who may read the pad is
+    # `padd.service`'s business now, and pairing one is `sudo robotctl pad pair`.
+    if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*off' "$BT_CONF"; then
+        printf '  %-22s %s\n' "bluetooth privacy" "off"
+    elif [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
+        # Named rather than lumped in with "not off": this is what older boards have, and it is
+        # the one value that makes pairing a pad impossible. See `configure_bluetooth`.
+        printf '  %-22s %s\n' "bluetooth privacy" "device — a pad CANNOT bond; re-run this script"
     else
-        printf '  %-22s %s\n' "bluetooth privacy" "NOT SET — a pad will drop on connect"
-    fi
-
-    operator="${SUDO_USER:-}"
-    if [ -z "$operator" ] || [ "$operator" = root ]; then
-        printf '  %-22s %s\n' "input group" "not applicable (no sudo user)"
-    elif id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
-        printf '  %-22s %s\n' "input group" "${operator} is a member"
-    else
-        printf '  %-22s %s\n' "input group" "${operator} NOT a member — padd sees no pad"
+        printf '  %-22s %s\n' "bluetooth privacy" "not set (BlueZ defaults to off, which works)"
     fi
 
     # The device node is what gilrs opens, so this is the only claim that matters.

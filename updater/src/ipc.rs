@@ -606,6 +606,8 @@ impl Server {
             | Call::RobotHead(_)
             | Call::RobotStop
             | Call::RobotEnable(_)
+            | Call::RobotInit
+            | Call::RobotRelax
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(
@@ -625,11 +627,17 @@ impl Server {
             | Call::SystemSetName(_)
             | Call::SystemReboot
             | Call::SystemPairingPin
-            | Call::SystemSetPairingPin(_) => Response::err(
+            | Call::SystemSetPairingPin(_)
+            // `pad.*` is `configd`'s for the same reason: pairing a gamepad is a root-only question
+            // about the radio's configuration, and it must be answerable when the robot is not
+            // working.
+            | Call::PadStatus
+            | Call::PadPair(_)
+            | Call::PadForget(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "net.* and system.* are served by configd, not updaterd",
+                    "net.*, system.* and pad.* are served by configd, not updaterd",
                 ),
             ),
 

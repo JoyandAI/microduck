@@ -62,6 +62,79 @@ behave, and those numbers stay radians whatever the screen is set to. The joint 
 robotctl monitor --json --hz 50 > run.jsonl
 ```
 
+### Power to the joints (`robotd`)
+
+```
+sudo robotctl robot init
+```
+
+```
+sudo robotctl robot relax --yes
+```
+
+`init` powers the joints and ramps to the home pose over about two seconds — **it moves every joint**,
+so have the robot on its stand. It needs no policy, and it is what the gamepad's Start does on its way
+to driving, so by hand it is a bench thing.
+
+`relax` cuts power and **the robot collapses** if nothing holds it, which is why it wants `--yes`. It
+is the only way back to limp short of pulling the plug: pressing Start again stops the policy and
+keeps the robot standing, and `robot.stop` zeroes the velocity while still standing.
+
+Both go through `robotd`, which owns the motor bus. `robotd init` — the subcommand — still exists for
+a robot whose daemon is not running, and it needs the daemon stopped, because two writers on one UART
+corrupt each other's replies:
+
+```
+sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
+```
+
+A fallen robot refuses `init`: the fall gate holds it limp on purpose. Stand it up by hand first.
+
+### Gamepad (`configd`)
+
+```
+robotctl pad status
+```
+
+```
+sudo robotctl pad pair
+```
+
+```
+sudo robotctl pad pair 78:86:2E:BB:13:28
+```
+
+```
+sudo robotctl pad forget 78:86:2E:BB:13:28
+```
+
+Pairing is once per pad and has a page of its own —
+[`pair-a-gamepad.md`](pair-a-gamepad.md): which button puts a pad in pairing mode, adding a second
+pad without forgetting the first, and what to do when it will not bond (`Privacy = device` is the
+answer more often than anything else).
+
+`padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. On the
+pad: **Start** toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks
+between body and head, **B**/circle stops.
+
+`pad status` answers two questions separately, because a connected pad and a dead driver look
+identical from the outside:
+
+```
+pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
+padd    active — driving whatever pad connects
+```
+
+To drive with non-default limits, stop the service first or two processes fight over the sticks:
+
+```
+sudo systemctl stop padd
+```
+
+```
+sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
+```
+
 ### Wifi (`configd`)
 
 ```

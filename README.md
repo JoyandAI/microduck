@@ -45,11 +45,32 @@ software
 
 ## Drive it
 
-`padd` reads a gamepad and sends intents over the socket. It has no privileged access — it is
-an ordinary client, sending exactly what the app and the SDK will send.
+Switch the pad on and drive — `padd` runs from boot, waits for a pad and drives whatever connects.
 
-The good way to run it is **from your laptop**, with the socket forwarded. Pad in your hands,
-robot on the bench, nothing cross-compiled and nothing installed:
+Pairing is once per pad and lives in
+[`docs/robot/pair-a-gamepad.md`](docs/robot/pair-a-gamepad.md): `sudo robotctl pad pair` with the pad
+in pairing mode, plus what to do when it will not bond.
+
+```bash
+robotctl pad status
+```
+
+```
+pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
+padd    active — driving whatever pad connects
+```
+
+`padd` reads the pad and sends intents over the socket. It has no privileged access — it is an
+ordinary client, sending exactly what the app and the SDK will send, which is why pairing is
+`configd`'s job rather than its own.
+
+Driving from **your laptop** works too, with the socket forwarded — pad in your hands, robot on
+the bench, nothing installed. Stop the one on the robot first, or two processes fight over the
+sticks:
+
+```bash
+sudo systemctl stop padd
+```
 
 ```bash
 ssh -L /tmp/robotd.sock:/run/robotd.sock radxa@192.168.1.42
@@ -61,18 +82,11 @@ Leave that open, and in another terminal from this clone:
 cargo run -p padd -- --socket /tmp/robotd.sock
 ```
 
-On the robot itself it ships with the release, but unlike `robotctl` it is not on `PATH` — so
-give the full path. The default socket is already the right one there:
-
-```bash
-/opt/robot/daemon/current/bin/padd
-```
-
 The controls:
 
 | | |
 |---|---|
-| **Start** | enable / disable the policy — nothing moves until this is on |
+| **Start** | enable / disable the policy — nothing moves until this is on. On a limp robot this is also what powers the joints: torque on, two seconds to the home pose, then it drives |
 | **Y** / triangle | switch between driving the **body** and posing the **head** |
 | **B** / circle | stop |
 | left stick | body: forward/back and strafe · head: neck pitch and roll |
@@ -83,9 +97,40 @@ never both, so switching to head mode zeroes the body velocity rather than leavi
 And if the pad disconnects, `padd` sends nothing at all — `robotd`'s deadman stops the robot on
 its own, which is the wanted behaviour and the reason `padd` does not invent a zero command.
 
+The first Start after power-on **moves the robot**: the joints go from wherever they are resting to
+the home pose over two seconds. Hold it, or have it on its stand.
+
+The same two steps by hand, for when there is no pad in the room:
+
+```bash
+sudo robotctl robot init
+```
+
+```bash
+sudo robotctl robot relax --yes
+```
+
+`init` powers the joints and ramps to the home pose; `relax` cuts power, and **the robot collapses**
+if nothing is holding it. That is the only way back to limp short of pulling the plug — pressing Start
+again stops the policy but keeps the robot standing.
+
+A robot the IMU already considers fallen refuses both Start and `robot init`: the fall gate holds a
+fallen robot limp on purpose. Stand it up by hand first.
+
 Speeds are conservative by default. `--max-linear` (m/s), `--max-angular` (rad/s) and
 `--max-head` (radians) raise them; `--deadzone` is there because analogue sticks rarely rest at
-exactly zero and the robot creeps without it.
+exactly zero and the robot creeps without it. The unit runs with the defaults, so to use those
+flags on the robot, stop it and run the binary yourself:
+
+```bash
+sudo systemctl stop padd
+```
+
+```bash
+sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
+```
+
+`systemctl start padd` puts the default back.
 
 ## Watch what it is doing
 
