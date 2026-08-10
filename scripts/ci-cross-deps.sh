@@ -50,6 +50,24 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
 
 sudo apt-get update
+
+# What apt believes about both architectures, before it is asked for anything.
+#
+# Here because this step failed with a refusal that explained nothing:
+#
+#   libudev-dev:arm64 : Depends: libudev1:arm64 (= 255.4-1ubuntu8.16)
+#                       but it is not going to be installed
+#
+# `libudev1` is `Multi-Arch: same`, so the ${ARCH} copy has to match the host's exactly — and every
+# guess about *why* it did not (mirrors drifting, phased updates, a runner image change) was
+# contradicted by the next piece of evidence. The resolver knows; it just does not say unless asked.
+# One screenful of `policy` and a simulated install is cheaper than another round of hypotheses.
+echo "==> what apt believes"
+apt-cache policy libudev1 "libudev1:${ARCH}" libudev-dev "libudev-dev:${ARCH}" || true
+dpkg -l | grep -i libudev || true
+echo "==> how it would resolve the install"
+sudo apt-get -s -o Debug::pkgProblemResolver=yes install "libudev-dev:${ARCH}" || true
+
 sudo apt-get install -y "libudev-dev:${ARCH}"
 
 # Prove it landed. A silent miss here surfaces much later as a confusing link error, or —
