@@ -136,6 +136,21 @@ builds with. Set `DUCK_DEV_SECRET_KEY` if yours lives elsewhere. The board must 
 [dev board](install-dev.md); the artifact is signed with a dev key, so a customer robot refuses
 it exactly as it refuses `--ref`.
 
+### Or build in a container, with no toolchain to set up
+
+```bash
+scripts/dev-push.sh --docker radxa@<board>
+```
+
+Needs Docker running and nothing else — no zig, no `cargo-zigbuild`, and no board to copy
+libudev from, which is what makes it the answer before you have a board at all. It builds inside
+Debian Bookworm on arm64, so on an Apple Silicon Mac the target is the host: nothing is
+cross-compiled and libudev is just installed. Same artifact, same `--dry-run` and `--bootstrap`.
+
+Slower to start — a first build compiles the workspace inside the container, and the two modes
+keep separate `target/` directories, so switching costs one full rebuild. Reach for it when the
+zig path is not set up or has broken; the default is faster day to day and is what CI uses.
+
 Verify without installing:
 
 ```bash

@@ -1,11 +1,17 @@
 #!/bin/sh
 # Build the daemon on this laptop and install it on a board, without CI.
 #
-# Usage:  scripts/dev-push.sh [--dry-run] [--bootstrap] [user@host]
+# Usage:  scripts/dev-push.sh [--docker] [--dry-run] [--bootstrap] [user@host]
 #         DUCK_BOARD=radxa@duck.local scripts/dev-push.sh
 #
-# Requires: cargo-zigbuild, zig, and the team dev secret key. The board must be a dev board
-# (`allow_dev_keys = true` and `team.dev.pub` in its trusted keys — `deploy/README.md`).
+# Requires the team dev secret key, and one of two build toolchains — `cargo-zigbuild` plus
+# `zig`, or `--docker`. The board must be a dev board (`allow_dev_keys = true` and
+# `team.dev.pub` in its trusted keys — `deploy/README.md`).
+#
+# **Two ways to build, same artifact.** The default cross-compiles here with `cargo zigbuild`:
+# fastest, and what CI uses. `--docker` builds inside the board's own userland instead, where
+# there is nothing to cross and libudev is an `apt-get install` — reach for it when the zig
+# toolchain is not set up, when it breaks, or before you have a board to take libudev from.
 #
 # What this is for: the loop between "I changed a line" and "the robot is running it" was a
 # push, a CI run and a `--ref` install. Everything CI does to make that artifact happens
@@ -42,12 +48,14 @@ KEY="${DUCK_DEV_SECRET_KEY:-$HOME/.duck-keys/team.dev.key}"
 
 BOOTSTRAP=no
 DRY_RUN=no
+DOCKER=no
 BOARD="${DUCK_BOARD:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --bootstrap) BOOTSTRAP=yes ;;
         --dry-run) DRY_RUN=yes ;;
+        --docker) DOCKER=yes ;;
         -h|--help)
             sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -64,13 +72,21 @@ if [ -z "$BOARD" ]; then
     exit 2
 fi
 
-# `command -v`, not `cargo zigbuild --version`: the subcommand forwards its arguments to
-# `cargo build`, which rejects `--version`, so asking it that way reports the toolchain as
-# missing on a machine where it is installed and working.
-if ! command -v cargo-zigbuild >/dev/null 2>&1; then
-    echo "cargo-zigbuild is not installed; the board target has no linker without it" >&2
-    echo "  cargo install cargo-zigbuild --locked" >&2
-    echo "  brew install zig" >&2
+if [ "$DOCKER" = no ]; then
+    # `command -v`, not `cargo zigbuild --version`: the subcommand forwards its arguments to
+    # `cargo build`, which rejects `--version`, so asking it that way reports the toolchain as
+    # missing on a machine where it is installed and working.
+    if ! command -v cargo-zigbuild >/dev/null 2>&1; then
+        echo "cargo-zigbuild is not installed; the board target has no linker without it" >&2
+        echo "  cargo install cargo-zigbuild --locked" >&2
+        echo "  brew install zig" >&2
+        echo "or build in a container instead, which needs neither:" >&2
+        echo "  scripts/dev-push.sh --docker $BOARD" >&2
+        exit 1
+    fi
+elif ! docker version >/dev/null 2>&1; then
+    echo "--docker needs a running Docker daemon" >&2
+    echo "  open -a Docker" >&2
     exit 1
 fi
 
@@ -96,8 +112,11 @@ fi
 # One difference from CI worth knowing about, and it is inert: `libudev-sys`'s build script
 # also probes for `udev_hwdb_new` by linking a test binary with the *host* toolchain, which
 # fails on a Mac and leaves its `hwdb` cfg off. `gilrs` calls nothing under that cfg.
+#
+# `--docker` needs none of this — see `scripts/dev-build.Dockerfile`. It is also the way out if
+# the board you would take libudev from is a board you have not set up yet.
 SYSROOT="${DUCK_CROSS_SYSROOT:-$HOME/.cache/duck-cross/aarch64}"
-if [ ! -f "$SYSROOT/lib/libudev.so" ]; then
+if [ "$DOCKER" = no ] && [ ! -f "$SYSROOT/lib/libudev.so" ]; then
     echo "==> fetching libudev from $BOARD for cross-linking (once)"
     remote_lib="$(ssh "$BOARD" 'ls /usr/lib/aarch64-linux-gnu/libudev.so.1 /lib/aarch64-linux-gnu/libudev.so.1 2>/dev/null | head -1')"
     if [ -z "$remote_lib" ]; then
@@ -116,12 +135,14 @@ Libs: -L\${libdir} -ludev
 Cflags:
 EOF
 fi
-# Prepended rather than replacing: on a Linux host with the multiarch package installed, both
-# are then visible and this one still wins.
-PKG_CONFIG_PATH="$SYSROOT/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-export PKG_CONFIG_PATH
-# pkg-config refuses to answer for another architecture unless told to.
-export PKG_CONFIG_ALLOW_CROSS=1
+if [ "$DOCKER" = no ]; then
+    # Prepended rather than replacing: on a Linux host with the multiarch package installed,
+    # both are then visible and this one still wins.
+    PKG_CONFIG_PATH="$SYSROOT/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export PKG_CONFIG_PATH
+    # pkg-config refuses to answer for another architecture unless told to.
+    export PKG_CONFIG_ALLOW_CROSS=1
+fi
 
 SHA="$(git rev-parse HEAD)"
 SHA7="$(git rev-parse --short=7 HEAD)"
@@ -132,21 +153,65 @@ SHA7="$(git rev-parse --short=7 HEAD)"
 CRATE="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "updater"))')"
 VERSION="${CRATE}-dev.local.$(date +%s).g${SHA7}"
 
-echo "==> building $VERSION for the board"
 rm -rf staged dist
-DUCK_REVISION="$SHA" DUCK_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" cargo board --bins
+
+# `DUCK_REVISION` and no `DUCK_BUILD_TIME`, unlike the release workflows, and it is worth a
+# measurement rather than a shrug. Both are read with `option_env!` in `duck-ipc-proto`, which
+# every daemon depends on, so a value that changes invalidates it and everything above it: with
+# a fresh timestamp each run, five crates rebuild on every push whether or not a line changed
+# (~30s here); with only the revision, which moves when you commit rather than when you push, an
+# unchanged tree rebuilds nothing at all. Nothing visible is lost — `robotctl version` reports
+# the revision and not the build time, and the version string carries the push's epoch.
+if [ "$DOCKER" = no ]; then
+    echo "==> building $VERSION for the board (zigbuild)"
+    BIN="target/aarch64-unknown-linux-gnu/release"
+    DUCK_REVISION="$SHA" cargo board --bins
+else
+    echo "==> building $VERSION for the board (docker)"
+    # A separate target directory, not the one `cargo board` writes. The two builds produce the
+    # same triple through different toolchains and linkers, and cargo's fingerprints do not
+    # capture all of that difference — sharing a directory risks it deciding a binary from the
+    # other environment is up to date. Two directories cost disk and nothing else.
+    BIN="target/docker/aarch64-unknown-linux-gnu/release"
+
+    # Rebuilt every time and cached by Docker, so a change to the Dockerfile takes effect
+    # without anyone remembering to bump a tag. The context is `scripts/`, which keeps the
+    # repository (and `target/`) out of the daemon's hands.
+    docker build -q -t duck-dev-build -f scripts/dev-build.Dockerfile scripts/ >/dev/null
+
+    if [ "$(uname -m)" != arm64 ] && [ "$(uname -m)" != aarch64 ]; then
+        echo "    host is $(uname -m): the arm64 container runs under emulation, expect slow" >&2
+    fi
+
+    # `--platform linux/arm64` so the binaries are aarch64 wherever this runs. On Apple Silicon
+    # that is a native build and the target is the host, which is the entire point: nothing to
+    # cross, and libudev came from apt.
+    #
+    # Registry cache in a named volume rather than the host's `~/.cargo`: crate sources are
+    # re-downloaded once instead of two cargos with different ideas about locking sharing a
+    # directory. `target/docker` is a bind mount so builds stay incremental across runs and the
+    # binaries are here afterwards without a copy step.
+    docker run --rm --platform linux/arm64 \
+        -v "$PWD:/src" -w /src \
+        -v duck-dev-cargo-registry:/usr/local/cargo/registry \
+        -e CARGO_TARGET_DIR=/src/target/docker \
+        -e DUCK_REVISION="$SHA" \
+        duck-dev-build \
+        cargo build --release --target aarch64-unknown-linux-gnu --bins
+fi
 
 echo "==> packaging"
 mkdir -p staged
-# Identical to the `cp` block in `dev.yml` and `release.yml`, deliberately: this pushes the
-# same artifact a release does, and `xtask/tests/artifact.rs` packages all three lists and
-# checks the tarball, so a binary added to one and not the others fails there.
-cp target/aarch64-unknown-linux-gnu/release/updaterd staged/
-cp target/aarch64-unknown-linux-gnu/release/robotctl staged/
-cp target/aarch64-unknown-linux-gnu/release/robotd staged/
-cp target/aarch64-unknown-linux-gnu/release/configd staged/
-cp target/aarch64-unknown-linux-gnu/release/btd staged/
-cp target/aarch64-unknown-linux-gnu/release/padd staged/
+# The same list as the `cp` block in `dev.yml` and `release.yml`, deliberately: this pushes the
+# same artifact a release does, and `xtask/tests/artifact.rs` packages all three lists and checks
+# the tarball, so a binary added to one and not the others fails there. Only the directory
+# differs, because which toolchain built these is the one thing that does.
+cp "$BIN"/updaterd staged/
+cp "$BIN"/robotctl staged/
+cp "$BIN"/robotd staged/
+cp "$BIN"/configd staged/
+cp "$BIN"/btd staged/
+cp "$BIN"/padd staged/
 
 # No `--base-url`: the manifest `LocalDir` reads names the artifact by bare filename, and
 # `package` leaves it bare when no base is given.

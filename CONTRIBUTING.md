@@ -43,7 +43,9 @@ modes, peer-credential authorization — on Debian 13 (Trixie). `BOARD_IMAGES=` 
 another.
 
 To run a change on a real robot without publishing it, `scripts/dev-push.sh <user@board>` builds
-here and installs there as an ordinary gated update. Setup and the one-time first push:
+here and installs there as an ordinary gated update. It cross-compiles with `cargo zigbuild` by
+default, or with `--docker` builds inside the board's userland instead, which needs no toolchain
+set up at all. Setup and the one-time first push:
 [`docs/robot/cheatsheet-dev.md`](docs/robot/cheatsheet-dev.md).
 
 ## The layout
@@ -59,8 +61,8 @@ btd/            the BLE front door, plus btctl (a laptop client, never shipped)
 robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
-scripts/        provision-board.sh · dev-push.sh (from your machine) · provision.sh →
-                setup-board.sh · migrate-network.sh · install.sh (on the board) ·
+scripts/        provision-board.sh · dev-push.sh + dev-build.Dockerfile (from your machine) ·
+                provision.sh → setup-board.sh · migrate-network.sh · install.sh (on the board) ·
                 board-test.sh (CI)
 docs/           robot/ (using one) · design/ (how it works) · project/ (roadmap, records)
 ```

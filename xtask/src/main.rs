@@ -1082,12 +1082,22 @@ mod tests {
                     panic!("{src} has no ExecStart naming a binary");
                 };
 
-                let staged = format!("release/{exec} staged/");
+                // The staged names, by basename of each `cp … staged/` line. Not
+                // `contains("release/<exec> staged/")`: `dev-push.sh` builds in one of two
+                // directories depending on the toolchain, so it names the source through a
+                // variable, and a check keyed to a literal path would have quietly stopped
+                // looking at the site that changes most often.
+                let staged: Vec<&str> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| l.starts_with("cp ") && l.ends_with(" staged/"))
+                    .filter_map(|l| l.trim_end_matches(" staged/").rsplit('/').next())
+                    .collect();
                 assert!(
-                    text.contains(&staged),
+                    staged.contains(&exec),
                     "{workflow} packages {src}, whose ExecStart is {exec:?}, but never stages \
-                     that binary. Without it the unit fails on the board with 203/EXEC. Add:  \
-                     cp target/aarch64-unknown-linux-gnu/release/{exec} staged/"
+                     that binary — it stages {staged:?}. Without it the unit fails on the board \
+                     with 203/EXEC. Add:  cp <build dir>/{exec} staged/"
                 );
             }
         }
