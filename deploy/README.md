@@ -17,6 +17,9 @@ loses recent logs on a power cut, which is how a robot is actually switched off.
 under `/var/lib` is therefore the only durable record — which is what `architecture.md` §8.2
 designed it to be.
 
+> To just get a dev board working, [`docs/robot/install-dev.md`](../docs/robot/install-dev.md) is the short
+> procedure. Below is the trust chain, what ends up where, and where logs go.
+
 ## Quickstart
 
 Three ways in, in order of how much you have to type. Everything after this section is the same
@@ -24,9 +27,8 @@ thing with the reasons attached — read it when something disagrees with you, n
 
 ### Dev board, repository private — this is today
 
-One command, from a clone on your own machine. The target is `[user@]host`, and the host can be
-a name or an address — use the address: mDNS on this image is unreliable, so a `.local` name
-resolves when it feels like it and a DHCP lease is the thing you can count on.
+One command from a clone, covered step by step in
+[`docs/robot/install-dev.md`](../docs/robot/install-dev.md):
 
 ```bash
 export DUCK_TOKEN=github_pat_replace_with_your_token
@@ -36,38 +38,13 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ./scripts/provision-board.sh radxa@192.168.1.42
 ```
 
-That sends the dev key from `~/.duck-keys/team.dev.pub` if you have one, starts provisioning,
-waits out the reboot, streams the log the unattended half writes, and ends on `robotctl health`.
+`--no-dev-key` for a board that should only take releases, `--ref BRANCH` to provision from a
+branch, `--local` to send this clone's `provision.sh` rather than fetching it, which is what makes
+testing an unpushed change to it possible.
 
-It is a **viewer**, not the thing doing the work: `provision.sh` installs a systemd unit that
-resumes at boot, so the board finishes whether or not this is still watching. If it loses sight
-of the board — a lease that moved, an ssh session that wedges — Ctrl-C costs you nothing:
-
-```bash
-ssh -t radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
-```
-It needs ssh key access, because it has to reconnect by itself after the board reboots — a
-password prompt cannot survive that. `--no-dev-key` for a board that should only take releases,
-`--ref BRANCH` to provision from a branch, `--local` to send this clone's `provision.sh` rather
-than fetching it, which is what makes testing an unpushed change to it possible.
-
-⚠ **After a reflash, ssh to the same address will refuse to connect.** Reflashing regenerates
-the board's host keys, so the address you used last time now presents a different one, and
-`StrictHostKeyChecking=accept-new` does not cover it — the host is not new, its key is. The
-script recognises that failure and names the fix; `--forget-host-key` does it for you:
-
-```bash
-./scripts/provision-board.sh radxa@192.168.1.42 --forget-host-key
-```
-
-Which matters more than it sounds, because a DHCP lease gets reused: the address that was one
-board last week is a different board today, with a different key, and the raw ssh error for that
-is a wall of text about a possible attack.
-
-`team.dev.pub` is deliberately not in the repository — a robot that trusts it installs anything
-anyone on the team builds, so that stays a per-board decision
-([`trusted_keys/README.md`](trusted_keys/README.md) has the argument). Carrying it to the board
-*is* the opt-in, which is why this script copies yours rather than fetching one.
+`team.dev.pub` is committed at [`dev-key/`](dev-key/), not in `trusted_keys/` — carrying it to a
+board *is* the opt-in, so it must not ship with every robot. The script sends the committed copy;
+`--dev-key PATH` overrides it.
 
 ### On the board, without a clone
 
@@ -75,7 +52,7 @@ Three commands, the first from your machine, and what `provision-board.sh` is do
 behalf above:
 
 ```bash
-scp ~/.duck-keys/team.dev.pub radxa@192.168.1.42:/tmp/
+scp deploy/dev-key/team.dev.pub radxa@192.168.1.42:/tmp/
 ```
 
 ```bash
@@ -167,7 +144,7 @@ rather than maintained the day we build an image with NetworkManager in it.
 Armbian's headless image runs netplan + `systemd-networkd` + `wpa_supplicant`, while `configd`
 drives NM over D-Bus — so until the migration runs, `robotctl net status` reports `Unavailable`
 and nothing over Bluetooth can configure wifi. Why NM rather than what the image ships is in
-[`../docs/app-path-design.md`](../docs/app-path-design.md) §2.
+[`../docs/design/app-path-design.md`](../docs/design/app-path-design.md) §2.
 
 `provision.sh` runs them in order and holds the state that has to cross the reboot — the token,
 a dev-key path, and the boot id it uses to tell whether you have actually rebooted. It has no
@@ -276,9 +253,8 @@ appending one would land it inside whichever `[table]` came last. It installs th
 key landing under any other name is trusted as a *release* key, and branch builds would then be
 accepted as reviewed.
 
-`team.dev.pub` is deliberately not in the repository —
-[`trusted_keys/README.md`](trusted_keys/README.md) explains why. Get it from a team member, or
-regenerate it from the secret with `minisign -R -s ~/.duck-keys/team.dev.key -p team.dev.pub`.
+`team.dev.pub` is committed at [`dev-key/`](dev-key/), deliberately outside `trusted_keys/` —
+[`dev-key/README.md`](dev-key/README.md) explains why that is safe.
 
 The closing report says `DEV BOARD` when this is on, and prints the two commands to undo it.
 Never do it to a robot you ship.
@@ -301,7 +277,7 @@ no token, so it never reaches that path. Without it `updaterd` would be installe
 and unable to fetch a single update, which is most of what it is for.
 
 Artifact hosting is therefore an open decision, not a settled one —
-[`../docs/updater-design.md`](../docs/updater-design.md) §6.1 has the options. The cheap one
+[`../docs/design/updater-design.md`](../docs/design/updater-design.md) §6.1 has the options. The cheap one
 is a second, public repository holding only signed artifacts: signatures are what make an
 artifact safe to serve, not obscurity, and the source stays private.
 

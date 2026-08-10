@@ -25,7 +25,7 @@ jobs:
     #
     # ⚠ `environment: release` is NOT a gate here. On this plan (free, private repo) the
     # environment cannot carry required reviewers or a deployment branch policy — both were
-    # attempted and refused, see docs/ci-setup.md — so anyone with push access can reach
+    # attempted and refused, see docs/project/ci-setup.md — so anyone with push access can reach
     # this key, by pushing a tag or by authoring a workflow that declares this environment.
     # That was accepted deliberately while no robot is in the field.
     #
@@ -121,8 +121,8 @@ jobs:
             --include "btd/systemd/btd.service=systemd/btd.service" \
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
-            --include "docs/architecture.md=docs/architecture.md" \
-            --include "docs/updater-design.md=docs/updater-design.md" \
+            --include "docs/design/architecture.md=docs/architecture.md" \
+            --include "docs/design/updater-design.md=docs/updater-design.md" \
             --include "deploy/README.md=docs/deploy.md" \
             --include "policies/alpha_walking.onnx=policies/alpha_walking.onnx" \
             --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx"
