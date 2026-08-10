@@ -43,12 +43,21 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `system.authenticate`, which a BLE client must now pass before anything else is served — a v3
 /// client would otherwise have every call refused with no idea why. v5 added the `pad.*`
 /// namespace, which is additive — a v4 client loses nothing by not knowing it — and bumps anyway,
-/// because the version's job is to say "these two peers were not built together". During
-/// v6 added `robot.init` and `robot.relax`, so powering the joints stops being a subcommand that
-/// fights the daemon for the motor bus. During
+/// because the version's job is to say "these two peers were not built together". v6 added
+/// `robot.init` and `robot.relax`, so powering the joints stops being a subcommand that fights the
+/// daemon for the motor bus. v7 added `ApplyOptions::from_dir`, and first ships in 0.5.0 — which
+/// is the version a board has to be on before `robotctl update apply --from` can be used to put
+/// anything there. During
 /// prototyping the wire shape simply changes and this bumps; no accommodation is made for
 /// peers that predate a field, because there are none in the field yet.
-pub const API_VERSION: u32 = 6;
+///
+/// **`from_dir` bumps this even though it is an optional field an older daemon would parse.** That
+/// is the reason to bump, not a reason not to: serde ignores what it does not know, so a v6
+/// `updaterd` would accept `update.apply --from /some/dir` and quietly install from its
+/// *configured* source instead — a mirror of the release the operator meant to sideload, or
+/// nothing at all. Refusing the call outright is what this constant is for, and the refusal
+/// names both versions.
+pub const API_VERSION: u32 = 7;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -888,6 +897,22 @@ pub struct ApplyOptions {
     /// signature, hash or compatibility — those have no override.
     #[serde(default)]
     pub interrupt_sessions: bool,
+    /// Take the release from this directory **on the robot** instead of the component's
+    /// configured source. The laptop-to-board path: `scripts/dev-push.sh`.
+    ///
+    /// Changes where the bytes come from, not what is trusted. The directory is read by
+    /// the same `LocalDir` source the tests and the offline installer use, so the
+    /// manifest signature, the artifact hash and the compatibility checks all still have
+    /// to pass — a locally built release installs because the dev key is in the robot's
+    /// trusted set, not because anything is skipped.
+    ///
+    /// A `String` rather than a `PathBuf` because this is a JSON wire type: a path that
+    /// is not UTF-8 cannot cross this socket in either form, and the plain type says so
+    /// instead of failing at serialisation. It is also interpreted by `updaterd`, whose
+    /// working directory is `/` — so a client sends an absolute path, and `robotctl`
+    /// resolves one before it gets here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1795,6 +1820,7 @@ mod tests {
                 options: ApplyOptions {
                     dry_run: true,
                     interrupt_sessions: false,
+                    from_dir: None,
                 },
             }),
             Call::Rollback(ComponentParams {
@@ -1916,6 +1942,7 @@ mod tests {
             options: ApplyOptions {
                 dry_run: true,
                 interrupt_sessions: false,
+                from_dir: None,
             },
         });
         let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
@@ -1923,6 +1950,37 @@ mod tests {
         assert!(line.contains(r#""jsonrpc":"2.0""#), "{line}");
         assert!(line.contains(r#""method":"update.apply""#), "{line}");
         assert!(line.contains(r#""dry_run":true"#), "{line}");
+        assert!(
+            !line.contains("from_dir"),
+            "an apply that names no directory must not mention one: {line}"
+        );
+    }
+
+    /// `from_dir` survives the wire, and only appears when it was asked for.
+    ///
+    /// The absence half is the load-bearing one. Every other client of this type — `btd`
+    /// relaying the app, the periodic scheduler — leaves it `None`, and an apply that
+    /// carried `"from_dir":null` would be a sideload request as far as a reader of the
+    /// journal or a future daemon is concerned.
+    #[test]
+    fn from_dir_round_trips_and_is_omitted_when_unset() {
+        let call = Call::Apply(ApplyParams {
+            component: ComponentId::new("daemon"),
+            target: Target::Latest,
+            options: ApplyOptions {
+                from_dir: Some("/var/tmp/duck-sideload".to_owned()),
+                ..Default::default()
+            },
+        });
+
+        let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
+        assert!(
+            line.contains(r#""from_dir":"/var/tmp/duck-sideload""#),
+            "{line}"
+        );
+
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.as_call().unwrap(), call);
     }
 
     /// An unknown method and unparseable parameters are different failures, and a client

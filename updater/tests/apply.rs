@@ -174,6 +174,20 @@ impl Fixture {
             .write();
     }
 
+    /// A directory a laptop would have rsynced onto the board, holding releases the
+    /// configured source has never heard of. `scripts/dev-push.sh` writes this shape.
+    fn sideload(&self) -> PathBuf {
+        let dir = self.root.join("var/tmp/duck-sideload");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Publish `version` into the sideload directory *only*, signed with the same key: a
+    /// local build is signed with a trusted dev key, which is the whole reason it installs.
+    fn publish_sideload(&self, version: &str) {
+        self.publisher.release(version).dir(self.sideload()).write();
+    }
+
     fn point_ref_at(&self, git_ref: &str, version: &str) {
         self.publisher.point_ref_at(git_ref, version);
     }
@@ -1756,4 +1770,178 @@ async fn a_ref_cannot_escape_the_source_directory() {
             "ref {bad:?} must be refused, got {err:?}"
         );
     }
+}
+
+// ── installing from a directory on the board (`apply --from`) ────────────────────────
+
+/// Applies a directory the same way `robotctl update apply --from <dir>` does.
+async fn apply_from(
+    engine: &mut Engine,
+    dir: &std::path::Path,
+    target: Target,
+) -> Result<ApplyResult, updater::Error> {
+    let (tx, _rx) = progress_channel();
+    engine
+        .apply(
+            "daemon",
+            target,
+            ApplyOptions {
+                from_dir: Some(dir.to_path_buf()),
+                ..Default::default()
+            },
+            tx,
+        )
+        .await
+}
+
+/// **`--from` reaches a release the configured source cannot see.**
+///
+/// The laptop path: the build never went to GitHub, so nothing but the directory knows it
+/// exists. The second half of the test is the load-bearing one — the same version asked for
+/// without `--from` must fail — because it proves the override is what made the build
+/// reachable, rather than the fixture having quietly published it everywhere.
+#[tokio::test]
+async fn from_dir_installs_what_the_configured_source_does_not_have() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+
+    fx.publish_sideload("2.0.0");
+
+    // Not through the configured source, which has never heard of it.
+    let err = apply_exact(&mut engine, "2.0.0").await.unwrap_err();
+    assert!(
+        matches!(err, updater::Error::Network(_) | updater::Error::Io { .. }),
+        "the configured source must not resolve a sideloaded version, got {err:?}"
+    );
+
+    let result = apply_from(&mut engine, &fx.sideload(), Target::Latest)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ApplyResult::Applied { .. }),
+        "expected Applied, got {result:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("2.0.0"));
+}
+
+/// **The health gate still runs, and a bad local build is rolled back.**
+///
+/// This is the entire reason `apply --from` exists rather than `updaterd install --from`,
+/// which has to force the gate off and so can never be used on a live release. A dev board
+/// running a build somebody made ten seconds ago is where auto-rollback earns its keep.
+#[tokio::test]
+async fn a_sideloaded_build_that_does_not_come_up_is_rolled_back() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish_sideload("1.1.0");
+
+    // The robot stops answering once the new release is live — a broken local build.
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::unhealthy()),
+        updater::faults::Faults::none(),
+        "",
+    );
+    let result = apply_from(&mut engine, &fx.sideload(), Target::Latest)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(result, ApplyResult::RolledBack { .. }),
+        "expected RolledBack, got {result:?}"
+    );
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "the board must be back on what it was running"
+    );
+}
+
+/// **A local directory is not a relaxed one.** Same signature check, same hash, same refusal.
+///
+/// Worth pinning separately from the `--ref` case: `--from` is the one path where the bytes
+/// never crossed a network, and "it came off my own laptop" is exactly the argument that
+/// would justify skipping a check. Nothing skips one.
+#[tokio::test]
+async fn from_dir_verifies_like_any_download() {
+    let fx = Fixture::new();
+    fx.publish_sideload("1.0.0");
+    fx.publisher.tamper_in(&fx.sideload(), "daemon", "1.0.0");
+
+    let mut engine = fx.engine_healthy();
+    let err = apply_from(&mut engine, &fx.sideload(), Target::Latest)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, updater::Error::Verification(_)),
+        "expected a verification failure, got {err:?}"
+    );
+    assert!(fx.live_version().is_none(), "nothing may be installed");
+}
+
+/// **`--from` bypasses the downgrade guard, and only `--from`.**
+///
+/// A laptop build is a prerelease of the version it precedes, so on a board that is up to
+/// date it sorts *below* what is installed — every push would be refused as a downgrade. The
+/// same manifest offered by the configured source is still refused, which is what keeps the
+/// guard meaningful: what stands aside is an operator naming a directory, not a mirror that
+/// has gone backwards.
+#[tokio::test]
+async fn from_dir_may_move_backwards_where_latest_may_not() {
+    let fx = Fixture::new();
+    fx.publish("0.3.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    // What `scripts/dev-push.sh` builds on a board already running the release.
+    let local = "0.3.0-dev.local.1754800000.gabc1234";
+    fx.publish_sideload(local);
+
+    // The same build offered by the configured source, and nothing newer — a mirror that has
+    // gone backwards, which is the case the guard is for.
+    fx.unpublish("0.3.0");
+    fx.publish(local, None);
+
+    let err = apply_latest(&mut engine).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        updater::proto::code::WOULD_DOWNGRADE,
+        "the guard must still hold for the configured source, got {err:?}"
+    );
+
+    let result = apply_from(&mut engine, &fx.sideload(), Target::Latest)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, ApplyResult::Applied { .. }),
+        "a named directory must not be refused as a downgrade, got {result:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some(local));
+}
+
+/// A missing directory must say so, and leave the robot alone.
+#[tokio::test]
+async fn from_dir_that_does_not_exist_fails_before_anything_changes() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    let missing = fx.root.join("var/tmp/not-there");
+    let err = apply_from(&mut engine, &missing, Target::Latest)
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("not-there"),
+        "the error must name the directory: {err}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+    assert_eq!(fx.staging_leftovers(), 0);
 }

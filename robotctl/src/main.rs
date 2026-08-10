@@ -400,6 +400,27 @@ enum UpdateCommand {
         #[arg(long, conflicts_with = "git_ref")]
         staging: bool,
 
+        /// Install from a directory on this robot instead of from the configured source.
+        ///
+        /// The laptop-to-board path: `scripts/dev-push.sh` builds, signs with the dev key,
+        /// copies the directory over and ends here. The directory holds what a release is —
+        /// `<version>.manifest.json`, its `.minisig`, the artifact and the artifact's
+        /// `.minisig` — which is what `cargo xtask package` writes.
+        ///
+        /// This is an ordinary apply: preflight, signature, hash, compatibility, the health
+        /// gate and auto-rollback all still run, and a build that does not come up is
+        /// reverted. That is the whole difference from `updaterd install --from`, which
+        /// forces the gate off and therefore refuses to touch a live release at all.
+        ///
+        /// Being local relaxes nothing: a build installs because the dev key is in this
+        /// robot's trusted set and `allow_dev_keys` is on, so a customer robot refuses it
+        /// exactly as it refuses `--ref`.
+        ///
+        /// `conflicts_with = "staging"` because a directory has no channels — the source
+        /// layer says so too, and being told at parse time is better than after a connection.
+        #[arg(long, value_name = "DIR", conflicts_with = "staging")]
+        from: Option<PathBuf>,
+
         /// Verify everything, then stop before the symlink swap.
         #[arg(long)]
         dry_run: bool,
@@ -1916,6 +1937,28 @@ fn apply_target(
     }
 }
 
+/// Absolutise `--from` here, in the client, before it goes on the wire.
+///
+/// Two reasons, and the first one bites silently. `updaterd` runs with `/` as its working
+/// directory, so a relative path means something different at each end: `--from dist` would
+/// arrive as `/dist` and be reported as missing on a robot where it is sitting right there.
+/// The second is that a typo should fail against the operator's own shell, with the path they
+/// typed, rather than as an I/O error from the source layer three steps into an apply.
+fn resolve_from_dir(dir: &std::path::Path) -> Result<String, Failure> {
+    let resolved = dir
+        .canonicalize()
+        .map_err(|e| Failure::new(exit::USAGE, format!("--from {}: {e}", dir.display())))?;
+    if !resolved.is_dir() {
+        return Err(Failure::new(
+            exit::USAGE,
+            format!("--from {} is not a directory", resolved.display()),
+        ));
+    }
+    // Lossy is unreachable in practice and honest about the wire: JSON carries text, so a
+    // path that is not UTF-8 could not be sent whatever type this returned.
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
         Namespace::Health { json } => {
@@ -1969,6 +2012,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             version,
             git_ref,
             staging,
+            from,
             dry_run,
             interrupt_sessions,
         } => proto::Call::Apply(proto::ApplyParams {
@@ -1977,6 +2021,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             options: proto::ApplyOptions {
                 dry_run: *dry_run,
                 interrupt_sessions: *interrupt_sessions,
+                from_dir: from.as_deref().map(resolve_from_dir).transpose()?,
             },
         }),
         UpdateCommand::Rollback { component: name } => proto::Call::Rollback(component(name)),
@@ -2335,6 +2380,100 @@ mod tests {
             target(&["--version", "0.3.0"]),
             proto::Target::Exact(semver::Version::new(0, 3, 0))
         );
+    }
+
+    /// `--from` parses, and pairs with `--version` and `--ref`.
+    ///
+    /// The pairing is the point: the directory says *where* to read, the target says *which*
+    /// release in it, and `dev-push.sh` names a version because a directory it has just
+    /// rsynced holds exactly one.
+    #[test]
+    fn apply_from_parses_with_a_target() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["robotctl", "update", "apply", "daemon"];
+            argv.extend_from_slice(args);
+            let cli = Cli::try_parse_from(argv).expect("must parse");
+            let Namespace::Update {
+                command:
+                    UpdateCommand::Apply {
+                        from,
+                        version,
+                        git_ref,
+                        ..
+                    },
+            } = cli.namespace
+            else {
+                panic!("expected update apply");
+            };
+            (from, version, git_ref)
+        };
+
+        let (from, version, _) = parse(&["--from", "/var/tmp/duck-sideload"]);
+        assert_eq!(from.as_deref(), Some(Path::new("/var/tmp/duck-sideload")));
+        assert!(version.is_none(), "no version means the newest in the dir");
+
+        let (from, version, _) = parse(&["--from", "/var/tmp/duck-sideload", "--version", "0.3.0"]);
+        assert!(from.is_some());
+        assert_eq!(version, Some(semver::Version::new(0, 3, 0)));
+
+        let (from, _, git_ref) = parse(&["--from", "/var/tmp/duck-sideload", "--ref", "my-branch"]);
+        assert!(from.is_some());
+        assert_eq!(
+            git_ref.as_deref(),
+            Some("my-branch"),
+            "a local_dir resolves a ref too — it becomes a filename there"
+        );
+    }
+
+    /// A directory has no channels, so `--from --staging` cannot mean anything.
+    #[test]
+    fn from_and_staging_are_refused_together() {
+        assert!(
+            Cli::try_parse_from([
+                "robotctl",
+                "update",
+                "apply",
+                "daemon",
+                "--from",
+                "/var/tmp/duck-sideload",
+                "--staging",
+            ])
+            .is_err(),
+            "--from with --staging must be refused"
+        );
+    }
+
+    /// A path that is not there fails as bad usage, against the shell that typed it.
+    ///
+    /// `updaterd` would also refuse it, but three steps into an apply and with the path as it
+    /// looked from `/` — which is the other half of what this function does. A relative
+    /// `--from dist` must not reach the daemon as `/dist`.
+    #[test]
+    fn from_dir_is_resolved_and_checked_locally() {
+        // No `tempfile`: this crate carries no dev-dependencies, for the same reason it
+        // carries so few dependencies.
+        let dir = std::env::temp_dir().join(format!("robotctl-from-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let Ok(resolved) = resolve_from_dir(&dir) else {
+            panic!("an existing directory must resolve");
+        };
+        assert!(Path::new(&resolved).is_absolute());
+
+        let file = dir.join("manifest.json");
+        std::fs::write(&file, b"{}").unwrap();
+        let Err(err) = resolve_from_dir(&file) else {
+            panic!("a file is not a directory");
+        };
+        assert_eq!(err.code, exit::USAGE);
+
+        let Err(err) = resolve_from_dir(&dir.join("nope")) else {
+            panic!("a missing path must fail");
+        };
+        assert_eq!(err.code, exit::USAGE);
+        assert!(err.message.contains("nope"), "{}", err.message);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A candidate and a branch build are different streams under different keys, so asking

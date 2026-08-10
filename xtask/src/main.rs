@@ -846,14 +846,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// The workflows that *package* a release, which is where the `--include` list and the staged
-    /// binaries live.
+    /// Every file that packages a release, which is where the `--include` list and the staged
+    /// binaries live. Repository paths, because one of them is not a workflow.
     ///
     /// Named once, because the tests below all read the same files and the recipe has moved before:
     /// it used to sit in `release.yml`, and now lives in the reusable `_build-release.yml` that both
     /// the staging and stable paths call. A test that kept reading the old name would pass while
     /// guarding nothing, which is worse than failing.
-    const PACKAGING_WORKFLOWS: [&str; 2] = ["dev.yml", "_build-release.yml"];
+    ///
+    /// `scripts/dev-push.sh` is the third because it assembles the same artifact from its own copy
+    /// of the same lists — a laptop build a board actually runs. `xtask/tests/artifact.rs` opens the
+    /// tarball each of these produces; the tests below are the cheaper string form of the same
+    /// question, and they have to look at the same set or the copy that drifts is whichever one they
+    /// skip.
+    const PACKAGING_SITES: [&str; 3] = [
+        ".github/workflows/dev.yml",
+        ".github/workflows/_build-release.yml",
+        "scripts/dev-push.sh",
+    ];
 
     /// Where promotion happens: the stable manifest, the artifact carried forward, the retire step.
     const PROMOTE_WORKFLOW: &str = "_promote-release.yml";
@@ -888,8 +898,8 @@ mod tests {
         units.dedup();
         assert!(units.len() >= 4, "expected several units, found {units:?}");
 
-        for workflow in PACKAGING_WORKFLOWS {
-            let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
+        for workflow in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(workflow))
                 .unwrap_or_else(|e| panic!("{workflow}: {e}"));
             for unit in &units {
                 let expected = format!("=systemd/{unit}");
@@ -975,10 +985,9 @@ mod tests {
                     continue;
                 }
                 found += 1;
-                for workflow in PACKAGING_WORKFLOWS {
-                    let text =
-                        std::fs::read_to_string(root.join(".github/workflows").join(workflow))
-                            .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+                for workflow in PACKAGING_SITES {
+                    let text = std::fs::read_to_string(root.join(workflow))
+                        .unwrap_or_else(|e| panic!("{workflow}: {e}"));
                     let expected = format!("=systemd/sysusers.d/{name}");
                     assert!(
                         text.contains(&expected),
@@ -1012,8 +1021,8 @@ mod tests {
                 continue;
             }
 
-            for workflow in PACKAGING_WORKFLOWS {
-                let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
+            for workflow in PACKAGING_SITES {
+                let text = std::fs::read_to_string(root.join(workflow))
                     .unwrap_or_else(|e| panic!("{workflow}: {e}"));
                 let expected = format!("=hooks/{name}");
                 assert!(
@@ -1042,8 +1051,8 @@ mod tests {
             .parent()
             .expect("xtask/ has a parent");
 
-        for workflow in PACKAGING_WORKFLOWS {
-            let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
+        for workflow in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(workflow))
                 .unwrap_or_else(|e| panic!("{workflow}: {e}"));
 
             // The units this workflow packages, as `<crate>/systemd/<unit>=systemd/<unit>`.
