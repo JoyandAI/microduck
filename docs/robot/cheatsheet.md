@@ -52,9 +52,11 @@ network is configured at all — because `walk` is a mode two releases with diff
 report. A robot with no policy says so, and one whose policy would not load says that instead,
 which the stream's `held` cannot distinguish.
 
-`q` quits; `↑`/`↓` scroll the joint list on a window too short for all of it. Redirected or piped
-it prints one line per tick instead, so `> run.log` and `| grep FALLEN` behave. The joint vectors
-are in `--json`, which carries the whole state, one object per line:
+`q` quits; `↑`/`↓` scroll the joint list on a window too short for all of it; `u` switches the
+angles between degrees and radians. Angles are degrees on screen — joints, head and the yaw rate.
+Redirected or piped it prints one line per tick instead, so `> run.log` and `| grep FALLEN`
+behave, and those numbers stay radians whatever the screen is set to. The joint vectors are in
+`--json`, which carries the whole state, one object per line:
 
 ```
 robotctl monitor --json --hz 50 > run.jsonl
