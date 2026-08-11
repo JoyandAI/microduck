@@ -178,10 +178,19 @@ this section:
 - **No new CI job.** If a check needs an artifact, it hangs off the `xtask package` step `check`
   already runs, and reuses the tarball that step already built.
 
-There is also something to *remove*, which buys more iteration speed than anything below adds:
-`coverage` runs the whole instrumented suite a second time against the base branch to produce a
-delta. The absolute `--fail-under-lines` gate is the part that catches a regression; the delta is a
-comment. Dropping the second run roughly halves the job.
+Two things to *remove*, which between them buy more iteration speed than anything below adds:
+
+- **`coverage` runs the whole instrumented suite twice** on a pull request, head and base, for a delta
+  comment. The absolute `--fail-under-lines` gate is the part that catches a regression; the delta is a
+  nicety on the critical path of every push. Dropping the second run roughly halves the job.
+- **A documentation-only change pays the whole bill.** `on: [push, pull_request]` has no path filter,
+  so editing this file cross-compiles for aarch64 under QEMU and builds the workspace twice under
+  instrumentation. Three consecutive docs pull requests did exactly that while this plan was being
+  written. A `paths-ignore` for `docs/**` and `*.md` removes it — with one caveat worth checking before
+  doing it, because it is a trap rather than a detail: a skipped job never reports, so if any of these
+  checks is *required* for merge, filtering it leaves docs pull requests permanently pending. The
+  standard shape is a filtered job plus a no-op job of the same name, and it is worth confirming which
+  is needed rather than discovering it on a branch nobody can merge.
 
 ### 1. Two tests that need no new machinery
 
