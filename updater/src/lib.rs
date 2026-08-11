@@ -37,6 +37,7 @@ pub mod hooks;
 pub mod ipc;
 pub mod journal;
 pub mod manifest;
+pub mod orphan;
 pub mod preflight;
 pub mod reconcile;
 /// The IPC contract, re-exported from the [`duck_ipc_proto`] crate. Re-exported under this
@@ -71,6 +72,13 @@ pub enum Error {
         installed: semver::Version,
         candidate: semver::Version,
     },
+
+    /// The candidate does not contain a binary an installed unit execs.
+    ///
+    /// Carries a preformatted message rather than its parts, because the useful half is the
+    /// remedy — see [`crate::orphan::refusal`], which builds and tests it.
+    #[error("{0}")]
+    WouldOrphanUnit(String),
 
     #[error("another update is already in progress")]
     Busy,
@@ -143,6 +151,11 @@ impl Error {
             Error::Network(_) => code::NETWORK,
             Error::Verification(_) => code::VERIFICATION_FAILED,
             Error::Incompatible(_) => code::INCOMPATIBLE,
+            // Shares the incompatible code rather than adding one, for the reason `SelfTest`
+            // shares health's: to a client this is the same answer — "that release will not run
+            // on this board as it stands" — and what distinguishes it is the message. A new code
+            // would also be an `API_VERSION` bump for a refusal no client branches on.
+            Error::WouldOrphanUnit(_) => code::INCOMPATIBLE,
             Error::ArchiveTooLarge(_) => code::ARCHIVE_TOO_LARGE,
             Error::Preflight(_) => code::PREFLIGHT_FAILED,
             Error::Hook { .. } => code::HOOK_FAILED,

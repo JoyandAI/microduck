@@ -520,8 +520,9 @@ fetch manifest ──► verify manifest signature ──► compare version, ch
 download artifact ──► verify sha256 ──► verify artifact signature
         │
         ▼
-extract to releases/<ver>.tmp/  ──► [pre_install hook]
-        │
+extract to releases/<ver>.tmp/  ──► orphaned-unit check (§7.3) ──► [pre_install hook]
+        │                                    │ (an installed unit execs a binary this release lacks)
+        │                                    └─► report + exit, nothing swapped
         ▼
 atomic symlink swap:  current → releases/<ver>        (rename(2), same fs)
         │
@@ -579,6 +580,52 @@ side effects:
 - **Disk space.** Storage is eMMC (finite, wear less of a concern than SD, but
   space still is). Verify free space for download + extract + `keep_previous`
   before starting.
+
+### 7.3 Would this release orphan an installed unit?
+
+`hooks/postinstall` installs the units a release ships and leaves them behind on a
+rollback (§9). For a rollback that is right — the next successful update reinstalls
+whatever it ships. For a **downgrade past the release that introduced a daemon** it is
+not: the unit stays, its `ExecStart` names a binary the older release does not contain,
+systemd fails it with `203/EXEC`, and since that daemon is in the derived restart set
+the failed restart fails the update, which reverts. Observed on a board that resolved
+to stable `0.2.0`, which predates `configd`.
+
+So a candidate that lacks a binary some installed unit execs is refused —
+`updater/src/orphan.rs`, `Error::WouldOrphanUnit`. It reads `/etc/systemd/system/*.service`
+filtered to units whose `Exec*=` points into the component's `current` symlink: the live
+directory is the only place an orphan appears, since it outlived the release that
+installed it, and the filter is what keeps out units no release of ours shipped. Anything
+it cannot parse produces no finding — refusing an update over a unit file the parser
+merely did not understand is the worse failure.
+
+Three placement decisions worth keeping:
+
+- **Not preflight (§7.2).** Both preflight passes run before the artifact is downloaded,
+  so the candidate's file list does not exist yet. This runs after extraction and before
+  the swap, which is still "no side effects": staging is disposable, the boot counter is
+  unarmed, `current` has not moved. It costs a download to find out.
+- **Before the dry run returns**, because "will this downgrade work?" is what a dry run
+  is asked.
+- **No target is exempt**, unlike the `WouldDowngrade` guard which fires on `Latest`
+  alone. That one is about a mirror serving a stale manifest; this one is about a unit
+  that will not start, which does not care how the target was named — and `Ref` is how
+  the case was observed.
+
+Not on rollback, reset-to-golden or `select`: those move backwards deliberately and are
+how a board gets off a bad release, so nothing that can refuse belongs in the recovery
+path ([`architecture.md`](architecture.md) §1.1).
+
+The refusal names the unit, the missing binary, and the way past it — remove the unit:
+
+```
+systemctl disable --now configd.service && rm /etc/systemd/system/configd.service
+```
+
+Deliberately not a `--force` flag. Removing the unit is what the operator means anyway,
+since a board below the release that introduced a daemon should not be running that
+daemon; it makes the situation true rather than overriding a check that says it is not,
+and the next update that ships the unit reinstalls it.
 
 ## 8. Health gate & rollback
 
