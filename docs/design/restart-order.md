@@ -98,6 +98,14 @@ Any failure from step 11 onward rolls back: swap `current` back, re-run `on_appl
 previous release, confirm the boot counter, journal it. Steps 1–10 fail with the old release still
 live and nothing to undo.
 
+**Step 2 can also end it, and not always without restarting anything.** If the manifest names the
+release already installed, the operation stops there and reports `already_current` — nothing is
+downloaded and nothing is swapped. Before replying it does §5's reading over that release's units and
+names in `stale` any that are running something else, and those are scheduled exactly as steps 16–18
+schedule the deferred pair. So `apply` on an up-to-date robot is inert, and `apply` on a robot whose
+daemons disagree with what is installed is not. `select` on the release a board already has active does
+the same, for the same reason.
+
 ### Step 11 in detail — `hooks/postinstall`
 
 The hook ships inside the signed artifact and runs with the release directory as its cwd. In order:
@@ -145,8 +153,13 @@ Four details that are load-bearing:
   restarting its own parent. A `systemd-run` timer lives outside it.
 - **The update lock is dropped first** (step 16, before the spawn). A fork duplicates every open
   descriptor, so spawning while holding the lock hands a copy to the child.
-- **Only on `Applied`.** A rollback leaves the resident `updaterd` already matching `current`, so
-  restarting there would be churn with nothing to fix.
+- **On `Applied`, and on `already_current` with stale units** — `engine.rs::restarts_owed` decides
+  which, and it is the only thing that decides it. The first owes the fixed pair; the second owes
+  whatever §2 found running the wrong release, which is usually `updaterd` itself. A rollback owes
+  nothing: it leaves the resident `updaterd` already matching `current`, so restarting there would be
+  churn with nothing to fix.
+- **Every unit goes through the timer**, including ones an update would restart in place at step 12. A
+  second, immediate path for `configd` and `robotd` would buy five seconds and cost a mechanism.
 - **Failures are logged, never returned.** An update that succeeded is not reported as failed because
   a restart could not be scheduled; the cost of that is a daemon on an old binary until the next boot.
 
@@ -302,8 +315,7 @@ Three deliberate non-actions:
 - **`updaterd` never restarts itself here.** A successor that disagreed about which release is active
   would restart, disagree again, and loop — in the one process that owns recovery, so nothing would be
   left to break the cycle. It is safe to only report: the process has just started, so anything stale
-  about it was decided before this code ran. This is the one skew that still needs a reboot or a
-  manual `systemctl restart updaterd`.
+  about it was decided before this code ran. It is repaired from the other side instead — see below.
 - **A stopped unit is left stopped.** No identity file means either stopped or too old to publish, and
   both read the same here. Starting it would override, on every `updaterd` start, whoever stopped it.
 - **A daemon that published nothing is not treated as stale.** Restarting a robot's daemons for being
@@ -314,6 +326,24 @@ release left *ahead* of `current` by an explicit rollback, not only one left beh
 
 It runs on every `updaterd` start, so at boot it is a no-op: everything started from the same symlink.
 The cost is one file read per unit.
+
+### The same reading, from `apply`
+
+`reconcile::stale_units` is `verdict_for` over the same identity files with the acting left out, and
+`apply` and `select` call it on their already-current paths (§2). It exists because of the exception
+above: a stale `updaterd` is the one skew this module refuses to repair, and the only thing that ever
+looks at it afterwards is a person running `apply` because a daemon seems wrong. That used to answer
+`already_current` and schedule nothing, which read as confirmation that there was nothing to fix.
+
+Two properties keep it from being the loop §5 guards against. It fires on a request rather than on
+every start, and it schedules through `systemd-run` rather than driving `systemctl` from inside the
+process being restarted. It reports as well as acts: the units are named in the `already_current`
+outcome, so a client — `robotctl`, or the app — sees which daemons were not running the release the
+robot has installed.
+
+Both stale verdicts count as stale here (`Restarted` and `ReportedOnly`); the difference between them
+is about who may perform the restart, not about what is wrong. Everything else the table says is
+unchanged: a stopped unit and a daemon that published nothing are still not stale.
 
 ## 6. First install
 
@@ -349,7 +379,7 @@ Two version numbers are legitimately different at once, and which pair it is dec
 |---|---|
 | `updaterd` or `btd` behind the installed release, for a few seconds after an update | expected — the deferred restart has not fired yet |
 | `btd`, `robotd`, `configd` or `padd` disagreeing with `current` at all, persistently | the restart did not take effect *and* §5 did not fix it — so either `updaterd` has not restarted since, or its restart failed (journal, at `error`) |
-| `updaterd` behind it, persistently | the deferred restart never landed, and §5 will not fix this one. `systemctl restart updaterd`, then read the journal for why |
+| `updaterd` behind it, persistently | the deferred restart never landed, and §5 will not fix this one. `robotctl update apply daemon` repairs it — it reports `already_current` with `updaterd` in `stale` and schedules the restart. `systemctl restart updaterd` is the same fix by hand; either way the journal has why it did not land |
 | any daemon reporting `build unknown (old)` | it predates the identity mechanism, so §5 leaves it alone. One update makes it answerable |
 
 Ask the robot rather than inferring:

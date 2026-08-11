@@ -475,7 +475,9 @@ async fn install(
         }
         // Unreachable given the store guard above, but reporting it as success would be
         // wrong if that guard ever moves.
-        Ok(ApplyResult::AlreadyCurrent { version }) => {
+        // `stale` is ignored rather than reported: this is a bootstrap install, before anything is
+        // serving, so there is no running daemon for it to disagree with.
+        Ok(ApplyResult::AlreadyCurrent { version, .. }) => {
             tracing::warn!(component, version = %version, "already current");
             ExitCode::SUCCESS
         }
