@@ -73,19 +73,40 @@ jobs:
       #
       # `migrate-network.sh` was missing from this list while being the riskiest of them —
       # it is the one step that can make a headless board unreachable, and the one nobody
-      # re-runs once their own board is migrated. `board-test.sh` is deliberately absent:
-      # it runs in CI, so CI failing is already the feedback.
+      # re-runs once their own board is migrated. `robot-rescue` is here because it is the script
+      # that runs when a board cannot start its update daemon — the worst possible moment to find a
+      # typo, and it ships as text like the rest.
+      #
+      # `board-test.sh` is linted by the step below rather than here, because it needs two codes
+      # excluded. It used to be skipped entirely on the grounds that CI failing is already the
+      # feedback, which was true and too expensive: that feedback is four QEMU minutes away.
       #
       # POSIX sh, not bash: the script is piped to `sh` by the documented one-liner, and
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.
             test -x "$script"
           done
+
+      # `board-test.sh` separately, because it needs different flags and was excluded for it.
+      #
+      # It builds the container-side checks as one enormous single-quoted string, so two codes fire on
+      # that construction itself and mean nothing: SC2037 reads `CHECKS='` as a command assignment,
+      # SC2016 objects to expressions that are *meant* not to expand until the container runs them.
+      #
+      # What is left is worth having, and is the failure that actually happens: an apostrophe inside
+      # that string closes it early, and everything after it is then expanded by this shell instead of
+      # the container's. It cost a full `board` run twice in one afternoon — four QEMU minutes to be
+      # told `unexpected EOF`, when SC2211 names the line. `sh -n` alone is not enough: two
+      # apostrophes balance, so the syntax is valid and the content is silently mangled.
+      - name: Lint the board checks
+        run: |
+          sh -n scripts/board-test.sh
+          shellcheck --shell=sh --exclude=SC2037,SC2016 scripts/board-test.sh
 
       # The publish tooling must keep working, or a release can't be cut. Cheap to
       # assert here rather than discovering it at tag time.

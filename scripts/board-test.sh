@@ -721,6 +721,32 @@ for src in "$REL"/systemd/*.service; do
 done
 echo "    [ok] every unit the release ships is installed, unmodified, mode 644"
 
+# The binary each unit execs, in the artifact that shipped the unit.
+#
+# This is bug 3 of install-path-gap.md, and the only class of the four with no strong test: the
+# packaging step stages binaries with an explicit `cp` per binary, `btd` and `configd` were built and
+# never staged, and `btd.service` failed with `203/EXEC` — which reads as a broken daemon rather than
+# an incomplete artifact. `xtask/tests/artifact.rs` covers it by comparing two *source* files, which
+# is the weaker form the doc criticises; here the tarball is already unpacked and `current` already
+# points at it, so asking is three lines.
+#
+# Only `ExecStart` paths inside the release are checked. A unit may deliberately exec out of the base
+# — the boot recovery net does, precisely so a broken release cannot break it — and demanding those
+# be in the artifact would be wrong rather than strict.
+for src in "$REL"/systemd/*.service; do
+    name="$(basename "$src")"
+    exec_line="$(grep -m1 "^ExecStart=" "$src")"
+    exec_path="${exec_line#ExecStart=}"
+    exec_path="${exec_path%% *}"
+    case "$exec_path" in
+        /opt/robot/daemon/current/*) ;;
+        *) continue ;;
+    esac
+    test -x "$exec_path" \
+        || { echo "    [FAIL] ${name} execs ${exec_path}, which the artifact does not contain"; exit 1; }
+done
+echo "    [ok] the ExecStart binary of every unit is in the release that shipped it"
+
 # Accounts before units, or a unit naming a User= that does not exist fails to start and the
 # failure reads as a broken daemon.
 test -f /usr/lib/sysusers.d/robot.conf
