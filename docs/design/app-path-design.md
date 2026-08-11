@@ -276,6 +276,54 @@ Also worth knowing: a single snapshot taken after a fixed sleep is not enough. A
 periodic and the adapter's view of a bonded peripheral comes and goes, so poll until a candidate
 appears.
 
+### 3.4 The robot has to advertise often enough to be caught  · **measured**
+
+`btctl` reported `no robot found` on roughly half its runs, and for a while that was read as flakiness
+in the tool — or as the gamepad, whose LE link shares the radio. It was neither. `btd` registered its
+advertisement without an interval, so BlueZ used the kernel's default of **1.28 s**, and a central
+scanning at a low duty cycle does not catch a 1.28 s advertiser reliably.
+
+Measured from a Mac scanning continuously for two minutes, counting arrivals per device:
+
+| device | signal | arrivals in 120 s |
+|---|---|---|
+| smart plug | −66 dBm | 130 |
+| beacon | −91 dBm | 159 |
+| the robot | **−36 dBm** | **16** |
+
+The robot was the strongest signal in the room and was heard an order of magnitude less often than
+anything else in it, so range, interference and the client were all ruled out rather than argued
+about. It arrived once every 7.5 s on average, with silences of 9 s, 14 s, 17 s and once 31 s; the
+large gaps came out as near-integer multiples of 1.28 s, which is what identified the interval from
+the arrivals. An eight-second scan landing in one of those silences finds nothing.
+
+Two things follow for the app.
+
+**A phone does not escape this by being a phone.** First connection is a scan, so onboarding hits the
+same silences — and that is the moment a robot has to be findable. What §3.3's
+`retrievePeripherals(withIdentifiers:)` buys is narrower than it looks: a stored identifier lets iOS
+connect *without* a fresh sighting, so reconnection degrades to latency instead of failure. It does
+nothing for the first connection, which is the one that matters most.
+
+**The advertising interval is a property of the robot, so it is `btd`'s to get right**: 100-150 ms,
+8-12× the default, which is what ordinary peripherals use. Not the 20 ms the spec allows — one antenna
+carries this, the gamepad's LE link and wifi, and airtime spent shouting comes out of what the robot
+is for.
+
+`btd/examples/advwatch.rs` is the measurement, kept because the claim is only checkable by re-running
+it: arrivals per device with signal strength, then the robot's silences.
+
+**Confirmed on the board.** With 100-150 ms installed, the same two-minute watch from the same Mac:
+
+| | arrivals in 120 s | mean spacing | worst silence | silences ≥ 8 s |
+|---|---|---|---|---|
+| 1.28 s, the default | 16 | 7.5 s | 30.8 s | 7 |
+| 100-150 ms | 151 | 0.8 s | 3.8 s | **0** |
+
+Nine times as often, and — the part that matters — nothing left within a factor of two of `btctl`'s
+eight-second window, so the failure it was diagnosed from cannot occur. The robot went from 34th of
+106 devices heard to 7th of 74.
+
 ## 5. Pairing: just-works, and a PIN the transport checks
 
 A six-digit PIN, stored by `configd`, checked by `btd` before it serves anything. **Not** by the
