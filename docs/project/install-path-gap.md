@@ -1,10 +1,11 @@
-# The install path has no test
+# The install path had no test
 
-Status: open · Date: 2026-08-05, revised 2026-08-07 and 2026-08-11 · Owner: pierre
+Status: closed · Date: 2026-08-05, revised 2026-08-07 and 2026-08-11 · Owner: pierre
 
 Four bugs in a row reached a board, all in the install path, none caught by 418 tests or by
-`board-test.sh`. This records why, and what would actually close it. Written the same day, while
-the reasons are still concrete.
+`board-test.sh`. This records why, and what closed it. Written the same day, while the reasons were
+still concrete, and kept in the past tense it has earned rather than rewritten as reference — what it
+is useful for now is the shape of the mistake, not the state of the tree.
 
 A second section covers two findings that *look* like the same thing and are not: version skew
 between a daemon that is already running and a release that has just been installed. Neither would
@@ -14,9 +15,13 @@ their own document because anyone investigating one will arrive believing it is 
 **Revision note.** All four bugs are fixed, and so is the version-skew section that follows them:
 case 1's `serde(default)` discipline landed, case 2's handshake proposal was decided *against* with
 its reasoning written down, and the "units outlive the release that installed them" consequence is
-now a refusal rather than emergent behaviour. What is still open is the *testing* gap the title
-names — no test installs a real artifact — plus the two smaller items marked below, both of which
-are that same gap in a specific form.
+now a refusal rather than emergent behaviour.
+
+**And the gap the title named is closed.** A test installs a real artifact — `board-test.sh` unpacks
+one and runs `install.sh` and `hooks/postinstall` against it — every unit's `ExecStart` binary is
+checked against the tarball that shipped it, a board check runs on every `dev-push.sh`, and
+`scripts/systemd-test.sh` drives a real update against real systemd. The plan those came from is
+below, with what each one turned up; two engine bugs were found by the last of them.
 
 One change since the first draft moves enough of this document to call out here: `updaterd` and
 `btd` are now restarted a few seconds *after* the update replies (`RESTART_AFTER_REPLYING`), and the
