@@ -21,6 +21,7 @@ the bug.
 | [`architecture.md`](design/architecture.md) | The service split, the IPC contract, state ownership, safety and authority. |
 | [`robotd-design.md`](design/robotd-design.md) | The control loop: model, bus, sensing, observations, policy, safety. |
 | [`updater-design.md`](design/updater-design.md) | The update engine: verification, atomic swap, health gate, rollback, release format. |
+| [`restart-order.md`](design/restart-order.md) | Which unit restarts, at which step, on every path that moves `current` — and at boot. |
 | [`app-path-design.md`](design/app-path-design.md) | `btd` and `configd` — how a phone configures a robot over BLE. |
 
 ## `project/` — you are running the project
