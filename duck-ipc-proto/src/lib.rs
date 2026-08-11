@@ -43,11 +43,25 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `system.authenticate`, which a BLE client must now pass before anything else is served — a v3
 /// client would otherwise have every call refused with no idea why. v5 added the `pad.*`
 /// namespace, which is additive — a v4 client loses nothing by not knowing it — and bumps anyway,
-/// because the version's job is to say "these two peers were not built together". During
-/// v6 added `robot.init` and `robot.relax`, so powering the joints stops being a subcommand that
-/// fights the daemon for the motor bus. During
-/// prototyping the wire shape simply changes and this bumps; no accommodation is made for
-/// peers that predate a field, because there are none in the field yet.
+/// because the version's job is to say "these two peers were not built together". v6 added
+/// `robot.init` and `robot.relax`, so powering the joints stops being a subcommand that fights the
+/// daemon for the motor bus. During prototyping the wire shape simply changes and this bumps; no
+/// accommodation is made for peers that predate a field, because there are none in the field yet.
+///
+/// # The rule, since a bump has consequences and nothing else states them
+///
+/// **A bump promises nothing in either direction.** It is not "additive unless stated": v5 was
+/// additive and v4 was not, and the constant does not distinguish them. So `updaterd` refuses on an
+/// exact `!=`, and that stays deliberate rather than pending — accepting an older client would
+/// promise backward compatibility on every past and future bump, with no mechanism to keep it and
+/// no way to make a non-additive change afterwards. There is one user and one robot; a promise is
+/// worth less here than the freedom to change the wire shape.
+///
+/// **What a bump therefore costs.** Every client on a board must come from the same release as
+/// `updaterd`, and for a few seconds after an update they do not: `robotctl` is a symlink into
+/// `current`, so it follows the new release immediately, while `updaterd` is mid-restart of itself.
+/// Retrying is the fix. A client that is *persistently* older is a copy taken from somewhere other
+/// than `/usr/local/bin/robotctl`. Both directions are named in the refusal — `updater/src/ipc.rs`.
 pub const API_VERSION: u32 = 6;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
