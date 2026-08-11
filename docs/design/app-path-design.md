@@ -503,41 +503,100 @@ leaves every board insecure. One fact decides the fix and is not yet known: whet
 the robot). *Bonded but not encrypting* and *never bonded* need opposite repairs, and shipping the
 wrong one leaves the problem in place while looking solved.
 
-### 8.2 Telling robots apart — three people, three robots, one room
+### 8.2 Telling robots apart — three people, three robots, one room  · **built**
 
-Not a refinement of the above; a second gap that happens to be discovered by the same scenario. Three
-friends with three robots must each reach *theirs*, and today they cannot.
+Three friends unbox three robots. Each has to reach *theirs*, and until this landed none of them
+could: every board flashed from one image advertised `radxa-zero3`.
 
-What the radio actually offers a phone right now:
+This is a usability problem first. It has a security tail — a phone that picks the wrong robot can
+authenticate to it and write its owner's wifi credentials into it, since the PIN is `000000` on all
+of them — but the tail is not what makes it worth fixing. A robot you cannot pick out of a list is
+one nobody can use, and that stands on its own. §8.1 is tracked separately and gates none of this.
 
-- **The advertised name is the hostname.** `configd`'s `Store` falls back to `hostname()` when no name
-  has been set, and `btd` advertises that as `local_name`. Every board flashed from one image
-  advertises `radxa-zero3`.
-- **There is no serial.** `system.info` returns `serial: null` — no per-device identity exists
-  (`updater-design.md` §5.7 owns that gap).
-- **The PIN is `000000` on all of them** (§5.3).
+#### What a robot is called
 
-The three compound into something worse than a bad UX: a phone cannot merely *pick* the wrong robot,
-it can **authenticate to it and reconfigure it**. Choosing your friend's robot from a list is a
-mistake; being able to put your wifi credentials into it is a security failure. So this is a
-prerequisite for shipping alongside encryption, not a nicety after it.
+**Identity comes from the SoC serial**, read from `/proc/device-tree/serial-number` and reported by
+`system.info` (`configd::identity`). Fused into the chip and handed over by the bootloader, so it
+survives a reflash, survives swapping the radio module, and needs no provisioning step to exist —
+which is what keeps a hand-flashed board working. It is also a plain file read: no root, no D-Bus,
+and available immediately rather than after the ~73 seconds `hci0` takes to appear.
 
-Directions, roughly in dependency order:
+The Bluetooth adapter address was the better-looking candidate, because a peer already sees it at
+the link layer, so a name derived from it leaks nothing new. It was rejected on evidence — see §8.6.
 
-- **A per-device identity, assigned at provisioning.** Everything else hangs off this. The default
-  advertised name should derive from it — `duck-7f3a` rather than `radxa-zero3` — so robots are
-  distinguishable straight out of the box, before anyone has renamed anything.
-- **Print it on the robot**, with the PIN. A sticker carrying name and PIN is what makes "connect to
-  the one in front of me" a *check* rather than a guess, and it composes with §5.3's requirement that
-  a shipped robot have a per-robot PIN rather than `000000`.
-- **An `identify` action** — make *this* robot nod, blink or chirp — so a human confirms the right one
-  before configuring it. Two decisions this needs, neither of them plumbing: motor control is refused
-  over BLE by design (§3.1), so `identify` cannot simply be a move and needs its own narrowly-scoped
-  action; and it has to work **before** authentication, because requiring the PIN first is circular
-  when aiming the PIN at the right robot is the whole problem. Allowing an unauthenticated stranger in
-  BLE range to make robots chirp is a real cost, and probably an acceptable one.
-- **RSSI as a sort key, never as identity.** Useful for putting the nearest robot first in a list.
-  Not evidence: signal strength through a body or a table reorders robots freely.
+**The default name is `duck-` plus four hex characters of a SHA-256 of the serial**: `duck-c51b`.
+Hashed rather than sliced, because nothing guarantees which part of a chip id varies between chips.
+SHA-256 rather than `std`'s hasher, whose output is not stable across Rust releases — a toolchain
+bump would rename every robot in the field, and nobody would ever connect the two events.
+
+Four hex characters is 65 536 possibilities, so three robots in a room collide about once in 22 000
+times. This is a default meant to be *distinguishable*, not a unique key.
+
+A name of more than **8 characters** does not fit the 31 bytes of a legacy advertisement once flags
+and the 128-bit service UUID are counted, so it travels in the scan response — a second exchange a
+central can miss. `duck-c51b` is 9, one over. Dropping to three hex characters would fit, at 4 096
+possibilities; whether that trade is worth taking is unmeasured, because it depends on how BlueZ
+packs the two payloads.
+
+#### The advertised name is the one the robot was given
+
+`btd` asks `configd` what the robot is called and reconciles its advertisement against that answer
+every few seconds. Before this it advertised `/etc/hostname` while `system.setName` wrote to a file
+nothing ever read: renaming a robot changed nothing a phone could see, not even after a restart, and
+three comments in the tree described the intended behaviour as though it existed.
+
+Reconciled rather than event-driven, deliberately. `btd` forwards `system.setName` without reading
+the reply — interpreting replies is what this daemon avoids — and re-asking the moment it forwards
+one races the write it just forwarded. Polling is fewer moving parts and covers renames made through
+`robotctl`, which never cross `btd` at all. `--name` pins the advertisement for bench work. An
+unreachable `configd` falls back to the hostname: `btd` is on the recovery path and has to come up
+when the rest of the robot has not.
+
+#### Provisioning can name a board, and does not have to
+
+`DUCK_NAME` makes `provision.sh` call `robotctl system set-name` at the end. Optional on purpose:
+the derived default already distinguishes a board, so provisioning *improves* on a working name
+rather than being what supplies one. That is what makes this survive a board flashed by hand, which
+was the objection that ruled out assigning identity at provisioning time.
+
+#### What the app should do
+
+- **Store the serial as the key.** It is the only handle that survives both a rename and a change of
+  Bluetooth address, and it is what a "favourite" or a user-chosen label should hang off.
+- **Store the peripheral identifier too**, as the fast path — `retrievePeripherals(withIdentifiers:)`
+  on iOS skips scanning entirely. It is a cache, not the identity: it dies with the address (§8.6),
+  and the serial is what re-establishes which robot a favourite meant.
+- **RSSI is a sort key, never identity.** Fine for putting the nearest robot first. Not evidence:
+  signal through a body or a table reorders robots freely.
+
+Once a robot has been connected to once, this is solved — the app goes straight back to it and shows
+whatever the owner called it.
+
+#### Still open
+
+- **Which of three is mine, the very first time.** Three distinct names in a list is not the same as
+  knowing which one is the duck in your hands. Bridging that needs a physical signal: something
+  printed on the robot, an `identify` action, or proximity. Cheapest mitigation costs nothing and is
+  not code — power one robot on at a time, and have the app say so.
+- **`identify`** — make *this* robot nod, blink or chirp. Nothing in the tree drives an LED, a
+  speaker or a screen, and motor control is refused over BLE by design (§3.1), so this is a missing
+  device path rather than the policy question it looks like. When it exists, two decisions come with
+  it: what it may actuate, and that it has to work *before* authentication, since requiring the PIN
+  first is circular when aiming the PIN at the right robot is the problem.
+- **A sticker, and a per-robot PIN to print on it.** §5.3 wants the PIN; both wait on hardware
+  nobody has settled. Note that the PIN cannot be derived from the identity: the identity is
+  published in an advertisement, so anything computed from it is public.
+- **What a factory reset does.** Nothing clears `configd`'s config today — it survives updates and
+  rollbacks by design, and `update.resetToGolden` reverts releases rather than config — so a
+  provisioned name and a user rename are indistinguishable. A separate "factory name" slot only
+  earns its keep once something can clear one without clearing the other.
+
+#### What the tests do not cover
+
+The identity and the derived name are ordinary unit tests. The scenario this exists for — three
+robots advertising at once and a client choosing correctly — is not testable off a board, and wants
+either three of them or a fake peripheral. Worth saying plainly rather than leaving the green suite
+to imply otherwise.
 
 ### 8.3 `API_VERSION` skew
 
@@ -553,3 +612,37 @@ restarts it and reports success anyway. `install-path-gap.md` §4 has the full a
 
 §5.6. Three wrong PINs close the session; nothing counts across reconnects, so a peer retries
 indefinitely at the cost of a bond per three guesses. Needs somewhere to keep per-address state.
+
+### 8.6 The adapter address does not hold still — **not investigated**
+
+Recorded so it is not rediscovered from scratch. Nothing here has been chased down, and it is
+deliberately parked rather than open work.
+
+One board reported two different Bluetooth addresses across sixteen boots, from `btd`'s own startup
+line (`serving BLE ... address=`):
+
+- `50:37:CD:16:2B:EC` — two `btd` starts within one boot, 10:04 and 10:05
+- `50:37:CD:16:1B:92` — every boot after, 10:18 onward, fifteen of them
+
+Between them: no reflash. Nothing done to the board but BLE connections through `btctl` and gamepad
+pairing. The top four bytes held; only the low two moved, which fits a driver that generates an
+address once behind a vendor prefix and caches it rather than reading one out of the module. `configd`
+never power-cycles the adapter — it only powers one on that is off — so pad pairing has no obvious
+mechanism, which makes it the thing to test rather than the thing to blame.
+
+Why it matters beyond a puzzling log line:
+
+- **Every bond lives under `/var/lib/bluetooth/<address>/`**, so an address change orphans all of
+  them. A paired gamepad and a bonded phone both stop working, and re-pairing looks like a fix for
+  an unrelated fault.
+- **iOS derives the peripheral identifier from the device address**, so an app's saved "my robot"
+  breaks with it. This is why §8.2 has the app key favourites on the *serial*.
+
+It is not an identity problem any more — §8.2 no longer depends on this value for anything — which is
+why this can wait.
+
+Cheapest next steps, when someone picks it up. `sudo ls -la --time-style=long-iso /var/lib/bluetooth/`
+dates the moment the second address first appeared, since BlueZ names a directory after each adapter
+it has seen. Then `bluetoothctl show | head -3` before and after `robotctl pad pair` settles the pad
+hypothesis without a reboot. If the address turns out to come from a file, it can be pinned
+deliberately — which would also make it survive a reflash.

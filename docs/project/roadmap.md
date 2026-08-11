@@ -22,7 +22,7 @@ Companion to [`architecture.md`](../design/architecture.md) (what we're building
 | `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
 | `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](../design/app-path-design.md) §5.5 |
-| `configd/` | wifi over NetworkManager, robot name, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
+| `configd/` | wifi over NetworkManager, robot name and the identity it derives from the SoC serial, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
 | tests | **458 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | missing | `mediad`, app, SDK |
 | on hardware | walking through the intent API, the update path (install · health gate · commit · auto-rollback), a signed release installed from the stable channel, BLE provisioning of wifi. The loop held 50.0 Hz with `missed=3` in 15022 ticks before inference |
@@ -252,12 +252,14 @@ That's the whole onboarding path, and M1+M2 are exactly what make it true.
    declaration is the hook that turns a real gate on with one settings change. See
    [`ci-setup.md`](ci-setup.md).
 2. **Safety authority** (§6) — pulled into M3 for the reason above.
-3. **Provisioning** — no longer safe to defer, and now has two claimants rather than one.
-   §5.7's per-device state (calibration, identity) needs a home before the first robot ships,
-   and BLE pairing security *rests* on a per-robot PIN: the factory default is `000000` and
-   public in this repository, so out of the box pairing proves physical presence and nothing
-   more. Something has to generate a PIN, print it, and record what was printed. Defining that
-   slot once — serial and PIN together — is cheaper than twice.
+3. **Provisioning** — still needed, but for less than it was. Identity no longer waits on it:
+   a robot derives one from its own SoC serial and names itself `duck-c51b`, so a board flashed
+   by hand is distinguishable out of the box ([`app-path-design.md`](../design/app-path-design.md)
+   §8.2). What is left is calibration and the PIN — BLE pairing security *rests* on a per-robot
+   PIN, the factory default is `000000` and public in this repository, so out of the box pairing
+   proves physical presence and nothing more. Something has to generate one, print it, and record
+   what was printed. Note the PIN cannot come from the identity, which was the plan: the identity
+   is published in an advertisement, so anything derived from it is public too.
 4. **Privacy** — consent + indicator in M5, not M6.
 
 ## Not doing, on purpose
