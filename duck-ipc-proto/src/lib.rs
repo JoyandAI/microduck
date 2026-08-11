@@ -65,6 +65,29 @@ pub mod socket {
     pub const CONFIG: &str = "/run/configd.sock";
 }
 
+/// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
+///
+/// One directory per service rather than one shared directory, because that is what
+/// `RuntimeDirectory=<service>` in a unit file gives — and it has to be that, for two reasons no
+/// tidier layout survives. `btd` and `padd` run under `ProtectSystem=strict`, so the filesystem is
+/// read-only to them *except* what systemd grants, and `RuntimeDirectory` is the grant. And systemd
+/// deletes the directory when the unit stops, so a stopped daemon cannot leave a stale identity
+/// behind claiming to be running.
+pub fn identity_path(service: &str) -> std::path::PathBuf {
+    runtime_root().join(service).join("identity.json")
+}
+
+/// Where the per-service runtime directories live: `/run`, unless `DUCK_RUNTIME_DIR` says otherwise.
+///
+/// Not a configuration knob for a robot — nothing on the board sets it. It exists so this is testable
+/// at all, since a test cannot write to `/run`, and it is the same reason a daemon run by hand on a
+/// laptop can publish an identity: `/run` is root-owned there too, and on macOS it does not exist.
+pub fn runtime_root() -> std::path::PathBuf {
+    std::env::var_os("DUCK_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/run"))
+}
+
 /// The robot's joint order, as every positional vector on the wire is indexed.
 ///
 /// It lives here rather than in `duck_control::model` because it *is* protocol:
@@ -1691,20 +1714,10 @@ pub struct ServiceUnit {
     /// The systemd unit, e.g. `btd.service`.
     pub unit: String,
     pub state: UnitState,
-    /// The release the running process was started from, when its path names one.
-    ///
-    /// `None` for a stopped unit, and for a binary outside the release layout — a hand-built one
-    /// during development, say, which [`Self::binary`] then names in full.
+    /// What the running process published about itself, or `None` when it published nothing —
+    /// stopped, or a build too old to publish. [`UnitState`] tells those apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub release: Option<semver::Version>,
-    /// The resolved path of the running binary, so an answer `release` cannot express is not lost.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binary: Option<String>,
-    /// The running binary is no longer on disk: it was replaced or pruned while the process kept
-    /// running. Worth its own field because it is the sharpest possible evidence that a restart did
-    /// not happen — the release this process came from has already been cleaned up.
-    #[serde(default)]
-    pub deleted: bool,
+    pub identity: Option<Identity>,
 }
 
 /// Answer to [`Call::PadStatus`].
@@ -1814,6 +1827,101 @@ macro_rules! build_info {
     };
 }
 
+/// The release a binary at this path was installed as.
+///
+/// Matches the layout rather than a configured root: any path with a `releases/<version>/` in it
+/// yields that version. The root is `updater.toml`'s to choose, and hardcoding a copy of it here is
+/// how the two drift apart. Here rather than in one daemon so that `configd`, `updaterd` and
+/// `robotctl` cannot come to disagree about what a release path means.
+///
+/// A path with no such component is not an error — a hand-built binary run from a developer's home
+/// directory is a normal thing on a dev board, and the full path is reported alongside.
+pub fn release_from_path(path: &str) -> Option<semver::Version> {
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    let mut parts = path.split('/');
+    while let Some(part) = parts.next() {
+        if part == "releases"
+            && let Some(version) = parts.next()
+            && let Ok(version) = semver::Version::parse(version)
+        {
+            return Some(version);
+        }
+    }
+    None
+}
+
+/// What a daemon says it is, published by the process itself at startup.
+///
+/// **Self-published, which is the whole design.** The alternative was reading `/proc/<pid>/exe` from
+/// outside, and that was chosen for a bad reason: that an *old* daemon could not have learned to
+/// publish anything. Designing around that bought a worse answer. A path names a release directory;
+/// a process knows its own version, its own git revision and its own exe — and it can read
+/// `/proc/self/exe` with no privilege at all, where reading another user's needs root.
+///
+/// So the two builds of `0.4.0` a dev channel produces are told apart here by `revision`, the field
+/// that actually differs, rather than inferred from a directory name that happens to embed it. A
+/// daemon too old to publish has no file and reports as `unknown`, which is honest — an inferred
+/// release reads as authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub service: String,
+    /// Crate version, compiled in. Shared across the workspace, so not enough on its own.
+    pub version: String,
+    /// Git SHA, compiled in from `DUCK_REVISION`. `None` for a build that did not come from CI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<String>,
+    /// The resolved path this process was launched from, via `/proc/self/exe` — so it names the
+    /// release directory even though the unit points at the `current` symlink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    pub pid: u32,
+}
+
+impl Identity {
+    /// The release this process was installed as, when its path names one.
+    pub fn release(&self) -> Option<semver::Version> {
+        release_from_path(self.exe.as_deref()?)
+    }
+}
+
+/// Write this process's identity where anything can read it.
+///
+/// Never fatal and never allowed to stop a daemon starting: a robot that would not come up because
+/// it could not describe itself is a worse failure than one that cannot say what it is. The
+/// directory is created if missing so a hand-run binary on a dev board still publishes; on the board
+/// it is already there, made by `RuntimeDirectory=`.
+pub fn publish_identity(service: &str, build: BuildInfo) -> Result<(), String> {
+    let identity = Identity {
+        service: service.to_owned(),
+        version: build.version.to_owned(),
+        revision: build.revision.map(str::to_owned),
+        built_at: build.built_at.map(str::to_owned),
+        exe: std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string()),
+        pid: std::process::id(),
+    };
+
+    let path = identity_path(service);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut json = serde_json::to_vec(&identity).map_err(|e| e.to_string())?;
+    json.push(b'\n');
+    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// What one daemon published, or `None` if it published nothing.
+///
+/// `None` covers both "not running" — systemd removes the directory with the unit — and "too old to
+/// publish". Those are told apart by the unit's state, a separate question with a separate answer.
+pub fn read_identity(service: &str) -> Option<Identity> {
+    let json = std::fs::read(identity_path(service)).ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
 /// The first line a daemon writes: its own identity.
 ///
 /// At `warn` so it survives `RUST_LOG=warn` on a long-running board (`architecture.md` §8.1) —
@@ -1832,7 +1940,12 @@ macro_rules! build_info {
 /// and semver and nothing else — the expansion happens where `tracing` already is.
 #[macro_export]
 macro_rules! log_startup_identity {
-    ($service:expr) => {
+    ($service:expr) => {{
+        if let Err(e) = $crate::publish_identity($service, $crate::build_info!()) {
+            // A warning: `robotctl health` will say `unknown` for this daemon, which is a worse
+            // report rather than a broken robot.
+            tracing::warn!(error = %e, "could not publish this process's identity");
+        }
         tracing::warn!(
             service = $service,
             build = %$crate::build_info!(),
@@ -1842,12 +1955,88 @@ macro_rules! log_startup_identity {
             pid = std::process::id(),
             "starting"
         )
-    };
+    }};
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The path a release actually installs to, which is what makes "which version is running"
+    /// answerable at all.
+    #[test]
+    fn a_release_path_names_its_version() {
+        assert_eq!(
+            release_from_path("/opt/robot/daemon/releases/0.4.0/bin/btd"),
+            Some(semver::Version::parse("0.4.0").unwrap())
+        );
+    }
+
+    /// A branch build, which is the case this was written against: the crate version says `0.4.0`
+    /// for both the old binary and the new one, and **only the path tells them apart**.
+    #[test]
+    fn a_dev_release_keeps_the_suffix_that_distinguishes_it() {
+        let version = release_from_path("/opt/robot/daemon/releases/0.4.0-dev.271.7610e6e/bin/btd");
+        assert_eq!(
+            version,
+            Some(semver::Version::parse("0.4.0-dev.271.7610e6e").unwrap())
+        );
+        // And it must compare as older than the release it precedes, or "running an older build
+        // than is installed" cannot be detected.
+        assert!(version.unwrap() < semver::Version::parse("0.4.0").unwrap());
+    }
+
+    /// The sharpest case: the binary is gone from disk and the process is still running it. The
+    /// version has to survive the marker the kernel appends, or the one report that proves a restart
+    /// did not happen would say "unknown".
+    #[test]
+    fn a_deleted_binary_still_names_its_release() {
+        assert_eq!(
+            release_from_path("/opt/robot/daemon/releases/0.3.0/bin/padd (deleted)"),
+            Some(semver::Version::parse("0.3.0").unwrap())
+        );
+    }
+
+    /// A hand-built binary on a dev board is not a release and must not be forced into looking like
+    /// one. The full path is reported instead, which is more use than a wrong version.
+    #[test]
+    fn a_binary_outside_the_layout_has_no_release() {
+        assert_eq!(
+            release_from_path("/home/pierre/duck/target/debug/btd"),
+            None
+        );
+        // A `releases` component whose child is not a version is not a release either.
+        assert_eq!(release_from_path("/srv/releases/nightly/bin/btd"), None);
+    }
+
+    /// The whole mechanism, over a real file: a process publishes what it is, and a reader gets it
+    /// back — including the release, derived from the exe path rather than stored twice.
+    ///
+    /// Round-tripped through `serde` in both directions on purpose. The published file is read by a
+    /// *different build* than the one that wrote it, every time an update lands, so a field that
+    /// could not round-trip would present as "this daemon published nothing".
+    #[test]
+    fn an_identity_survives_being_published_and_read_back() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // SAFETY: single-threaded test, and nothing else reads the variable concurrently.
+        unsafe { std::env::set_var("DUCK_RUNTIME_DIR", dir.path()) };
+
+        publish_identity("btd", build_info!()).expect("publishing");
+        let read = read_identity("btd").expect("reading it back");
+
+        assert_eq!(read.service, "btd");
+        assert_eq!(read.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(read.pid, std::process::id());
+        // The exe is this test binary, which is not in a release directory — so there is no release,
+        // and that is the honest answer rather than an invented one.
+        assert!(read.exe.is_some(), "{read:?}");
+        assert_eq!(read.release(), None);
+
+        // A service that published nothing reads as nothing, which is how an old daemon reports.
+        assert_eq!(read_identity("padd"), None);
+
+        unsafe { std::env::remove_var("DUCK_RUNTIME_DIR") };
+    }
 
     /// One of every [`Call`] variant, so the tests below cannot silently skip one.
     fn every_call() -> Vec<Call> {

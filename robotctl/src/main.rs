@@ -1172,17 +1172,28 @@ fn render_units(units: &[proto::ServiceUnit], indent: usize) -> String {
             proto::UnitState::Unknown => "unknown",
         };
 
-        let mut detail = String::new();
-        match (&unit.release, &unit.binary) {
-            (Some(release), _) => detail = format!(" · {release}"),
-            // No release in the path: a hand-built binary, which is a normal thing on a dev board
-            // and worth naming in full rather than reporting as an unknown version.
-            (None, Some(path)) => detail = format!(" · {path}"),
-            (None, None) => {}
-        }
-        if unit.deleted {
-            detail.push_str(" · binary deleted");
-        }
+        let detail = match &unit.identity {
+            // The release, because that is what gets compared with what is installed — and the
+            // revision beside it, because on the dev channel two releases share a crate version and
+            // the SHA is the whole difference.
+            Some(identity) => {
+                let build = match identity.release() {
+                    Some(release) => release.to_string(),
+                    // Published, but not from a release directory: a hand-built binary on a dev
+                    // board. Its own version is all it can honestly claim.
+                    None => format!("{} (not a release)", identity.version),
+                };
+                match &identity.revision {
+                    Some(rev) => format!(" · {build} (rev {})", short_revision(rev)),
+                    None => format!(" · {build}"),
+                }
+            }
+            // Nothing published. For a stopped unit that is expected — systemd removes the runtime
+            // directory with the unit. For a running one it means a build too old to publish, and
+            // saying so beats inferring a version from somewhere else.
+            None if unit.state == proto::UnitState::Active => " · build unknown (old)".to_owned(),
+            None => String::new(),
+        };
         let _ = writeln!(out, "{:indent$}{name:<9} {state}{detail}", "");
     }
 
@@ -1214,24 +1225,19 @@ fn unit_warnings(
         if socket_reported.iter().any(|service| service.name == name) {
             continue;
         }
-        let Some(running) = &unit.release else {
+        let Some(running) = unit.identity.as_ref().and_then(proto::Identity::release) else {
             continue;
         };
-        if running == installed {
+        if running == *installed {
             continue;
         }
 
         warnings.push(format!(
             "{name} is running {running} but the installed daemon release is {installed}.\n  \
              The restart did not take effect, so the old binary is still the one serving.\n  \
-             {}An update schedules some of these a few seconds after it replies, so a report\n  \
+             An update schedules some of these a few seconds after it replies, so a report\n  \
              taken during one can show this briefly. Otherwise restart it:\n  \
-             sudo systemctl restart {name}",
-            if unit.deleted {
-                "The release it came from has since been removed from disk.\n  "
-            } else {
-                ""
-            }
+             sudo systemctl restart {name}"
         ));
     }
     warnings
@@ -2849,13 +2855,19 @@ mod tests {
         }
     }
 
+    /// A unit whose process published an identity, as one installed from a release would.
     fn unit(name: &str, state: proto::UnitState, release: Option<&str>) -> proto::ServiceUnit {
         proto::ServiceUnit {
             unit: format!("{name}.service"),
             state,
-            release: release.map(|v| semver::Version::parse(v).expect("a test version")),
-            binary: release.map(|v| format!("/opt/robot/daemon/releases/{v}/bin/{name}")),
-            deleted: false,
+            identity: release.map(|v| proto::Identity {
+                service: name.to_owned(),
+                version: "0.4.0".to_owned(),
+                revision: Some("7610e6e19f151949e685bdd56783e564a72991e6".to_owned()),
+                built_at: None,
+                exe: Some(format!("/opt/robot/daemon/releases/{v}/bin/{name}")),
+                pid: 4242,
+            }),
         }
     }
 
@@ -2915,39 +2927,54 @@ mod tests {
         );
     }
 
-    /// The sharpest evidence a restart did not happen: the process is running a binary that is no
-    /// longer on disk, because the release it came from has been pruned. Both the line and the
-    /// warning have to say so — "running 0.3.0" alone invites someone to go looking for a 0.3.0
-    /// that is not there any more.
+    /// **A daemon too old to publish an identity, which is the case that made this design possible.**
+    /// It is allowed to simply not answer: saying `unknown (old)` beats inferring a version from
+    /// somewhere else and presenting the guess as fact — and it must not read as a disagreement,
+    /// because there is no version to disagree with.
     #[test]
-    fn a_deleted_binary_is_called_out() {
-        let mut gone = unit("btd", proto::UnitState::Active, Some("0.3.0"));
-        gone.deleted = true;
+    fn a_daemon_that_published_nothing_says_so() {
+        let silent = proto::ServiceUnit {
+            unit: "btd.service".into(),
+            state: proto::UnitState::Active,
+            identity: None,
+        };
         let installed = semver::Version::parse("0.4.0").unwrap();
 
-        assert!(render_units(std::slice::from_ref(&gone), 2).contains("binary deleted"));
-        let warnings = unit_warnings(&[gone], &[], Some(&installed));
-        assert!(warnings[0].contains("removed from disk"), "{warnings:?}");
+        let rendered = render_units(std::slice::from_ref(&silent), 2);
+        assert!(rendered.contains("build unknown (old)"), "{rendered}");
+        assert!(unit_warnings(&[silent], &[], Some(&installed)).is_empty());
     }
 
-    /// A hand-built binary is normal on a dev board and is not a release. Reporting it as an
-    /// unknown version would hide the one fact that explains the robot's behaviour, so the path is
-    /// printed whole — and it is not a version disagreement, so it must not warn.
+    /// A revision is what distinguishes two builds of one version, so the line has to carry it —
+    /// abbreviated, because forty characters of SHA in a column is noise around the seven anyone
+    /// compares.
+    #[test]
+    fn the_revision_is_shown_beside_the_release() {
+        let rendered = render_units(&[unit("btd", proto::UnitState::Active, Some("0.4.0"))], 2);
+        assert!(rendered.contains("0.4.0 (rev 7610e6e)"), "{rendered}");
+    }
+
+    /// A hand-built binary is normal on a dev board and is not a release. It publishes an identity
+    /// like anything else, and reporting its crate version as a release would invent a fact — so the
+    /// line says the build is not a release, and it must not warn.
     #[test]
     fn a_binary_outside_the_release_layout_is_named_not_guessed() {
         let hand_built = proto::ServiceUnit {
             unit: "btd.service".into(),
             state: proto::UnitState::Active,
-            release: None,
-            binary: Some("/home/pierre/duck/target/debug/btd".into()),
-            deleted: false,
+            identity: Some(proto::Identity {
+                service: "btd".into(),
+                version: "0.4.0".into(),
+                revision: None,
+                built_at: None,
+                exe: Some("/home/pierre/duck/target/debug/btd".into()),
+                pid: 4242,
+            }),
         };
         let installed = semver::Version::parse("0.4.0").unwrap();
 
-        assert!(
-            render_units(std::slice::from_ref(&hand_built), 2)
-                .contains("/home/pierre/duck/target/debug/btd")
-        );
+        let rendered = render_units(std::slice::from_ref(&hand_built), 2);
+        assert!(rendered.contains("not a release"), "{rendered}");
         assert!(unit_warnings(&[hand_built], &[], Some(&installed)).is_empty());
     }
 

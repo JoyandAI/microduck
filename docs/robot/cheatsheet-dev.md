@@ -70,20 +70,16 @@ Three things are true at once, and together they cost an afternoon if you do not
 - **`robotctl update apply` then reports `already_current` and does nothing**, so the obvious
   recovery command is a no-op.
 
-The symptom is a fix that is definitely installed and definitely not working. `robotctl version` says
-so in as many words. To check by hand:
+The symptom is a fix that is definitely installed and definitely not working. Ask which release each
+daemon is running:
 
 ```
-pgrep -a configd
+robotctl health
 ```
 
-```
-sudo readlink /proc/$(pgrep -x configd)/exe; readlink /opt/robot/daemon/current
-```
-
-The command line always says `current/bin/configd` because that is what it was exec'd with; the
-`/proc/<pid>/exe` link is the release it is *actually* running from. If those disagree, the process
-predates the swap.
+The `units` block prints one line per daemon with the release its process was launched from, and a
+warning naming the restart when that disagrees with what is installed. `build unknown (old)` means
+that daemon predates the release which taught it to say — restart it and it will answer.
 
 ```
 sudo systemctl restart configd
