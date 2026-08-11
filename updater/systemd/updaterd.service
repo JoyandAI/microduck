@@ -8,10 +8,11 @@
 #   1. NO dependency on robotd. updaterd is the recovery path — if it only ran when
 #      the robot was healthy, it would be unavailable in exactly the situation a
 #      client needs it.
-#   2. updaterd is never in the restart set of an update it applies. `on_apply` in
-#      updater.toml restarts robotd/mediad only; this process picks up a new binary
-#      at the next boot. Restarting itself mid-swap would kill the executor at the
-#      most dangerous moment.
+#   2. updaterd is never in the restart set of an update it applies: restarting
+#      itself mid-swap would kill the executor at the most dangerous moment. It is
+#      not left on the old binary either — the engine schedules its restart through
+#      a systemd transient unit 5s after the outcome is on the wire, which is a
+#      transient unit precisely so it outlives this one's cgroup.
 
 [Unit]
 Description=Robot update daemon
