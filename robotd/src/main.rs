@@ -437,24 +437,6 @@ impl RobotState {
     }
 }
 
-/// The first line each daemon logs, before anything that can fail.
-///
-/// At `warn` so it survives `RUST_LOG=warn` on a long-running board: identifying the running
-/// build is not a debug-level concern. `exe` is here because after an update `updaterd` is
-/// still running the *previous* binary by design, so which release directory a process came
-/// from cannot be inferred (`docs/design/architecture.md` §8).
-fn log_startup_identity(service: &str) {
-    tracing::warn!(
-        service,
-        build = %proto::build_info!(),
-        exe = %std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "unknown".into()),
-        pid = std::process::id(),
-        "starting"
-    );
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     // Rust ignores SIGPIPE, which turns `robotd ... | head` into a panic.
@@ -470,7 +452,7 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    log_startup_identity("robotd");
+    duck_ipc_proto::log_startup_identity!("robotd");
 
     let explicit = args.params.is_some();
     let params_path = args

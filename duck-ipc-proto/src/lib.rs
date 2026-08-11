@@ -1814,6 +1814,37 @@ macro_rules! build_info {
     };
 }
 
+/// The first line a daemon writes: its own identity.
+///
+/// At `warn` so it survives `RUST_LOG=warn` on a long-running board (`architecture.md` §8.1) —
+/// identifying the running build is not a debug-level concern. `exe` earns its place by naming the
+/// release directory the process was actually launched from, which is the difference between "the
+/// update worked" and "the symlink moved but systemd is still running the old path".
+///
+/// **Here rather than copied into each daemon, which is where it started.** Four of the five had an
+/// identical private copy and `padd` had none, so `padd` was the one daemon whose journal could not
+/// answer which build was running — discovered while chasing exactly that question. A shared
+/// definition makes the next daemon's omission a missing call rather than a missing idea.
+///
+/// A macro, not a function, because [`build_info!`] reads `CARGO_PKG_VERSION` and `DUCK_REVISION`
+/// through `env!` at the *call site*: a function here would report this crate's version for
+/// everyone. It also keeps `tracing` out of this crate's dependencies, which are deliberately serde
+/// and semver and nothing else — the expansion happens where `tracing` already is.
+#[macro_export]
+macro_rules! log_startup_identity {
+    ($service:expr) => {
+        tracing::warn!(
+            service = $service,
+            build = %$crate::build_info!(),
+            exe = %std::env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "unknown".to_owned()),
+            pid = std::process::id(),
+            "starting"
+        )
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

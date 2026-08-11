@@ -158,19 +158,6 @@ struct Service {
     policy: PeerPolicy,
 }
 
-fn log_startup_identity(service: &str) {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_owned());
-    tracing::warn!(
-        service,
-        build = %proto::build_info!(),
-        exe,
-        pid = std::process::id(),
-        "starting"
-    );
-}
-
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_owned())
@@ -190,7 +177,7 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
-    log_startup_identity("configd");
+    duck_ipc_proto::log_startup_identity!("configd");
 
     let net: Arc<dyn Net> = match backend(args.fake_net).await {
         Ok(net) => net,

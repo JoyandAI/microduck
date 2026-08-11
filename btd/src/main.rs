@@ -63,26 +63,6 @@ struct Args {
     name: Option<String>,
 }
 
-/// The first line this daemon writes is its own identity, at `warn` so it survives
-/// `RUST_LOG=warn` on a long-running board (`architecture.md` §8.1).
-///
-/// `exe` earns its place: it says which release directory the process was actually launched
-/// from, which is the difference between "the update worked" and "the symlink moved but systemd
-/// is still running the old path".
-fn log_startup_identity(service: &str) {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_owned());
-
-    tracing::warn!(
-        service,
-        build = %duck_ipc_proto::build_info!(),
-        exe,
-        pid = std::process::id(),
-        "starting"
-    );
-}
-
 fn hostname() -> String {
     // /etc/hostname rather than the `hostname` crate or a libc call: one file read, no
     // dependency, and it is what the board is actually configured with.
@@ -120,7 +100,7 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
-    log_startup_identity("btd");
+    duck_ipc_proto::log_startup_identity!("btd");
 
     let sockets = Sockets {
         updater: args.update_socket,
