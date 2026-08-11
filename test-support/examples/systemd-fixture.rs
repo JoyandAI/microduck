@@ -14,13 +14,23 @@
 //!   bin/updaterd  bin/robotctl        the binaries under test, built for the container
 //!   systemd/updaterd.service          so the update can restart the updater — the whole point
 //!   systemd/fake-robotd.service       a stand-in for a daemon in the restart set
-//!   systemd/broken.service            only in a `:broken-unit` release: ExecStart=/bin/false
+//!   systemd/btd.service               a stand-in for the one daemon held back from that restart
+//!   bin/fake-btd                      what it runs: publishes an identity, then sleeps
+//!   systemd/broken.service            only in `:broken-unit`: ExecStart=/bin/false
+//!   systemd/needs-a-user.service      only in `:sysusers` and `:missing-user`, with `User=`
+//!   systemd/sysusers.d/duck-test.conf only in `:sysusers`, and what creates that user
 //!   hooks/postinstall                 the real one, so it installs and enables units for real
 //! ```
 //!
 //! `fake-robotd` rather than a real `robotd`: what is under test is whether the engine restarts what
 //! a release ships, and a `sleep` proves that as well as motor control does while needing no
 //! hardware, no policy and no socket. Its main PID changing is the observation.
+//!
+//! **The stand-in named `btd` is named that on purpose.** `NEVER_RESTART` is a list of unit names in
+//! code, so only a unit actually called `btd` is excluded from the in-flight restart and picked up by
+//! the deferred one — which makes it the only way to observe the case the startup reconciliation
+//! exists for: a deferred restart that never happened. Unlike `fake-robotd` it publishes an identity,
+//! because that is what the reconciliation reads.
 
 use std::path::{Path, PathBuf};
 
@@ -50,8 +60,10 @@ struct Cli {
     #[arg(long)]
     prefix: Option<PathBuf>,
 
-    /// `<version>[:broken-unit]`. `broken-unit` adds a unit that installs and cannot start, which
-    /// must fail the update and roll it back.
+    /// `<version>[:broken-unit|:sysusers|:missing-user]`.
+    ///
+    /// `broken-unit` adds a unit that installs and cannot start; `sysusers` a unit whose `User=` the
+    /// release also brings the account for; `missing-user` the same unit with nothing creating it.
     #[arg(required = true, value_name = "SPEC")]
     releases: Vec<String>,
 }
@@ -77,6 +89,44 @@ fn updaterd_unit(prefix: &Path) -> String {
 /// A daemon in the restart set, whose only job is to be restartable and observable.
 const FAKE_ROBOTD_UNIT: &str = "[Unit]\nDescription=Stand-in for a daemon an update restarts\n\n\
      [Service]\nType=exec\nExecStart=/bin/sleep infinity\nRestart=always\nRestartSec=1s\n\n\
+     [Install]\nWantedBy=multi-user.target\n";
+
+/// What the `btd` stand-in runs.
+///
+/// `readlink -f`, not `$0`: the unit points through `current`, and an identity naming a symlink says
+/// nothing about which release is running. The real daemons read `/proc/self/exe`, which resolves for
+/// the same reason.
+const FAKE_BTD: &str = "#!/bin/sh\n\
+     exe=\"$(readlink -f \"$0\")\"\n\
+     mkdir -p /run/btd\n\
+     printf '{\"service\":\"btd\",\"version\":\"0.0.0\",\"exe\":\"%s\",\"pid\":%s}\\n' \\\n\
+         \"$exe\" \"$$\" > /run/btd/identity.json\n\
+     exec sleep infinity\n";
+
+/// The unit for it, named `btd` so `NEVER_RESTART` applies to it.
+fn fake_btd_unit(prefix: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=Stand-in for the daemon an update must not restart\n\n\
+         [Service]\nType=exec\nExecStart={p}/opt/daemon/current/bin/fake-btd\n\
+         Restart=always\nRestartSec=1s\nRuntimeDirectory=btd\n\n\
+         [Install]\nWantedBy=multi-user.target\n",
+        p = prefix.display()
+    )
+}
+
+/// A unit whose `User=` is created by the release's own `sysusers.d` file, which is the ordering
+/// `hooks/postinstall` calls load-bearing: accounts before units, or the unit fails to start and the
+/// failure reads as a broken daemon rather than a missing account.
+const NEEDS_A_USER_UNIT: &str = "[Unit]\nDescription=A unit that runs as a shipped user\n\n\
+     [Service]\nType=exec\nExecStart=/bin/sleep infinity\nUser=duck-test\nRestart=always\n\
+     RestartSec=1s\n\n[Install]\nWantedBy=multi-user.target\n";
+
+const SYSUSERS_CONF: &str = "u duck-test - \"a user a release brings with it\" /nonexistent\n";
+
+/// The same unit with nothing creating its user — `enable --now` cannot start it, and neither can the
+/// restart that follows.
+const GHOST_USER_UNIT: &str = "[Unit]\nDescription=A unit whose user does not exist\n\n\
+     [Service]\nType=exec\nExecStart=/bin/sleep infinity\nUser=nosuchuser-duck\n\n\
      [Install]\nWantedBy=multi-user.target\n";
 
 /// A unit that installs cleanly and cannot start. Bug 1 of `install-path-gap.md` in one file: the
@@ -133,6 +183,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 FAKE_ROBOTD_UNIT.as_bytes(),
                 0o644,
             )
+            .file("bin/fake-btd", FAKE_BTD.as_bytes(), 0o755)
+            .file(
+                "systemd/btd.service",
+                fake_btd_unit(&prefix).as_bytes(),
+                0o644,
+            )
             .hook(&postinstall);
 
         match kind {
@@ -140,15 +196,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "broken-unit" => {
                 release = release.file("systemd/broken.service", BROKEN_UNIT.as_bytes(), 0o644);
             }
+            "sysusers" => {
+                release = release
+                    .file(
+                        "systemd/sysusers.d/duck-test.conf",
+                        SYSUSERS_CONF.as_bytes(),
+                        0o644,
+                    )
+                    .file(
+                        "systemd/needs-a-user.service",
+                        NEEDS_A_USER_UNIT.as_bytes(),
+                        0o644,
+                    );
+            }
+            "missing-user" => {
+                release = release.file(
+                    "systemd/needs-a-user.service",
+                    GHOST_USER_UNIT.as_bytes(),
+                    0o644,
+                );
+            }
             other => return Err(format!("unknown spec `:{other}` in `{spec}`").into()),
         }
         release.write();
         println!(
             "r/{version}{}",
             if kind.is_empty() {
-                ""
+                String::new()
             } else {
-                " (broken-unit)"
+                format!(" ({kind})")
             }
         );
     }

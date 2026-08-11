@@ -71,8 +71,8 @@ BIN=target/docker/release
 
 # ── the fixture ──
 #
-# Three releases: one to start on, one to move to, and one that installs a unit which cannot start.
-echo "==> minting three signed releases"
+# One to start on, one to move to, then one per injection.
+echo "==> minting the signed releases"
 rm -rf "$FIXTURE"
 mkdir -p "$WORK"
 cargo run -q -p test-support --example systemd-fixture -- "$FIXTURE" \
@@ -80,7 +80,7 @@ cargo run -q -p test-support --example systemd-fixture -- "$FIXTURE" \
     --robotctl "$BIN/robotctl" \
     --postinstall hooks/postinstall \
     --prefix "$MOUNT" \
-    1.0.0 1.1.0 1.2.0:broken-unit | sed 's/^/    /'
+    1.0.0 1.1.0 1.2.0 1.3.0:sysusers 1.4.0:missing-user 1.5.0:broken-unit | sed 's/^/    /'
 
 # `local_dir` serves the newest version it can see, so what is offered is decided by what has been
 # copied in. One at a time, and the harness controls when.
@@ -125,6 +125,8 @@ in_container "systemctl is-active --quiet fake-robotd" \
     || fail "postinstall installed fake-robotd but it is not running"
 in_container "systemctl is-active --quiet updaterd" \
     || fail "postinstall installed updaterd.service but it is not running"
+in_container "test -f /run/btd/identity.json" \
+    || fail "the btd stand-in did not publish an identity, so nothing here can be observed"
 pass "postinstall installed, enabled and started units on a board that had none"
 
 live() { docker exec "$NAME" readlink "$MOUNT/opt/daemon/current" | sed 's|releases/||'; }
@@ -133,14 +135,21 @@ main_pid() { docker exec "$NAME" systemctl show -p MainPID --value "$1" | tr -d 
 [ "$(live)" = 1.0.0 ] || fail "current is $(live), expected 1.0.0"
 pass "1.0.0 is live"
 
+# `robotctl` from the live release, so the client and the daemon are always the same build — an
+# `API_VERSION` bump would otherwise refuse the call, which is the contract and not the subject here.
+apply() {
+    in_container "$MOUNT/opt/daemon/current/bin/robotctl update apply daemon" > "$1" 2>&1 || true
+}
+
 # ── the update, through the daemon ──
 robotd_before="$(main_pid fake-robotd)"
 updaterd_before="$(main_pid updaterd)"
 
 cp "$FIXTURE"/r/1.1.0/* "$FIXTURE/published/"
 echo "==> applying 1.1.0 through the running updaterd"
-in_container "$MOUNT/opt/daemon/current/bin/robotctl update apply daemon" \
-    > "$WORK/apply.log" 2>&1 || { sed 's/^/    /' "$WORK/apply.log"; fail "apply failed"; }
+apply "$WORK/apply.log"
+grep -q '"outcome": "applied"' "$WORK/apply.log" \
+    || { sed 's/^/    /' "$WORK/apply.log"; fail "apply did not report success"; }
 
 [ "$(live)" = 1.1.0 ] || fail "current is $(live) after applying 1.1.0"
 pass "1.1.0 is live"
@@ -183,26 +192,148 @@ then
 fi
 pass "its startup reconciliation restarted nothing, as it should"
 
+# ── injection: `systemd-run` cannot be run ──
+#
+# Scheduling the deferred restarts is best-effort by design: the update is committed and journalled by
+# then, so an update that worked must not be reported as failed because a timer could not be created.
+# That is only affordable because it is not the last word — the next `updaterd` start compares each
+# unit against the active release and restarts what is stale (`updater/src/reconcile.rs`). Both halves
+# of that are asserted here, and neither is observable without systemd.
+#
+# Shadowed in `/usr/local/sbin`, which comes first in the PATH systemd gives a unit, so the engine
+# resolves this one instead of the real `systemd-run`.
+echo "==> applying 1.2.0 with systemd-run broken"
+in_container "printf '#!/bin/sh\nexit 1\n' > /usr/local/sbin/systemd-run && chmod 755 /usr/local/sbin/systemd-run"
+btd_before="$(main_pid btd)"
+updaterd_before="$(main_pid updaterd)"
+
+cp "$FIXTURE"/r/1.2.0/* "$FIXTURE/published/"
+apply "$WORK/no-timer.log"
+grep -q '"outcome": "applied"' "$WORK/no-timer.log" \
+    || { sed 's/^/    /' "$WORK/no-timer.log"; fail "a restart that could not be scheduled failed the update"; }
+pass "the update still succeeded — an unschedulable restart is not an update failure"
+
+# Matched on the half both arms share: a `systemd-run` that cannot be *executed* and one that exits
+# non-zero are different log lines, and which of them a shadow produces is not the point.
+in_container "journalctl -u updaterd -b --no-pager | grep -q 'until the next updaterd start notices'" \
+    || fail "nothing in the journal says the restart could not be scheduled"
+pass "the journal says the restart could not be scheduled"
+
+# Nothing restarted them, so both are still on 1.1.0 — which is the silent state this exists to end.
+sleep 8
+[ "$(main_pid btd)" = "$btd_before" ] \
+    || fail "btd restarted anyway, so this is not testing what it claims"
+[ "$(main_pid updaterd)" = "$updaterd_before" ] \
+    || fail "updaterd restarted anyway, so this is not testing what it claims"
+in_container "grep -q 'releases/1.1.0/bin/fake-btd' /run/btd/identity.json" \
+    || fail "btd is not on the old release, so there is nothing for the successor to fix"
+pass "btd and updaterd are left on 1.1.0, as a missed timer leaves them"
+
+# The successor's job. Restarted by hand here; on a board this is the next boot, or the next update.
+in_container "rm -f /usr/local/sbin/systemd-run"
+echo "==> restarting updaterd, whose successor should notice"
+in_container "systemctl restart updaterd"
+waited=0
+until in_container "grep -q 'releases/1.2.0/bin/fake-btd' /run/btd/identity.json 2>/dev/null"; do
+    waited=$((waited + 1))
+    [ "$waited" -lt 30 ] || fail "the successor did not restart the stale btd"
+    sleep 1
+done
+pass "its reconciliation restarted the stale btd onto 1.2.0 after ${waited}s"
+
+# And it did not restart *itself*. There is nothing for it to fix here — a restarted `updaterd`
+# re-execs through `current`, so the successor is the active release by construction — but the
+# reconciliation runs over a list that includes its own unit, and a self-restart there would be a loop
+# in the one process that owns recovery. The absence of a second restart is the assertion.
+self_pid="$(main_pid updaterd)"
+sleep 3
+[ "$(main_pid updaterd)" = "$self_pid" ] \
+    || fail "updaterd restarted itself from its own startup path, which is a loop"
+pass "and did not restart itself, which in that process would be a loop with no way out"
+
+# ── injection: a unit whose `User=` the release brings with it ──
+#
+# `hooks/postinstall` installs `sysusers.d` files and runs `systemd-sysusers` *before* the units, and
+# its comment calls that ordering load-bearing: a unit naming a `User=` that does not exist fails to
+# start, and the failure reads as a broken daemon rather than a missing account. Nothing observed it.
+cp "$FIXTURE"/r/1.3.0/* "$FIXTURE/published/"
+echo "==> applying 1.3.0, which ships a unit and the account it needs"
+apply "$WORK/sysusers.log"
+grep -q '"outcome": "applied"' "$WORK/sysusers.log" \
+    || { sed 's/^/    /' "$WORK/sysusers.log"; fail "a release bringing its own user did not apply"; }
+in_container "id duck-test >/dev/null 2>&1" \
+    || fail "postinstall did not create the account the release ships"
+in_container "systemctl is-active --quiet needs-a-user" \
+    || fail "the unit is not running, so accounts did not come before units"
+pass "accounts before units: the shipped user exists and its unit is running"
+
+# ── injection: the same unit with nothing creating its user ──
+#
+# The other half of the ordering claim. `enable --now` failing in the hook is only a warning — a
+# service that cannot start must not fail an otherwise good update — but the restart in `on_apply`
+# right afterwards is not, and that is the distinction `restart_one` draws deliberately.
+cp "$FIXTURE"/r/1.4.0/* "$FIXTURE/published/"
+echo "==> applying 1.4.0, whose unit names a user nothing creates"
+apply "$WORK/ghost.log"
+grep -q '"outcome": "applied"' "$WORK/ghost.log" \
+    && fail "a unit that cannot start reported success"
+grep -q "needs-a-user" "$WORK/ghost.log" \
+    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the reason does not name the unit"; }
+pass "the update failed and named the unit rather than the account"
+
+# The release did revert: `rollback_to` swaps `current` before it re-runs the apply action, so the
+# tree is right even when what follows is not.
+[ "$(live)" = 1.3.0 ] || fail "current is $(live) after the failed update, expected 1.3.0"
+pass "current went back to 1.3.0"
+
+# **A gap this harness found, pinned here rather than papered over.** The rollback *also* failed:
+#
+#     rollback failed after a failed update: restart failed:
+#     Job for needs-a-user.service failed
+#
+# `hooks/postinstall` overwrote 1.3.0's good unit file with 1.4.0's broken one, and by design does not
+# put it back — the hook argues that a release which did not take leaves one service failing until the
+# next one does, which is the same situation either way. That reasoning holds while the failing unit is
+# only *failing*. It stops holding when the unit is in the restart set of the release being reverted
+# *to*, because then the revert re-runs the same restart and inherits the same failure — and
+# `RollbackFailed` is the outcome the design calls the most serious one.
+#
+# Reachable by an ordinary bad release, not only by the downgrade case `install-path-gap.md` records:
+# two consecutive releases ship the same unit name and the newer one is broken. Asserted as-is, so
+# that whatever is decided about it is a deliberate change rather than a surprise.
+grep -q "rollback failed" "$WORK/ghost.log" \
+    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the known rollback gap did not reproduce — if it is fixed, this check should be too"; }
+pass "the rollback failed too, which is the known gap: the bad unit file outlived the release"
+
+# The rest of the robot is still up, which is what keeps this a gap rather than an outage.
+in_container "systemctl is-active --quiet fake-robotd" \
+    || fail "fake-robotd is down as well"
+pass "the daemons that could restart did, so only the broken unit is down"
+
+# Cleared by hand, so the next case starts from a board whose units match its release. On a real board
+# this is what the next good release does on its own.
+in_container "rm -f /etc/systemd/system/needs-a-user.service && systemctl daemon-reload"
+
 # ── the injection: a unit that installs and cannot start ──
 #
 # Bug 1's class. The unit arrives with the release, postinstall installs and enables it, `enable
 # --now` fails and is only a warning — and then `on_apply` restarts it, which is not. The update must
 # fail, roll back, and say which unit.
-cp "$FIXTURE"/r/1.2.0/* "$FIXTURE/published/"
-echo "==> applying 1.2.0, which ships a unit that cannot start"
+cp "$FIXTURE"/r/1.5.0/* "$FIXTURE/published/"
+echo "==> applying 1.5.0, which ships a unit that cannot start"
 # Exit status is deliberately not the check. A rollback is a *successful* call that reports an
 # unsuccessful outcome — `robotctl` exits 0 having told you what happened, and reading the status
 # instead would assert a different contract than the one that matters here.
-in_container "$MOUNT/opt/daemon/current/bin/robotctl update apply daemon" \
-    > "$WORK/broken.log" 2>&1 || true
+apply "$WORK/broken.log"
 grep -q rolled_back "$WORK/broken.log" \
     || { sed 's/^/    /' "$WORK/broken.log"; fail "the update did not roll back"; }
 grep -q '"outcome": "applied"' "$WORK/broken.log" \
     && fail "the update reported success despite a unit that cannot start"
 pass "the update rolled back rather than reporting success"
 
-[ "$(live)" = 1.1.0 ] || fail "rolled back to $(live), expected 1.1.0"
-pass "rolled back to 1.1.0"
+# 1.3.0, not 1.4.0: that one never became live, so it was never what this rolled back from.
+[ "$(live)" = 1.3.0 ] || fail "rolled back to $(live), expected 1.3.0"
+pass "rolled back to 1.3.0"
 
 grep -qi "broken" "$WORK/broken.log" \
     || { sed 's/^/    /' "$WORK/broken.log"; fail "the reason does not name the unit that failed"; }

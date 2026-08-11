@@ -355,9 +355,36 @@ binary with no `--config`, so it validated `/etc/robot/updater.toml` however the
 started — defeating the check's whole purpose, which is to catch a new binary that rejects *the
 board's* config file.
 
-Two injections named here are still worth adding now that the harness exists, and neither needs new
-machinery: `systemd-run` failing (the update must still succeed, and the successor must reconcile the
-stale unit), and `enable --now` on a unit whose `User=` does not exist.
+Both injections named here are in it too, and both landed assertions nothing else could make:
+
+- **`systemd-run` cannot be run.** The update still succeeds — scheduling is best-effort by design,
+  because the update is committed by then — the journal says so, and `btd` and `updaterd` are left on
+  the old release exactly as a missed timer leaves them. Then the next `updaterd` start reconciles the
+  stale `btd` onto the active release and does **not** restart itself, which in that process would be a
+  loop with no way out. That is `reconcile.rs` closing the loop for the first time outside a unit test.
+- **A unit whose `User=` the release brings with it.** `postinstall` installs `sysusers.d` files and
+  runs `systemd-sysusers` before the units, and its comment calls that ordering load-bearing. The
+  account exists and its unit runs. The other half — the same unit with nothing creating the user —
+  fails the update and names the unit rather than the account.
+
+### The gap the harness found on the way
+
+**A failed update can fail its own rollback**, and `RollbackFailed` is the outcome the design calls the
+most serious one. Reproduced by the missing-user release above, and asserted as current behaviour so
+that changing it is deliberate:
+
+`hooks/postinstall` overwrites unit files and, by design, does not put them back on a rollback — the
+hook argues that a release which did not take leaves one service failing until the next one does, which
+is the same situation either way. That holds while the failing unit is only *failing*. It stops holding
+when the unit is in the restart set of the release being reverted **to**, because the revert re-runs
+the same restart and inherits the same failure.
+
+Reachable by an ordinary bad release rather than only by the downgrade case this document already
+records: two consecutive releases ship the same unit name and the newer one is broken. The revert
+itself does happen — `current` goes back — so what is lost is the apply action, not the tree. Worth a
+decision rather than a patch, and the options are not symmetric: making `postinstall` reversible is the
+change the hook explicitly declined, while tolerating a failed restart *during a rollback* weakens the
+distinction `restart_one` draws on purpose.
 
 ### Not doing
 
