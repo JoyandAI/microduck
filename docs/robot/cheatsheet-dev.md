@@ -62,12 +62,15 @@ filter's only opt-in, it applies to the one command, and it leaves nothing switc
   after it replies** — the first cannot restart itself mid-update, and the second may be carrying the
   reply. So a `btd` fix is live a few seconds later, with no manual step. Reconnect and it is there.
 - **If one of those two restarts does not happen, the next `updaterd` start fixes it.** Except
-  `updaterd` itself, which reports the disagreement rather than restarting itself — that one is a
-  `systemctl restart updaterd` by hand.
+  `updaterd` itself, which reports the disagreement rather than restarting itself. Run the apply again
+  for that one: it answers `already_current`, names the daemon that is not running it, and schedules
+  the restart. `sudo systemctl restart updaterd` does the same by hand.
 - **A board running an `updaterd` older than 0.4.0 has none of that** and keeps both on the old binary
   until you restart them. One update fixes it, and only the update after that behaves.
-- **`robotctl update apply` reports `already_current` and does nothing** if you try to reinstall the
-  same version, so it is not the command to reach for when a fix looks absent.
+- **`robotctl update apply` reports `already_current` and installs nothing** if you ask for the version
+  a board already has — but it is no longer inert. It checks which daemons are running that release and
+  restarts the ones that are not, naming them in `stale`. So it *is* the command to reach for when a
+  fix looks absent: either it fixes it, or `stale` is empty and the fix was never in that release.
 
 The symptom is a fix that is definitely installed and definitely not working. Ask which release each
 daemon is running:

@@ -1166,11 +1166,22 @@ pub enum ApplyResult {
     },
     AlreadyCurrent {
         version: semver::Version,
+        /// Units running something other than `version`, which this outcome has scheduled a restart
+        /// for. Empty in the ordinary case, where nothing was installed because nothing needed to be.
+        ///
+        /// It earns a field rather than only a log line because "already current" is otherwise
+        /// indistinguishable from "already current, and a daemon is not running it" — the state that
+        /// made a recovery command look like a confirmation that there was nothing to recover.
+        ///
+        /// `default`, so an older `updaterd`'s reply still parses: it reports no stale units because
+        /// it did not look, which reads the same as finding none. `ApplyResult` does not
+        /// `deny_unknown_fields`, so an older client ignores the field rather than failing to decode
+        /// the outcome of an update it just performed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stale: Vec<String>,
     },
     /// Everything verified; stopped before the swap because `dry_run` was set.
-    DryRunPassed {
-        candidate: semver::Version,
-    },
+    DryRunPassed { candidate: semver::Version },
     /// Applied, failed its gate, reverted. The robot is on `reverted_to`.
     RolledBack {
         attempted: semver::Version,

@@ -364,7 +364,7 @@ impl Engine {
         // parallel, copies of *other* engines' locks too. It surfaced as unrelated operations
         // failing with `Busy`. Nothing below this point touches the store.
         drop(lock);
-        schedule_restarts_if_applied(self.deferred_restarts, &outcome).await;
+        schedule_restarts_if_needed(self.deferred_restarts, &outcome).await;
         outcome
     }
 
@@ -413,8 +413,15 @@ impl Engine {
         }
 
         if Some(&manifest.version) == installed.as_ref() {
+            // Correct, and for years the whole answer. It is the wrong *question* in one case: the
+            // release is installed and a daemon is serving from a different one. That is what an
+            // operator reaching for `apply` is usually trying to fix, and answering "already current"
+            // told them there was nothing to fix. The units are named here and restarted after the
+            // reply — see `restarts_owed`.
+            let stale = self.stale_units(&manifest.version, cfg, store);
             return Ok(ApplyResult::AlreadyCurrent {
                 version: manifest.version,
+                stale,
             });
         }
 
@@ -908,8 +915,11 @@ impl Engine {
 
         let current = store.current()?;
         if current.as_ref() == Some(version) {
+            // Same repair as `apply`'s, for the same reason: selecting the release a board already has
+            // active is the other command an operator reaches for when a daemon looks wrong.
             return Ok(ApplyResult::AlreadyCurrent {
                 version: version.clone(),
+                stale: self.stale_units(version, &cfg, &store),
             });
         }
 
@@ -919,7 +929,7 @@ impl Engine {
             .transition_to(component, &cfg, &store, version, current)
             .await;
         drop(lock);
-        schedule_restarts_if_applied(self.deferred_restarts, &outcome).await;
+        schedule_restarts_if_needed(self.deferred_restarts, &outcome).await;
         outcome
     }
 
@@ -1121,6 +1131,22 @@ impl Engine {
     /// [`MAX_BOOT_ATTEMPTS`] boots, and delete staging leftovers. This is the path
     /// that catches a release which doesn't start at all — the in-process health
     /// gate can't, because it died with it.
+    /// The units of one component that are not running the release named, and so are owed a restart.
+    ///
+    /// The same reading [`Self::reconcile_running_units`] does at startup, for one component and
+    /// without acting: the acting happens after the reply is on the wire, because the units this most
+    /// often names are the two that cannot be restarted before it. Called on the already-current
+    /// paths only, which is where the answer changes what the operation reports.
+    fn stale_units(
+        &self,
+        version: &semver::Version,
+        cfg: &ComponentConfig,
+        store: &Store,
+    ) -> Vec<String> {
+        let units = units_shipped(&store.release_dir(version), &configured_units(cfg));
+        crate::reconcile::stale_units(version, &units)
+    }
+
     /// Check that the restarts an update scheduled actually happened, and fix what did not.
     ///
     /// Runs at startup, beside [`Self::recover_on_start`], because that is the first moment the
@@ -1144,13 +1170,12 @@ impl Engine {
                 continue;
             };
 
-            let configured = match &self.config.components[name].on_apply {
-                ApplyAction::Restart { units } => units.clone(),
-                _ => Vec::new(),
-            };
             // The *shipped* set rather than the restart set: `updaterd` and `btd` are excluded from
             // an update's own restarts, which makes them the two this check exists for.
-            let units = units_shipped(&store.release_dir(&active), &configured);
+            let units = units_shipped(
+                &store.release_dir(&active),
+                &configured_units(&self.config.components[name]),
+            );
             if units.is_empty() {
                 continue;
             }
@@ -1775,20 +1800,55 @@ async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
     Err(Error::SelfTest(format!("{}: {reason}", output.status)))
 }
 
-/// Schedule the deferred restarts when an operation actually moved to a new release.
+/// Which units an outcome leaves owing a restart.
 ///
-/// Only on `Applied`. A rollback leaves the resident `updaterd` already matching `current` — it was
-/// never restarted, so it is still the binary belonging to the release being returned to — and
-/// restarting there would be churn with nothing to fix.
-async fn schedule_restarts_if_applied(enabled: bool, outcome: &Result<ApplyResult, Error>) {
+/// Two cases, and they are one act for two reasons.
+///
+/// **`Applied`** owes the pair a running update cannot restart in place: itself, and the transport the
+/// reply may be travelling over.
+///
+/// **`AlreadyCurrent` with stale units** owes exactly those. Nothing was installed because nothing
+/// needed to be, and a daemon is still running something else — the state
+/// [`crate::reconcile`] repairs at every start, except for the one unit it refuses to repair. A stale
+/// `updaterd` will not restart itself from its own startup path, so the only thing that ever looks at
+/// it is an operator running `apply`, who until now got `already_current`, no restart, and a robot
+/// still on the old binary. Repairing it here is not the loop the startup check guards against: it
+/// fires once, on a request, rather than on every start.
+///
+/// A rollback owes nothing, and that is not an omission: it leaves the resident `updaterd` already
+/// matching `current` — it was never restarted, so it is still the binary belonging to the release
+/// being returned to — and restarting there would be churn with nothing to fix.
+///
+/// Pure, and separated from the scheduling below for the reason `reconcile::verdict_for` is: which
+/// outcomes owe what is the part that can be wrong, and arranging each of them on a board costs an
+/// afternoon apiece.
+fn restarts_owed(outcome: &Result<ApplyResult, Error>) -> Vec<&str> {
+    match outcome {
+        Ok(ApplyResult::Applied { .. }) => RESTART_AFTER_REPLYING.to_vec(),
+        Ok(ApplyResult::AlreadyCurrent { stale, .. }) => stale.iter().map(String::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Schedule what [`restarts_owed`] says the outcome owes.
+async fn schedule_restarts_if_needed(enabled: bool, outcome: &Result<ApplyResult, Error>) {
     if !enabled {
         // A test binary. See `Engine::without_deferred_restarts` for why this is about forking.
         tracing::debug!("deferred restarts suppressed");
         return;
     }
-    if matches!(outcome, Ok(ApplyResult::Applied { .. })) {
-        schedule_deferred_restarts(SYSTEMD_RUN).await;
+    let units = restarts_owed(outcome);
+    if units.is_empty() {
+        return;
     }
+    if let Ok(ApplyResult::AlreadyCurrent { version, .. }) = outcome {
+        tracing::warn!(
+            %version,
+            units = units.join(","),
+            "this release is already installed, and these are not running it; restarting them"
+        );
+    }
+    schedule_deferred_restarts(SYSTEMD_RUN, &units).await;
 }
 
 /// The program that schedules the deferred restarts.
@@ -1811,8 +1871,15 @@ const SYSTEMD_RUN: &str = "systemd-run";
 /// update that succeeded must not be reported as failed because a restart could not be scheduled.
 /// Swallowing them is affordable because they are not the last word: [`crate::reconcile`] checks at
 /// the next start that each unit is on the active release and restarts what is not.
-async fn schedule_deferred_restarts(systemd_run: &str) {
-    for unit in RESTART_AFTER_REPLYING {
+///
+/// The units are a parameter because two callers owe different ones — see [`restarts_owed`] — and
+/// because every unit that reaches here goes through the transient timer, including the ones an update
+/// restarts in place. A second, immediate path for `robotd` and `configd` would buy five seconds and
+/// cost a mechanism. Nor does this need [`restart_one`]'s absent-unit handling: a unit is named here
+/// either because the release ships it or because it published an identity, and a process that
+/// published one is running.
+async fn schedule_deferred_restarts(systemd_run: &str, units: &[&str]) {
+    for unit in units.iter().copied() {
         let mut command = tokio::process::Command::new(systemd_run);
         command
             .arg(format!("--on-active={DEFERRED_RESTART_DELAY}"))
@@ -1863,9 +1930,11 @@ const NEVER_RESTART: [&str; 2] = ["updaterd", "btd"];
 /// `on_apply`'s list lives in the operator's `/etc/robot/updater.toml`, and `install.sh` preserves
 /// that file — so a board provisioned before a daemon existed keeps a list that does not mention it,
 /// and every release swaps that daemon's binary while leaving the old process running. The update
-/// reports success, the daemon answers on stale code, and `apply` then says `already_current` and
-/// does nothing. Four correct fixes were diagnosed as broken that way in one afternoon; see
-/// `docs/project/install-path-gap.md` §4.
+/// reports success, the daemon answers on stale code, and `apply` — as it then was — said
+/// `already_current` and did nothing, so the obvious recovery command confirmed there was nothing to
+/// recover. Four correct fixes were diagnosed as broken that way in one afternoon; see
+/// `docs/project/install-path-gap.md` §4. Both halves are closed now: this function is the first, and
+/// [`restarts_owed`] is the second.
 ///
 /// A release already states which units it provides — it ships them in `systemd/` — so it can say
 /// which to restart. Same realisation that made `hooks/postinstall` the right place to *install*
@@ -1877,6 +1946,17 @@ const NEVER_RESTART: [&str; 2] = ["updaterd", "btd"];
 ///
 /// An unreadable or absent `systemd/` directory yields the configured list unchanged. Older releases
 /// predate the directory, and a rollback to one must still work.
+/// The units a board's config names for this component, if it names any.
+///
+/// Shared by the three callers that need it rather than matched inline at each, so a component whose
+/// `on_apply` is not a restart cannot be read as naming units in one place and not another.
+fn configured_units(cfg: &ComponentConfig) -> Vec<String> {
+    match &cfg.on_apply {
+        ApplyAction::Restart { units } => units.clone(),
+        _ => Vec::new(),
+    }
+}
+
 fn units_shipped(release_dir: &Path, configured: &[String]) -> Vec<String> {
     let mut units: Vec<String> = Vec::new();
 
@@ -2242,7 +2322,7 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let systemd_run = stub_recorder(dir.path(), "systemd-run");
 
-        schedule_deferred_restarts(systemd_run.to_str().unwrap()).await;
+        schedule_deferred_restarts(systemd_run.to_str().unwrap(), &RESTART_AFTER_REPLYING).await;
 
         let log = calls(dir.path());
         let lines: Vec<&str> = log.lines().collect();
@@ -2272,6 +2352,66 @@ esac
         assert!(log.contains("restart btd"), "{log}");
     }
 
+    /// A stale unit reported by an already-current apply is scheduled by name, and only it.
+    ///
+    /// The pair an `Applied` owes is fixed; this list is not, so the two cases cannot share one
+    /// assertion. `configd` here rather than `updaterd` for a reason that is not arbitrary: it proves
+    /// the scheduler is driven by the outcome's list and not by `RESTART_AFTER_REPLYING`, which is the
+    /// mistake this generalisation makes possible.
+    #[tokio::test]
+    async fn the_stale_units_are_the_ones_scheduled() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemd_run = stub_recorder(dir.path(), "systemd-run");
+
+        schedule_deferred_restarts(systemd_run.to_str().unwrap(), &["configd"]).await;
+
+        let log = calls(dir.path());
+        assert!(log.ends_with("-- systemctl restart configd\n"), "{log}");
+        assert_eq!(log.lines().count(), 1, "{log}");
+    }
+
+    fn already_current(stale: &[&str]) -> Result<ApplyResult, Error> {
+        Ok(ApplyResult::AlreadyCurrent {
+            version: semver::Version::parse("0.4.0").expect("a test version"),
+            stale: stale.iter().map(|u| (*u).to_owned()).collect(),
+        })
+    }
+
+    /// What each outcome owes, which is the part a board cannot be made to demonstrate.
+    ///
+    /// The third case is the one this exists for, and it is the whole reason `apply` stopped being
+    /// inert: a stale `updaterd` is the skew `reconcile` refuses to repair, so an operator running
+    /// `apply` is the only thing that ever reaches it.
+    #[test]
+    fn which_outcomes_owe_a_restart() {
+        let applied = Ok(ApplyResult::Applied {
+            from: None,
+            to: semver::Version::parse("0.4.0").expect("a test version"),
+        });
+        assert_eq!(restarts_owed(&applied), RESTART_AFTER_REPLYING.to_vec());
+
+        // Nothing installed, nothing skewed: the ordinary already-current, and it must stay silent.
+        // Restarting a healthy robot's daemons because someone asked for a release it already has
+        // would be a worse command than the inert one.
+        assert!(restarts_owed(&already_current(&[])).is_empty());
+
+        assert_eq!(restarts_owed(&already_current(&["updaterd"])), ["updaterd"]);
+        assert_eq!(
+            restarts_owed(&already_current(&["configd", "updaterd"])),
+            ["configd", "updaterd"]
+        );
+
+        // A rollback leaves the resident `updaterd` already matching `current`, so there is nothing
+        // to fix and a restart would be churn.
+        let rolled_back = Ok(ApplyResult::RolledBack {
+            attempted: semver::Version::parse("0.5.0").expect("a test version"),
+            reverted_to: None,
+            reason: "the gate".to_owned(),
+        });
+        assert!(restarts_owed(&rolled_back).is_empty());
+        assert!(restarts_owed(&Err(Error::Busy)).is_empty());
+    }
+
     /// Scheduling that fails must not propagate. The update is already committed and journalled by
     /// this point, so an unschedulable restart cannot be allowed to report a good update as failed —
     /// `reconcile` picks it up at the next start instead.
@@ -2279,7 +2419,11 @@ esac
     async fn a_scheduler_that_cannot_be_run_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         // Nothing at this path, so the spawn fails outright.
-        schedule_deferred_restarts(dir.path().join("absent").to_str().unwrap()).await;
+        schedule_deferred_restarts(
+            dir.path().join("absent").to_str().unwrap(),
+            &RESTART_AFTER_REPLYING,
+        )
+        .await;
     }
 
     /// One invocation per unit, which is the fix. `systemctl restart a b` fails as a whole when

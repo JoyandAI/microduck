@@ -38,6 +38,12 @@
 //! disagreed about what "current" is, and a loop in the process that owns recovery is the one
 //! failure with no way out. It is reported and left alone, which is safe: it has just started, so
 //! anything stale about it was decided before this code ran.
+//!
+//! That exception used to be the end of the story, and it left one skew nothing repaired. It is now
+//! reached from the other side: [`stale_units`] is the same reading without the acting, and
+//! `Engine::apply` calls it when a release turns out to be already installed — so an operator running
+//! `apply` on a robot that looks wrong schedules the restart this module refuses to perform. Once,
+//! on a request, which is not the loop guarded against above.
 
 use duck_ipc_proto as proto;
 
@@ -85,6 +91,30 @@ pub fn verdict_for(
         Some(_) if is_self => Verdict::ReportedOnly,
         Some(_) => Verdict::Restarted,
     }
+}
+
+/// Which of these units are not running `expected`, without touching any of them.
+///
+/// The observing half of [`check`], for the one caller that must act differently. `Engine::apply`
+/// reaching an already-current release is the only way a stale `updaterd` gets looked at — this
+/// module will not restart it, deliberately — and it cannot drive `systemctl` the way [`check`] does:
+/// restarting `updaterd` or `btd` from inside a running update kills the process doing the restarting
+/// or drops the transport carrying the reply. So it reads here and schedules there.
+///
+/// [`verdict_for`] rather than a second comparison, so what counts as stale stays in one place: a
+/// stopped unit does not, and neither does one whose build predates the identity file.
+///
+/// `is_self` is false and both stale verdicts are accepted, because whether a unit may be restarted
+/// is the caller's question and not this one's. Every stale unit is named.
+pub fn stale_units(expected: &semver::Version, units: &[String]) -> Vec<String> {
+    units
+        .iter()
+        .filter(|unit| {
+            let verdict = verdict_for(running_release(unit).as_ref(), expected, false);
+            matches!(verdict, Verdict::Restarted | Verdict::ReportedOnly)
+        })
+        .cloned()
+        .collect()
 }
 
 /// The release each unit is running, checked against what its component has active.
@@ -307,7 +337,13 @@ mod tests {
             .map(str::to_owned)
             .to_vec();
 
-        let findings = check(systemctl.to_str().unwrap(), &active, "updaterd", units).await;
+        let findings = check(
+            systemctl.to_str().unwrap(),
+            &active,
+            "updaterd",
+            units.clone(),
+        )
+        .await;
 
         assert_eq!(verdict_of(&findings, "configd"), Verdict::Restarted);
         assert_eq!(verdict_of(&findings, "robotd"), Verdict::Current);
@@ -324,5 +360,12 @@ mod tests {
         assert!(!calls.contains("restart robotd"), "{calls}");
         assert!(!calls.contains("restart padd"), "{calls}");
         assert!(!calls.contains("restart updaterd"), "{calls}");
+
+        // And the observing half, over the same files, because it has to agree with the above on what
+        // stale means while disagreeing on what to do about it. `updaterd` is in this list precisely
+        // where it is absent from the calls: the caller schedules that restart instead of running it,
+        // and a `stale_units` that hid it would leave the one skew nothing else repairs unreported.
+        let stale = stale_units(&active, &units);
+        assert_eq!(stale, ["btd", "configd", "updaterd"], "{stale:?}");
     }
 }

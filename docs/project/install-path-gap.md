@@ -15,7 +15,8 @@ their own document because anyone investigating one will arrive believing it is 
 case 1's `serde(default)` discipline landed, case 2's handshake proposal was decided *against* with
 its reasoning written down, and the "units outlive the release that installed them" consequence is
 now a refusal rather than emergent behaviour. What is still open is the *testing* gap the title
-names — no test installs a real artifact — plus three smaller decisions marked below.
+names — no test installs a real artifact — plus the two smaller items marked below, both of which
+are that same gap in a specific form.
 
 One change since the first draft moves enough of this document to call out here: `updaterd` and
 `btd` are now restarted a few seconds *after* the update replies (`RESTART_AFTER_REPLYING`), and the
@@ -116,16 +117,25 @@ with what its component has active, and anything stale is restarted. Since `upda
 five seconds after every applied update, that check runs seconds after every `apply`, so the state
 this section is about now heals itself with `Engine::apply` unchanged.
 
-What that leaves is narrower than either option as written. `Engine::apply` still returns
-`AlreadyCurrent` on the installed version alone, and `reconcile` deliberately does not repair one
-skew: `updaterd`'s own, because a self-restart loop in the process that owns recovery is the one
-failure with no way out. Those two meet in a single case — a stale `updaterd`, an operator reaching
-for `apply`, `already_current`, no restart scheduled, and nothing to fix it but a hand-run `systemctl
-restart updaterd`. **Still open**, as one narrow change to `apply` rather than as two options; a
-`--force` flag is what is left if `apply` is not to repair skew by itself. If it is added, its guard
-needs its own reasoning: `install --force` refuses while `robotd` answers because it disables the
-health gate, and `apply` keeps that gate, so copying the guard by symmetry would disable the flag
-exactly when a robot is up and skewed.
+What that left was narrower than either option as written, and it is now closed too. `reconcile`
+deliberately does not repair one skew — `updaterd`'s own, because a self-restart loop in the process
+that owns recovery is the one failure with no way out — and that met an `apply` returning
+`AlreadyCurrent` on the installed version alone in a single case: a stale `updaterd`, an operator
+reaching for `apply`, `already_current`, no restart scheduled, and nothing to fix it but a hand-run
+`systemctl restart updaterd`.
+
+**Fixed** (`engine.rs::restarts_owed`, `reconcile::stale_units`). `apply` and `select` read the same
+identity files on their already-current paths, name the units running something else in the
+`already_current` outcome, and schedule those restarts the way an update schedules its deferred pair.
+It is not the loop the startup check guards against: it fires once, on a request, and through
+`systemd-run` rather than from inside the process being restarted.
+
+**And `apply --force` is dropped rather than deferred.** Its whole job was to re-run the restart on an
+already-current release; that is now what `apply` does when — and only when — something is actually
+stale. A flag would add a second way to ask for it, gated by a question that took a paragraph to get
+right: `install --force` refuses while `robotd` answers because it disables the health gate, `apply`
+keeps that gate, so copying the guard by symmetry would have disabled the flag exactly when a robot is
+up and skewed. Nothing needs to answer that now.
 
 **Fixed, and this paragraph used to say otherwise.** `btd` is excluded from the *in-flight* restart
 because restarting it drops the BLE connection carrying the update's own progress stream — that part
