@@ -260,6 +260,62 @@ impl Pins {
     }
 }
 
+/// What `scripts/robot-rescue` leaves in the state dir when it swaps `current` to golden.
+///
+/// The file it writes, verbatim:
+///
+/// ```text
+/// at=1786453421
+/// install_dir=/opt/robot/daemon
+/// from=1.2.0
+/// to=1.0.0
+/// because=boot check: robotd.service (failed, 7 restarts)
+/// ```
+///
+/// `key=value` rather than JSON because the writer is a shell script running on a board where things
+/// are already going wrong, and quoting JSON correctly in `sh` is a way to produce a record nothing
+/// can read. Which makes this the reader for it — and a lenient one on purpose: **every field is
+/// optional**. A breadcrumb that is half-written, or written by an older rescue that did not carry
+/// `install_dir`, still has to be recognised, because the alternative is a board whose loop guard
+/// never opens (`Engine::record_rescue` clears the file, and only recognises it here).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Breadcrumb {
+    pub at: Option<i64>,
+    pub install_dir: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub because: Option<String>,
+}
+
+/// Name of that file inside the state dir.
+pub const RESCUE_BREADCRUMB: &str = "rescued";
+
+impl Breadcrumb {
+    pub fn parse(text: &str) -> Self {
+        let mut crumb = Self::default();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            // Trimmed, because a human may well have looked at this file — and `from=(none)` is
+            // what the rescue writes for a board that had no live release, which is not a version.
+            let value = value.trim();
+            if value.is_empty() || value == "(none)" {
+                continue;
+            }
+            match key.trim() {
+                "at" => crumb.at = value.parse().ok(),
+                "install_dir" => crumb.install_dir = Some(value.to_owned()),
+                "from" => crumb.from = Some(value.to_owned()),
+                "to" => crumb.to = Some(value.to_owned()),
+                "because" => crumb.because = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+        crumb
+    }
+}
+
 /// Counts boots since an update that has not yet proven itself healthy.
 ///
 /// Catches the failure the in-process health gate cannot: a release that doesn't
@@ -529,6 +585,39 @@ mod tests {
             previous: Some(semver::Version::new(1, 0, 0)),
             boots,
         }
+    }
+
+    /// Exactly what `scripts/robot-rescue` writes, so the two cannot drift without this failing.
+    #[test]
+    fn a_breadcrumb_is_read_the_way_the_rescue_writes_it() {
+        let crumb = Breadcrumb::parse(
+            "at=1786453421\n\
+             install_dir=/opt/robot/daemon\n\
+             from=1.2.0\n\
+             to=1.0.0\n\
+             because=boot check: robotd.service (failed, 7 restarts)\n",
+        );
+
+        assert_eq!(crumb.at, Some(1786453421));
+        assert_eq!(crumb.install_dir.as_deref(), Some("/opt/robot/daemon"));
+        assert_eq!(crumb.from.as_deref(), Some("1.2.0"));
+        assert_eq!(crumb.to.as_deref(), Some("1.0.0"));
+        assert!(crumb.because.unwrap().contains("robotd.service"));
+    }
+
+    /// Lenient on purpose. A breadcrumb this cannot read is a board whose loop guard never opens,
+    /// so a torn write, an unknown key from a newer rescue, or `from=(none)` on a board that had no
+    /// live release must all still parse.
+    #[test]
+    fn a_partial_breadcrumb_is_still_a_breadcrumb() {
+        let crumb = Breadcrumb::parse(
+            "at=1786453421\nfrom=(none)\nto=1.0.0\nsomething_new=42\nnot a pair at all\nbeca",
+        );
+
+        assert_eq!(crumb.from, None, "(none) is not a version");
+        assert_eq!(crumb.to.as_deref(), Some("1.0.0"));
+        assert_eq!(crumb.install_dir, None);
+        assert_eq!(crumb.because, None);
     }
 
     #[test]

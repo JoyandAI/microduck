@@ -859,6 +859,13 @@ mod tests {
 
     /// Where promotion happens: the stable manifest, the artifact carried forward, the retire step.
     const PROMOTE_WORKFLOW: &str = "_promote-release.yml";
+
+    /// Where a unit's `ExecStart` points when it runs a program out of the live release.
+    ///
+    /// Nearly all of them do, and for those the binary has to be staged and packaged or the unit
+    /// fails with `203/EXEC`. The exception is the boot recovery net, which execs out of the base
+    /// precisely so that a broken release cannot break it.
+    const RELEASE_BIN_DIR: &str = "/opt/robot/daemon/current/bin/";
     /// Every unit `install.sh` installs must actually be in the artifact.
     ///
     /// The packaging workflows name each shipped file with an explicit `--include`, and
@@ -1066,14 +1073,28 @@ mod tests {
                 });
 
                 // `ExecStart=/opt/robot/daemon/current/bin/<name> [args]`
-                let Some(exec) = unit
+                let Some(exec_path) = unit
                     .lines()
                     .find(|l| l.starts_with("ExecStart="))
                     .and_then(|l| l.split_whitespace().next())
-                    .and_then(|l| l.rsplit('/').next())
+                    .and_then(|l| l.strip_prefix("ExecStart="))
                 else {
                     panic!("{src} has no ExecStart naming a binary");
                 };
+
+                // A unit that execs out of the *base* rather than the release, which the boot
+                // recovery net does on purpose: it runs when the release cannot, so reading its
+                // program through `current` would route the recovery through the thing being
+                // recovered. Nothing to stage, and `xtask/tests/artifact.rs` checks that the
+                // script it names is packaged and installed.
+                if !exec_path.starts_with(RELEASE_BIN_DIR) {
+                    continue;
+                }
+
+                let exec = exec_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_else(|| panic!("{src}: ExecStart={exec_path} names nothing"));
 
                 let staged = format!("release/{exec} staged/");
                 assert!(

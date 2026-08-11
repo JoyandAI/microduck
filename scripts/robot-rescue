@@ -19,11 +19,20 @@
 # disease it is treating. `updaterd` publishes golden as a symlink on every start
 # (`Engine::refresh_golden_links`) so that the answer is one `readlink` away and survives the daemon.
 #
-# There is no loop guard here yet, on purpose: nothing invokes this automatically, and a human is
-# rate-limited by being a human. The guard arrives with the boot-deadline timer that calls it — see
-# `docs/project/boot-recovery-net.md`.
+# THE LOOP GUARD. `robot-boot-check` invokes this without a human, so "swap and reboot" has to be
+# something that cannot happen twice on its own. Two independent things stop it:
 #
-# Usage:  robot-rescue [--dry-run] [--reboot]
+#   - it refuses when `current` is already golden, which covers the ordinary case, because a
+#     successful rescue leaves exactly that state;
+#   - and it refuses when a breadcrumb from a previous attempt is still there, which covers the case
+#     the first check misses — an update moved `current` away from golden and failed again.
+#
+# The breadcrumb is cleared by `updaterd` on its next start, once it has copied the record into the
+# update log (`Engine::record_rescue`). So the guard releases itself exactly when the board proves it
+# can run the update daemon again, and stays shut when it cannot: a robot sitting still with a clear
+# journal beats one rebooting forever. `--force` is the way past it by hand.
+#
+# Usage:  robot-rescue [--dry-run] [--reboot] [--force] [--because <text>]
 #
 # Exit: 0 swapped (or would have), 2 declined with nothing to do, 1 something went wrong.
 set -eu
@@ -35,6 +44,8 @@ STATE_DIR="${ROBOT_STATE_DIR:-/var/lib/robot/updater}"
 
 DRY_RUN=
 REBOOT=
+FORCE=
+BECAUSE="invoked by hand"
 
 # Reboot is opt-in, not the default. The units all exec through `current`, so nothing picks up the
 # swap until they restart — but this script is also runnable on a board that is merely suspect, and
@@ -43,15 +54,23 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --reboot)  REBOOT=1 ;;
+        --force)   FORCE=1 ;;
+        --because)
+            [ $# -ge 2 ] || { echo "robot-rescue: --because needs a value" >&2; exit 1; }
+            BECAUSE="$2"
+            shift
+            ;;
         -h|--help)
             cat <<'USAGE'
-usage: robot-rescue [--dry-run] [--reboot]
+usage: robot-rescue [--dry-run] [--reboot] [--force] [--because <text>]
 
 Point /opt/robot/daemon/current at the golden release, without going through updaterd.
 For a board whose daemons will not start: see docs/project/boot-recovery-net.md.
 
-  --dry-run   report the decision and change nothing
-  --reboot    reboot after the swap, instead of printing the command
+  --dry-run        report the decision and change nothing
+  --reboot         reboot after the swap, instead of printing the command
+  --force          act even though a previous attempt left a breadcrumb
+  --because TEXT   why, recorded in the breadcrumb and in the update log
 
 Exit: 0 swapped (or would have), 2 declined with nothing to do, 1 something went wrong.
 USAGE
@@ -59,7 +78,7 @@ USAGE
             ;;
         *)
             echo "robot-rescue: unknown argument: $1" >&2
-            echo "usage: robot-rescue [--dry-run] [--reboot]" >&2
+            echo "usage: robot-rescue [--dry-run] [--reboot] [--force] [--because <text>]" >&2
             exit 1
             ;;
     esac
@@ -81,6 +100,23 @@ decline() {
 
 golden_link="${INSTALL_DIR}/golden"
 current_link="${INSTALL_DIR}/current"
+breadcrumb="${STATE_DIR}/rescued"
+
+# The loop guard, checked before anything else so that a jammed board says so rather than
+# re-deriving a decision it is not going to act on.
+#
+# Still here means `updaterd` has not started since the last attempt — it clears this once it has
+# copied the record into the update log. So the release the last rescue chose is not starting either,
+# and the fault is not one a rollback fixes.
+if [ -f "$breadcrumb" ] && [ -z "$FORCE" ]; then
+    decline "a previous rescue is still on record, and updaterd has not started since:
+
+$(cat "$breadcrumb")
+
+  So golden did not fix it, and swapping again would only reboot the robot a second time.
+  Read the journal:  journalctl -b -u robotd -u updaterd -u btd -u configd
+  Then, to try anyway:  robot-rescue --force --reboot"
+fi
 
 # No golden means no rollback target. That is the state of every board until 1.0.0 exists, so it is
 # a declined run and not an error — but say which of the two reasons it is, because "unset in
@@ -121,10 +157,21 @@ fi
 # The breadcrumb before the swap, matching the order the engine arms its boot counter in: a record
 # of an attempt that did not happen is recoverable, a swap nothing recorded is not. Outside
 # `install_dir`, so it survives the swap it is describing.
+#
+# `key=value` and not JSON, though `updaterd` reads it: this file is written by a shell script on a
+# board where things are already going wrong, and quoting JSON correctly in `sh` is a way to produce
+# a record nothing can read. It is also read by a human first — it is the evidence.
+#
+# Overwritten rather than appended. It is a guard and the latest record, one attempt at a time; the
+# history that must not be lost goes into the update log, which is append-only and bounded.
 mkdir -p "$STATE_DIR"
-printf '%s rescued from %s to golden %s\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$current_version" "$golden_version" \
-    >> "${STATE_DIR}/rescued"
+cat > "$breadcrumb" <<EOF
+at=$(date -u '+%s')
+install_dir=${INSTALL_DIR}
+from=${current_version}
+to=${golden_version}
+because=${BECAUSE}
+EOF
 
 # `ln -sfn` unlinks and recreates, which leaves a window where `current` does not exist — and a
 # daemon starting in that window fails to exec. Rename over the top instead: `rename(2)` within one

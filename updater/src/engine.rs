@@ -1089,6 +1089,12 @@ impl Engine {
             }
         }
 
+        // Before the boot counter, and that ordering is load-bearing: a rescue has already made the
+        // decision an armed trial was going to make, and further than the trial would have gone.
+        // Left in place, `record_boot` below would advance that trial and eventually revert to
+        // `previous` — moving `current` off the golden release the rescue just chose.
+        self.record_rescue();
+
         self.refresh_golden_links();
 
         // Every component's trial advances, independently. A model transition must
@@ -1216,6 +1222,89 @@ impl Engine {
     fn store(&self, component: &str) -> Result<Store, Error> {
         let cfg = self.config.component(component)?;
         Ok(Store::new(cfg.install_dir.clone()))
+    }
+
+    /// Turn a `robot-rescue` breadcrumb into a permanent record, and clear it.
+    ///
+    /// The rescue swaps `current` to golden and reboots with no daemon running, so this start is the
+    /// first moment anything can write that down where it will be found. Three things happen, and
+    /// each is one of the constraints the design names:
+    ///
+    /// - **the update log gets an entry**, because the breadcrumb is deleted below and a rollback
+    ///   nobody can see afterwards is how a day goes to "it works on my board";
+    /// - **any armed trial for that component is cleared**, since the rescue already decided it;
+    /// - **the breadcrumb is removed**, which is what releases the rescue's loop guard. It refuses to
+    ///   act while one is on record, so the guard opens exactly when the board proves it can run its
+    ///   update daemon again, and stays shut when it cannot.
+    ///
+    /// Never fatal. A board that has just been rescued must not be a board whose `updaterd` refuses
+    /// to serve.
+    fn record_rescue(&mut self) {
+        let path = self
+            .config
+            .state_dir
+            .join(crate::journal::RESCUE_BREADCRUMB);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+
+        let crumb = crate::journal::Breadcrumb::parse(&text);
+        tracing::warn!(
+            from = crumb.from.as_deref().unwrap_or("(none)"),
+            to = crumb.to.as_deref().unwrap_or("(unknown)"),
+            because = crumb.because.as_deref().unwrap_or("(unrecorded)"),
+            "this board was rescued to golden since the last start"
+        );
+
+        // Matched on `install_dir` rather than on the name `daemon`: the rescue knows which tree it
+        // swapped and nothing else about the config, and a hardcoded component name would be a
+        // second place that has to agree with `updater.toml`.
+        let component = crumb.install_dir.as_deref().and_then(|dir| {
+            self.config
+                .components
+                .iter()
+                .find(|(_, cfg)| cfg.install_dir == std::path::Path::new(dir))
+                .map(|(name, _)| name.clone())
+        });
+
+        match component {
+            Some(name) => {
+                let entry = crate::proto::LogEntry {
+                    at: crate::journal::now_unix(),
+                    component: crate::proto::ComponentId(name.clone()),
+                    from: crumb.from.as_deref().and_then(|v| v.parse().ok()),
+                    to: crumb.to.as_deref().and_then(|v| v.parse().ok()),
+                    outcome: crate::proto::Outcome::RolledBack {
+                        reason: format!(
+                            "boot recovery swapped to golden without updaterd ({})",
+                            crumb.because.as_deref().unwrap_or("no reason recorded")
+                        ),
+                    },
+                };
+                if let Err(e) = self.journal.append(&entry) {
+                    tracing::error!(error = %e, "could not record the rescue in the update log");
+                }
+                if let Err(e) = self.boot_counter.confirm(&name) {
+                    tracing::error!(error = %e, "could not clear the trial the rescue superseded");
+                }
+            }
+            // Not attributed to a component we guessed. The journal warning above is the record in
+            // this case, and the breadcrumb is still cleared: a guard that never opens would leave
+            // the board unable to rescue itself a second time, which is worse than a missing log
+            // line for a state only a moved `install_dir` produces.
+            None => tracing::warn!(
+                install_dir = crumb.install_dir.as_deref().unwrap_or("(unrecorded)"),
+                "the rescued tree matches no configured component; not recording it in the log"
+            ),
+        }
+
+        // Durable, because the guard depends on this being gone: a delete that did not reach disk
+        // means the next start declines to act on a board that has already been rescued once.
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::error!(error = %e, "could not clear the rescue breadcrumb; robot-rescue will decline until it is removed by hand");
+        } else {
+            let _ = crate::fsutil::fsync_parent(&path);
+        }
     }
 
     /// Publish each component's configured golden release as a `golden` symlink.
