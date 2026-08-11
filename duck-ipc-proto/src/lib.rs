@@ -43,12 +43,36 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `system.authenticate`, which a BLE client must now pass before anything else is served — a v3
 /// client would otherwise have every call refused with no idea why. v5 added the `pad.*`
 /// namespace, which is additive — a v4 client loses nothing by not knowing it — and bumps anyway,
-/// because the version's job is to say "these two peers were not built together". During
-/// v6 added `robot.init` and `robot.relax`, so powering the joints stops being a subcommand that
-/// fights the daemon for the motor bus. During
-/// prototyping the wire shape simply changes and this bumps; no accommodation is made for
-/// peers that predate a field, because there are none in the field yet.
-pub const API_VERSION: u32 = 6;
+/// because the version's job is to say "these two peers were not built together". v6 added
+/// `robot.init` and `robot.relax`, so powering the joints stops being a subcommand that fights the
+/// daemon for the motor bus. During prototyping the wire shape simply changes and this bumps; no
+/// accommodation is made for peers that predate a field, because there are none in the field yet.
+///
+/// # The rule, since a bump has consequences and nothing else states them
+///
+/// **A bump promises nothing in either direction.** It is not "additive unless stated": v5 was
+/// additive and v4 was not, and the constant does not distinguish them. So `updaterd` refuses on an
+/// exact `!=`, and that stays deliberate rather than pending — accepting an older client would
+/// promise backward compatibility on every past and future bump, with no mechanism to keep it and
+/// no way to make a non-additive change afterwards. There is one user and one robot; a promise is
+/// worth less here than the freedom to change the wire shape.
+///
+/// **What a bump therefore costs.** Every client on a board must come from the same release as
+/// `updaterd`, and for a few seconds after an update they do not: `robotctl` is a symlink into
+/// `current`, so it follows the new release immediately, while `updaterd` is mid-restart of itself.
+/// Retrying is the fix. A client that is *persistently* older is a copy taken from somewhere other
+/// than `/usr/local/bin/robotctl`. Both directions are named in the refusal — `updater/src/ipc.rs`.
+/// # v7 — `ApplyOptions::from_dir`
+///
+/// First ships in 0.5.0, which is therefore the version a board has to be on before
+/// `robotctl update apply --from` can put anything there.
+///
+/// **It bumps even though `from_dir` is an optional field an older daemon would happily parse.**
+/// That is the reason to bump rather than a reason not to: serde ignores what it does not know, so a
+/// v6 `updaterd` would accept `update.apply --from /some/dir` and quietly install from its
+/// *configured* source instead — a mirror of the release the operator meant to sideload, or nothing
+/// at all. Refusing the call outright is what this constant is for.
+pub const API_VERSION: u32 = 7;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -63,6 +87,29 @@ pub mod socket {
     pub const UPDATER: &str = super::DEFAULT_SOCKET;
     pub const ROBOT: &str = "/run/robotd.sock";
     pub const CONFIG: &str = "/run/configd.sock";
+}
+
+/// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
+///
+/// One directory per service rather than one shared directory, because that is what
+/// `RuntimeDirectory=<service>` in a unit file gives — and it has to be that, for two reasons no
+/// tidier layout survives. `btd` and `padd` run under `ProtectSystem=strict`, so the filesystem is
+/// read-only to them *except* what systemd grants, and `RuntimeDirectory` is the grant. And systemd
+/// deletes the directory when the unit stops, so a stopped daemon cannot leave a stale identity
+/// behind claiming to be running.
+pub fn identity_path(service: &str) -> std::path::PathBuf {
+    runtime_root().join(service).join("identity.json")
+}
+
+/// Where the per-service runtime directories live: `/run`, unless `DUCK_RUNTIME_DIR` says otherwise.
+///
+/// Not a configuration knob for a robot — nothing on the board sets it. It exists so this is testable
+/// at all, since a test cannot write to `/run`, and it is the same reason a daemon run by hand on a
+/// laptop can publish an identity: `/run` is root-owned there too, and on macOS it does not exist.
+pub fn runtime_root() -> std::path::PathBuf {
+    std::env::var_os("DUCK_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/run"))
 }
 
 /// The robot's joint order, as every positional vector on the wire is indexed.
@@ -204,6 +251,8 @@ pub mod method {
 
     /// Name, serial, uptime.
     pub const SYSTEM_INFO: &str = "system.info";
+    /// What systemd says about each daemon, and which release each is running from.
+    pub const SYSTEM_SERVICES: &str = "system.services";
     /// Rename the robot. This is the name a phone sees.
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
@@ -330,6 +379,7 @@ pub enum Call {
 
     // ── system.* ─────────────────────────────────────────────────────────────
     SystemInfo,
+    SystemServices,
     SystemSetName(SetNameParams),
     SystemReboot,
     /// Read the pairing PIN.
@@ -385,6 +435,7 @@ impl Call {
             Call::NetConnect(_) => method::NET_CONNECT,
             Call::NetForget(_) => method::NET_FORGET,
             Call::SystemInfo => method::SYSTEM_INFO,
+            Call::SystemServices => method::SYSTEM_SERVICES,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
@@ -477,6 +528,7 @@ impl Call {
             Call::NetStatus
             | Call::NetScan
             | Call::SystemInfo
+            | Call::SystemServices
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::PadStatus => Value::Object(serde_json::Map::new()),
@@ -522,6 +574,7 @@ impl Call {
             method::NET_CONNECT => Call::NetConnect(decode(params)?),
             method::NET_FORGET => Call::NetForget(decode(params)?),
             method::SYSTEM_INFO => Call::SystemInfo,
+            method::SYSTEM_SERVICES => Call::SystemServices,
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
@@ -888,6 +941,22 @@ pub struct ApplyOptions {
     /// signature, hash or compatibility — those have no override.
     #[serde(default)]
     pub interrupt_sessions: bool,
+    /// Take the release from this directory **on the robot** instead of the component's
+    /// configured source. The laptop-to-board path: `scripts/dev-push.sh`.
+    ///
+    /// Changes where the bytes come from, not what is trusted. The directory is read by
+    /// the same `LocalDir` source the tests and the offline installer use, so the
+    /// manifest signature, the artifact hash and the compatibility checks all still have
+    /// to pass — a locally built release installs because the dev key is in the robot's
+    /// trusted set, not because anything is skipped.
+    ///
+    /// A `String` rather than a `PathBuf` because this is a JSON wire type: a path that
+    /// is not UTF-8 cannot cross this socket in either form, and the plain type says so
+    /// instead of failing at serialisation. It is also interpreted by `updaterd`, whose
+    /// working directory is `/` — so a client sends an absolute path, and `robotctl`
+    /// resolves one before it gets here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1123,11 +1192,22 @@ pub enum ApplyResult {
     },
     AlreadyCurrent {
         version: semver::Version,
+        /// Units running something other than `version`, which this outcome has scheduled a restart
+        /// for. Empty in the ordinary case, where nothing was installed because nothing needed to be.
+        ///
+        /// It earns a field rather than only a log line because "already current" is otherwise
+        /// indistinguishable from "already current, and a daemon is not running it" — the state that
+        /// made a recovery command look like a confirmation that there was nothing to recover.
+        ///
+        /// `default`, so an older `updaterd`'s reply still parses: it reports no stale units because
+        /// it did not look, which reads the same as finding none. `ApplyResult` does not
+        /// `deny_unknown_fields`, so an older client ignores the field rather than failing to decode
+        /// the outcome of an update it just performed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stale: Vec<String>,
     },
     /// Everything verified; stopped before the swap because `dry_run` was set.
-    DryRunPassed {
-        candidate: semver::Version,
-    },
+    DryRunPassed { candidate: semver::Version },
     /// Applied, failed its gate, reverted. The robot is on `reverted_to`.
     RolledBack {
         attempted: semver::Version,
@@ -1592,8 +1672,14 @@ pub struct ForgetResult {
 pub struct SystemInfoResult {
     /// The robot's name, as advertised over BLE and shown in an app.
     pub name: String,
-    /// Per-device identity, once provisioning defines one. `None` until then rather than a
-    /// fabricated value.
+    /// Per-device identity: the SoC serial, which the default name is derived from.
+    ///
+    /// The durable handle a client should key on. It outlives a rename, and it outlives a change of
+    /// Bluetooth address — which is not hypothetical, so an app that remembers a robot by its
+    /// peripheral identifier alone will lose it (`app-path-design.md` §8.6).
+    ///
+    /// `None` where there is none to read rather than a fabricated value; the robot then falls back
+    /// to its hostname for a name.
     pub serial: Option<String>,
     pub uptime_seconds: u64,
 }
@@ -1649,22 +1735,46 @@ pub struct Pad {
     pub connected: bool,
 }
 
-/// Whether `padd` — the process that turns a pad into intents — is running.
+/// Whether one of the robot's units is running, as systemd sees it.
 ///
-/// Reported alongside the pads because a connected pad and a dead `padd` is the failure that looks
-/// like working hardware, and it is not otherwise visible without knowing to ask systemd.
+/// Named for the unit rather than for `padd`, which is where it started: the same four answers are
+/// what [`ServiceUnit`] needs about every daemon. The wire form is unchanged by that rename — these
+/// serialise as their own names, not as the type's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DriverState {
+pub enum UnitState {
     /// Running. With a connected pad, the robot is drivable.
     Active,
     /// The unit exists and is not running. Someone stopped it, or it is failed.
     Inactive,
-    /// No `padd.service` on this board — a release older than the one that added it.
+    /// No such unit on this board — a release older than the one that added it.
     Absent,
     /// Could not ask: no systemd, or the query failed. Distinct from `Absent`, because "I do not
     /// know" must not read as "it is not installed".
     Unknown,
+}
+
+/// One daemon, as systemd and `/proc` describe it. Answer element for [`Call::SystemServices`].
+///
+/// **This exists to answer "which version is actually running", which nothing else could.**
+/// `updaterd`, `robotd` and `configd` report their build over their own sockets, so a running
+/// daemon that did not restart into a new release is already visible for those three. `btd` and
+/// `padd` serve no socket, and asking them is not an option — the process that needs interrogating
+/// is by definition the *old* one, which cannot have learned a new way to answer.
+///
+/// So it is read from outside the process: systemd knows the PID, and `/proc/<pid>/exe` resolves to
+/// the real path the binary was executed from. Since a release installs to `…/releases/<version>/`
+/// and the unit points at a `current` symlink, that path names the release the process is running —
+/// including when it is not the installed one, which is the whole question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceUnit {
+    /// The systemd unit, e.g. `btd.service`.
+    pub unit: String,
+    pub state: UnitState,
+    /// What the running process published about itself, or `None` when it published nothing —
+    /// stopped, or a build too old to publish. [`UnitState`] tells those apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
 }
 
 /// Answer to [`Call::PadStatus`].
@@ -1672,7 +1782,7 @@ pub enum DriverState {
 pub struct PadStatusResult {
     /// Every pad the robot is bonded to, connected first.
     pub pads: Vec<Pad>,
-    pub driver: DriverState,
+    pub driver: UnitState,
 }
 
 /// Why pairing a pad failed.
@@ -1774,9 +1884,216 @@ macro_rules! build_info {
     };
 }
 
+/// The release a binary at this path was installed as.
+///
+/// Matches the layout rather than a configured root: any path with a `releases/<version>/` in it
+/// yields that version. The root is `updater.toml`'s to choose, and hardcoding a copy of it here is
+/// how the two drift apart. Here rather than in one daemon so that `configd`, `updaterd` and
+/// `robotctl` cannot come to disagree about what a release path means.
+///
+/// A path with no such component is not an error — a hand-built binary run from a developer's home
+/// directory is a normal thing on a dev board, and the full path is reported alongside.
+pub fn release_from_path(path: &str) -> Option<semver::Version> {
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    let mut parts = path.split('/');
+    while let Some(part) = parts.next() {
+        if part == "releases"
+            && let Some(version) = parts.next()
+            && let Ok(version) = semver::Version::parse(version)
+        {
+            return Some(version);
+        }
+    }
+    None
+}
+
+/// What a daemon says it is, published by the process itself at startup.
+///
+/// **Self-published, which is the whole design.** The alternative was reading `/proc/<pid>/exe` from
+/// outside, and that was chosen for a bad reason: that an *old* daemon could not have learned to
+/// publish anything. Designing around that bought a worse answer. A path names a release directory;
+/// a process knows its own version, its own git revision and its own exe — and it can read
+/// `/proc/self/exe` with no privilege at all, where reading another user's needs root.
+///
+/// So the two builds of `0.4.0` a dev channel produces are told apart here by `revision`, the field
+/// that actually differs, rather than inferred from a directory name that happens to embed it. A
+/// daemon too old to publish has no file and reports as `unknown`, which is honest — an inferred
+/// release reads as authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub service: String,
+    /// Crate version, compiled in. Shared across the workspace, so not enough on its own.
+    pub version: String,
+    /// Git SHA, compiled in from `DUCK_REVISION`. `None` for a build that did not come from CI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<String>,
+    /// The resolved path this process was launched from, via `/proc/self/exe` — so it names the
+    /// release directory even though the unit points at the `current` symlink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    pub pid: u32,
+}
+
+impl Identity {
+    /// The release this process was installed as, when its path names one.
+    pub fn release(&self) -> Option<semver::Version> {
+        release_from_path(self.exe.as_deref()?)
+    }
+}
+
+/// Write this process's identity where anything can read it.
+///
+/// Never fatal and never allowed to stop a daemon starting: a robot that would not come up because
+/// it could not describe itself is a worse failure than one that cannot say what it is. The
+/// directory is created if missing so a hand-run binary on a dev board still publishes; on the board
+/// it is already there, made by `RuntimeDirectory=`.
+pub fn publish_identity(service: &str, build: BuildInfo) -> Result<(), String> {
+    let identity = Identity {
+        service: service.to_owned(),
+        version: build.version.to_owned(),
+        revision: build.revision.map(str::to_owned),
+        built_at: build.built_at.map(str::to_owned),
+        exe: std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string()),
+        pid: std::process::id(),
+    };
+
+    let path = identity_path(service);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut json = serde_json::to_vec(&identity).map_err(|e| e.to_string())?;
+    json.push(b'\n');
+    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// What one daemon published, or `None` if it published nothing.
+///
+/// `None` covers both "not running" — systemd removes the directory with the unit — and "too old to
+/// publish". Those are told apart by the unit's state, a separate question with a separate answer.
+pub fn read_identity(service: &str) -> Option<Identity> {
+    let json = std::fs::read(identity_path(service)).ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
+/// The first line a daemon writes: its own identity.
+///
+/// At `warn` so it survives `RUST_LOG=warn` on a long-running board (`architecture.md` §8.1) —
+/// identifying the running build is not a debug-level concern. `exe` earns its place by naming the
+/// release directory the process was actually launched from, which is the difference between "the
+/// update worked" and "the symlink moved but systemd is still running the old path".
+///
+/// **Here rather than copied into each daemon, which is where it started.** Four of the five had an
+/// identical private copy and `padd` had none, so `padd` was the one daemon whose journal could not
+/// answer which build was running — discovered while chasing exactly that question. A shared
+/// definition makes the next daemon's omission a missing call rather than a missing idea.
+///
+/// A macro, not a function, because [`build_info!`] reads `CARGO_PKG_VERSION` and `DUCK_REVISION`
+/// through `env!` at the *call site*: a function here would report this crate's version for
+/// everyone. It also keeps `tracing` out of this crate's dependencies, which are deliberately serde
+/// and semver and nothing else — the expansion happens where `tracing` already is.
+#[macro_export]
+macro_rules! log_startup_identity {
+    ($service:expr) => {{
+        if let Err(e) = $crate::publish_identity($service, $crate::build_info!()) {
+            // A warning: `robotctl health` will say `unknown` for this daemon, which is a worse
+            // report rather than a broken robot.
+            tracing::warn!(error = %e, "could not publish this process's identity");
+        }
+        tracing::warn!(
+            service = $service,
+            build = %$crate::build_info!(),
+            exe = %std::env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "unknown".to_owned()),
+            pid = std::process::id(),
+            "starting"
+        )
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The path a release actually installs to, which is what makes "which version is running"
+    /// answerable at all.
+    #[test]
+    fn a_release_path_names_its_version() {
+        assert_eq!(
+            release_from_path("/opt/robot/daemon/releases/0.4.0/bin/btd"),
+            Some(semver::Version::parse("0.4.0").unwrap())
+        );
+    }
+
+    /// A branch build, which is the case this was written against: the crate version says `0.4.0`
+    /// for both the old binary and the new one, and **only the path tells them apart**.
+    #[test]
+    fn a_dev_release_keeps_the_suffix_that_distinguishes_it() {
+        let version = release_from_path("/opt/robot/daemon/releases/0.4.0-dev.271.7610e6e/bin/btd");
+        assert_eq!(
+            version,
+            Some(semver::Version::parse("0.4.0-dev.271.7610e6e").unwrap())
+        );
+        // And it must compare as older than the release it precedes, or "running an older build
+        // than is installed" cannot be detected.
+        assert!(version.unwrap() < semver::Version::parse("0.4.0").unwrap());
+    }
+
+    /// The sharpest case: the binary is gone from disk and the process is still running it. The
+    /// version has to survive the marker the kernel appends, or the one report that proves a restart
+    /// did not happen would say "unknown".
+    #[test]
+    fn a_deleted_binary_still_names_its_release() {
+        assert_eq!(
+            release_from_path("/opt/robot/daemon/releases/0.3.0/bin/padd (deleted)"),
+            Some(semver::Version::parse("0.3.0").unwrap())
+        );
+    }
+
+    /// A hand-built binary on a dev board is not a release and must not be forced into looking like
+    /// one. The full path is reported instead, which is more use than a wrong version.
+    #[test]
+    fn a_binary_outside_the_layout_has_no_release() {
+        assert_eq!(
+            release_from_path("/home/pierre/duck/target/debug/btd"),
+            None
+        );
+        // A `releases` component whose child is not a version is not a release either.
+        assert_eq!(release_from_path("/srv/releases/nightly/bin/btd"), None);
+    }
+
+    /// The whole mechanism, over a real file: a process publishes what it is, and a reader gets it
+    /// back — including the release, derived from the exe path rather than stored twice.
+    ///
+    /// Round-tripped through `serde` in both directions on purpose. The published file is read by a
+    /// *different build* than the one that wrote it, every time an update lands, so a field that
+    /// could not round-trip would present as "this daemon published nothing".
+    #[test]
+    fn an_identity_survives_being_published_and_read_back() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // SAFETY: single-threaded test, and nothing else reads the variable concurrently.
+        unsafe { std::env::set_var("DUCK_RUNTIME_DIR", dir.path()) };
+
+        publish_identity("btd", build_info!()).expect("publishing");
+        let read = read_identity("btd").expect("reading it back");
+
+        assert_eq!(read.service, "btd");
+        assert_eq!(read.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(read.pid, std::process::id());
+        // The exe is this test binary, which is not in a release directory — so there is no release,
+        // and that is the honest answer rather than an invented one.
+        assert!(read.exe.is_some(), "{read:?}");
+        assert_eq!(read.release(), None);
+
+        // A service that published nothing reads as nothing, which is how an old daemon reports.
+        assert_eq!(read_identity("padd"), None);
+
+        unsafe { std::env::remove_var("DUCK_RUNTIME_DIR") };
+    }
 
     /// One of every [`Call`] variant, so the tests below cannot silently skip one.
     fn every_call() -> Vec<Call> {
@@ -1795,6 +2112,7 @@ mod tests {
                 options: ApplyOptions {
                     dry_run: true,
                     interrupt_sessions: false,
+                    from_dir: None,
                 },
             }),
             Call::Rollback(ComponentParams {
@@ -1845,6 +2163,7 @@ mod tests {
                 ssid: "Old Network".into(),
             }),
             Call::SystemInfo,
+            Call::SystemServices,
             Call::SystemSetName(SetNameParams {
                 name: "duck-01".into(),
             }),
@@ -1875,7 +2194,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            35,
+            36,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -1916,6 +2235,7 @@ mod tests {
             options: ApplyOptions {
                 dry_run: true,
                 interrupt_sessions: false,
+                from_dir: None,
             },
         });
         let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
@@ -1923,6 +2243,37 @@ mod tests {
         assert!(line.contains(r#""jsonrpc":"2.0""#), "{line}");
         assert!(line.contains(r#""method":"update.apply""#), "{line}");
         assert!(line.contains(r#""dry_run":true"#), "{line}");
+        assert!(
+            !line.contains("from_dir"),
+            "an apply that names no directory must not mention one: {line}"
+        );
+    }
+
+    /// `from_dir` survives the wire, and only appears when it was asked for.
+    ///
+    /// The absence half is the load-bearing one. Every other client of this type — `btd`
+    /// relaying the app, the periodic scheduler — leaves it `None`, and an apply that
+    /// carried `"from_dir":null` would be a sideload request as far as a reader of the
+    /// journal or a future daemon is concerned.
+    #[test]
+    fn from_dir_round_trips_and_is_omitted_when_unset() {
+        let call = Call::Apply(ApplyParams {
+            component: ComponentId::new("daemon"),
+            target: Target::Latest,
+            options: ApplyOptions {
+                from_dir: Some("/var/tmp/duck-sideload".to_owned()),
+                ..Default::default()
+            },
+        });
+
+        let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
+        assert!(
+            line.contains(r#""from_dir":"/var/tmp/duck-sideload""#),
+            "{line}"
+        );
+
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.as_call().unwrap(), call);
     }
 
     /// An unknown method and unparseable parameters are different failures, and a client

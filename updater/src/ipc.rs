@@ -495,11 +495,7 @@ impl Server {
                         Some(id),
                         proto::Error::new(
                             proto::code::PROTOCOL_MISMATCH,
-                            format!(
-                                "client speaks API v{}, daemon speaks v{}",
-                                params.api_version,
-                                proto::API_VERSION
-                            ),
+                            protocol_mismatch(params.api_version),
                         ),
                     );
                 }
@@ -548,6 +544,7 @@ impl Server {
                                 ApplyOptions {
                                     dry_run: params.options.dry_run,
                                     interrupt_sessions: params.options.interrupt_sessions,
+                                    from_dir: params.options.from_dir.map(std::path::PathBuf::from),
                                 },
                                 tx,
                             )
@@ -624,6 +621,7 @@ impl Server {
             | Call::NetConnect(_)
             | Call::NetForget(_)
             | Call::SystemInfo
+            | Call::SystemServices
             | Call::SystemSetName(_)
             | Call::SystemReboot
             | Call::SystemPairingPin
@@ -856,6 +854,35 @@ impl Server {
             }
         }
     }
+}
+
+/// Why the handshake failed, and what the operator does about it.
+///
+/// The refusal is an exact `!=` in both directions, and stays one — see [`proto::API_VERSION`] for
+/// why accepting an older client is a promise this protocol cannot keep. What was missing is not
+/// leniency but a remedy: the old text named both versions and stopped there, on a board where the
+/// two halves are a symlink and a running process and neither is obvious to reach.
+///
+/// The direction is the whole diagnosis, so it decides the sentence:
+///
+/// - **Client newer.** Almost always the seconds after an update, while `updaterd` is restarting
+///   itself into the release `robotctl` already follows. Retrying is the fix, and saying so stops
+///   this reading as a broken install.
+/// - **Client older.** `robotctl` on PATH is a symlink into `current`, so it cannot lag by
+///   construction; a client that does is a copy from somewhere else — a scp'd binary, a laptop
+///   build, a shell open since before the update.
+fn protocol_mismatch(client: u32) -> String {
+    let daemon = proto::API_VERSION;
+    let remedy = if client > daemon {
+        "this client is from a newer release than the running updaterd, which is normal for a few \
+         seconds after an update while updaterd restarts itself — retry, and if it persists, \
+         `systemctl restart updaterd`"
+    } else {
+        "this client is from an older release than the running updaterd. `/usr/local/bin/robotctl` \
+         is a symlink into `current` and follows the installed release, so a client this old is a \
+         copy from somewhere else — use that one"
+    };
+    format!("client speaks API v{client}, daemon speaks v{daemon}: {remedy}")
 }
 
 async fn write_line<T: serde::Serialize>(

@@ -17,7 +17,7 @@
 //!    health check is still recoverable. The reverse order would leave an
 //!    unrecorded bad release live.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{ApplyAction, ComponentConfig, Config, HealthCheck};
@@ -106,12 +106,32 @@ pub struct Engine {
     /// On a robot, always. Off only in the test binaries, and for a reason that is about processes
     /// rather than about restarts — see [`Engine::without_deferred_restarts`].
     deferred_restarts: bool,
+    /// Where systemd's installed unit files live, for the orphan check ([`crate::orphan`]).
+    ///
+    /// A field so a test can point it at a directory it owns, and **not** a config key, for the
+    /// reason `NEVER_RESTART` is not one: `/etc/systemd/system` is a property of the system rather
+    /// than a choice, and a board that got it wrong would silently stop checking.
+    unit_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
     pub dry_run: bool,
     pub interrupt_sessions: bool,
+    /// Read the release from this directory instead of the component's configured source.
+    ///
+    /// The laptop-to-board path (`scripts/dev-push.sh`): build, sign with the dev key, copy
+    /// the directory over, apply. Served by [`Engine::apply`] and not by
+    /// `updaterd install --from`, which is the reason it exists — `install` has to force
+    /// `on_apply` and the health gate off, so it can only be used on a board with no live
+    /// release, and every use of it on a working robot silently gives up auto-rollback.
+    /// A dev board is exactly where a release most needs to be gated and rolled back.
+    ///
+    /// It changes where the bytes come from and nothing else: same `LocalDir` source as the
+    /// tests and the offline installer, so signature, hash and compatibility are checked
+    /// identically. A locally built release installs because the dev key is trusted on that
+    /// board, not because a check was skipped.
+    pub from_dir: Option<std::path::PathBuf>,
 }
 
 impl Engine {
@@ -133,7 +153,18 @@ impl Engine {
             pins,
             faults,
             deferred_restarts: true,
+            unit_dir: PathBuf::from(UNIT_DIR),
         })
+    }
+
+    /// Look for orphaned units somewhere other than `/etc/systemd/system`.
+    ///
+    /// For tests, which cannot write to the real one — and must not, since the check reads whatever
+    /// the machine running them happens to have installed.
+    #[doc(hidden)]
+    pub fn with_unit_dir(mut self, dir: PathBuf) -> Self {
+        self.unit_dir = dir;
+        self
     }
 
     /// Stop this engine spawning anything when a release is applied.
@@ -347,7 +378,7 @@ impl Engine {
         // parallel, copies of *other* engines' locks too. It surfaced as unrelated operations
         // failing with `Busy`. Nothing below this point touches the store.
         drop(lock);
-        schedule_restarts_if_applied(self.deferred_restarts, &outcome).await;
+        schedule_restarts_if_needed(self.deferred_restarts, &outcome).await;
         outcome
     }
 
@@ -363,7 +394,13 @@ impl Engine {
         emit: &impl Fn(Phase, Option<u8>),
     ) -> Result<ApplyResult, Error> {
         let installed = store.current()?;
-        let source = source::from_config(&cfg.source);
+        // A per-call source override, so the configured one stays in place: a dev board keeps
+        // reaching GitHub for `--ref <branch>`, `--staging` and a return to the release stream,
+        // and a laptop build is one flag rather than a config edit to undo afterwards.
+        let source = match &options.from_dir {
+            Some(dir) => Box::new(source::LocalDir::new(dir.clone())) as Box<dyn source::Source>,
+            None => source::from_config(&cfg.source),
+        };
 
         // 0. Environment preflight, *before* touching the network. The manifest
         //    fetch is HTTPS, and on a board with no battery-backed RTC it fails
@@ -396,8 +433,15 @@ impl Engine {
         }
 
         if Some(&manifest.version) == installed.as_ref() {
+            // Correct, and for years the whole answer. It is the wrong *question* in one case: the
+            // release is installed and a daemon is serving from a different one. That is what an
+            // operator reaching for `apply` is usually trying to fix, and answering "already current"
+            // told them there was nothing to fix. The units are named here and restarted after the
+            // reply — see `restarts_owed`.
+            let stale = self.stale_units(&manifest.version, cfg, store);
             return Ok(ApplyResult::AlreadyCurrent {
                 version: manifest.version,
+                stale,
             });
         }
 
@@ -418,7 +462,15 @@ impl Engine {
         // release, so the guard would rarely fire — but when it did, it would be refusing a
         // reinstall of the candidate a board had just rolled back from, which is exactly the
         // move someone reaches for while investigating that rollback.
+        //
+        // `from_dir` is exempt for the `Exact` reason. The guard defends against a *mirror*
+        // that has gone backwards, and a directory named on the command line by somebody with
+        // root is not a mirror — it is the same explicit statement of intent as naming a
+        // version. It also would not leave a usable flag: a locally built release is a
+        // prerelease of the version it precedes, so it sorts below whatever the board is on
+        // and every single laptop push would be refused as a downgrade.
         if matches!(target, crate::proto::Target::Latest)
+            && options.from_dir.is_none()
             && let Some(installed) = &installed
             && manifest.version < *installed
         {
@@ -574,6 +626,28 @@ impl Engine {
             }
         })?;
 
+        // 5b. Would this release leave an installed unit with nothing to exec? See
+        //     [`crate::orphan`] — a downgrade past the release that introduced a daemon leaves
+        //     that daemon's unit behind, and it then fails with `203/EXEC`, which fails the
+        //     restart, which reverts the update.
+        //
+        //     Here rather than in `preflight` because the candidate's file list does not exist
+        //     until now, and before the dry run returns because "will this downgrade work?" is
+        //     exactly what a dry run is asked. Nothing has moved yet: staging is disposable, the
+        //     boot counter is unarmed, `current` still points where it did.
+        //
+        //     No target is exempt. `WouldDowngrade` above guards only `Latest`, because it is
+        //     about a mirror serving a stale manifest; this is about a unit that will not start,
+        //     which does not care how the target was named — and `Ref` is how the case was
+        //     observed.
+        let orphans = crate::orphan::would_orphan(&self.unit_dir, &store.link_path(), extract_dir);
+        if !orphans.is_empty() {
+            return Err(Error::WouldOrphanUnit(crate::orphan::refusal(
+                &manifest.version,
+                &orphans,
+            )));
+        }
+
         if options.dry_run {
             return Ok(ApplyResult::DryRunPassed {
                 candidate: manifest.version.clone(),
@@ -661,8 +735,8 @@ impl Engine {
                 {
                     Some(reverted) => Ok(ApplyResult::RolledBack {
                         attempted: manifest.version.clone(),
-                        reverted_to: Some(reverted),
-                        reason: reason.to_string(),
+                        reason: reverted.describe(&reason.to_string()),
+                        reverted_to: Some(reverted.version),
                     }),
                     // Nothing was reverted, so saying "rolled back" would be a lie.
                     None => Ok(ApplyResult::Stuck {
@@ -704,7 +778,7 @@ impl Engine {
         // has none to restart — a model, or the bootstrap install, which forces it precisely
         // because nothing is installed yet and there is no running daemon to make stale.
         if matches!(cfg.on_apply, ApplyAction::Restart { .. }) {
-            self_test_updaterd(release_dir).await?;
+            self_test_updaterd(release_dir, self.config.loaded_from.as_deref()).await?;
         }
 
         emit(Phase::HealthGate, None);
@@ -758,13 +832,18 @@ impl Engine {
         })
     }
 
+    /// What a revert achieved: the release now live, and whatever went wrong after it was.
+    ///
+    /// Two facts rather than one, because they have different urgencies and used to be collapsed into
+    /// a single `RollbackFailed`. The version is the recovery; `apply_error` is a daemon that is down
+    /// on a robot which is otherwise back where it was.
     async fn rollback_to(
         &self,
         component: &str,
         cfg: &ComponentConfig,
         store: &Store,
         previous: Option<&semver::Version>,
-    ) -> Result<Option<semver::Version>, Error> {
+    ) -> Result<Option<Reverted>, Error> {
         if self.faults.fail_rollback {
             return Err(Error::RollbackFailed("injected rollback failure".into()));
         }
@@ -783,17 +862,53 @@ impl Engine {
             return Ok(None);
         };
 
+        // The swap and the trial are the recovery: past here the robot *is* back on the release it
+        // came from, and only these two failing mean it could not be put back.
         store
             .swap_to(previous)
             .map_err(|e| Error::RollbackFailed(e.to_string()))?;
         self.boot_counter
             .confirm(component)
             .map_err(|e| Error::RollbackFailed(e.to_string()))?;
-        self.run_apply_action(&cfg.on_apply, &store.release_dir(previous))
-            .await
-            .map_err(|e| Error::RollbackFailed(e.to_string()))?;
 
-        Ok(Some(previous.clone()))
+        // The apply action is not, and this used to be `RollbackFailed` too.
+        //
+        // It is reachable by an ordinary bad release: `hooks/postinstall` overwrites unit files and
+        // deliberately does not put them back, so a release that fails *because* one of its units
+        // cannot start leaves that file behind — and if the release being reverted to ships a unit of
+        // the same name, this restart inherits the same failure. `scripts/systemd-test.sh` reproduces
+        // exactly that.
+        //
+        // Reporting it as a failed rollback asserted the one thing that was not true — the swap had
+        // already happened — and buried the one thing that was: a daemon is down. So it is carried
+        // into the outcome instead, which says both. `RollbackFailed` keeps its meaning: the robot
+        // could not be put back at all.
+        let apply_error = if self.faults.fail_rollback_apply {
+            Some("injected apply-action failure during rollback".to_owned())
+        } else {
+            match self
+                .run_apply_action(&cfg.on_apply, &store.release_dir(previous))
+                .await
+            {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            }
+        };
+        if let Some(detail) = &apply_error {
+            // At error, because a reverted robot with a dead daemon needs someone to look at it even
+            // though the operation it belongs to reports an outcome rather than a failure.
+            tracing::error!(
+                component,
+                reverted_to = %previous,
+                error = %detail,
+                "reverted, but a unit did not restart — the release is back and something is down"
+            );
+        }
+
+        Ok(Some(Reverted {
+            version: previous.clone(),
+            apply_error,
+        }))
     }
 
     // ── explicit transitions ─────────────────────────────────────────────────
@@ -869,8 +984,11 @@ impl Engine {
 
         let current = store.current()?;
         if current.as_ref() == Some(version) {
+            // Same repair as `apply`'s, for the same reason: selecting the release a board already has
+            // active is the other command an operator reaches for when a daemon looks wrong.
             return Ok(ApplyResult::AlreadyCurrent {
                 version: version.clone(),
+                stale: self.stale_units(version, &cfg, &store),
             });
         }
 
@@ -880,7 +998,7 @@ impl Engine {
             .transition_to(component, &cfg, &store, version, current)
             .await;
         drop(lock);
-        schedule_restarts_if_applied(self.deferred_restarts, &outcome).await;
+        schedule_restarts_if_needed(self.deferred_restarts, &outcome).await;
         outcome
     }
 
@@ -941,8 +1059,8 @@ impl Engine {
                 {
                     Some(reverted) => Ok(ApplyResult::RolledBack {
                         attempted: to.clone(),
-                        reverted_to: Some(reverted),
-                        reason: reason.to_string(),
+                        reason: reverted.describe(&reason.to_string()),
+                        reverted_to: Some(reverted.version),
                     }),
                     None => Ok(ApplyResult::Stuck {
                         version: to.clone(),
@@ -1082,12 +1200,75 @@ impl Engine {
     /// [`MAX_BOOT_ATTEMPTS`] boots, and delete staging leftovers. This is the path
     /// that catches a release which doesn't start at all — the in-process health
     /// gate can't, because it died with it.
+    /// The units of one component that are not running the release named, and so are owed a restart.
+    ///
+    /// The same reading [`Self::reconcile_running_units`] does at startup, for one component and
+    /// without acting: the acting happens after the reply is on the wire, because the units this most
+    /// often names are the two that cannot be restarted before it. Called on the already-current
+    /// paths only, which is where the answer changes what the operation reports.
+    fn stale_units(
+        &self,
+        version: &semver::Version,
+        cfg: &ComponentConfig,
+        store: &Store,
+    ) -> Vec<String> {
+        let units = units_shipped(&store.release_dir(version), &configured_units(cfg));
+        crate::reconcile::stale_units(version, &units)
+    }
+
+    /// Check that the restarts an update scheduled actually happened, and fix what did not.
+    ///
+    /// Runs at startup, beside [`Self::recover_on_start`], because that is the first moment the
+    /// answer exists: `updaterd` cannot watch its own replacement land, so the check belongs to the
+    /// successor. See [`crate::reconcile`] for why scheduling a restart is not evidence one
+    /// happened.
+    ///
+    /// Per component, since each has its own active release and ships its own units. Failures are
+    /// logged rather than returned, for the same reason the scheduling is: this must never be a
+    /// reason to refuse to serve.
+    pub async fn reconcile_running_units(&self) -> Vec<crate::reconcile::Finding> {
+        let mut findings = Vec::new();
+
+        for name in self.config.components.keys() {
+            let Ok(store) = self.store(name) else {
+                continue;
+            };
+            let Ok(Some(active)) = store.current() else {
+                // No active release: a component that has never been installed. Nothing to compare
+                // against, and nothing to fix.
+                continue;
+            };
+
+            // The *shipped* set rather than the restart set: `updaterd` and `btd` are excluded from
+            // an update's own restarts, which makes them the two this check exists for.
+            let units = units_shipped(
+                &store.release_dir(&active),
+                &configured_units(&self.config.components[name]),
+            );
+            if units.is_empty() {
+                continue;
+            }
+
+            findings.extend(crate::reconcile::check(SYSTEMCTL, &active, SELF_UNIT, units).await);
+        }
+
+        findings
+    }
+
     pub async fn recover_on_start(&mut self) -> Result<Vec<ApplyResult>, Error> {
         for name in self.config.components.keys().cloned().collect::<Vec<_>>() {
             if let Ok(store) = self.store(&name) {
                 let _ = store.clean_staging();
             }
         }
+
+        // Before the boot counter, and that ordering is load-bearing: a rescue has already made the
+        // decision an armed trial was going to make, and further than the trial would have gone.
+        // Left in place, `record_boot` below would advance that trial and eventually revert to
+        // `previous` — moving `current` off the golden release the rescue just chose.
+        self.record_rescue();
+
+        self.refresh_golden_links();
 
         // Every component's trial advances, independently. A model transition must
         // not consume or clear a daemon update's budget.
@@ -1155,8 +1336,8 @@ impl Engine {
             let outcome = match reverted {
                 Some(reverted) => ApplyResult::RolledBack {
                     attempted: pending.version.clone(),
-                    reverted_to: Some(reverted),
-                    reason: reason.clone(),
+                    reason: reverted.describe(&reason),
+                    reverted_to: Some(reverted.version),
                 },
                 // Nothing to revert to. `rollback_to` has cleared the trial, so this
                 // is reported exactly once rather than on every subsequent boot.
@@ -1214,6 +1395,130 @@ impl Engine {
     fn store(&self, component: &str) -> Result<Store, Error> {
         let cfg = self.config.component(component)?;
         Ok(Store::new(cfg.install_dir.clone()))
+    }
+
+    /// Turn a `robot-rescue` breadcrumb into a permanent record, and clear it.
+    ///
+    /// The rescue swaps `current` to golden and reboots with no daemon running, so this start is the
+    /// first moment anything can write that down where it will be found. Three things happen, and
+    /// each is one of the constraints the design names:
+    ///
+    /// - **the update log gets an entry**, because the breadcrumb is deleted below and a rollback
+    ///   nobody can see afterwards is how a day goes to "it works on my board";
+    /// - **any armed trial for that component is cleared**, since the rescue already decided it;
+    /// - **the breadcrumb is removed**, which is what releases the rescue's loop guard. It refuses to
+    ///   act while one is on record, so the guard opens exactly when the board proves it can run its
+    ///   update daemon again, and stays shut when it cannot.
+    ///
+    /// Never fatal. A board that has just been rescued must not be a board whose `updaterd` refuses
+    /// to serve.
+    fn record_rescue(&mut self) {
+        let path = self
+            .config
+            .state_dir
+            .join(crate::journal::RESCUE_BREADCRUMB);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+
+        let crumb = crate::journal::Breadcrumb::parse(&text);
+        tracing::warn!(
+            from = crumb.from.as_deref().unwrap_or("(none)"),
+            to = crumb.to.as_deref().unwrap_or("(unknown)"),
+            because = crumb.because.as_deref().unwrap_or("(unrecorded)"),
+            "this board was rescued to golden since the last start"
+        );
+
+        // Matched on `install_dir` rather than on the name `daemon`: the rescue knows which tree it
+        // swapped and nothing else about the config, and a hardcoded component name would be a
+        // second place that has to agree with `updater.toml`.
+        let component = crumb.install_dir.as_deref().and_then(|dir| {
+            self.config
+                .components
+                .iter()
+                .find(|(_, cfg)| cfg.install_dir == std::path::Path::new(dir))
+                .map(|(name, _)| name.clone())
+        });
+
+        match component {
+            Some(name) => {
+                let entry = crate::proto::LogEntry {
+                    at: crate::journal::now_unix(),
+                    component: crate::proto::ComponentId(name.clone()),
+                    from: crumb.from.as_deref().and_then(|v| v.parse().ok()),
+                    to: crumb.to.as_deref().and_then(|v| v.parse().ok()),
+                    outcome: crate::proto::Outcome::RolledBack {
+                        reason: format!(
+                            "boot recovery swapped to golden without updaterd ({})",
+                            crumb.because.as_deref().unwrap_or("no reason recorded")
+                        ),
+                    },
+                };
+                if let Err(e) = self.journal.append(&entry) {
+                    tracing::error!(error = %e, "could not record the rescue in the update log");
+                }
+                if let Err(e) = self.boot_counter.confirm(&name) {
+                    tracing::error!(error = %e, "could not clear the trial the rescue superseded");
+                }
+            }
+            // Not attributed to a component we guessed. The journal warning above is the record in
+            // this case, and the breadcrumb is still cleared: a guard that never opens would leave
+            // the board unable to rescue itself a second time, which is worse than a missing log
+            // line for a state only a moved `install_dir` produces.
+            None => tracing::warn!(
+                install_dir = crumb.install_dir.as_deref().unwrap_or("(unrecorded)"),
+                "the rescued tree matches no configured component; not recording it in the log"
+            ),
+        }
+
+        // Durable, because the guard depends on this being gone: a delete that did not reach disk
+        // means the next start declines to act on a board that has already been rescued once.
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::error!(error = %e, "could not clear the rescue breadcrumb; robot-rescue will decline until it is removed by hand");
+        } else {
+            let _ = crate::fsutil::fsync_parent(&path);
+        }
+    }
+
+    /// Publish each component's configured golden release as a `golden` symlink.
+    ///
+    /// `scripts/robot-rescue` runs when `updaterd` does not, so it cannot ask this process for
+    /// golden and must not parse `updater.toml` to find it — a release whose `updaterd` rejects
+    /// that file is the likeliest thing the rescue exists for. The link is how the answer survives
+    /// the daemon.
+    ///
+    /// Never fatal. Failing to publish golden loses the rescue path; refusing to start over it
+    /// loses the update path as well, which is strictly worse.
+    fn refresh_golden_links(&self) {
+        for (name, cfg) in &self.config.components {
+            let Some(golden) = &cfg.golden else {
+                continue;
+            };
+            let store = Store::new(cfg.install_dir.clone());
+
+            // A configured golden that is not installed is not a rollback target, and a dangling
+            // link would make the rescue believe otherwise. Loud, because it means the never-brick
+            // guarantee is currently void on this board — `prune` protects golden once it is here,
+            // but nothing installs it retroactively.
+            if !store.release_dir(golden).is_dir() {
+                tracing::warn!(
+                    component = %name,
+                    version = %golden,
+                    "golden is configured but not installed; no rollback target for the recovery path"
+                );
+                continue;
+            }
+
+            match store.mark_golden(golden) {
+                Ok(()) => tracing::debug!(component = %name, version = %golden, "golden published"),
+                Err(e) => tracing::warn!(
+                    component = %name,
+                    version = %golden,
+                    error = %e,
+                    "could not publish the golden symlink; robot-rescue will decline to act"
+                ),
+            }
+        }
     }
 
     /// The manifest kept inside an installed release, if it's readable.
@@ -1332,8 +1637,16 @@ impl Engine {
             }
             HealthCheck::Command { program, args, .. } => {
                 let mut command = tokio::process::Command::new(program);
-                command.args(args).kill_on_drop(true);
-                let output = tokio::time::timeout(timeout, command.output())
+                command
+                    .args(args)
+                    .kill_on_drop(true)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let child = crate::spawn::retrying_busy(&mut command)
+                    .await
+                    .map_err(|e| Error::Health(format!("could not run probe: {e}")))?;
+                let output = tokio::time::timeout(timeout, child.wait_with_output())
                     .await
                     .map_err(|_| {
                         Error::Health(format!("probe timed out after {}s", timeout.as_secs()))
@@ -1470,8 +1783,40 @@ impl Engine {
     }
 }
 
+/// The outcome of a revert: where the robot ended up, and what did not come back with it.
+struct Reverted {
+    version: semver::Version,
+    /// The apply action's failure, when the swap succeeded and it did not.
+    apply_error: Option<String>,
+}
+
+impl Reverted {
+    /// The reason to report, which must carry both facts when there are two.
+    ///
+    /// Appended rather than replacing: why the update failed is what someone is looking for, and a
+    /// unit that then failed to restart is a second thing to act on, not a correction of the first.
+    fn describe(&self, why: &str) -> String {
+        match &self.apply_error {
+            None => why.to_owned(),
+            Some(detail) => format!(
+                "{why}; the release was reverted but a unit did not restart ({detail}), so \
+                 something on this robot is down"
+            ),
+        }
+    }
+}
+
 /// The program that drives units. A constant so tests can substitute a stub for it.
 const SYSTEMCTL: &str = "systemctl";
+
+/// Where `hooks/postinstall` installs unit files, and so where the orphan check reads them.
+const UNIT_DIR: &str = "/etc/systemd/system";
+
+/// This process's own unit, which the reconciliation must recognise and never restart.
+///
+/// The bare name rather than `updaterd.service`, matching what [`units_shipped`] yields — it takes
+/// the file stem, and `systemctl` accepts either.
+const SELF_UNIT: &str = "updaterd";
 
 /// Restart one unit, skipping it if this board does not have it installed.
 ///
@@ -1516,7 +1861,7 @@ const DEFERRED_RESTART_DELAY: &str = "5s";
 ///
 /// A release with no `updaterd` — a model component, or one predating the flag — passes. The point
 /// is to catch a broken replacement, not to require every artifact to contain one.
-async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
+async fn self_test_updaterd(release_dir: &Path, config: Option<&Path>) -> Result<(), Error> {
     let binary = release_dir.join("bin").join("updaterd");
     if !binary.is_file() {
         return Ok(());
@@ -1524,20 +1869,47 @@ async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
 
     let mut command = tokio::process::Command::new(&binary);
     command.arg("--self-test");
+    // The config *this* engine was loaded from, not the flag's default. Without it the probe reads
+    // `/etc/robot/updater.toml` whatever the running daemon was started with, so on any board using
+    // `--config` it validates a file that is not in use — and reports the release as broken when
+    // that file does not exist. Found by `scripts/systemd-test.sh` on its first run.
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
 
-    let output = match tokio::time::timeout(SELF_TEST_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) => output,
+    // Through the retry, and this is the call that most needs it: the binary being exec'd was
+    // written by *this update*, moments ago, while hooks and `systemctl` were spawning around it —
+    // the exact conditions `spawn::retrying_busy` documents. An `ETXTBSY` here is an `Error::SelfTest`,
+    // which rolls back a release that was fine.
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let spawned = crate::spawn::retrying_busy(&mut command).await;
+    let output = match spawned {
+        Ok(child) => {
+            match tokio::time::timeout(SELF_TEST_TIMEOUT, child.wait_with_output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(e)) => {
+                    return Err(Error::SelfTest(format!(
+                        "{} could not be waited for: {e}",
+                        binary.display()
+                    )));
+                }
+                Err(_) => {
+                    return Err(Error::SelfTest(format!(
+                        "{} did not finish within {SELF_TEST_TIMEOUT:?}",
+                        binary.display()
+                    )));
+                }
+            }
+        }
         // Could not be executed at all: the wrong architecture, a missing interpreter, a corrupt
         // file. Exactly what this exists to catch.
-        Ok(Err(e)) => {
+        Err(e) => {
             return Err(Error::SelfTest(format!(
                 "could not run {}: {e}",
-                binary.display()
-            )));
-        }
-        Err(_) => {
-            return Err(Error::SelfTest(format!(
-                "{} did not finish within {SELF_TEST_TIMEOUT:?}",
                 binary.display()
             )));
         }
@@ -1555,21 +1927,65 @@ async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
     Err(Error::SelfTest(format!("{}: {reason}", output.status)))
 }
 
-/// Schedule the deferred restarts when an operation actually moved to a new release.
+/// Which units an outcome leaves owing a restart.
 ///
-/// Only on `Applied`. A rollback leaves the resident `updaterd` already matching `current` — it was
-/// never restarted, so it is still the binary belonging to the release being returned to — and
-/// restarting there would be churn with nothing to fix.
-async fn schedule_restarts_if_applied(enabled: bool, outcome: &Result<ApplyResult, Error>) {
+/// Two cases, and they are one act for two reasons.
+///
+/// **`Applied`** owes the pair a running update cannot restart in place: itself, and the transport the
+/// reply may be travelling over.
+///
+/// **`AlreadyCurrent` with stale units** owes exactly those. Nothing was installed because nothing
+/// needed to be, and a daemon is still running something else — the state
+/// [`crate::reconcile`] repairs at every start, except for the one unit it refuses to repair. A stale
+/// `updaterd` will not restart itself from its own startup path, so the only thing that ever looks at
+/// it is an operator running `apply`, who until now got `already_current`, no restart, and a robot
+/// still on the old binary. Repairing it here is not the loop the startup check guards against: it
+/// fires once, on a request, rather than on every start.
+///
+/// A rollback owes nothing, and that is not an omission: it leaves the resident `updaterd` already
+/// matching `current` — it was never restarted, so it is still the binary belonging to the release
+/// being returned to — and restarting there would be churn with nothing to fix.
+///
+/// Pure, and separated from the scheduling below for the reason `reconcile::verdict_for` is: which
+/// outcomes owe what is the part that can be wrong, and arranging each of them on a board costs an
+/// afternoon apiece.
+fn restarts_owed(outcome: &Result<ApplyResult, Error>) -> Vec<&str> {
+    match outcome {
+        Ok(ApplyResult::Applied { .. }) => RESTART_AFTER_REPLYING.to_vec(),
+        Ok(ApplyResult::AlreadyCurrent { stale, .. }) => stale.iter().map(String::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Schedule what [`restarts_owed`] says the outcome owes.
+async fn schedule_restarts_if_needed(enabled: bool, outcome: &Result<ApplyResult, Error>) {
     if !enabled {
         // A test binary. See `Engine::without_deferred_restarts` for why this is about forking.
         tracing::debug!("deferred restarts suppressed");
         return;
     }
-    if matches!(outcome, Ok(ApplyResult::Applied { .. })) {
-        schedule_deferred_restarts().await;
+    let units = restarts_owed(outcome);
+    if units.is_empty() {
+        return;
     }
+    if let Ok(ApplyResult::AlreadyCurrent { version, .. }) = outcome {
+        tracing::warn!(
+            %version,
+            units = units.join(","),
+            "this release is already installed, and these are not running it; restarting them"
+        );
+    }
+    schedule_deferred_restarts(SYSTEMD_RUN, &units).await;
 }
+
+/// The program that schedules the deferred restarts.
+///
+/// A constant taken as a parameter below, for exactly the reason `SYSTEMCTL` is: a test needs to
+/// hand it a stub and assert what was asked. Hardcoded at the call site, this was the one command in
+/// the update path that no test could observe — `--on-active` could have been misspelled and every
+/// test would still have passed, while on a board the only symptom is a restart that silently never
+/// happens.
+const SYSTEMD_RUN: &str = "systemd-run";
 
 /// Restart the deferred units, detached, a few seconds from now.
 ///
@@ -1580,11 +1996,18 @@ async fn schedule_restarts_if_applied(enabled: bool, outcome: &Result<ApplyResul
 ///
 /// Failures are logged, never returned. This runs after the update is committed and journalled; an
 /// update that succeeded must not be reported as failed because a restart could not be scheduled.
-/// The cost of that is the situation we already have today — a daemon running an old binary until
-/// the next boot — which `robotctl version` reports.
-async fn schedule_deferred_restarts() {
-    for unit in RESTART_AFTER_REPLYING {
-        let mut command = tokio::process::Command::new("systemd-run");
+/// Swallowing them is affordable because they are not the last word: [`crate::reconcile`] checks at
+/// the next start that each unit is on the active release and restarts what is not.
+///
+/// The units are a parameter because two callers owe different ones — see [`restarts_owed`] — and
+/// because every unit that reaches here goes through the transient timer, including the ones an update
+/// restarts in place. A second, immediate path for `robotd` and `configd` would buy five seconds and
+/// cost a mechanism. Nor does this need [`restart_one`]'s absent-unit handling: a unit is named here
+/// either because the release ships it or because it published an identity, and a process that
+/// published one is running.
+async fn schedule_deferred_restarts(systemd_run: &str, units: &[&str]) {
+    for unit in units.iter().copied() {
+        let mut command = tokio::process::Command::new(systemd_run);
         command
             .arg(format!("--on-active={DEFERRED_RESTART_DELAY}"))
             .arg("--timer-property=AccuracySec=100ms")
@@ -1596,19 +2019,26 @@ async fn schedule_deferred_restarts() {
         // `tokio::process`, not `std::process`: this runs inside the async engine, and a blocking
         // `status()` here stalls the runtime — which showed up as unrelated operations later
         // failing with `Busy`, because the update lock had not been released yet.
-        match command.status().await {
+        let spawned = crate::spawn::retrying_busy(&mut command).await;
+        let waited = match spawned {
+            Ok(mut child) => child.wait().await,
+            Err(e) => Err(e),
+        };
+        match waited {
             Ok(status) if status.success() => {
                 tracing::info!(unit, delay = DEFERRED_RESTART_DELAY, "restart scheduled");
             }
             Ok(status) => tracing::warn!(
                 unit,
                 %status,
-                "could not schedule the restart; it keeps the old binary until the next boot"
+                "could not schedule the restart; it keeps the old binary until the next updaterd \
+                 start notices"
             ),
             Err(e) => tracing::warn!(
                 unit,
                 error = %e,
-                "could not run systemd-run; the unit keeps the old binary until the next boot"
+                "could not run systemd-run; the unit keeps the old binary until the next updaterd \
+                 start notices"
             ),
         }
     }
@@ -1632,9 +2062,11 @@ const NEVER_RESTART: [&str; 2] = ["updaterd", "btd"];
 /// `on_apply`'s list lives in the operator's `/etc/robot/updater.toml`, and `install.sh` preserves
 /// that file — so a board provisioned before a daemon existed keeps a list that does not mention it,
 /// and every release swaps that daemon's binary while leaving the old process running. The update
-/// reports success, the daemon answers on stale code, and `apply` then says `already_current` and
-/// does nothing. Four correct fixes were diagnosed as broken that way in one afternoon; see
-/// `docs/project/install-path-gap.md` §4.
+/// reports success, the daemon answers on stale code, and `apply` — as it then was — said
+/// `already_current` and did nothing, so the obvious recovery command confirmed there was nothing to
+/// recover. Four correct fixes were diagnosed as broken that way in one afternoon; see
+/// `docs/project/install-path-gap.md` §4. Both halves are closed now: this function is the first, and
+/// [`restarts_owed`] is the second.
 ///
 /// A release already states which units it provides — it ships them in `systemd/` — so it can say
 /// which to restart. Same realisation that made `hooks/postinstall` the right place to *install*
@@ -1646,7 +2078,18 @@ const NEVER_RESTART: [&str; 2] = ["updaterd", "btd"];
 ///
 /// An unreadable or absent `systemd/` directory yields the configured list unchanged. Older releases
 /// predate the directory, and a rollback to one must still work.
-fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
+/// The units a board's config names for this component, if it names any.
+///
+/// Shared by the three callers that need it rather than matched inline at each, so a component whose
+/// `on_apply` is not a restart cannot be read as naming units in one place and not another.
+fn configured_units(cfg: &ComponentConfig) -> Vec<String> {
+    match &cfg.on_apply {
+        ApplyAction::Restart { units } => units.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn units_shipped(release_dir: &Path, configured: &[String]) -> Vec<String> {
     let mut units: Vec<String> = Vec::new();
 
     match std::fs::read_dir(release_dir.join("systemd")) {
@@ -1654,6 +2097,26 @@ fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("service") {
+                    continue;
+                }
+                // A unit with no `[Install]` section is started by something else — a timer, or
+                // another unit pulling it in — so its lifecycle is not this engine's to drive.
+                //
+                // The recovery net's oneshot is exactly that, and deliberately: it asks whether the
+                // release that booted came up, and hands over to `robot-rescue` if not.
+                // `hooks/postinstall` already skips `enable --now` on it for that reason, in as many
+                // words — "`enable --now` on it would run a rollback check in the middle of the
+                // update that installed it, with daemons legitimately mid-restart". Reading every
+                // `*.service` then restarted it a moment later anyway, which is the same mistake
+                // one function further on.
+                //
+                // The rule rather than a name in `NEVER_RESTART`: `postinstall` and this now agree
+                // by construction, and the next unit like it needs nobody to remember.
+                if !has_install_section(&path) {
+                    tracing::debug!(
+                        unit = %path.display(),
+                        "no [Install] section, so something other than this update starts it"
+                    );
                     continue;
                 }
                 if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
@@ -1678,6 +2141,28 @@ fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
     // because the config and the release will usually name the same daemons.
     units.sort();
     units.dedup();
+    units
+}
+
+/// Is this unit one systemd is asked to enable, or one something else triggers?
+///
+/// An unreadable file answers "yes", which errs towards restarting: a unit whose contents cannot be
+/// read is more likely a permissions or IO problem than a deliberately triggerless unit, and the
+/// restart failing loudly beats it being skipped quietly.
+fn has_install_section(path: &Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text.lines().any(|line| line.trim() == "[Install]"),
+        Err(e) => {
+            tracing::warn!(unit = %path.display(), error = %e, "cannot read this unit; treating it as one to restart");
+            true
+        }
+    }
+}
+
+/// The subset an update restarts in flight: everything shipped, less the two it cannot touch while
+/// it is running.
+fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
+    let mut units = units_shipped(release_dir, configured);
     units.retain(|unit| !NEVER_RESTART.contains(&unit.as_str()));
     units
 }
@@ -1720,7 +2205,14 @@ async fn unit_is_absent(systemctl: &str, unit: &str) -> bool {
         .arg(unit);
     c.kill_on_drop(true);
 
-    match tokio::time::timeout(APPLY_ACTION_TIMEOUT, c.output()).await {
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let Ok(child) = crate::spawn::retrying_busy(&mut c).await else {
+        return false;
+    };
+    match tokio::time::timeout(APPLY_ACTION_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).trim() == "not-found",
         _ => false,
     }
@@ -1729,7 +2221,20 @@ async fn unit_is_absent(systemctl: &str, unit: &str) -> bool {
 async fn run_systemctl(mut command: tokio::process::Command, what: &str) -> Result<(), Error> {
     command.kill_on_drop(true);
 
-    let output = tokio::time::timeout(APPLY_ACTION_TIMEOUT, command.output())
+    // `spawn` + `wait_with_output` rather than `output()`, so the spawn can go through the
+    // `ETXTBSY` retry — `output()` spawns internally and gives nothing to retry. `output()` also
+    // pipes both streams for you, and this does not, so they are set explicitly: without them the
+    // child inherits ours and the stderr this reports back would be empty.
+    let child = crate::spawn::retrying_busy(
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .await
+    .map_err(|e| Error::Internal(format!("running systemctl: {e}")))?;
+
+    let output = tokio::time::timeout(APPLY_ACTION_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| Error::Internal(format!("{what} timed out")))?
         .map_err(|e| Error::Internal(format!("running systemctl: {e}")))?;
@@ -1811,7 +2316,7 @@ esac
             "#!/bin/sh\necho 'config error: unknown field `nope`' >&2\nexit 1\n",
         );
 
-        let err = self_test_updaterd(release.path()).await.unwrap_err();
+        let err = self_test_updaterd(release.path(), None).await.unwrap_err();
 
         assert!(
             matches!(err, Error::SelfTest(_)),
@@ -1826,7 +2331,7 @@ esac
     #[tokio::test]
     async fn a_replacement_updaterd_that_starts_passes() {
         let release = release_with_updaterd("#!/bin/sh\nexit 0\n");
-        assert!(self_test_updaterd(release.path()).await.is_ok());
+        assert!(self_test_updaterd(release.path(), None).await.is_ok());
     }
 
     /// Model components ship no `updaterd`, and neither do releases predating the flag. Requiring
@@ -1834,7 +2339,7 @@ esac
     #[tokio::test]
     async fn a_release_without_an_updaterd_passes() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(self_test_updaterd(dir.path()).await.is_ok());
+        assert!(self_test_updaterd(dir.path(), None).await.is_ok());
     }
 
     /// The two lists are one decision, and splitting them is how a daemon gets excluded from the
@@ -1853,9 +2358,11 @@ esac
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("systemd")).unwrap();
         for unit in units {
+            // With an `[Install]` section, because that is what makes a unit one an update starts.
+            // The unit without one has its own test.
             std::fs::write(
                 dir.path().join("systemd").join(format!("{unit}.service")),
-                "[Unit]\n",
+                "[Unit]\n\n[Install]\nWantedBy=multi-user.target\n",
             )
             .unwrap();
         }
@@ -1919,6 +2426,57 @@ esac
         );
     }
 
+    /// **The recovery net's oneshot must not be restarted by an update.** It asks whether the release
+    /// that booted came up and hands over to `robot-rescue` if not, so running it mid-update points a
+    /// rollback check at daemons that are legitimately mid-restart — and `robot-rescue` can swap to
+    /// golden and reboot.
+    ///
+    /// `hooks/postinstall` already declines to `enable --now` it, for that reason and in those words.
+    /// Reading every `*.service` then restarted it a moment later anyway: two places applying one rule
+    /// to one unit and disagreeing. Keyed on `[Install]` rather than on the name, so the next unit
+    /// like it needs nobody to remember.
+    #[test]
+    fn a_unit_something_else_triggers_is_not_restarted_by_an_update() {
+        let release = release_shipping(&["robotd", "configd"]);
+        // As the real one is: a oneshot with no `[Install]`, armed by a timer.
+        std::fs::write(
+            release
+                .path()
+                .join("systemd")
+                .join("robot-boot-check.service"),
+            "[Unit]\nDescription=Did the release that booted come up?\n\n\
+             [Service]\nType=oneshot\nExecStart=/usr/local/sbin/robot-boot-check\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            units_to_restart(release.path(), &[]),
+            vec!["configd".to_owned(), "robotd".to_owned()],
+            "a unit with no [Install] is triggered by something else and is left to it"
+        );
+    }
+
+    /// The other half, so the rule cannot be satisfied by skipping everything: a unit that *is*
+    /// enabled stays in the set, and the timer beside the oneshot changes nothing — only `.service`
+    /// files were ever read.
+    #[test]
+    fn a_unit_with_an_install_section_is_still_restarted() {
+        let release = release_shipping(&["robotd"]);
+        std::fs::write(
+            release
+                .path()
+                .join("systemd")
+                .join("robot-boot-check.timer"),
+            "[Timer]\nOnBootSec=180\n\n[Install]\nWantedBy=timers.target\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            units_to_restart(release.path(), &[]),
+            vec!["robotd".to_owned()]
+        );
+    }
+
     /// Only `.service` files. A release ships `sysusers.d/` too, and `postinstall` reads it —
     /// nothing there is a unit to restart.
     #[test]
@@ -1949,6 +2507,41 @@ esac
         );
     }
 
+    /// A `systemctl` that is briefly busy for exec is retried, not reported as a failed restart.
+    ///
+    /// This is the flake that prompted the change, reproduced deterministically. These tests write a
+    /// stub `systemctl` and exec it from parallel threads of one process; a fork in another test
+    /// duplicates the write handle to *this* stub into its child, and for a few microseconds the
+    /// kernel refuses to exec it. Holding a write handle here is the same condition, on purpose.
+    ///
+    /// On a board the consequence is worse than a red CI job: the same race reaches
+    /// `self_test_updaterd`, which execs a binary the update wrote moments earlier, and an `ETXTBSY`
+    /// there rolls back a release that was fine.
+    ///
+    /// Linux-only, and deliberately not made portable: macOS permits the exec, so on a Mac this
+    /// would pass without ever provoking the condition. `hooks.rs`'s
+    /// `a_hook_busy_forever_still_fails` is the control that keeps the pair honest — if the platform
+    /// stopped producing `ETXTBSY`, that test fails and this one becomes vacuous.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_systemctl_busy_for_exec_is_retried_rather_than_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = stub_recorder(dir.path(), "systemctl");
+
+        let holder = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // Well inside the ~100 ms budget, and long enough that the first attempts do fail.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(holder);
+        });
+
+        restart_one(path.to_str().unwrap(), "robotd")
+            .await
+            .expect("a transiently busy systemctl must be retried, not reported as a failure");
+
+        releaser.await.unwrap();
+    }
+
     /// The other half, and the reason this is not just "ignore failures": a unit that exists and
     /// will not start is a real problem, and swallowing it would turn a broken daemon into a
     /// silent success.
@@ -1973,6 +2566,139 @@ esac
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("restart failed"), "{err:?}");
+    }
+
+    /// A stub that records its whole argument list and nothing else. `stub_systemctl` above answers
+    /// `show` and branches on units; here the argv *is* the thing under test, so recording it is all
+    /// this needs to do.
+    fn stub_recorder(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\n",
+        )
+        .expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// The deferred restarts, as an actual command line. Until this existed nothing in the repository
+    /// could observe that call: the program name was hardcoded, so `--on-active` could have been
+    /// wrong and every test would still pass — while on a board the only symptom is `btd` quietly
+    /// never restarting, which is the exact failure `RESTART_AFTER_REPLYING` was added to fix.
+    ///
+    /// Four claims, and each one is load-bearing rather than incidental:
+    #[tokio::test]
+    async fn the_deferred_restarts_are_scheduled_as_transient_timers() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemd_run = stub_recorder(dir.path(), "systemd-run");
+
+        schedule_deferred_restarts(systemd_run.to_str().unwrap(), &RESTART_AFTER_REPLYING).await;
+
+        let log = calls(dir.path());
+        let lines: Vec<&str> = log.lines().collect();
+
+        // One transient unit per deferred unit, not one command naming both — the same lesson as
+        // `units_are_restarted_one_at_a_time`.
+        assert_eq!(lines.len(), RESTART_AFTER_REPLYING.len(), "{log}");
+
+        for (line, unit) in lines.iter().zip(RESTART_AFTER_REPLYING) {
+            // The delay is what lets the reply reach the client first. Without it the engine hands
+            // whoever asked a broken pipe instead of the outcome they waited minutes for.
+            assert!(
+                line.contains(&format!("--on-active={DEFERRED_RESTART_DELAY}")),
+                "{line}"
+            );
+            // `systemd-run … -- systemctl restart <unit>`: the transient unit *wraps* systemctl, so
+            // the restart runs outside updaterd's cgroup and survives its own parent being killed.
+            assert!(
+                line.ends_with(&format!("-- systemctl restart {unit}")),
+                "{line}"
+            );
+        }
+
+        // Both, and by name. A list that quietly lost one would leave that daemon on the old binary
+        // until the next `updaterd` start noticed.
+        assert!(log.contains("restart updaterd"), "{log}");
+        assert!(log.contains("restart btd"), "{log}");
+    }
+
+    /// A stale unit reported by an already-current apply is scheduled by name, and only it.
+    ///
+    /// The pair an `Applied` owes is fixed; this list is not, so the two cases cannot share one
+    /// assertion. `configd` here rather than `updaterd` for a reason that is not arbitrary: it proves
+    /// the scheduler is driven by the outcome's list and not by `RESTART_AFTER_REPLYING`, which is the
+    /// mistake this generalisation makes possible.
+    #[tokio::test]
+    async fn the_stale_units_are_the_ones_scheduled() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemd_run = stub_recorder(dir.path(), "systemd-run");
+
+        schedule_deferred_restarts(systemd_run.to_str().unwrap(), &["configd"]).await;
+
+        let log = calls(dir.path());
+        assert!(log.ends_with("-- systemctl restart configd\n"), "{log}");
+        assert_eq!(log.lines().count(), 1, "{log}");
+    }
+
+    fn already_current(stale: &[&str]) -> Result<ApplyResult, Error> {
+        Ok(ApplyResult::AlreadyCurrent {
+            version: semver::Version::parse("0.4.0").expect("a test version"),
+            stale: stale.iter().map(|u| (*u).to_owned()).collect(),
+        })
+    }
+
+    /// What each outcome owes, which is the part a board cannot be made to demonstrate.
+    ///
+    /// The third case is the one this exists for, and it is the whole reason `apply` stopped being
+    /// inert: a stale `updaterd` is the skew `reconcile` refuses to repair, so an operator running
+    /// `apply` is the only thing that ever reaches it.
+    #[test]
+    fn which_outcomes_owe_a_restart() {
+        let applied = Ok(ApplyResult::Applied {
+            from: None,
+            to: semver::Version::parse("0.4.0").expect("a test version"),
+        });
+        assert_eq!(restarts_owed(&applied), RESTART_AFTER_REPLYING.to_vec());
+
+        // Nothing installed, nothing skewed: the ordinary already-current, and it must stay silent.
+        // Restarting a healthy robot's daemons because someone asked for a release it already has
+        // would be a worse command than the inert one.
+        assert!(restarts_owed(&already_current(&[])).is_empty());
+
+        assert_eq!(restarts_owed(&already_current(&["updaterd"])), ["updaterd"]);
+        assert_eq!(
+            restarts_owed(&already_current(&["configd", "updaterd"])),
+            ["configd", "updaterd"]
+        );
+
+        // A rollback leaves the resident `updaterd` already matching `current`, so there is nothing
+        // to fix and a restart would be churn.
+        let rolled_back = Ok(ApplyResult::RolledBack {
+            attempted: semver::Version::parse("0.5.0").expect("a test version"),
+            reverted_to: None,
+            reason: "the gate".to_owned(),
+        });
+        assert!(restarts_owed(&rolled_back).is_empty());
+        assert!(restarts_owed(&Err(Error::Busy)).is_empty());
+    }
+
+    /// Scheduling that fails must not propagate. The update is already committed and journalled by
+    /// this point, so an unschedulable restart cannot be allowed to report a good update as failed —
+    /// `reconcile` picks it up at the next start instead.
+    #[tokio::test]
+    async fn a_scheduler_that_cannot_be_run_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing at this path, so the spawn fails outright.
+        schedule_deferred_restarts(
+            dir.path().join("absent").to_str().unwrap(),
+            &RESTART_AFTER_REPLYING,
+        )
+        .await;
     }
 
     /// One invocation per unit, which is the fix. `systemctl restart a b` fails as a whole when

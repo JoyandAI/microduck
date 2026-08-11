@@ -58,48 +58,130 @@ filter's only opt-in, it applies to the one command, and it leaves nothing switc
 
 ## After an update — the part that bites
 
-Three things are true at once, and together they cost an afternoon if you do not know them:
+- **`robotd`, `configd` and `padd` restart during the update. `updaterd` and `btd` restart 5 seconds
+  after it replies** — the first cannot restart itself mid-update, and the second may be carrying the
+  reply. So a `btd` fix is live a few seconds later, with no manual step. Reconnect and it is there.
+- **If one of those two restarts does not happen, the next `updaterd` start fixes it.** Except
+  `updaterd` itself, which reports the disagreement rather than restarting itself. Run the apply again
+  for that one: it answers `already_current`, names the daemon that is not running it, and schedules
+  the restart. `sudo systemctl restart updaterd` does the same by hand.
+- **A board running an `updaterd` older than 0.4.0 has none of that** and keeps both on the old binary
+  until you restart them. One update fixes it, and only the update after that behaves.
+- **`robotctl update apply` reports `already_current` and installs nothing** if you ask for the version
+  a board already has — but it is no longer inert. It checks which daemons are running that release and
+  restarts the ones that are not, naming them in `stale`. So it *is* the command to reach for when a
+  fix looks absent: either it fixes it, or `stale` is empty and the fix was never in that release.
 
-- **`btd` is never restarted by an update.** Deliberate: restarting it drops the BLE connection
-  carrying the update's own progress stream. So a `btd` fix needs a manual restart or a reboot.
-- **`configd` used to be restarted only if the board's `/etc/robot/updater.toml` listed it** — that
-  file belongs to the operator and is preserved across installs, so a board set up before `configd`
-  existed kept `units = ["robotd"]` and silently ran the old binary. Fixed: the restart set now comes
-  from the units the release ships. A board running an older `updaterd` still has the old behaviour
-  until it restarts, because `updaterd` never restarts itself.
-- **`robotctl update apply` then reports `already_current` and does nothing**, so the obvious
-  recovery command is a no-op.
-
-The symptom is a fix that is definitely installed and definitely not working. `robotctl version` says
-so in as many words. To check by hand:
-
-```
-pgrep -a configd
-```
+The symptom is a fix that is definitely installed and definitely not working. Ask which release each
+daemon is running:
 
 ```
-sudo readlink /proc/$(pgrep -x configd)/exe; readlink /opt/robot/daemon/current
+robotctl health
 ```
 
-The command line always says `current/bin/configd` because that is what it was exec'd with; the
-`/proc/<pid>/exe` link is the release it is *actually* running from. If those disagree, the process
-predates the swap.
+The `units` block prints one line per daemon with the release its process was launched from, and a
+warning naming the restart when that disagrees with what is installed. `build unknown (old)` means
+that daemon predates the release which taught it to say — restart it and it will answer.
+
+If a daemon is genuinely stale, restart it — this should not be necessary, so it is worth reading the
+journal for why it was:
 
 ```
 sudo systemctl restart configd
 ```
 
-```
-sudo systemctl restart btd
-```
-
-Editing the board's `updater.toml` is no longer needed — the restart set is derived from the release.
-The one thing that still requires a manual step is `updaterd` itself, which never restarts itself, so
-the fix above only takes effect once it has:
+`updaterd` is the one that never fixes itself:
 
 ```
 sudo systemctl restart updaterd
 ```
+
+Editing the board's `updater.toml` is not needed — the restart set comes from the units the release
+ships. `../design/restart-order.md` is the full sequence, step by step.
+
+## From a laptop — build here, install on the board
+
+No push, no CI run, no tag. One command from a clone of this repo:
+
+```bash
+scripts/dev-push.sh radxa@<board>
+```
+
+```bash
+export DUCK_BOARD=radxa@<board>
+```
+
+```bash
+scripts/dev-push.sh
+```
+
+It cross-compiles for the board, packages the same artifact a release does, signs it with the dev
+key, copies it to `/var/tmp/duck-sideload` on the board and applies it there. Roughly a minute on
+an incremental build, against several for a push plus a CI run.
+
+Needs, once:
+
+```bash
+cargo install cargo-zigbuild --locked
+```
+
+```bash
+brew install zig
+```
+
+and `team.dev.key` at `~/.duck-keys/team.dev.key` — the secret half of the key CI signs branch
+builds with. Set `DUCK_DEV_SECRET_KEY` if yours lives elsewhere. The board must be a
+[dev board](install-dev.md); the artifact is signed with a dev key, so a customer robot refuses
+it exactly as it refuses `--ref`.
+
+### Or build in a container, with no toolchain to set up
+
+```bash
+scripts/dev-push.sh --docker radxa@<board>
+```
+
+Needs Docker running and nothing else — no zig, no `cargo-zigbuild`, and no board to copy
+libudev from, which is what makes it the answer before you have a board at all. It builds inside
+Debian Bookworm on arm64, so on an Apple Silicon Mac the target is the host: nothing is
+cross-compiled and libudev is just installed. Same artifact, same `--dry-run` and `--bootstrap`.
+
+Slower to start — a first build compiles the workspace inside the container, and the two modes
+keep separate `target/` directories, so switching costs one full rebuild. Reach for it when the
+zig path is not set up or has broken; the default is faster day to day and is what CI uses.
+
+Verify without installing:
+
+```bash
+scripts/dev-push.sh --dry-run radxa@<board>
+```
+
+**This is an ordinary update.** It goes through `robotctl update apply --from <dir>`, so the
+signature, the artifact hash, compatibility, the health gate and auto-rollback all run — a build
+that does not come up is reverted and the board is back on what it was running. The restart traps
+above still apply: `btd` and `updaterd` keep running the old binary until they are restarted.
+
+The version is `<crate>-dev.local.<epoch>.g<sha7>`, so `robotctl version` on the board says which
+push it is running and two pushes of the same dirty tree never collide.
+
+To install what is already in that directory, or to point at one you filled yourself:
+
+```bash
+sudo robotctl update apply daemon --from /var/tmp/duck-sideload
+```
+
+### The first push to a board below 0.5.0
+
+`apply --from` is part of the release being pushed: it needs API version 7, which first ships in
+0.5.0. A board running anything earlier has an `updaterd` that cannot be asked to use it, and says
+so — `robotctl` and `updaterd` report an API mismatch and refuse the call rather than quietly
+installing from the configured source instead. Deliver it once the ungated way, which stops
+`robotd` and gives up the health gate for that one install:
+
+```bash
+scripts/dev-push.sh --bootstrap radxa@<board>
+```
+
+Every push after that is the ordinary command.
 
 ## From a laptop — `btctl`
 

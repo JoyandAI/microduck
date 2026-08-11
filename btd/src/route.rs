@@ -89,6 +89,11 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         SystemInfo => Some(Upstream::Config),
         SystemSetName(_) => Some(Upstream::Config),
 
+        // Which daemons are up and which release each is running. Routed because an app that can
+        // trigger an update should be able to show whether it took — and because the one daemon it
+        // cannot report on this way is `btd` itself, which answering at all proves is running.
+        SystemServices => Some(Upstream::Config),
+
         // Rebooting is drastic but recoverable, and it is what an app offers when a robot is
         // confused — the alternative being "unplug it", which for a walking robot is worse.
         // Unlike `resetToGolden` it discards nothing.

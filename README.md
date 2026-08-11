@@ -231,6 +231,19 @@ sudo robotctl update rollback daemon
 
 Every push needs the apply again.
 
+### Or skip CI entirely
+
+From a clone of this repo, with the board reachable over ssh:
+
+```bash
+scripts/dev-push.sh radxa@<board>
+```
+
+It builds here, signs with the dev key, copies the release to the board and applies it — same
+verification, same health gate, same auto-rollback, about a minute instead of a push and a CI run.
+Setup and the one-time first push are in the
+[dev board cheat sheet](docs/robot/cheatsheet-dev.md).
+
 ## Where next
 
 ### Going further with a robot

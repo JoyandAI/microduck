@@ -53,6 +53,34 @@ use crate::upstream::{NameChoice, Sockets};
 /// support — which is slower than necessary on a good link and correct on every link.
 const FLOOR_MTU: usize = 20;
 
+/// How often to advertise, and this is the difference between a robot that is found and one that is
+/// not.
+///
+/// Left unset, BlueZ takes the kernel's default of **1.28 s**, and that was measured against this
+/// board from a Mac scanning continuously for two minutes: the robot arrived once every 7.5 s on
+/// average with silences of 9 s, 14 s, 17 s and once 31 s. Every other radio in the room — a smart
+/// plug at −66 dBm, a beacon at −91 dBm — arrived 130 to 212 times over the same window, against the
+/// robot's 16, while the robot was the *strongest* signal there at −36 dBm. So it was not range,
+/// not interference and not the client: it simply spoke too rarely to be caught.
+///
+/// A central scans at a low duty cycle, which is what turns "6× slower" into "absent for seconds at
+/// a time" — an eight-second scan that lands in one of those silences finds nothing, and roughly
+/// half of them did. The large gaps came out as near-integer multiples of 1.28 s, which is what
+/// identified the interval from the arrivals rather than from a guess.
+///
+/// 100-150 ms is the range ordinary peripherals use, and it is 8-12× the default. Not the 20 ms
+/// floor the spec allows: one antenna carries this, a gamepad's LE link and wifi, so airtime spent
+/// shouting is taken from the things the robot is for. A *range* rather than one value because a
+/// fixed interval can keep colliding with the same neighbour's, which the controller avoids by
+/// jittering inside the window.
+///
+/// Measured again with this installed, same Mac and same two minutes: **151 arrivals, one every
+/// 0.8 s, worst silence 3.8 s, and not one silence of 8 s or more.** The failure it was diagnosed
+/// from cannot happen at that spacing, which is the point — the margin against an eight-second scan
+/// is now a factor of two rather than a coin toss.
+const ADV_INTERVAL_MIN: Duration = Duration::from_millis(100);
+const ADV_INTERVAL_MAX: Duration = Duration::from_millis(150);
+
 /// How long to wait between attempts to find a usable adapter.
 ///
 /// Measured on the board: `hci0` does not exist until roughly 73 seconds after power-on —
@@ -83,14 +111,59 @@ const NAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// `configd` would be the tidier answer and is a protocol change nobody needs yet.
 const NAME_POLL: Duration = Duration::from_secs(5);
 
-/// Wait for an adapter, then advertise and serve until cancelled.
+/// Serve BLE for as long as this process lives, across an adapter that comes and goes.
+///
+/// Waiting for an adapter to *appear* was never enough. Everything after that wait — powering the
+/// adapter, registering the agent, advertising, publishing the GATT application — used to propagate
+/// its error out of this function and exit the process, so an adapter that appeared and then
+/// misbehaved took `btd` down where an adapter that never appeared did not. On a robot with no
+/// network that is the difference between "wifi is unavailable" and "unreachable".
+///
+/// So the whole bring-up retries in place, on the same 5s cadence as the wait it already did:
+///
+/// - **radio faults never leave this function.** A `failed` `btd` therefore means a broken binary,
+///   which is what admits it to the boot recovery net — see `docs/design/boot-recovery-net.md`;
+/// - **and it self-heals.** Exiting non-zero got the same retry from `Restart=always`, but only by
+///   spending a process death on it, and only until the day the unit gains a start limit.
 ///
 /// `require_pairing` controls whether writing a request needs an authenticated, encrypted link.
 /// It defaults on, because §7 requires it for anything carrying wifi credentials and
 /// `net.connect` now does. The opt-out exists for bench work against a client that cannot pair.
 pub async fn serve(sockets: Sockets, name: NameChoice, require_pairing: bool) -> bluer::Result<()> {
+    loop {
+        match serve_on_an_adapter(&sockets, &name, require_pairing).await {
+            Ok(()) => tracing::warn!(
+                retry_in = ?ADAPTER_RETRY,
+                "the adapter is gone; waiting for it to come back"
+            ),
+            // Not fatal, deliberately: every failure reachable here is a property of the radio or
+            // of BlueZ, and none of them is fixed by dying. See this function's own doc comment.
+            Err(e) => tracing::warn!(
+                error = %e,
+                retry_in = ?ADAPTER_RETRY,
+                "BLE bring-up failed"
+            ),
+        }
+        tokio::time::sleep(ADAPTER_RETRY).await;
+    }
+}
+
+/// One bring-up: acquire an adapter, advertise, serve, and return when the adapter goes away.
+///
+/// The advertisement, GATT application and agent handles all deregister on drop, so returning here
+/// is what releases them before the next attempt registers its own.
+async fn serve_on_an_adapter(
+    sockets: &Sockets,
+    name: &NameChoice,
+    require_pairing: bool,
+) -> bluer::Result<()> {
+    let sockets = sockets.clone();
+    let name = name.clone();
     let bt = bluer::Session::new().await?;
 
+    // Kept as its own loop rather than folded into the caller's: "no adapter yet" is the ordinary
+    // state of a board for its first 73 seconds and reads as progress, while a failure after this
+    // point is a fault. Collapsing them would log a fault every 5s during a normal boot.
     let adapter = loop {
         match bt.default_adapter().await {
             Ok(adapter) => break adapter,
@@ -151,11 +224,11 @@ pub async fn serve(sockets: Sockets, name: NameChoice, require_pairing: bool) ->
     // carried `/etc/hostname` while `system.setName` wrote a name nothing ever read: every board
     // flashed from one image appeared as `radxa-zero3`, and renaming one changed nothing a phone
     // could see, not even after a restart.
-    let mut advertised = match &name.pinned {
+    let advertised = match &name.pinned {
         Some(pinned) => pinned.clone(),
         None => ask_name(&sockets, &name.fallback).await,
     };
-    let mut handle = Some(advertise(&adapter, &advertised).await?);
+    let handle = Some(advertise(&adapter, &advertised).await?);
 
     // **One session per subscription**, not one per daemon.
     //
@@ -361,43 +434,26 @@ pub async fn serve(sockets: Sockets, name: NameChoice, require_pairing: bool) ->
 
     tracing::info!("GATT application registered; waiting for a central");
 
-    // The advertisement and application handles deregister on drop, so what follows must never
-    // return: the loop below is what keeps this robot visible, not just what renames it.
+    // The advertisement and application handles deregister on drop, so this must not return while
+    // the adapter is usable — which used to mean `pending()`, waiting forever. Forever was wrong in
+    // one direction: an adapter that disappeared left this task parked on a dead radio, holding
+    // handles to nothing and advertising nothing, with no way back short of a restart nobody knew
+    // to perform. Returning hands the caller a bring-up on the adapter's next appearance.
+    //
+    // The name is reconciled *alongside* that wait rather than after it, so losing the adapter ends
+    // both: whichever finishes first ends the bring-up, and the reconcile is dropped with the
+    // advertisement handle it owns.
     if name.pinned.is_some() {
         tracing::info!(name = %advertised, "--name pins the advertisement; not reconciling");
-        std::future::pending::<()>().await;
-    }
-
-    loop {
-        tokio::time::sleep(NAME_POLL).await;
-
-        let current = ask_name(&for_reconcile, &advertised).await;
-        // `handle` is `None` only after a failed re-advertise, and then the robot is invisible —
-        // so retry regardless of whether the name moved.
-        if current == advertised && handle.is_some() {
-            continue;
-        }
-
-        // Deregistered before the replacement is registered: BlueZ is being asked to change one
-        // advertisement, and holding two while swapping invites it to refuse the second. The gap is
-        // brief, and a central that is already connected does not notice — a connection is not an
-        // advertisement.
-        drop(handle.take());
-        match advertise(&adapter, &current).await {
-            Ok(new) => {
-                if current == advertised {
-                    tracing::info!(name = %current, "advertising again after a failure");
-                } else {
-                    tracing::info!(from = %advertised, to = %current, "renamed; advertising");
-                }
-                handle = Some(new);
-                advertised = current;
-            }
-            // Left for the next tick rather than fatal: a robot that stops advertising is
-            // unreachable, and exiting would take the recovery path down with it.
-            Err(e) => tracing::error!(error = %e, name = %current, "cannot advertise"),
+        watch_adapter(&adapter).await;
+    } else {
+        tokio::select! {
+            () = watch_adapter(&adapter) => {}
+            // Never completes on its own.
+            () = reconcile_name(&adapter, &for_reconcile, advertised, handle) => {}
         }
     }
+    Ok(())
 }
 
 /// Advertise the service under `name`.
@@ -413,9 +469,53 @@ async fn advertise(
             service_uuids: [SERVICE_UUID].into_iter().collect(),
             discoverable: Some(true),
             local_name: Some(name.to_owned()),
+            min_interval: Some(ADV_INTERVAL_MIN),
+            max_interval: Some(ADV_INTERVAL_MAX),
             ..Default::default()
         })
         .await
+}
+
+/// Keep the advertised name in step with `configd`'s. Never returns.
+///
+/// Owns the advertisement handle, because changing the name means deregistering one advertisement
+/// and registering another — nothing else may be holding it while that happens.
+async fn reconcile_name(
+    adapter: &bluer::Adapter,
+    sockets: &Sockets,
+    mut advertised: String,
+    mut handle: Option<bluer::adv::AdvertisementHandle>,
+) {
+    loop {
+        tokio::time::sleep(NAME_POLL).await;
+
+        let current = ask_name(sockets, &advertised).await;
+        // `handle` is `None` only after a failed re-advertise, and then the robot is invisible —
+        // so retry regardless of whether the name moved.
+        if current == advertised && handle.is_some() {
+            continue;
+        }
+
+        // Deregistered before the replacement is registered: BlueZ is being asked to change one
+        // advertisement, and holding two while swapping invites it to refuse the second. The gap is
+        // brief, and a central that is already connected does not notice — a connection is not an
+        // advertisement.
+        drop(handle.take());
+        match advertise(adapter, &current).await {
+            Ok(new) => {
+                if current == advertised {
+                    tracing::info!(name = %current, "advertising again after a failure");
+                } else {
+                    tracing::info!(from = %advertised, to = %current, "renamed; advertising");
+                }
+                handle = Some(new);
+                advertised = current;
+            }
+            // Left for the next tick rather than fatal, and never propagated: this is inside a
+            // bring-up whose whole point is that radio faults do not end the process.
+            Err(e) => tracing::error!(error = %e, name = %current, "cannot advertise"),
+        }
+    }
 }
 
 /// What `configd` says the robot is called, or `fallback` if it will not say.
@@ -442,6 +542,35 @@ async fn ask_name(sockets: &Sockets, fallback: &str) -> String {
         Err(e) => {
             tracing::debug!(error = %e, fallback, "configd would not say the robot's name");
             fallback.to_owned()
+        }
+    }
+}
+
+/// Return once the adapter stops being usable.
+///
+/// A poll, not an event stream. `bluer` can report adapter removal, but the failure this has to
+/// catch is broader than removal — an adapter still on the bus that answers nothing is the case
+/// that used to kill the process — and reading one property covers both without depending on which
+/// events BlueZ emits for a radio that is wedged rather than absent.
+///
+/// The interval is [`ADAPTER_RETRY`] because the cost of noticing late is exactly the cost of
+/// retrying late: BLE stays dark a few more seconds, on a daemon that is otherwise idle.
+async fn watch_adapter(adapter: &bluer::Adapter) {
+    loop {
+        tokio::time::sleep(ADAPTER_RETRY).await;
+        match adapter.is_powered().await {
+            Ok(true) => {}
+            // Powered off underneath us — by `bluetoothctl power off`, by a driver reset, or by a
+            // suspend. The next bring-up powers it again: on a robot whose only front door may be
+            // BLE, an unpowered adapter is not a state to preserve out of politeness.
+            Ok(false) => {
+                tracing::warn!("the adapter is no longer powered");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the adapter stopped answering");
+                return;
+            }
         }
     }
 }

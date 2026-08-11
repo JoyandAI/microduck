@@ -114,6 +114,15 @@ A ref bypasses the downgrade guard by design: a prerelease always sorts below th
 board is on, so guarding it would refuse every branch install. A plain `apply` returns the
 board to the release stream, since `latest` resolves to the highest *stable* version.
 
+- **`apply --from <dir>`** and `scripts/dev-push.sh` — build on a laptop, install on a board, no
+  push and no CI run. A per-call source override rather than a config edit, so the board keeps
+  reaching GitHub for `--ref`, `--staging` and a return to the release stream. It is an ordinary
+  apply: health gate, auto-rollback, dev-key verification. `API_VERSION` moved with it, because a
+  daemon one version older would have parsed the option, ignored it, and installed from its
+  configured source while reporting success. v7 first ships in **0.5.0**, so each board takes one
+  `scripts/dev-push.sh --bootstrap` to get there — the binary that would gate the update is the one
+  being replaced.
+
 **Done:** verified against the real repository — `dev.yml` published, `--ref main` installed
 over the network, and a customer-robot config refused the same build.
 

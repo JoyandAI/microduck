@@ -354,8 +354,10 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
             let (src, dest) = include
                 .split_once('=')
                 .ok_or_else(|| format!("--include expects src=dest, got {include:?}"))?;
-            // Hooks must be executable; everything else needn't be.
-            let mode = if dest.starts_with("hooks/") {
+            // Hooks and scripts must be executable; everything else needn't be. `scripts/` is
+            // there for `robot-rescue`, which an operator may well run straight out of the
+            // release directory on a board where nothing else works.
+            let mode = if dest.starts_with("hooks/") || dest.starts_with("scripts/") {
                 0o755
             } else {
                 0o644
@@ -846,17 +848,34 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// The workflows that *package* a release, which is where the `--include` list and the staged
-    /// binaries live.
+    /// Every file that packages a release, which is where the `--include` list and the staged
+    /// binaries live. Repository paths, because one of them is not a workflow.
     ///
     /// Named once, because the tests below all read the same files and the recipe has moved before:
     /// it used to sit in `release.yml`, and now lives in the reusable `_build-release.yml` that both
     /// the staging and stable paths call. A test that kept reading the old name would pass while
     /// guarding nothing, which is worse than failing.
-    const PACKAGING_WORKFLOWS: [&str; 2] = ["dev.yml", "_build-release.yml"];
+    ///
+    /// `scripts/dev-push.sh` is the third because it assembles the same artifact from its own copy
+    /// of the same lists — a laptop build a board actually runs. `xtask/tests/artifact.rs` opens the
+    /// tarball each of these produces; the tests below are the cheaper string form of the same
+    /// question, and they have to look at the same set or the copy that drifts is whichever one they
+    /// skip.
+    const PACKAGING_SITES: [&str; 3] = [
+        ".github/workflows/dev.yml",
+        ".github/workflows/_build-release.yml",
+        "scripts/dev-push.sh",
+    ];
 
     /// Where promotion happens: the stable manifest, the artifact carried forward, the retire step.
     const PROMOTE_WORKFLOW: &str = "_promote-release.yml";
+
+    /// Where a unit's `ExecStart` points when it runs a program out of the live release.
+    ///
+    /// Nearly all of them do, and for those the binary has to be staged and packaged or the unit
+    /// fails with `203/EXEC`. The exception is the boot recovery net, which execs out of the base
+    /// precisely so that a broken release cannot break it.
+    const RELEASE_BIN_DIR: &str = "/opt/robot/daemon/current/bin/";
     /// Every unit `install.sh` installs must actually be in the artifact.
     ///
     /// The packaging workflows name each shipped file with an explicit `--include`, and
@@ -888,8 +907,8 @@ mod tests {
         units.dedup();
         assert!(units.len() >= 4, "expected several units, found {units:?}");
 
-        for workflow in PACKAGING_WORKFLOWS {
-            let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
+        for workflow in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(workflow))
                 .unwrap_or_else(|e| panic!("{workflow}: {e}"));
             for unit in &units {
                 let expected = format!("=systemd/{unit}");
@@ -975,10 +994,9 @@ mod tests {
                     continue;
                 }
                 found += 1;
-                for workflow in PACKAGING_WORKFLOWS {
-                    let text =
-                        std::fs::read_to_string(root.join(".github/workflows").join(workflow))
-                            .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+                for workflow in PACKAGING_SITES {
+                    let text = std::fs::read_to_string(root.join(workflow))
+                        .unwrap_or_else(|e| panic!("{workflow}: {e}"));
                     let expected = format!("=systemd/sysusers.d/{name}");
                     assert!(
                         text.contains(&expected),
@@ -1012,8 +1030,8 @@ mod tests {
                 continue;
             }
 
-            for workflow in PACKAGING_WORKFLOWS {
-                let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
+            for workflow in PACKAGING_SITES {
+                let text = std::fs::read_to_string(root.join(workflow))
                     .unwrap_or_else(|e| panic!("{workflow}: {e}"));
                 let expected = format!("=hooks/{name}");
                 assert!(
@@ -1042,8 +1060,8 @@ mod tests {
             .parent()
             .expect("xtask/ has a parent");
 
-        for workflow in PACKAGING_WORKFLOWS {
-            let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
+        for workflow in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(workflow))
                 .unwrap_or_else(|e| panic!("{workflow}: {e}"));
 
             // The units this workflow packages, as `<crate>/systemd/<unit>=systemd/<unit>`.
@@ -1064,21 +1082,45 @@ mod tests {
                 });
 
                 // `ExecStart=/opt/robot/daemon/current/bin/<name> [args]`
-                let Some(exec) = unit
+                let Some(exec_path) = unit
                     .lines()
                     .find(|l| l.starts_with("ExecStart="))
                     .and_then(|l| l.split_whitespace().next())
-                    .and_then(|l| l.rsplit('/').next())
+                    .and_then(|l| l.strip_prefix("ExecStart="))
                 else {
                     panic!("{src} has no ExecStart naming a binary");
                 };
 
-                let staged = format!("release/{exec} staged/");
+                // A unit that execs out of the *base* rather than the release, which the boot
+                // recovery net does on purpose: it runs when the release cannot, so reading its
+                // program through `current` would route the recovery through the thing being
+                // recovered. Nothing to stage, and `xtask/tests/artifact.rs` checks that the
+                // script it names is packaged and installed.
+                if !exec_path.starts_with(RELEASE_BIN_DIR) {
+                    continue;
+                }
+
+                let exec = exec_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_else(|| panic!("{src}: ExecStart={exec_path} names nothing"));
+
+                // The staged names, by basename of each `cp … staged/` line. Not
+                // `contains("release/<exec> staged/")`: `dev-push.sh` builds in one of two
+                // directories depending on the toolchain, so it names the source through a
+                // variable, and a check keyed to a literal path would have quietly stopped
+                // looking at the site that changes most often.
+                let staged: Vec<&str> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| l.starts_with("cp ") && l.ends_with(" staged/"))
+                    .filter_map(|l| l.trim_end_matches(" staged/").rsplit('/').next())
+                    .collect();
                 assert!(
-                    text.contains(&staged),
+                    staged.contains(&exec),
                     "{workflow} packages {src}, whose ExecStart is {exec:?}, but never stages \
-                     that binary. Without it the unit fails on the board with 203/EXEC. Add:  \
-                     cp target/aarch64-unknown-linux-gnu/release/{exec} staged/"
+                     that binary — it stages {staged:?}. Without it the unit fails on the board \
+                     with 203/EXEC. Add:  cp <build dir>/{exec} staged/"
                 );
             }
         }
@@ -1125,6 +1167,49 @@ mod tests {
         );
         assert!(rendered.contains("ONNX_FLOOR=\"1.23\""));
         assert!(rendered.contains("ONNX_TARGET=\"1.28.0\""));
+    }
+
+    /// `board-test.sh` hands its whole container script to `sh -c` inside **one single-quoted
+    /// string**, so a single quote anywhere in it ends that string early.
+    ///
+    /// Both ways this fails are quiet. An apostrophe in a comment — "the oneshot's job" — leaves the
+    /// file syntactically broken, which at least fails loudly. Worse is a quoted argument:
+    /// `grep -q '^\[Install\]'` arrives at the container as `grep -q ^\[Install\]`, and the shell
+    /// there strips the backslashes, so grep is handed `^[Install]` — a bracket expression matching
+    /// one character from `I n s t a l`. It runs, it exits 0 or 1 for the wrong reason, and the
+    /// assertion built on it reports something that was never checked. That is how this test came to
+    /// exist, and finding it took a CI round trip and a while.
+    ///
+    /// Comments are *not* exempt, unlike the check below: the shell does not know it is reading one.
+    #[test]
+    fn the_board_test_container_script_contains_no_single_quotes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let script = std::fs::read_to_string(root.join("scripts/board-test.sh"))
+            .expect("scripts/board-test.sh must exist");
+
+        // The container script is assigned as `CHECKS='` … `'` at the start of a line.
+        let (_, rest) = script
+            .split_once("\nCHECKS='")
+            .expect("board-test.sh no longer assigns CHECKS with a single-quoted string");
+        let (checks, _) = rest
+            .split_once("\n'\n")
+            .expect("the CHECKS string is no longer closed by a lone quote on its own line");
+
+        let offenders: Vec<(usize, &str)> = checks
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains('\''))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "single quotes inside the CHECKS string end it early. Use double quotes for grep \
+             patterns (\"^\\\\[Install\\\\]\" survives; '^\\\\[Install\\\\]' does not) and reword \
+             any apostrophe. Offending lines, numbered from the start of CHECKS: {offenders:#?}"
+        );
     }
 
     /// Advice the provisioning scripts print must be runnable from where the operator is

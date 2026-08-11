@@ -254,6 +254,65 @@ sudo robotctl update pin daemon
 
 The second form unpins.
 
+### When `updaterd` itself will not start
+
+Everything above goes through `updaterd`, so none of it works when `updaterd` is the daemon that is
+down. Check which one it is:
+
+```
+systemctl status updaterd robotd btd configd
+```
+
+Then go back to golden without it:
+
+```
+sudo robot-rescue --dry-run
+```
+
+```
+sudo robot-rescue --reboot
+```
+
+`--dry-run` says what it would do and changes nothing. Without `--reboot` it swaps the release and
+prints the reboot command rather than running it: every daemon execs through `current`, so nothing
+picks up the swap until it restarts, and a robot that is standing should be caught first.
+
+It declines, and says why, when no golden is configured or when `current` is already golden — if the
+daemons are failing on golden itself, a rollback is not the answer and the journal is:
+
+```
+journalctl -b -u robotd -u updaterd -u btd -u configd
+```
+
+### The robot may have done this already
+
+Three minutes into every boot, a timer asks whether the release brought its daemons up, and falls back
+to golden if it did not. So a robot that rebooted on its own and is running an older release than you
+installed has probably rescued itself. What it did:
+
+```
+robotctl update log
+```
+
+The entry reads as a rollback, with the daemon that failed named in its reason. To see the decision
+being made rather than its result:
+
+```
+journalctl -b -u robot-boot-check
+```
+
+```
+sudo robot-boot-check --dry-run
+```
+
+It acts once. A second rescue is refused while the first is still on record — `updaterd` clears that
+when it next starts, so being refused means the daemons did not come up on golden either, and the
+answer is the journal rather than another reboot. Past it, if you have read the journal and decided:
+
+```
+sudo robot-rescue --force --reboot
+```
+
 ### Three things that are easy to get wrong
 
 **`rollback` needs a predecessor, but an update creates one.** A freshly provisioned board has

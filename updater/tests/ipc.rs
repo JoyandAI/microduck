@@ -332,7 +332,30 @@ async fn hello_accepts_matching_version_and_refuses_a_mismatch() {
     let response = client
         .call(method::HELLO, serde_json::json!({ "api_version": 999 }))
         .await;
-    assert_eq!(response.error.unwrap().code, proto::code::PROTOCOL_MISMATCH);
+    let error = response.error.unwrap();
+    assert_eq!(error.code, proto::code::PROTOCOL_MISMATCH);
+    // Client newer than the daemon is what the seconds after an update look like, so the refusal
+    // has to say "retry" rather than leave an operator reinstalling a board that is already fine.
+    assert!(error.message.contains("newer release"), "{}", error.message);
+    assert!(
+        error.message.contains("systemctl restart updaterd"),
+        "{}",
+        error.message
+    );
+
+    // The other direction is a different situation with a different remedy, and a refusal naming
+    // only the two numbers made them look like one problem.
+    let response = client
+        .call(method::HELLO, serde_json::json!({ "api_version": 1 }))
+        .await;
+    let error = response.error.unwrap();
+    assert_eq!(error.code, proto::code::PROTOCOL_MISMATCH);
+    assert!(error.message.contains("older release"), "{}", error.message);
+    assert!(
+        error.message.contains("/usr/local/bin/robotctl"),
+        "{}",
+        error.message
+    );
 }
 
 #[tokio::test]
@@ -370,6 +393,50 @@ async fn apply_streams_progress_then_a_terminal_result() {
             "missing {expected:?} in {phases:?}"
         );
     }
+}
+
+/// `from_dir` has to survive the wire, because the wire is the whole path.
+///
+/// `robotctl update apply --from <dir>` is one JSON field: everything else about it — the
+/// source override, the exempted downgrade guard, the health gate that still runs — is on the
+/// daemon side of the socket, and reachable only if this field arrives. It is also the field a
+/// daemon one API version older would parse and silently ignore, installing from its
+/// configured source instead, which is why `API_VERSION` moved with it.
+#[tokio::test]
+async fn apply_from_a_directory_over_the_wire() {
+    let fx = Harness::new();
+    fx.publish("1.0.0", false);
+    let _server = fx.serve(fx.engine(true, Faults::none())).await;
+    let mut client = Client::connect(&fx.socket).await;
+    client.hello().await;
+
+    // A directory the configured source knows nothing about, as a laptop push would leave it.
+    let sideload = fx.root.join("var/tmp/duck-sideload");
+    std::fs::create_dir_all(&sideload).unwrap();
+    fx.publisher.release("1.1.0").dir(sideload.clone()).write();
+
+    let response = client
+        .call(
+            method::APPLY,
+            serde_json::json!({
+                "component": "daemon",
+                "target": "latest",
+                "options": { "from_dir": sideload },
+            }),
+        )
+        .await;
+
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result: proto::ApplyResult = response.result_as().unwrap();
+    assert!(
+        matches!(result, proto::ApplyResult::Applied { .. }),
+        "{result:?}"
+    );
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.1.0"),
+        "the release in the named directory is the one that must be live"
+    );
 }
 
 /// Error codes must survive the round trip: clients (and `robotctl`'s exit codes)

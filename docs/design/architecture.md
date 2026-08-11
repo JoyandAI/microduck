@@ -407,14 +407,20 @@ case, not the ideal one.
 
 ### 8.3 The running version and the installed version are different questions
 
-`updaterd` never restarts itself during an update (`updater-design.md` §4.1), so **after
-every update the running binary legitimately lags the installed release until the next
-reboot**. Any tool reporting one version number is therefore wrong half the time, and wrong
-in the direction that makes a working robot look broken.
+`updaterd` cannot restart itself mid-update (`updater-design.md` §4.1), so for a few seconds
+after every update the running binary legitimately lags the installed release. Any tool
+reporting one version number is therefore wrong for that window, and wrong in the direction
+that makes a working robot look broken.
+
+Seconds, not "until a reboot": the engine schedules its own restart and `btd`'s 5 s after it
+replies, and the next `updaterd` start checks that those landed and restarts what did not
+(`restart-order.md` §5).
 
 `robotctl version` reports both and names the disagreement:
 
-- `updaterd` behind the installed release → expected, resolves at reboot;
+- `updaterd` behind the installed release → expected briefly, and the one skew nothing
+  self-heals: the successor reports it rather than restarting itself, so if it persists the
+  scheduled restart did not happen;
 - `robotd` behind it → *not* expected, because it is in `on_apply`'s restart set, so the
   restart did not take effect.
 
@@ -466,9 +472,12 @@ rolled back for the state of the board it landed on.
 6. **Bond revocation over BLE.** Nothing un-pairs a phone; `bluetoothctl untrust` is the
    manual escape. Needs an API and a rule about who may call it
    ([`app-path-design.md`](app-path-design.md) §5).
-7. **Per-device provisioning state**, which now has two claimants rather than one: the robot's
-   serial (§5.7) and its per-robot pairing PIN. Both need generating, recording and printing at
-   manufacture, and defining that once is cheaper than twice.
+7. **Per-device provisioning state** — the per-robot pairing PIN, and nothing else now. The serial
+   was the other claimant and no longer needs a slot: it is fused into the SoC and read from
+   `/proc/device-tree/serial-number` (`updater-design.md` §5.6,
+   [`app-path-design.md`](app-path-design.md) §8.2). The PIN cannot share the identity, which was
+   the plan: the identity is published in an advertisement, so anything derived from it is public.
+   A secret still has to be generated, recorded and printed at manufacture.
 
 ## 10. Build order
 

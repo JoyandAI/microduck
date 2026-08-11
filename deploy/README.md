@@ -241,6 +241,10 @@ release before publishing it.
 
 ### Making it a dev board, so `--ref <branch>` works
 
+The same two conditions gate a build pushed straight from a laptop with
+`scripts/dev-push.sh` — it is signed with the same dev key, so a board that refuses branch
+builds refuses those too.
+
 A board refuses branch builds twice over: `allow_dev_keys` is false, and a trusted key only
 counts as a dev key if its filename ends `.dev.pub`. Both halves are needed, they are independent
 checks, and doing one without the other leaves a board that still refuses branch builds — with a
@@ -457,9 +461,10 @@ change fleet-wide.
 ## Versions, for support
 
 The question is always "what was running?", and on this robot it has **two answers at once**:
-`updaterd` never restarts itself during an update (`updater-design.md` §4.1), so the running
-binary legitimately lags the installed release until the next reboot. Anything reporting a single
-version number is therefore misleading.
+`updaterd` cannot restart itself mid-update (`updater-design.md` §4.1), so for a few seconds after
+one the running binary legitimately lags the installed release. Anything reporting a single version
+number is therefore misleading. If the lag outlives those seconds it is a fault, not the design —
+see `../docs/design/restart-order.md` §7.
 
 `robotctl version` reports both and flags the disagreement. It deliberately works when `updaterd`
 is **down**, reporting that as a line rather than exiting — that is when someone is most likely

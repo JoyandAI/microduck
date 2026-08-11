@@ -1,23 +1,41 @@
-# The install path has no test
+# The install path had no test
 
-Status: open · Date: 2026-08-05, revised 2026-08-07 · Owner: pierre
+Status: closed · Date: 2026-08-05, revised 2026-08-07 and 2026-08-11 · Owner: pierre
 
 Four bugs in a row reached a board, all in the install path, none caught by 418 tests or by
-`board-test.sh`. This records why, and what would actually close it. Written the same day, while
-the reasons are still concrete.
+`board-test.sh`. This records why, and what closed it. Written the same day, while the reasons were
+still concrete, and kept in the past tense it has earned rather than rewritten as reference — what it
+is useful for now is the shape of the mistake, not the state of the tree.
 
 A second section covers two findings that *look* like the same thing and are not: version skew
 between a daemon that is already running and a release that has just been installed. Neither would
 be caught by any amount of install testing, and they need their own fixes — kept here rather than in
 their own document because anyone investigating one will arrive believing it is the other.
 
-**Revision note.** All four bugs are fixed. What is still open is the *testing* gap the title names —
-no test installs a real artifact — plus four smaller decisions marked below. One change since the
-first draft moves enough of this document to call out here: `updaterd` and `btd` are now restarted a
-few seconds *after* the update replies (`RESTART_AFTER_REPLYING`), and the release's own `updaterd` is
-proved to start before the commit (`updaterd --self-test`). Two claims below were written against the
-old behaviour and are now false — both are corrected in place, and the second section's premise in
-particular no longer holds.
+**Revision note.** All four bugs are fixed, and so is the version-skew section that follows them:
+case 1's `serde(default)` discipline landed, case 2's handshake proposal was decided *against* with
+its reasoning written down, and the "units outlive the release that installed them" consequence is
+now a refusal rather than emergent behaviour.
+
+**And the gap the title named is closed.** A test installs a real artifact — `board-test.sh` unpacks
+one and runs `install.sh` and `hooks/postinstall` against it — every unit's `ExecStart` binary is
+checked against the tarball that shipped it, a board check runs on every `dev-push.sh`, and
+`scripts/systemd-test.sh` drives a real update against real systemd. The plan those came from is
+below, with what each one turned up; two engine bugs were found by the last of them.
+
+One change since the first draft moves enough of this document to call out here: `updaterd` and
+`btd` are now restarted a few seconds *after* the update replies (`RESTART_AFTER_REPLYING`), and the
+release's own `updaterd` is proved to start before the commit (`updaterd --self-test`). Two claims
+below were written against the old behaviour and are now false — both are corrected in place, and
+the second section's premise in particular no longer holds.
+
+**Second revision note.** The skew half of §4 is now closed by code rather than by argument. Every
+daemon publishes what it is running (`duck_ipc_proto::publish_identity`), and `updaterd` compares each
+unit against the active release at every start and restarts what is stale
+(`updater/src/reconcile.rs`, `Engine::reconcile_running_units`). Two more claims below were true when
+written and are not now: that a running/installed mismatch is undecided, and that `btd`'s running
+revision cannot be read. Both are corrected in place. `docs/design/restart-order.md` §5 and §7 own
+the mechanism and how to read a skew; what stays here is why it was needed.
 
 ## What got through
 
@@ -90,14 +108,39 @@ ships, minus the two documented exclusions (`updaterd`, which is performing the 
 may be the transport it was requested over). Then a release that adds a daemon restarts that daemon
 on every board, with no operator edit and no way for a board's config to be silently out of date.
 
-Two smaller options, **both still open**, worth noting because they are not alternatives to the above
-so much as companions: `apply` could gain a `--force` that re-runs the hooks and the restart on an
-already-current release (there is precedent — `install --force` exists for the same class of
-chicken-and-egg), and `already_current` could compare *running* revisions rather than only the
-installed one, so it stops being a no-op precisely when something is wrong.
+Two smaller options were noted here as companions to the above rather than alternatives to it:
+`apply` could gain a `--force` that re-runs the hooks and the restart on an already-current release
+(there is precedent — `install --force` exists for the same class of chicken-and-egg), and
+`already_current` could compare *running* revisions rather than only the installed one, so it stops
+being a no-op precisely when something is wrong.
 
-Neither is urgent now that the restart set is derived from the release: the situation they exist to
-dig you out of is much harder to reach. `already_current` still compares only the installed version.
+**The second one is answered, and not where it was proposed.** The question it really posed was
+whether a running/installed mismatch should be reported and refused or repaired, and the answer is
+repaired — by `updater/src/reconcile.rs`, which runs at every `updaterd` start rather than inside
+`apply`. Each unit's running release comes from the identity file its process published, is compared
+with what its component has active, and anything stale is restarted. Since `updaterd` restarts itself
+five seconds after every applied update, that check runs seconds after every `apply`, so the state
+this section is about now heals itself with `Engine::apply` unchanged.
+
+What that left was narrower than either option as written, and it is now closed too. `reconcile`
+deliberately does not repair one skew — `updaterd`'s own, because a self-restart loop in the process
+that owns recovery is the one failure with no way out — and that met an `apply` returning
+`AlreadyCurrent` on the installed version alone in a single case: a stale `updaterd`, an operator
+reaching for `apply`, `already_current`, no restart scheduled, and nothing to fix it but a hand-run
+`systemctl restart updaterd`.
+
+**Fixed** (`engine.rs::restarts_owed`, `reconcile::stale_units`). `apply` and `select` read the same
+identity files on their already-current paths, name the units running something else in the
+`already_current` outcome, and schedule those restarts the way an update schedules its deferred pair.
+It is not the loop the startup check guards against: it fires once, on a request, and through
+`systemd-run` rather than from inside the process being restarted.
+
+**And `apply --force` is dropped rather than deferred.** Its whole job was to re-run the restart on an
+already-current release; that is now what `apply` does when — and only when — something is actually
+stale. A flag would add a second way to ask for it, gated by a question that took a paragraph to get
+right: `install --force` refuses while `robotd` answers because it disables the health gate, `apply`
+keeps that gate, so copying the guard by symmetry would have disabled the flag exactly when a robot is
+up and skewed. Nothing needs to answer that now.
 
 **Fixed, and this paragraph used to say otherwise.** `btd` is excluded from the *in-flight* restart
 because restarting it drops the BLE connection carrying the update's own progress stream — that part
@@ -107,9 +150,12 @@ expires the moment the outcome is on the wire, so `btd` and `updaterd` both rest
 via `systemd-run --on-active=5s` (`RESTART_AFTER_REPLYING`). A client sees its outcome and then a
 dropped connection, which for BLE is an ordinary reconnect.
 
-What survives is the *observability* half: `robotctl version` still cannot see `btd`, because `btd`
-serves no socket, so there is nothing to ask. That matters less now that nothing silently keeps `btd`
-on old code, but it is still the one daemon whose running revision cannot be checked.
+**Also fixed, and this paragraph used to say otherwise too.** The observability half was said to
+survive: `robotctl version` could not see `btd`, because `btd` serves no socket, so there was nothing
+to ask. The premise was that the answer had to come over a socket. It does not — every daemon now
+writes its identity to a file at startup, `btd` and `padd` included, so `robotctl health` reads the
+release each process was launched from and warns when it disagrees with what is installed. No daemon
+is unobservable for the reason this claimed.
 
 ### A consequence worth knowing: units outlive the release that installed them
 
@@ -128,77 +174,241 @@ and said so. The outcome is right — a board should not silently downgrade belo
 introduced a daemon it is now running — but nothing states the rule, and the error names a systemd
 failure rather than the cause.
 
-Worth deciding rather than leaving as emergent behaviour, and **still open**: whether preflight should
-refuse a target that lacks a binary some installed unit execs, so the refusal arrives before the swap
-and names the real reason. Today the only downgrade guard is `Error::WouldDowngrade`, which fires on
-`Latest` alone — `Exact` and `Ref` bypass it deliberately, and `Ref` is precisely how this was
+**Now stated rather than emergent.** `updater/src/orphan.rs` refuses a candidate that lacks a binary
+some installed unit execs, and the refusal names the unit, the missing binary and the way past it —
+remove the unit, `systemctl disable --now configd.service && rm /etc/systemd/system/configd.service`.
+There is no override flag: removing the unit is what the operator means anyway, since a board below
+the release that introduced a daemon should not be running that daemon, and the next update that
+ships the unit reinstalls it.
+
+Two things about where it runs. It is **not** in preflight, which cannot see the candidate's file
+list — both preflight passes run before the artifact is downloaded — so it runs after extraction and
+before the swap, where staging is still disposable and nothing is armed. And **no target is exempt**,
+unlike `Error::WouldDowngrade`, which fires on `Latest` alone: that guard is about a mirror serving a
+stale manifest, this one is about a unit that will not start, and `Ref` is precisely how it was
 observed.
+
+It does not run on rollback, reset-to-golden or `select`. Those move backwards on purpose and are how
+a board gets off a bad release, so a check that can refuse must not sit in the recovery path
+(`docs/design/architecture.md` §1.1) — rolling back onto an orphaned unit stays the documented
+behaviour above, and stays self-correcting.
 
 ## Why the existing tests could not have caught them
 
 Not an accusation of the tests; they cover what they claim. The point is what nothing covers.
 
+This was written when the answer was "nothing", and the row that says so has since changed. Kept as
+the record of what was missing, with what each check covers **today**:
+
 | | covers | does not |
 |---|---|---|
-| `board-test.sh` | binaries executed on real aarch64 Linux from the *build directory*: engine behaviour, socket modes, `SO_PEERCRED`, the layered authorisation, `setup-board.sh` against a stubbed `systemctl` | unpacking an artifact, installing units, starting services |
+| `board-test.sh` | binaries executed on real aarch64 Linux, **and a real artifact unpacked and installed** by `install.sh` and `hooks/postinstall` against a stubbed `systemctl` — placements, modes, ordering, idempotence, and every unit's `ExecStart` binary being present | services actually starting, which needs real systemd |
 | `xtask` tests | the workflow YAML vs `install.sh`, and unit `ExecStart` vs staged binaries | whether the *built artifact* matches either — it reads source files |
 | `updater` tests | engine, journal, verification, rollback, with fakes | `install.sh` at all |
 | `shipped_config_is_safe_for_a_client_robot` | `deploy/updater.toml`'s content | that the config is installable |
 
-So: **no test takes a real artifact and installs it.** Every check either runs a binary that was
-never packaged, or reads a source file that describes packaging without observing it. The two
-`xtask` tests I added are strictly better than nothing and still the weaker form — they assert that
-two files agree with each other, not that the thing they produce is correct.
+What the first row used to say was "unpacking an artifact, installing units, starting services", and
+the sentence beneath it was: **no test takes a real artifact and installs it.** That was the finding
+this document exists for, and it is fixed — the `xtask` row is still the weaker form, asserting that
+two source files agree rather than observing what they produce, but it is no longer the only thing
+standing between a packaging mistake and a board.
 
 ## What would close it
 
-Roughly in order of cost.
+Revised 2026-08-11, after the restart mechanisms below landed and with one constraint that was not
+stated the first time: **CI is already the slowest part of iterating, so the plan is judged on what it
+adds to the wait, not only on what it covers.** Everything here therefore names where it runs.
 
-**A. Assert the artifact's contents.** Run `xtask package` in a test, then inspect the tarball:
-every unit named by `install.sh` is present, and every unit's `ExecStart` binary is present. Cheap,
-and strictly stronger than the two current tests because it observes the artifact instead of the
-YAML that builds it. **Would have caught bugs 2 and 3.**
+### The budget, first
 
-Still open in the form described. There are now *three* source-reading tests rather than two — a
-`every_hook_in_the_repo_is_packaged` was added so `hooks/postinstall` cannot silently stop shipping —
-but all three still assert that `.github/workflows/*.yml` agrees with `scripts/install.sh`. They cover
-the drift class; none of them observes a tarball.
+CI runs on every push and every pull request that touches code, as parallel jobs, so the wait for
+green is the *slowest* job — not the total. That single fact decides where new tests belong:
 
-**B. Install the artifact in a container, with `systemctl` stubbed.** Extend `board-test.sh`: unpack
-into a fake root, run `install.sh` *and* `hooks/postinstall` against it, and assert what landed
-where — `/etc/systemd/system/*.service`, `/usr/lib/sysusers.d/`, the `robotctl` symlink, the state
-directory. `setup-board.sh` is already tested this way, so the pattern and the stub exist. Catches
-bugs 2 and 3 *and* file-placement regressions in `install.sh`, which nothing tests today.
+| job | what makes it slow |
+|---|---|
+| `check` | fmt, clippy, `cargo test --workspace`, the installer lint, and a real `xtask package` |
+| `board` | `cargo install cargo-zigbuild` from source, plus QEMU emulation for aarch64 |
+| `coverage` | a full instrumented build |
 
-Still open, and untouched. `board-test.sh` has a comment reading "the first install, which is the path
-`scripts/install.sh` takes on a bare board" — the line beneath it runs `updaterd install --from`, not
-`scripts/install.sh`. Nothing in the repository executes `scripts/install.sh` or the real
-`hooks/postinstall`; the engine's hook tests use a stub hook built by `test-support`.
+So a millisecond-scale test added to `cargo test` costs nothing anybody notices, while anything that
+lands in `board` or `coverage` is paid on every push. Three rules follow, and they are the point of
+this section:
 
-The postinstall hook makes this more valuable, not less: it is now a second thing that places files
-on a board, it runs unattended on every update rather than once by hand, and its failures are inside
-the update gate. A hook that installs a unit wrongly is worse than an installer that does, because
-nobody is watching when it runs.
+- **The default `cargo test --workspace` takes only in-process tests.** No tarballs, no `systemd`, no
+  network, no sleeps.
+- **Anything that unpacks an artifact or drives a service runs on demand**, as a script or an
+  `#[ignore]`d test — never on the pull-request path.
+- **No new CI job.** If a check needs an artifact, it hangs off the `xtask package` step `check`
+  already runs, and reuses the tarball that step already built.
 
-**C. Real systemd in a container.** `systemd-nspawn`, or a privileged container with systemd as
-pid 1. Full fidelity: units actually start, `on_apply` actually restarts, the health gate actually
-gates. **Would have caught bug 1** — the only one A and B miss. Real work: cgroup and privilege
-setup in CI, and slow.
+Both of those numbers used to be worse, and the two removals that fixed them are the shape this
+section argues for — **taking work out of CI is worth more than any test below adds**:
 
-**D. A board as a self-hosted runner.** Highest fidelity, and the only thing that ever tests the
-motor bus, the radio and the timings. Ops cost, and a single point of failure for CI.
+- **`coverage` ran the whole instrumented suite twice** on a pull request, head and base, purely to
+  print a delta. Removed: `--fail-under-lines` is what catches a regression, and this job went from
+  over seven minutes to about two. The cost is stated rather than glossed — a change that lowers
+  coverage while staying over the floor no longer says so, and the floor is a ratchet now.
+- **A documentation-only change paid the whole bill.** `on:` had no path filter, so editing this file
+  cross-compiled for aarch64 under QEMU and built the workspace under instrumentation. Three
+  consecutive docs pull requests did exactly that while this plan was being written. Removed with a
+  `paths-ignore` for `docs/**` and `*.md`.
 
-## Suggested first step
+  That one has a trap attached, checked rather than assumed: a skipped job reports **no status at
+  all**, so filtering a check that is *required* for merge leaves docs pull requests permanently
+  pending. It is safe here because `main` has no required status checks — the branch-protection API
+  answers 403 on this plan. Turning protection on means revisiting it, and the shape then is a
+  filtered job plus a no-op job of the same name.
 
-**A, then B.** Together they cover two of the three bugs and remove the "files agree with each
-other" weakness, for a fraction of C's cost. B is the better value of the two because it exercises
-`install.sh`, which is 500 lines that nothing currently runs.
+### 1. Two tests that need no new machinery
 
-C is worth revisiting when `on_apply` grows again — it is the only option that tests the restart and
-the gate, and it is now also the only way to observe the postinstall hook doing its real job
-(enabling and starting a unit), which no stub can show.
+In-process, in `cargo test`, and they cover the acting half of the two mechanisms that exist to make
+an update self-healing — neither of which was observable by any test. Both are written; what follows
+is why they were the first thing to do.
 
-D is a separate conversation, and probably follows M4 rather than preceding it.
+- **`systemd-run` is unobservable.** `schedule_deferred_restarts` hardcodes
+  `Command::new("systemd-run")`, while `SYSTEMCTL` two functions away is a `const` precisely so
+  `restart_tests` can substitute a stub script. Same treatment, and then assert what has never been
+  asserted: `--on-active=5s`, one invocation per unit, both `updaterd` and `btd` named. The flag could
+  be wrong today and every test would still pass.
+- **`reconcile::check` is never called by a test**, only its pure `verdict_for`. It already takes
+  `systemctl` as a parameter, and identities are read through `DUCK_RUNTIME_DIR` — a seam whose own
+  comment says it exists so this is testable. Write identity files into a temp runtime directory and
+  assert the four outcomes: stale is restarted, `updaterd` is reported and not restarted, a missing
+  identity file is left alone, a failed restart reports itself.
+
+### 2. The artifact install — done, and what it left
+
+**This is no longer open, and the title of this document is no longer true.** `scripts/board-test.sh`
+packages a real release from the `--include` list in `_build-release.yml`, unpacks it, and runs
+`scripts/install.sh` *and* `hooks/postinstall` against it inside the container with a stubbed
+`systemctl` (PR #47, 2026-08-07). Eleven assertions: units installed byte-identical at mode 644,
+sysusers drop-ins, the `robotctl` symlink resolving through `current`, the journald drop-in,
+`daemon-reload` before any `enable` and `configd` before `btd`, operator config files preserved,
+idempotence on a second run, a unit `install.sh` does not recognise installed-but-not-started, and
+postinstall reproducing the lot on its own.
+
+That covers what this section used to ask for, and the "assert the artifact's contents" idea with it,
+because the tarball is open by then. **Bug 2 is closed against the artifact rather than against the
+YAML.**
+
+One gap was left, and it is bug 3 — the one class of the four with no strong test. Nothing asked
+whether the binary a unit `ExecStart`s is *in* the artifact that shipped the unit, which is exactly how
+`btd.service` came to fail with `203/EXEC` on a board where the release looked complete. The
+protection was `xtask/tests/artifact.rs`, comparing a workflow against `install.sh` — the
+two-files-agree form criticised above. Now asked directly, three lines, in the job that already has
+the tree unpacked and `current` pointing at it.
+
+Only `ExecStart` paths inside the release are checked: a unit may deliberately exec out of the base —
+the boot recovery net does, so that a broken release cannot break it — and requiring those to be
+packaged would be wrong rather than strict.
+
+**What is still genuinely missing here is nothing.** The remaining items are the two below, and they
+cover different things rather than more of this one.
+
+### 3. The board check — done, inside `dev-push.sh`
+
+**Done, and not as a separate scenario script.** `dev-push.sh` used to end at "is live", which means
+the swap happened and the health gate passed — not that the five daemons are running what was swapped
+in. That gap is where an afternoon goes: four wifi fixes were once verified as broken against a
+`configd` that had never restarted.
+
+So the check runs on every push rather than before a promotion. It reads the identity each daemon
+publishes at startup, compares the release named there against the board's `current`, and — separately,
+because everything agreeing on the *previous* release would otherwise pass — against the version this
+push built. `robotd`, `configd` and `padd` are expected to match at once; `updaterd` and `btd` are
+polled for up to 30 s, because they restart five seconds after the reply.
+
+This is the only thing that observes the whole restart mechanism end to end, and nothing in CI can
+replace it: the transient timer, the `RuntimeDirectory=` holding each identity, and the five-second
+delay are all systemd, on real timing. A stale unit fails the push and names what to look at.
+
+Two deliberate non-failures. A daemon that published nothing is reported and not failed — systemd
+removes the runtime directory when a unit stops, so it is also what a deliberately disabled `padd`
+looks like. And `robotctl health` only has to *answer*: a bench board with no servo power reports
+degraded, which is a fact about the bench rather than about the build, exactly as the health gate
+treats it.
+
+### 4. Real systemd — done, as `scripts/systemd-test.sh`
+
+**Done, and it paid for itself before asserting anything.** `scripts/systemd-test.sh` boots systemd as
+pid 1, mints three signed releases carrying real units and a real `updaterd`, installs one, applies
+the next through the running daemon, and then applies one that ships a unit which cannot start.
+
+Four things it observes that nothing else in the tree can, because everything else has a stub
+`systemctl`:
+
+- **`on_apply` really restarts** what the release ships — asserted on the unit's main PID changing,
+  not on the command having been issued;
+- **the deferred transient timer really fires and really replaces `updaterd`**, in about four
+  seconds, and the successor is running the new release. A child process could not do this: it would
+  sit in the cgroup being killed, which is the reason for `systemd-run` and was until now an
+  untested claim;
+- **`hooks/postinstall` really installs, enables and starts** a unit the board has never had;
+- **a unit that installs cleanly and cannot start fails the update and names itself** —
+  `restart failed: Job for broken.service failed` — rather than reverting with
+  `not healthy within 30s: unreachable`. That is bug 1, and it is the one class the items above
+  cannot reach.
+
+**Docker rather than `systemd-nspawn`**, which is a change from what this section used to propose.
+The objection to privileged containers *in CI* stands and this is not CI. What decided it is the
+argument this section itself made for ranking real systemd last: a check that can only run on a
+machine nobody develops on stops being read. Docker Desktop runs a privileged container with systemd
+as pid 1 on the laptop this is developed on; nspawn does not.
+
+It found a bug on its first run, in the code rather than in itself. `self_test_updaterd` ran the new
+binary with no `--config`, so it validated `/etc/robot/updater.toml` however the running daemon was
+started — defeating the check's whole purpose, which is to catch a new binary that rejects *the
+board's* config file.
+
+Both injections named here are in it too, and both landed assertions nothing else could make:
+
+- **`systemd-run` cannot be run.** The update still succeeds — scheduling is best-effort by design,
+  because the update is committed by then — the journal says so, and `btd` and `updaterd` are left on
+  the old release exactly as a missed timer leaves them. Then the next `updaterd` start reconciles the
+  stale `btd` onto the active release and does **not** restart itself, which in that process would be a
+  loop with no way out. That is `reconcile.rs` closing the loop for the first time outside a unit test.
+- **A unit whose `User=` the release brings with it.** `postinstall` installs `sysusers.d` files and
+  runs `systemd-sysusers` before the units, and its comment calls that ordering load-bearing. The
+  account exists and its unit runs. The other half — the same unit with nothing creating the user —
+  fails the update and names the unit rather than the account.
+
+### The gap the harness found on the way — fixed
+
+**A failed update reported a failed rollback for a robot it had successfully put back.** Reproduced by
+the missing-user release above, and `RollbackFailed` is the outcome the design calls the most serious
+one — so it was worth more than a note.
+
+The cause is not the rollback. `hooks/postinstall` overwrites unit files and, by design, does not put
+them back: the hook argues that a release which did not take leaves one service failing until the next
+one does, which is the same situation either way. That reasoning holds and is unchanged. What it did
+not anticipate is the unit being in the restart set of the release being reverted **to** — then the
+revert re-runs the same restart and inherits the same failure. Reachable by an ordinary bad release
+rather than only by the downgrade case above: two consecutive releases ship the same unit name and the
+newer one is broken.
+
+**The fix separates the swap from the apply action, because only one of them is the recovery.** Past
+`swap_to` and the trial being cleared, the robot *is* back on the release it came from; a unit that
+then fails to restart is a second fact, not a contradiction of the first. So `Error::RollbackFailed`
+keeps its meaning — the robot could not be put back at all — and a failed apply action during a revert
+is carried into the reported outcome and logged at `error`:
+
+```text
+not healthy within 30s: …; the release was reverted but a unit did not restart (…), so
+something on this robot is down
+```
+
+Both facts, in the order someone needs them: why the update failed first, then what is still down.
+
+The two rejected alternatives, since neither is obviously wrong. Making `postinstall` reversible is the
+change the hook explicitly declined; it needs state outside the release and adds a failure mode to the
+recovery path, which is the one place that has to stay boring. Tolerating a failed restart *everywhere*
+would weaken the distinction `restart_one` draws on purpose — a unit that exists and will not start is
+how a broken release is caught, and that is still fatal on the way *in*.
+
+### Not doing
+
+**A board as a self-hosted runner.** Ops cost, and a single point of failure for CI. Item 3 gets most
+of the value on demand, which is where a robot in a room belongs.
 
 ## A second, separate problem: version skew on the dev channel
 
@@ -211,15 +421,16 @@ until the next reboot, while everything else on the box moves to the new release
 the root cause of both instances below, and it is fixed — `updaterd` now restarts itself five seconds
 after the update replies. The skew window is seconds, not "until someone reboots".
 
-Read the two cases with that in mind. Neither is a live incident any more; what remains is that both
-were *diagnosed* badly, and one of the two fixes is still worth having on its own merits:
+Read the two cases with that in mind. Neither is a live incident any more, and **both are now
+closed** — case 1 by fixing what it proposed, case 2 by deciding against it:
 
-- Case 1's `serde(default)` fix is **not** made redundant by the shorter window. Version skew is only
-  the commonest way to hit it; any newer-parser-older-sender pair does, and the fields that caused it
-  still have no defaults.
-- Case 2's handshake fix is **mostly** made redundant, and drops from "the recovery command itself
-  stops working" to "a five-second window during which it does". It stays proposed on design grounds,
-  not urgency.
+- Case 1's `serde(default)` fix was **not** made redundant by the shorter window: version skew is
+  only the commonest way to hit it, and any newer-parser-older-sender pair does. Done, on the
+  sections where a defaulted zero is honest.
+- Case 2's handshake fix was **mostly** made redundant by it, dropping from "the recovery command
+  itself stops working" to "a five-second window during which it does" — and when the design
+  argument was finally written out, the premise it rested on did not survive. The exact `!=` stays;
+  what changed is the message. See below and #77.
 
 Two instances, both real, both cost about an hour.
 
@@ -232,24 +443,29 @@ reply for a missing field. `RobotIo::health` maps an unparseable answer to `Heal
 the gate reported `not healthy within 30s: unreachable` about a robot that was entirely healthy, and
 reverted a good release.
 
-Fixes, both small, and **both still open**:
+Fixes, both small, and **both done**:
 
 - **`#[serde(default)]` on new `HealthResult` fields**, so a newer `updaterd` can still parse an
-  older `robotd`. Every `--ref` install of a branch predating a health-field addition hits this
+  older `robotd`. Every `--ref` install of a branch predating a health-field addition hit this
   otherwise, which is the entire dev workflow.
 
-  Half-true today, and the wrong half is the one that bit. Every *top-level* `HealthResult` field
-  carries `#[serde(default)]`, including `imu`. The field that actually caused this —
-  `consecutive_stale_blocks` on the nested `ImuHealth` — does not, and neither do `LoopHealth`'s or
-  `BusHealth`'s. So the incident reproduces verbatim the next time a field is added to a nested health
-  struct, which is exactly how it happened the first time.
+  The half that bit was the nested one: every *top-level* field carried `#[serde(default)]`
+  already, including `imu`, while `consecutive_stale_blocks` on the nested `ImuHealth` did not.
+  `ImuHealth` and `BusHealth` now carry it at the container level, so a field added to either
+  defaults rather than failing the whole parse.
+
+  `LoopHealth`, `Battery` and `MotorThermal` deliberately do **not**, and the exception is the
+  useful part of the fix: those sections carry *measurements*, where a defaulted zero is a lie an
+  older sender never told — a defaulted `percent: 0.0` renders as a flat pack on a robot with a
+  full one. The rule is "default what an omission honestly means", not "default everything", and
+  `ImuHealth`'s doc comment argues it field by field.
 - **A distinct `Health::Incompatible`** rather than reusing `Unreachable`, so the reason reads
   "answered in a shape this updaterd does not understand" instead of implying the robot is down.
   Pure diagnostics, and it would have found the above in a minute.
 
-  Not done. `Health` still has four variants and `SocketRobotClient::health` still collapses an
-  unparseable reply to `Unreachable`. (`Error::Incompatible` exists and is a different thing — it is
-  about a *release* being refused, not a reply being unreadable.)
+  Done. It also turned up its own neighbour while being added: `safe_to_restart` was collapsing an
+  unreadable reply the same way, and `permits_restart` then read it as *safe* — the opposite of what
+  its own comment promised. That became `SafeToRestart::Incompatible` and #68.
 
 ### 2. `API_VERSION` skew between `robotctl` and `updaterd`
 
@@ -265,26 +481,32 @@ or to restart `updaterd` — neither of which is discoverable from the error.
 
 The handshake at least *caught* it and named both versions, which is more than case 1 managed.
 
-Proposed fix, **still open**, and the reason it is not already done is that it is a protocol-policy
-decision rather than a bug:
+The proposed fix was **`hello` should refuse only when the client is *newer* than the daemon** — a v3
+daemon serves a v2 client perfectly when v3 only *added* methods, so refusing that direction costs
+the ability to recover and buys nothing. It would also have made `API_VERSION` mean "the newest
+contract I understand" rather than "the only contract I will speak".
 
-- **`hello` should refuse only when the client is *newer* than the daemon.** A v3 daemon can serve a
-  v2 client perfectly, because v3 only *added* methods — refusing that direction costs the ability
-  to recover and buys nothing. Client-newer-than-daemon must stay a hard failure: there the client
-  may ask for something that genuinely is not there.
+**Decided against** (#77), because writing the argument out exposed the premise underneath it: that
+bumps are additive. They are not, and the constant does not distinguish them — v5 added `pad.*` and
+was additive, v4 made `system.authenticate` mandatory and was not. Accepting older clients would
+promise backward compatibility on every past and future bump, with nothing to enforce it and no way
+to make a non-additive change afterwards. With one user and one robot, the freedom to change the
+wire shape is worth more than a promise the protocol cannot keep. `API_VERSION`'s doc comment now
+states that outright, which is the part that was genuinely missing: the rule existed only as an
+`!=` in one file.
 
-  The handshake is still an exact `!=`. `API_VERSION` has since reached 5 — v5 added `pad.*`, which
-  is purely additive and still bumps — and the failure was observed at v4-against-v3, so this keeps
-  recurring on every additive bump, just for seconds at a time now instead of until a reboot.
-
-That change would also make `API_VERSION` mean what it should — "the newest contract I understand"
-rather than "the only contract I will speak" — and additive protocol growth would stop being a
-breaking change for every client on the box.
+What did change is the message, because the remaining cost was never leniency — it was that
+`client speaks API v2, daemon speaks v3` names no way out, on a board where the two halves are a
+symlink and a running process. The refusal now branches on direction: client newer is the seconds
+after an update, so retry and then `systemctl restart updaterd`; client older cannot happen through
+`/usr/local/bin/robotctl`, which is a symlink into `current`, so the answer is to use that one.
+`robotctl` correspondingly stopped appending "install matching versions", which was true and not
+actionable.
 
 ### Why these are not install-path bugs
 
-Nothing in options A–D above would have caught either. The artifact was correct both times; what was
+Nothing in the plan above would have caught either. The artifact was correct both times; what was
 wrong was the *pair* of versions running at one moment, which only exists on a machine that has been
-updated. Option C (real systemd in a container) would catch the *health-gate* consequence of case 1
-if the container also ran an older `updaterd`, but constructing that skew deliberately is a different
-kind of test — closer to a compatibility matrix than to an install test, and worth keeping separate.
+updated. Item 4 (real systemd locally) would catch the *health-gate* consequence of case 1 if the
+container also ran an older `updaterd`, but constructing that skew deliberately is a different kind of
+test — closer to a compatibility matrix than to an install test, and worth keeping separate.

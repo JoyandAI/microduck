@@ -170,9 +170,19 @@ artifact hosting is still an open question — see `docs/design/updater-design.m
 
 ## Installing without a network
 
-A factory or offline install, or sideloading a build you carried in on a stick. This one is
-`updaterd` rather than `robotctl`, because it is also the path a board takes *before* there is a
-daemon to ask, and `updaterd` is deliberately not on `PATH`:
+On a board that already has a release, install a local directory the ordinary way — through the
+daemon, with the health gate and auto-rollback:
+
+```bash
+sudo robotctl update apply daemon --from /media/usb/release
+```
+
+That is also what `scripts/dev-push.sh` ends with; the
+[dev board cheat sheet](cheatsheet-dev.md) has the laptop-to-board path.
+
+The rest of this section is the **bare-board** case: a factory or offline install, before there is
+a daemon to ask. It is `updaterd` rather than `robotctl` for that reason, and `updaterd` is
+deliberately not on `PATH`:
 
 ```bash
 sudo /opt/robot/daemon/current/bin/updaterd install --from /media/usb/release

@@ -15,3 +15,8 @@ description = "IPC contracts between the robot's services and their clients"
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
+
+# `tempfile` only for the identity round-trip test: it needs a writable runtime root, and a
+# test cannot have /run.
+[dev-dependencies]
+tempfile = "3.27.0"
