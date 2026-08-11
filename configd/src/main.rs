@@ -11,7 +11,7 @@ use configd::net::{FakeNet, Net};
 use configd::pad::{FakePads, Pads};
 use configd::power;
 use configd::store::Store;
-use configd::{driver, pad};
+use configd::{pad, units};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -158,19 +158,6 @@ struct Service {
     policy: PeerPolicy,
 }
 
-fn log_startup_identity(service: &str) {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_owned());
-    tracing::warn!(
-        service,
-        build = %proto::build_info!(),
-        exe,
-        pid = std::process::id(),
-        "starting"
-    );
-}
-
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_owned())
@@ -190,7 +177,7 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
-    log_startup_identity("configd");
+    duck_ipc_proto::log_startup_identity!("configd");
 
     let net: Arc<dyn Net> = match backend(args.fake_net).await {
         Ok(net) => net,
@@ -429,6 +416,11 @@ async fn dispatch(
         }
         proto::Call::NetForget(params) => reply(id, service.net.forget(&params.ssid).await),
 
+        // Read-only, so not gated behind `may_mutate`: "which release is actually running" is the
+        // question support asks first, and needing privilege to ask it would put it out of reach of
+        // exactly the person diagnosing a robot.
+        proto::Call::SystemServices => proto::Response::ok(Some(id), &units::all().await),
+
         proto::Call::SystemInfo => proto::Response::ok(
             Some(id),
             &proto::SystemInfoResult {
@@ -481,7 +473,7 @@ async fn dispatch(
                 Some(id),
                 &proto::PadStatusResult {
                     pads,
-                    driver: driver::state().await,
+                    driver: units::state(units::PADD).await,
                 },
             ),
             Err(e) => {

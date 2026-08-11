@@ -26,10 +26,10 @@
 
 #[cfg(target_os = "linux")]
 pub mod bluez;
-pub mod driver;
 pub mod net;
 #[cfg(target_os = "linux")]
 pub mod nm;
 pub mod pad;
 pub mod power;
 pub mod store;
+pub mod units;

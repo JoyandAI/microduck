@@ -680,6 +680,11 @@ struct VersionReport {
     robotctl: String,
     robotctl_revision: Option<String>,
     services: Vec<ServiceReport>,
+    /// What systemd says about every unit a release manages, and which release each is running
+    /// from. Empty when `configd` could not be asked — including on a release older than the one
+    /// that added `system.services`, which is a silence rather than a warning.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    units: Vec<proto::ServiceUnit>,
     components: Vec<ComponentReport>,
     /// Human-readable warnings: running/installed disagreements, unreachable daemons.
     warnings: Vec<String>,
@@ -909,6 +914,11 @@ fn render_health(report: &HealthReport) -> String {
             }
         }
     }
+    if !report.software.units.is_empty() {
+        let _ = writeln!(out, "\nunits");
+        out.push_str(&render_units(&report.software.units, 2));
+    }
+
     for component in &report.software.components {
         let _ = writeln!(
             out,
@@ -968,6 +978,7 @@ fn collect_version_report(
         robotctl: build.version.to_owned(),
         robotctl_revision: build.revision.map(str::to_owned),
         services: Vec::new(),
+        units: Vec::new(),
         components: Vec::new(),
         warnings: Vec::new(),
     };
@@ -1028,17 +1039,31 @@ fn collect_version_report(
         Err(failure) => report
             .services
             .push(ServiceReport::failed("configd", failure.message)),
-        Ok(mut client) => match client.hello_result() {
-            Ok(hello) => report.services.push(ServiceReport {
-                name: "configd",
-                version: hello.daemon_version.map(|v| v.to_string()),
-                revision: hello.revision,
-                error: None,
-            }),
-            Err(failure) => report
-                .services
-                .push(ServiceReport::failed("configd", failure.message)),
-        },
+        Ok(mut client) => {
+            match client.hello_result() {
+                Ok(hello) => report.services.push(ServiceReport {
+                    name: "configd",
+                    version: hello.daemon_version.map(|v| v.to_string()),
+                    revision: hello.revision,
+                    error: None,
+                }),
+                Err(failure) => report
+                    .services
+                    .push(ServiceReport::failed("configd", failure.message)),
+            }
+            // The same connection: `configd` is the only thing on the robot that can answer this —
+            // reading another user's `/proc/<pid>/exe` needs privilege this CLI does not have.
+            //
+            // A failure is left silent rather than warned about. The commonest cause is a `configd`
+            // from a release older than the one that added `system.services`, and a support tool
+            // that shouts about the old robot it was pointed at is a support tool people stop
+            // reading.
+            report.units = client
+                .call(&proto::Call::SystemServices)
+                .ok()
+                .and_then(|response| response.result_as::<Vec<proto::ServiceUnit>>().ok())
+                .unwrap_or_default();
+        }
     }
 
     report.warnings = version_warnings(&report, updaterd_running.as_ref());
@@ -1125,6 +1150,99 @@ fn describe_attempt(entry: &proto::LogEntry) -> String {
 /// `GITHUB_SHA` in full and `DUCK_REVISION` is likewise full, but a hand-built release with a
 /// `--short` revision must not read as a mismatch. Seven characters minimum, because a prefix
 /// rule with no floor would make an empty string match everything.
+/// The unit lines: what systemd says, and which release each process is actually running.
+///
+/// A block of its own rather than merged into the service lines above, because it answers a
+/// different question with different evidence. A service line is what a daemon *said about itself*
+/// over its socket; a unit line is what systemd and `/proc` say about it from outside — which is the
+/// only available answer for `btd` and `padd`, and the only one at all for a daemon that is not
+/// running to be asked.
+fn render_units(units: &[proto::ServiceUnit], indent: usize) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    for unit in units {
+        // `btd.service` is how systemd names it and `btd` is how everyone else does, including the
+        // `systemctl` line someone is about to type.
+        let name = unit.unit.strip_suffix(".service").unwrap_or(&unit.unit);
+        let state = match unit.state {
+            proto::UnitState::Active => "active",
+            proto::UnitState::Inactive => "stopped",
+            proto::UnitState::Absent => "not installed",
+            proto::UnitState::Unknown => "unknown",
+        };
+
+        let detail = match &unit.identity {
+            // The release, because that is what gets compared with what is installed — and the
+            // revision beside it, because on the dev channel two releases share a crate version and
+            // the SHA is the whole difference.
+            Some(identity) => {
+                let build = match identity.release() {
+                    Some(release) => release.to_string(),
+                    // Published, but not from a release directory: a hand-built binary on a dev
+                    // board. Its own version is all it can honestly claim.
+                    None => format!("{} (not a release)", identity.version),
+                };
+                match &identity.revision {
+                    Some(rev) => format!(" · {build} (rev {})", short_revision(rev)),
+                    None => format!(" · {build}"),
+                }
+            }
+            // Nothing published. For a stopped unit that is expected — systemd removes the runtime
+            // directory with the unit. For a running one it means a build too old to publish, and
+            // saying so beats inferring a version from somewhere else.
+            None if unit.state == proto::UnitState::Active => " · build unknown (old)".to_owned(),
+            None => String::new(),
+        };
+        let _ = writeln!(out, "{:indent$}{name:<9} {state}{detail}", "");
+    }
+
+    out
+}
+
+/// Units running a different release than the one installed.
+///
+/// **Only the ones no socket covers.** `updaterd`, `robotd` and `configd` report their own build
+/// when asked, and that answer is better than a path — it comes from the running process. Warning
+/// from both sources would print one problem twice in two different wordings.
+///
+/// A stopped unit is deliberately *not* warned about here. The unit block already prints `stopped`
+/// next to its name, and a robot whose owner has no gamepad and disabled `padd` should not be told
+/// off about it on every health check. A version disagreement is different: nobody chooses that, and
+/// it is invisible without being pointed at.
+fn unit_warnings(
+    units: &[proto::ServiceUnit],
+    socket_reported: &[ServiceReport],
+    installed: Option<&semver::Version>,
+) -> Vec<String> {
+    let Some(installed) = installed else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::new();
+    for unit in units {
+        let name = unit.unit.strip_suffix(".service").unwrap_or(&unit.unit);
+        if socket_reported.iter().any(|service| service.name == name) {
+            continue;
+        }
+        let Some(running) = unit.identity.as_ref().and_then(proto::Identity::release) else {
+            continue;
+        };
+        if running == *installed {
+            continue;
+        }
+
+        warnings.push(format!(
+            "{name} is running {running} but the installed daemon release is {installed}.\n  \
+             The restart did not take effect, so the old binary is still the one serving.\n  \
+             An update schedules some of these a few seconds after it replies, so a report\n  \
+             taken during one can show this briefly. Otherwise restart it:\n  \
+             sudo systemctl restart {name}"
+        ));
+    }
+    warnings
+}
+
 fn is_behind(
     running_version: &semver::Version,
     running_revision: Option<&str>,
@@ -1164,6 +1282,14 @@ fn version_warnings(
     let daemon_installed = daemon
         .and_then(|c| c.installed.as_deref())
         .and_then(|v| semver::Version::parse(v).ok());
+
+    // First, because "the new binary is not the one running" outranks everything else here: it
+    // explains symptoms that otherwise look like the release itself being broken.
+    warnings.extend(unit_warnings(
+        &report.units,
+        &report.services,
+        daemon_installed.as_ref(),
+    ));
     let daemon_revision = daemon.and_then(|c| c.revision.as_deref());
 
     let updaterd_revision = report
@@ -1185,10 +1311,10 @@ fn version_warnings(
     {
         warnings.push(format!(
             "updaterd is running {} but the installed daemon release is {}.\n  \
-             Expected right after an update — updaterd never restarts itself, so it keeps\n  \
-             running the old binary until the next reboot. If this survives a reboot, the\n  \
-             new release is not being launched: check the `current` symlink and the unit's\n  \
-             ExecStart path.",
+             Expected for a few seconds after an update — updaterd cannot restart itself\n  \
+             mid-update, so the engine schedules that restart 5s after it replies. If this\n  \
+             is still true a minute later, the scheduled restart did not happen or the new\n  \
+             binary would not start: check `systemctl status updaterd` and the journal.",
             identify(running, updaterd_revision),
             identify(installed, daemon_revision)
         ));
@@ -1289,6 +1415,11 @@ fn render_version(report: &VersionReport) -> String {
                 );
             }
         }
+    }
+
+    if !report.units.is_empty() {
+        let _ = writeln!(out, "\nunits");
+        out.push_str(&render_units(&report.units, 2));
     }
 
     if !report.components.is_empty() {
@@ -1627,14 +1758,12 @@ fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
     }
 
     let driver = match status.driver {
-        proto::DriverState::Active => "active — driving whatever pad connects".to_owned(),
-        proto::DriverState::Inactive => {
+        proto::UnitState::Active => "active — driving whatever pad connects".to_owned(),
+        proto::UnitState::Inactive => {
             "NOT running — start it:  sudo systemctl start padd".to_owned()
         }
-        proto::DriverState::Absent => {
-            "not installed — this release predates padd.service".to_owned()
-        }
-        proto::DriverState::Unknown => "unknown — could not ask systemd".to_owned(),
+        proto::UnitState::Absent => "not installed — this release predates padd.service".to_owned(),
+        proto::UnitState::Unknown => "unknown — could not ask systemd".to_owned(),
     };
     let _ = write!(out, "padd    {driver}");
     Ok(out)
@@ -2714,6 +2843,7 @@ mod tests {
             robotctl: "0.2.0".into(),
             robotctl_revision: None,
             services,
+            units: Vec::new(),
             components: vec![ComponentReport {
                 name: "daemon".into(),
                 installed: daemon_installed.map(str::to_owned),
@@ -2723,6 +2853,137 @@ mod tests {
             }],
             warnings: Vec::new(),
         }
+    }
+
+    /// A unit whose process published an identity, as one installed from a release would.
+    fn unit(name: &str, state: proto::UnitState, release: Option<&str>) -> proto::ServiceUnit {
+        proto::ServiceUnit {
+            unit: format!("{name}.service"),
+            state,
+            identity: release.map(|v| proto::Identity {
+                service: name.to_owned(),
+                version: "0.4.0".to_owned(),
+                revision: Some("7610e6e19f151949e685bdd56783e564a72991e6".to_owned()),
+                built_at: None,
+                exe: Some(format!("/opt/robot/daemon/releases/{v}/bin/{name}")),
+                pid: 4242,
+            }),
+        }
+    }
+
+    /// **The question this whole path exists for.** After an update, `btd` serves no socket, so
+    /// nothing could say whether the process running was the new binary or the old one — and the
+    /// crate version cannot tell them apart on the dev channel, where both read `0.4.0`.
+    ///
+    /// The warning has to name the restart, because that is the fix and it is one command.
+    #[test]
+    fn a_unit_still_running_the_old_release_is_named() {
+        let units = vec![unit(
+            "btd",
+            proto::UnitState::Active,
+            Some("0.4.0-dev.271.7610e6e"),
+        )];
+        let installed = semver::Version::parse("0.4.0").unwrap();
+        let warnings = unit_warnings(&units, &[], Some(&installed));
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("btd is running 0.4.0-dev.271.7610e6e"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("systemctl restart btd"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A daemon that answers its own socket must not be warned about from `/proc` as well. It
+    /// already has a warning worded for its own case — `updaterd`'s says the lag is expected,
+    /// because it cannot restart itself — and two warnings about one problem read as two problems.
+    #[test]
+    fn a_daemon_with_a_socket_is_not_warned_about_twice() {
+        let units = vec![unit("robotd", proto::UnitState::Active, Some("0.3.0"))];
+        let installed = semver::Version::parse("0.4.0").unwrap();
+        let reported = vec![service("robotd", "0.3.0")];
+
+        assert!(unit_warnings(&units, &reported, Some(&installed)).is_empty());
+        // …and with no socket answer for it, the same disagreement does warn.
+        assert_eq!(unit_warnings(&units, &[], Some(&installed)).len(), 1);
+    }
+
+    /// A stopped unit is printed, never warned about: a robot whose owner has no gamepad and
+    /// disabled `padd` should not be scolded on every health check. The line in the unit block is
+    /// the report; a warning is for what nobody chose.
+    #[test]
+    fn a_stopped_unit_is_shown_but_not_warned_about() {
+        let units = vec![unit("padd", proto::UnitState::Inactive, None)];
+        let installed = semver::Version::parse("0.4.0").unwrap();
+
+        assert!(unit_warnings(&units, &[], Some(&installed)).is_empty());
+        assert!(
+            render_units(&units, 2).contains("padd      stopped"),
+            "{}",
+            render_units(&units, 2)
+        );
+    }
+
+    /// **A daemon too old to publish an identity, which is the case that made this design possible.**
+    /// It is allowed to simply not answer: saying `unknown (old)` beats inferring a version from
+    /// somewhere else and presenting the guess as fact — and it must not read as a disagreement,
+    /// because there is no version to disagree with.
+    #[test]
+    fn a_daemon_that_published_nothing_says_so() {
+        let silent = proto::ServiceUnit {
+            unit: "btd.service".into(),
+            state: proto::UnitState::Active,
+            identity: None,
+        };
+        let installed = semver::Version::parse("0.4.0").unwrap();
+
+        let rendered = render_units(std::slice::from_ref(&silent), 2);
+        assert!(rendered.contains("build unknown (old)"), "{rendered}");
+        assert!(unit_warnings(&[silent], &[], Some(&installed)).is_empty());
+    }
+
+    /// A revision is what distinguishes two builds of one version, so the line has to carry it —
+    /// abbreviated, because forty characters of SHA in a column is noise around the seven anyone
+    /// compares.
+    #[test]
+    fn the_revision_is_shown_beside_the_release() {
+        let rendered = render_units(&[unit("btd", proto::UnitState::Active, Some("0.4.0"))], 2);
+        assert!(rendered.contains("0.4.0 (rev 7610e6e)"), "{rendered}");
+    }
+
+    /// A hand-built binary is normal on a dev board and is not a release. It publishes an identity
+    /// like anything else, and reporting its crate version as a release would invent a fact — so the
+    /// line says the build is not a release, and it must not warn.
+    #[test]
+    fn a_binary_outside_the_release_layout_is_named_not_guessed() {
+        let hand_built = proto::ServiceUnit {
+            unit: "btd.service".into(),
+            state: proto::UnitState::Active,
+            identity: Some(proto::Identity {
+                service: "btd".into(),
+                version: "0.4.0".into(),
+                revision: None,
+                built_at: None,
+                exe: Some("/home/pierre/duck/target/debug/btd".into()),
+                pid: 4242,
+            }),
+        };
+        let installed = semver::Version::parse("0.4.0").unwrap();
+
+        let rendered = render_units(std::slice::from_ref(&hand_built), 2);
+        assert!(rendered.contains("not a release"), "{rendered}");
+        assert!(unit_warnings(&[hand_built], &[], Some(&installed)).is_empty());
+    }
+
+    /// Nothing to compare against is not a disagreement. A robot whose `updaterd` is down reports
+    /// no installed release, and inventing a mismatch there would accuse a healthy install.
+    #[test]
+    fn no_installed_release_means_no_verdict() {
+        let units = vec![unit("btd", proto::UnitState::Active, Some("0.3.0"))];
+        assert!(unit_warnings(&units, &[], None).is_empty());
     }
 
     fn service(name: &'static str, version: &str) -> ServiceReport {
@@ -2821,9 +3082,14 @@ mod tests {
         ));
     }
 
-    /// The whole point of the command: after an update, `updaterd` is still running the old
-    /// binary. Support must be told, and told that it is expected — otherwise the obvious
-    /// reading is "the update did not work" and someone starts undoing a working robot.
+    /// The whole point of the command: for a few seconds after an update, `updaterd` is still
+    /// running the old binary. Support must be told, and told that it is expected — otherwise the
+    /// obvious reading is "the update did not work" and someone starts undoing a working robot.
+    ///
+    /// The wording is pinned because it went stale once already: it promised the old binary would
+    /// last "until the next reboot", written before the engine began scheduling that restart
+    /// itself. Advice that outlives the mechanism it describes sends someone to reboot a robot that
+    /// had already fixed itself.
     #[test]
     fn a_running_updaterd_behind_the_installed_release_is_flagged_and_explained() {
         let r = report(vec![service("updaterd", "0.1.0")], Some("0.2.0"));
@@ -2834,12 +3100,16 @@ mod tests {
         assert!(warning.contains("running 0.1.0"), "{warning}");
         assert!(warning.contains("0.2.0"), "{warning}");
         assert!(
-            warning.contains("never restarts itself"),
+            warning.contains("cannot restart itself"),
             "must explain why this is expected, not merely report it: {warning}"
         );
         assert!(
-            warning.contains("reboot"),
-            "must say what resolves it: {warning}"
+            warning.contains("5s after it replies"),
+            "must name the mechanism that resolves it, since it resolves itself: {warning}"
+        );
+        assert!(
+            warning.contains("still true a minute later"),
+            "must say when it stops being expected and becomes a fault: {warning}"
         );
     }
 

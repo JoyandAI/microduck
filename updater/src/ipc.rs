@@ -624,6 +624,7 @@ impl Server {
             | Call::NetConnect(_)
             | Call::NetForget(_)
             | Call::SystemInfo
+            | Call::SystemServices
             | Call::SystemSetName(_)
             | Call::SystemReboot
             | Call::SystemPairingPin
