@@ -186,7 +186,7 @@ async fn main() -> ExitCode {
     //
     // It is also what admits `configd` to the boot recovery net: a unit may join the set only if it
     // waits for its dependency rather than exiting, so that a `failed` unit means a broken release
-    // and not a broken board (`docs/project/boot-recovery-net.md`).
+    // and not a broken board (`docs/design/boot-recovery-net.md`).
     let net: Arc<dyn Net> = match backend(args.fake_net).await {
         Ok(net) => net,
         Err(e) => {

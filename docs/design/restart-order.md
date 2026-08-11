@@ -219,6 +219,13 @@ adapter rather than failing.
 5. `Engine::recover_on_start`, **before the socket is served**, so a robot that booted into a bad
    release has already begun reverting by the time anything can ask it to do something else:
    - `clean_staging` for every component: delete `releases/.staging-*`.
+   - `record_rescue`: if `<state_dir>/rescued` exists, the boot recovery net swapped `current` to
+     golden while nothing was running. Copy it into the update log as a rollback, **clear the trial
+     for that component**, and delete the file. Before `record_boot` on purpose: the rescue already
+     went further than the trial would have, and a trial left armed would move `current` back off
+     golden a boot or two later. Deleting the file is also what releases the rescue's loop guard.
+   - `refresh_golden_links`: publish each component's configured golden as a `golden` symlink beside
+     `current`, so the rescue can find it with one `readlink` and no parser.
    - `record_boot`: increment `boots` on every armed trial in `pending.json`.
    - For each trial with `boots >= 2` (`MAX_BOOT_ATTEMPTS`): revert to `previous`, escalating to
      `golden` when `previous` is absent, missing from disk, or itself recorded as rolled back. That
@@ -242,6 +249,13 @@ A trial only exists if an apply was interrupted between step 9 and step 15 of §
 `kill -9`, or a cancelled RPC after the swap. A committed update leaves nothing armed. And since
 `exhausted` is `boots >= 2` while `arm` writes `boots = 0`, the *first* `updaterd` start after the
 interruption logs "update still on trial" and the *second* reverts.
+
+**Every step above presupposes an `updaterd` that starts.** One more thing happens at boot for the
+case where none of it runs: `robot-boot-check.timer` fires 180 s in, asks whether `robotd`, `configd`,
+`btd` and `updaterd` came up, and hands over to a `/bin/sh` rescue that swaps `current` to golden and
+reboots if they did not. It is deliberately outside every process on this page —
+[`boot-recovery-net.md`](boot-recovery-net.md) owns it, including why it is a deadline rather than
+`OnFailure=` on these units.
 
 ## 5. The startup reconciliation — did the restarts happen?
 

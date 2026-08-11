@@ -65,7 +65,7 @@ while [ $# -gt 0 ]; do
 usage: robot-rescue [--dry-run] [--reboot] [--force] [--because <text>]
 
 Point /opt/robot/daemon/current at the golden release, without going through updaterd.
-For a board whose daemons will not start: see docs/project/boot-recovery-net.md.
+For a board whose daemons will not start: see docs/design/boot-recovery-net.md.
 
   --dry-run        report the decision and change nothing
   --reboot         reboot after the swap, instead of printing the command

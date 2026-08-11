@@ -101,7 +101,7 @@ const ADAPTER_RETRY: Duration = Duration::from_secs(5);
 /// So the whole bring-up retries in place, on the same 5s cadence as the wait it already did:
 ///
 /// - **radio faults never leave this function.** A `failed` `btd` therefore means a broken binary,
-///   which is what admits it to the boot recovery net — see `docs/project/boot-recovery-net.md`;
+///   which is what admits it to the boot recovery net — see `docs/design/boot-recovery-net.md`;
 /// - **and it self-heals.** Exiting non-zero got the same retry from `Restart=always`, but only by
 ///   spending a process death on it, and only until the day the unit gains a start limit.
 ///

@@ -2,7 +2,7 @@
 # Did the release that just booted actually come up? If not, hand over to `robot-rescue`.
 #
 # Run once per boot by `robot-boot-check.timer`, three minutes in. See
-# `docs/project/boot-recovery-net.md` for why this exists at all and why it is a deadline rather
+# `docs/design/boot-recovery-net.md` for why this exists at all and why it is a deadline rather
 # than `OnFailure=` on each daemon.
 #
 # WHAT COUNTS AS "DID NOT COME UP". Two conditions, both positive evidence that systemd tried to run
@@ -55,7 +55,7 @@ while [ $# -gt 0 ]; do
 usage: robot-boot-check [--dry-run]
 
 Decide whether the booted release brought its daemons up, and hand over to robot-rescue if not.
-Run once per boot by robot-boot-check.timer. See docs/project/boot-recovery-net.md.
+Run once per boot by robot-boot-check.timer. See docs/design/boot-recovery-net.md.
 
   --dry-run   report the verdict, and do not invoke robot-rescue
 
