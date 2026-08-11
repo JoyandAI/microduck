@@ -354,8 +354,10 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
             let (src, dest) = include
                 .split_once('=')
                 .ok_or_else(|| format!("--include expects src=dest, got {include:?}"))?;
-            // Hooks must be executable; everything else needn't be.
-            let mode = if dest.starts_with("hooks/") {
+            // Hooks and scripts must be executable; everything else needn't be. `scripts/` is
+            // there for `robot-rescue`, which an operator may well run straight out of the
+            // release directory on a board where nothing else works.
+            let mode = if dest.starts_with("hooks/") || dest.starts_with("scripts/") {
                 0o755
             } else {
                 0o644

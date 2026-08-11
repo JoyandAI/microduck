@@ -30,8 +30,20 @@ set -eu
 
 UNIT_DIR=/etc/systemd/system
 SYSUSERS_DIR=/usr/lib/sysusers.d
+SBIN_DIR=/usr/local/sbin
 
 # Hooks run with the release directory as their working directory.
+
+# The rescue script, copied out for the same reason as the units below and one more: it is what an
+# operator runs when this release cannot start, so it must not be read through `current`. A warning
+# and not a failure — a release that cannot install its rescue script is still a release worth
+# having, and `install.sh` puts one there on a fresh board.
+if [ -f scripts/robot-rescue ]; then
+    mkdir -p "$SBIN_DIR"
+    install -m 755 scripts/robot-rescue "${SBIN_DIR}/robot-rescue" \
+        || echo "postinstall: cannot install robot-rescue; the board keeps the previous copy" >&2
+fi
+
 [ -d systemd ] || exit 0
 
 # Users and groups before units: a unit naming a `User=` that does not exist fails to start, and
