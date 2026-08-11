@@ -1,6 +1,6 @@
 # The install path has no test
 
-Status: open · Date: 2026-08-05, revised 2026-08-07 · Owner: pierre
+Status: open · Date: 2026-08-05, revised 2026-08-07 and 2026-08-11 · Owner: pierre
 
 Four bugs in a row reached a board, all in the install path, none caught by 418 tests or by
 `board-test.sh`. This records why, and what would actually close it. Written the same day, while
@@ -18,6 +18,14 @@ few seconds *after* the update replies (`RESTART_AFTER_REPLYING`), and the relea
 proved to start before the commit (`updaterd --self-test`). Two claims below were written against the
 old behaviour and are now false — both are corrected in place, and the second section's premise in
 particular no longer holds.
+
+**Second revision note.** The skew half of §4 is now closed by code rather than by argument. Every
+daemon publishes what it is running (`duck_ipc_proto::publish_identity`), and `updaterd` compares each
+unit against the active release at every start and restarts what is stale
+(`updater/src/reconcile.rs`, `Engine::reconcile_running_units`). Two more claims below were true when
+written and are not now: that a running/installed mismatch is undecided, and that `btd`'s running
+revision cannot be read. Both are corrected in place. `docs/design/restart-order.md` §5 and §7 own
+the mechanism and how to read a skew; what stays here is why it was needed.
 
 ## What got through
 
@@ -90,14 +98,30 @@ ships, minus the two documented exclusions (`updaterd`, which is performing the 
 may be the transport it was requested over). Then a release that adds a daemon restarts that daemon
 on every board, with no operator edit and no way for a board's config to be silently out of date.
 
-Two smaller options, **both still open**, worth noting because they are not alternatives to the above
-so much as companions: `apply` could gain a `--force` that re-runs the hooks and the restart on an
-already-current release (there is precedent — `install --force` exists for the same class of
-chicken-and-egg), and `already_current` could compare *running* revisions rather than only the
-installed one, so it stops being a no-op precisely when something is wrong.
+Two smaller options were noted here as companions to the above rather than alternatives to it:
+`apply` could gain a `--force` that re-runs the hooks and the restart on an already-current release
+(there is precedent — `install --force` exists for the same class of chicken-and-egg), and
+`already_current` could compare *running* revisions rather than only the installed one, so it stops
+being a no-op precisely when something is wrong.
 
-Neither is urgent now that the restart set is derived from the release: the situation they exist to
-dig you out of is much harder to reach. `already_current` still compares only the installed version.
+**The second one is answered, and not where it was proposed.** The question it really posed was
+whether a running/installed mismatch should be reported and refused or repaired, and the answer is
+repaired — by `updater/src/reconcile.rs`, which runs at every `updaterd` start rather than inside
+`apply`. Each unit's running release comes from the identity file its process published, is compared
+with what its component has active, and anything stale is restarted. Since `updaterd` restarts itself
+five seconds after every applied update, that check runs seconds after every `apply`, so the state
+this section is about now heals itself with `Engine::apply` unchanged.
+
+What that leaves is narrower than either option as written. `Engine::apply` still returns
+`AlreadyCurrent` on the installed version alone, and `reconcile` deliberately does not repair one
+skew: `updaterd`'s own, because a self-restart loop in the process that owns recovery is the one
+failure with no way out. Those two meet in a single case — a stale `updaterd`, an operator reaching
+for `apply`, `already_current`, no restart scheduled, and nothing to fix it but a hand-run `systemctl
+restart updaterd`. **Still open**, as one narrow change to `apply` rather than as two options; a
+`--force` flag is what is left if `apply` is not to repair skew by itself. If it is added, its guard
+needs its own reasoning: `install --force` refuses while `robotd` answers because it disables the
+health gate, and `apply` keeps that gate, so copying the guard by symmetry would disable the flag
+exactly when a robot is up and skewed.
 
 **Fixed, and this paragraph used to say otherwise.** `btd` is excluded from the *in-flight* restart
 because restarting it drops the BLE connection carrying the update's own progress stream — that part
@@ -107,9 +131,12 @@ expires the moment the outcome is on the wire, so `btd` and `updaterd` both rest
 via `systemd-run --on-active=5s` (`RESTART_AFTER_REPLYING`). A client sees its outcome and then a
 dropped connection, which for BLE is an ordinary reconnect.
 
-What survives is the *observability* half: `robotctl version` still cannot see `btd`, because `btd`
-serves no socket, so there is nothing to ask. That matters less now that nothing silently keeps `btd`
-on old code, but it is still the one daemon whose running revision cannot be checked.
+**Also fixed, and this paragraph used to say otherwise too.** The observability half was said to
+survive: `robotctl version` could not see `btd`, because `btd` serves no socket, so there was nothing
+to ask. The premise was that the answer had to come over a socket. It does not — every daemon now
+writes its identity to a file at startup, `btd` and `padd` included, so `robotctl health` reads the
+release each process was launched from and warns when it disagrees with what is installed. No daemon
+is unobservable for the reason this claimed.
 
 ### A consequence worth knowing: units outlive the release that installed them
 
