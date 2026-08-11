@@ -608,13 +608,11 @@ impl Client {
             api_version: proto::API_VERSION,
         }))?;
         if let Some(error) = response.error {
-            return Err(Failure::new(
-                exit::FAILED,
-                format!(
-                    "{}\nrobotctl and updaterd are out of step; install matching versions.",
-                    error.message
-                ),
-            ));
+            // The daemon's message is passed through unadorned. It used to gain
+            // "robotctl and updaterd are out of step; install matching versions" here, which was
+            // true and not actionable — the daemon now says which of the two is behind and what
+            // to do, which this side cannot know, and two remedies would disagree.
+            return Err(Failure::new(exit::FAILED, error.message));
         }
         response
             .result
