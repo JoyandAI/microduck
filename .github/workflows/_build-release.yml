@@ -128,6 +128,7 @@ jobs:
             --include "updater/systemd/sysusers.d/robot.conf=systemd/sysusers.d/robot.conf" \
             --include "robotd/systemd/robotd.service=systemd/robotd.service" \
             --include "hooks/postinstall=hooks/postinstall" \
+            --include "scripts/robot-rescue=scripts/robot-rescue" \
             --include "configd/systemd/configd.service=systemd/configd.service" \
             --include "btd/systemd/btd.service=systemd/btd.service" \
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \

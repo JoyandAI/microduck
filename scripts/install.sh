@@ -638,6 +638,20 @@ install_units() {
     # purpose here: it is a tool an operator invokes, not a file systemd caches.
     ln -sfn "${INSTALL_DIR}/current/bin/robotctl" /usr/local/bin/robotctl
 
+    # `robot-rescue` on root's PATH, and *copied* — the opposite decision to `robotctl` above, for
+    # the same reason the units are copied. It exists for boards whose release cannot start, so
+    # reading it through `current` would route the rescue through the thing being rescued.
+    #
+    # Absent from releases predating it, which is every release on a first install from a branch.
+    src="${INSTALL_DIR}/current/scripts/robot-rescue"
+    if [ -f "$src" ]; then
+        mkdir -p /usr/local/sbin
+        install -m 755 "$src" /usr/local/sbin/robot-rescue
+    else
+        warn "the release carries no scripts/robot-rescue; a board whose daemons cannot start
+  has no recovery path that does not need updaterd. The next update installs it."
+    fi
+
     install_completions
 
     systemctl daemon-reload

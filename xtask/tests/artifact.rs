@@ -211,6 +211,22 @@ fn the_artifact_carries_what_install_sh_reads() {
              /usr/local/bin/robotctl at nothing"
         );
 
+        // `install -m 755 .../current/scripts/robot-rescue /usr/local/sbin/robot-rescue`, which
+        // `hooks/postinstall` repeats on every update. Executable in the artifact as well as at the
+        // destination: a board where nothing else works is a board where someone runs it in place.
+        let (mode, _) = entries.get("scripts/robot-rescue").unwrap_or_else(|| {
+            panic!(
+                "{workflow}'s artifact has no scripts/robot-rescue, so a board whose release \
+                 cannot start has no recovery path that does not go through updaterd"
+            )
+        });
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "{workflow} packages scripts/robot-rescue with mode {mode:o}; an operator runs it \
+             out of the release directory"
+        );
+
         // install.sh globs `current/systemd/*.service` rather than asserting a list, so a unit
         // landing anywhere else is silently not installed.
         let units: Vec<&String> = entries

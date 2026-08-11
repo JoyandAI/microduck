@@ -1089,6 +1089,8 @@ impl Engine {
             }
         }
 
+        self.refresh_golden_links();
+
         // Every component's trial advances, independently. A model transition must
         // not consume or clear a daemon update's budget.
         let mut outcomes = Vec::new();
@@ -1214,6 +1216,47 @@ impl Engine {
     fn store(&self, component: &str) -> Result<Store, Error> {
         let cfg = self.config.component(component)?;
         Ok(Store::new(cfg.install_dir.clone()))
+    }
+
+    /// Publish each component's configured golden release as a `golden` symlink.
+    ///
+    /// `scripts/robot-rescue` runs when `updaterd` does not, so it cannot ask this process for
+    /// golden and must not parse `updater.toml` to find it — a release whose `updaterd` rejects
+    /// that file is the likeliest thing the rescue exists for. The link is how the answer survives
+    /// the daemon.
+    ///
+    /// Never fatal. Failing to publish golden loses the rescue path; refusing to start over it
+    /// loses the update path as well, which is strictly worse.
+    fn refresh_golden_links(&self) {
+        for (name, cfg) in &self.config.components {
+            let Some(golden) = &cfg.golden else {
+                continue;
+            };
+            let store = Store::new(cfg.install_dir.clone());
+
+            // A configured golden that is not installed is not a rollback target, and a dangling
+            // link would make the rescue believe otherwise. Loud, because it means the never-brick
+            // guarantee is currently void on this board — `prune` protects golden once it is here,
+            // but nothing installs it retroactively.
+            if !store.release_dir(golden).is_dir() {
+                tracing::warn!(
+                    component = %name,
+                    version = %golden,
+                    "golden is configured but not installed; no rollback target for the recovery path"
+                );
+                continue;
+            }
+
+            match store.mark_golden(golden) {
+                Ok(()) => tracing::debug!(component = %name, version = %golden, "golden published"),
+                Err(e) => tracing::warn!(
+                    component = %name,
+                    version = %golden,
+                    error = %e,
+                    "could not publish the golden symlink; robot-rescue will decline to act"
+                ),
+            }
+        }
     }
 
     /// The manifest kept inside an installed release, if it's readable.

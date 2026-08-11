@@ -1280,6 +1280,56 @@ async fn failed_transition_leaves_no_armed_trial() {
     assert!(engine.recover_on_start().await.unwrap().is_empty());
 }
 
+/// `scripts/robot-rescue` runs when `updaterd` does not, so it cannot ask this process which
+/// release is golden and must not parse `updater.toml` to find out — a release whose `updaterd`
+/// rejects that file is the likeliest thing it exists to rescue. Every start publishes the answer
+/// as a symlink instead.
+#[tokio::test]
+async fn starting_up_publishes_golden_as_a_symlink() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    fx.publish("1.1.0", None);
+
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        r#"golden = "1.0.0""#,
+    );
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+    apply_latest(&mut engine).await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    engine.recover_on_start().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_link(fx.install.join("golden")).unwrap(),
+        std::path::Path::new("releases/1.0.0"),
+        "golden must be published relative, like `current`, so the tree survives a moved mount"
+    );
+}
+
+/// A configured golden that was never installed is not a rollback target. A link pointing at it
+/// would tell the rescue otherwise, and swapping onto it leaves a board that can exec nothing.
+#[tokio::test]
+async fn a_golden_that_is_not_installed_is_not_published() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        r#"golden = "9.9.9""#,
+    );
+    apply_latest(&mut engine).await.unwrap();
+
+    engine.recover_on_start().await.unwrap();
+
+    assert!(
+        !fx.install.join("golden").exists(),
+        "a dangling golden link is worse than none"
+    );
+}
+
 /// **#7** `select` on a version that isn't installed reported UNKNOWN_COMPONENT,
 /// telling clients the wrong thing — the component exists, the version doesn't.
 #[tokio::test]

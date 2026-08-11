@@ -31,6 +31,18 @@ const RELEASES_DIR: &str = "releases";
 /// Symlink consumers read through.
 const CURRENT_LINK: &str = "current";
 
+/// Symlink naming the release with a standing known-good guarantee.
+///
+/// A cache of `ComponentConfig::golden`, refreshed on every `updaterd` start, and it exists for
+/// one reader: `scripts/robot-rescue`, which runs when `updaterd` does not. The rescue path must
+/// not parse `updater.toml`, because a release whose `updaterd` rejects that file is the likeliest
+/// thing it has to rescue — so golden has to be readable with one `readlink` and no parser.
+///
+/// A cache rather than a second source of truth, and it fails safe: if `updaterd` stops starting,
+/// the link is stale but still names a release that was golden when it was last written, which is a
+/// release that was known good.
+const GOLDEN_LINK: &str = "golden";
+
 pub struct Store {
     root: PathBuf,
 }
@@ -47,6 +59,11 @@ impl Store {
     /// Path of the symlink consumers read through.
     pub fn link_path(&self) -> PathBuf {
         self.root.join(CURRENT_LINK)
+    }
+
+    /// Path of the golden symlink. See [`GOLDEN_LINK`].
+    pub fn golden_link_path(&self) -> PathBuf {
+        self.root.join(GOLDEN_LINK)
     }
 
     pub fn release_dir(&self, version: &semver::Version) -> PathBuf {
@@ -68,13 +85,25 @@ impl Store {
     /// `Ok(None)` when the link is absent (a fresh robot) or dangling — both are
     /// recoverable states, not errors.
     pub fn current(&self) -> Result<Option<semver::Version>, Error> {
-        let link = self.link_path();
-        let target = match fs::read_link(&link) {
+        self.link_version(&self.link_path())
+    }
+
+    /// Version the golden symlink points at, if it has been written.
+    ///
+    /// `Ok(None)` on a board whose `updater.toml` sets no golden, which is every board until 1.0.0
+    /// exists — the same answer as for a link that is absent, because the two are the same
+    /// situation to anything that has to decide whether a rollback target exists.
+    pub fn golden(&self) -> Result<Option<semver::Version>, Error> {
+        self.link_version(&self.golden_link_path())
+    }
+
+    fn link_version(&self, link: &Path) -> Result<Option<semver::Version>, Error> {
+        let target = match fs::read_link(link) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
                 return Err(Error::Io {
-                    path: link,
+                    path: link.to_path_buf(),
                     source: e,
                 });
             }
@@ -113,13 +142,27 @@ impl Store {
         Ok(versions)
     }
 
-    /// Point the symlink at `version` atomically.
+    /// Point `current` at `version` atomically.
+    pub fn swap_to(&self, version: &semver::Version) -> Result<(), Error> {
+        self.link_to(CURRENT_LINK, version)
+    }
+
+    /// Point `golden` at `version`, so the rescue path can find it without a parser.
+    ///
+    /// Idempotent, and called on every `updaterd` start rather than only when golden changes:
+    /// the link has to appear on boards that already have a golden configured, and re-writing a
+    /// symlink that already says the right thing costs one `rename`.
+    pub fn mark_golden(&self, version: &semver::Version) -> Result<(), Error> {
+        self.link_to(GOLDEN_LINK, version)
+    }
+
+    /// Point one of this store's symlinks at `version` atomically.
     ///
     /// Writes a temporary symlink beside the real one and `rename`s it over the
     /// top: `rename(2)` on the same directory is atomic, so a concurrent reader
     /// sees either the old target or the new one, never a missing link. Removing
     /// and recreating the symlink would open exactly that window.
-    pub fn swap_to(&self, version: &semver::Version) -> Result<(), Error> {
+    fn link_to(&self, name: &str, version: &semver::Version) -> Result<(), Error> {
         let release = self.release_dir(version);
         if !release.is_dir() {
             return Err(Error::Corrupt(format!(
@@ -132,8 +175,8 @@ impl Store {
         // moves (and so it reads sensibly in a shell).
         let target = Path::new(RELEASES_DIR).join(version.to_string());
 
-        let link = self.link_path();
-        let tmp = self.root.join(format!(".{CURRENT_LINK}.tmp"));
+        let link = self.root.join(name);
+        let tmp = self.root.join(format!(".{name}.tmp"));
 
         // A leftover tmp link from a crashed run must not block the swap.
         let _ = fs::remove_file(&tmp);
@@ -151,10 +194,11 @@ impl Store {
             }
         })?;
 
-        // Durability, not just atomicity. The boot counter is armed before this
-        // swap; if the swap reached disk and the pending record did not, a power cut
-        // would leave a bad release live with no trial to revert it — the one state
-        // §7 says cannot happen.
+        // Durability, not just atomicity. For `current`: the boot counter is armed before the
+        // swap, so if the swap reached disk and the pending record did not, a power cut would
+        // leave a bad release live with no trial to revert it — the one state §7 says cannot
+        // happen. For `golden`: a link that did not survive the power cut is a rescue that has
+        // nothing to aim at, on a board that just lost power mid-update.
         crate::fsutil::fsync_parent(&link)
     }
 
@@ -289,6 +333,37 @@ mod tests {
         // And back, which is the rollback path.
         store.swap_to(&v("1.0.0")).unwrap();
         assert_eq!(store.current().unwrap(), Some(v("1.0.0")));
+    }
+
+    /// `golden` is a second link in the same directory, and the two must not interfere: the rescue
+    /// reads golden precisely when `current` has been swapped to something that will not start.
+    #[test]
+    fn golden_is_published_independently_of_current() {
+        let (_dir, store) = scratch();
+        fs::create_dir_all(store.release_dir(&v("1.0.0"))).unwrap();
+        fs::create_dir_all(store.release_dir(&v("1.1.0"))).unwrap();
+
+        assert_eq!(store.golden().unwrap(), None, "nothing published yet");
+
+        store.mark_golden(&v("1.0.0")).unwrap();
+        store.swap_to(&v("1.1.0")).unwrap();
+
+        assert_eq!(store.golden().unwrap(), Some(v("1.0.0")));
+        assert_eq!(store.current().unwrap(), Some(v("1.1.0")));
+
+        // Called on every `updaterd` start, so re-publishing the same answer has to be a no-op
+        // rather than an error.
+        store.mark_golden(&v("1.0.0")).unwrap();
+        assert_eq!(store.golden().unwrap(), Some(v("1.0.0")));
+    }
+
+    /// A dangling `golden` would tell the rescue it has a target when it does not, and swapping
+    /// onto it leaves a board that can exec nothing at all.
+    #[test]
+    fn marking_golden_refuses_a_release_that_is_not_installed() {
+        let (_dir, store) = scratch();
+        assert!(store.mark_golden(&v("9.9.9")).is_err());
+        assert_eq!(store.golden().unwrap(), None);
     }
 
     #[test]

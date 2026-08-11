@@ -250,6 +250,36 @@ sudo robotctl update pin daemon
 
 The second form unpins.
 
+### When `updaterd` itself will not start
+
+Everything above goes through `updaterd`, so none of it works when `updaterd` is the daemon that is
+down. Check which one it is:
+
+```
+systemctl status updaterd robotd btd configd
+```
+
+Then go back to golden without it:
+
+```
+sudo robot-rescue --dry-run
+```
+
+```
+sudo robot-rescue --reboot
+```
+
+`--dry-run` says what it would do and changes nothing. Without `--reboot` it swaps the release and
+prints the reboot command rather than running it: every daemon execs through `current`, so nothing
+picks up the swap until it restarts, and a robot that is standing should be caught first.
+
+It declines, and says why, when no golden is configured or when `current` is already golden — if the
+daemons are failing on golden itself, a rollback is not the answer and the journal is:
+
+```
+journalctl -b -u robotd -u updaterd -u btd -u configd
+```
+
 ### Three things that are easy to get wrong
 
 **`rollback` needs a predecessor, but an update creates one.** A freshly provisioned board has
