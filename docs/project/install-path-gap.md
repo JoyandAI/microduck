@@ -158,14 +158,14 @@ adds to the wait, not only on what it covers.** Everything here therefore names 
 
 ### The budget, first
 
-CI runs on every push and every pull request, as four parallel jobs, so the wait for green is the
-*slowest* job — not the total. That single fact decides where new tests belong:
+CI runs on every push and every pull request that touches code, as parallel jobs, so the wait for
+green is the *slowest* job — not the total. That single fact decides where new tests belong:
 
 | job | what makes it slow |
 |---|---|
 | `check` | fmt, clippy, `cargo test --workspace`, the installer lint, and a real `xtask package` |
 | `board` | `cargo install cargo-zigbuild` from source, plus QEMU emulation for aarch64 |
-| `coverage` | a full instrumented build — **twice** on a pull request, head and base, for a delta comment |
+| `coverage` | a full instrumented build |
 
 So a millisecond-scale test added to `cargo test` costs nothing anybody notices, while anything that
 lands in `board` or `coverage` is paid on every push. Three rules follow, and they are the point of
@@ -178,24 +178,29 @@ this section:
 - **No new CI job.** If a check needs an artifact, it hangs off the `xtask package` step `check`
   already runs, and reuses the tarball that step already built.
 
-Two things to *remove*, which between them buy more iteration speed than anything below adds:
+Both of those numbers used to be worse, and the two removals that fixed them are the shape this
+section argues for — **taking work out of CI is worth more than any test below adds**:
 
-- **`coverage` runs the whole instrumented suite twice** on a pull request, head and base, for a delta
-  comment. The absolute `--fail-under-lines` gate is the part that catches a regression; the delta is a
-  nicety on the critical path of every push. Dropping the second run roughly halves the job.
-- **A documentation-only change pays the whole bill.** `on: [push, pull_request]` has no path filter,
-  so editing this file cross-compiles for aarch64 under QEMU and builds the workspace twice under
-  instrumentation. Three consecutive docs pull requests did exactly that while this plan was being
-  written. A `paths-ignore` for `docs/**` and `*.md` removes it — with one caveat worth checking before
-  doing it, because it is a trap rather than a detail: a skipped job never reports, so if any of these
-  checks is *required* for merge, filtering it leaves docs pull requests permanently pending. The
-  standard shape is a filtered job plus a no-op job of the same name, and it is worth confirming which
-  is needed rather than discovering it on a branch nobody can merge.
+- **`coverage` ran the whole instrumented suite twice** on a pull request, head and base, purely to
+  print a delta. Removed: `--fail-under-lines` is what catches a regression, and this job went from
+  over seven minutes to about two. The cost is stated rather than glossed — a change that lowers
+  coverage while staying over the floor no longer says so, and the floor is a ratchet now.
+- **A documentation-only change paid the whole bill.** `on:` had no path filter, so editing this file
+  cross-compiled for aarch64 under QEMU and built the workspace under instrumentation. Three
+  consecutive docs pull requests did exactly that while this plan was being written. Removed with a
+  `paths-ignore` for `docs/**` and `*.md`.
+
+  That one has a trap attached, checked rather than assumed: a skipped job reports **no status at
+  all**, so filtering a check that is *required* for merge leaves docs pull requests permanently
+  pending. It is safe here because `main` has no required status checks — the branch-protection API
+  answers 403 on this plan. Turning protection on means revisiting it, and the shape then is a
+  filtered job plus a no-op job of the same name.
 
 ### 1. Two tests that need no new machinery
 
 In-process, in `cargo test`, and they cover the acting half of the two mechanisms that exist to make
-an update self-healing — neither of which is observable by any test today.
+an update self-healing — neither of which was observable by any test. Both are written; what follows
+is why they were the first thing to do.
 
 - **`systemd-run` is unobservable.** `schedule_deferred_restarts` hardcodes
   `Command::new("systemd-run")`, while `SYSTEMCTL` two functions away is a `const` precisely so
