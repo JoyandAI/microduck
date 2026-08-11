@@ -1568,8 +1568,16 @@ impl Engine {
             }
             HealthCheck::Command { program, args, .. } => {
                 let mut command = tokio::process::Command::new(program);
-                command.args(args).kill_on_drop(true);
-                let output = tokio::time::timeout(timeout, command.output())
+                command
+                    .args(args)
+                    .kill_on_drop(true)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let child = crate::spawn::retrying_busy(&mut command)
+                    .await
+                    .map_err(|e| Error::Health(format!("could not run probe: {e}")))?;
+                let output = tokio::time::timeout(timeout, child.wait_with_output())
                     .await
                     .map_err(|_| {
                         Error::Health(format!("probe timed out after {}s", timeout.as_secs()))
@@ -1770,19 +1778,39 @@ async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
     let mut command = tokio::process::Command::new(&binary);
     command.arg("--self-test");
 
-    let output = match tokio::time::timeout(SELF_TEST_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) => output,
+    // Through the retry, and this is the call that most needs it: the binary being exec'd was
+    // written by *this update*, moments ago, while hooks and `systemctl` were spawning around it —
+    // the exact conditions `spawn::retrying_busy` documents. An `ETXTBSY` here is an `Error::SelfTest`,
+    // which rolls back a release that was fine.
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let spawned = crate::spawn::retrying_busy(&mut command).await;
+    let output = match spawned {
+        Ok(child) => {
+            match tokio::time::timeout(SELF_TEST_TIMEOUT, child.wait_with_output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(e)) => {
+                    return Err(Error::SelfTest(format!(
+                        "{} could not be waited for: {e}",
+                        binary.display()
+                    )));
+                }
+                Err(_) => {
+                    return Err(Error::SelfTest(format!(
+                        "{} did not finish within {SELF_TEST_TIMEOUT:?}",
+                        binary.display()
+                    )));
+                }
+            }
+        }
         // Could not be executed at all: the wrong architecture, a missing interpreter, a corrupt
         // file. Exactly what this exists to catch.
-        Ok(Err(e)) => {
+        Err(e) => {
             return Err(Error::SelfTest(format!(
                 "could not run {}: {e}",
-                binary.display()
-            )));
-        }
-        Err(_) => {
-            return Err(Error::SelfTest(format!(
-                "{} did not finish within {SELF_TEST_TIMEOUT:?}",
                 binary.display()
             )));
         }
@@ -1892,7 +1920,12 @@ async fn schedule_deferred_restarts(systemd_run: &str, units: &[&str]) {
         // `tokio::process`, not `std::process`: this runs inside the async engine, and a blocking
         // `status()` here stalls the runtime — which showed up as unrelated operations later
         // failing with `Busy`, because the update lock had not been released yet.
-        match command.status().await {
+        let spawned = crate::spawn::retrying_busy(&mut command).await;
+        let waited = match spawned {
+            Ok(mut child) => child.wait().await,
+            Err(e) => Err(e),
+        };
+        match waited {
             Ok(status) if status.success() => {
                 tracing::info!(unit, delay = DEFERRED_RESTART_DELAY, "restart scheduled");
             }
@@ -2038,7 +2071,14 @@ async fn unit_is_absent(systemctl: &str, unit: &str) -> bool {
         .arg(unit);
     c.kill_on_drop(true);
 
-    match tokio::time::timeout(APPLY_ACTION_TIMEOUT, c.output()).await {
+    c.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let Ok(child) = crate::spawn::retrying_busy(&mut c).await else {
+        return false;
+    };
+    match tokio::time::timeout(APPLY_ACTION_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).trim() == "not-found",
         _ => false,
     }
@@ -2047,7 +2087,20 @@ async fn unit_is_absent(systemctl: &str, unit: &str) -> bool {
 async fn run_systemctl(mut command: tokio::process::Command, what: &str) -> Result<(), Error> {
     command.kill_on_drop(true);
 
-    let output = tokio::time::timeout(APPLY_ACTION_TIMEOUT, command.output())
+    // `spawn` + `wait_with_output` rather than `output()`, so the spawn can go through the
+    // `ETXTBSY` retry — `output()` spawns internally and gives nothing to retry. `output()` also
+    // pipes both streams for you, and this does not, so they are set explicitly: without them the
+    // child inherits ours and the stderr this reports back would be empty.
+    let child = crate::spawn::retrying_busy(
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .await
+    .map_err(|e| Error::Internal(format!("running systemctl: {e}")))?;
+
+    let output = tokio::time::timeout(APPLY_ACTION_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| Error::Internal(format!("{what} timed out")))?
         .map_err(|e| Error::Internal(format!("running systemctl: {e}")))?;
@@ -2265,6 +2318,41 @@ esac
                 .is_ok(),
             "a missing unit must not fail the update"
         );
+    }
+
+    /// A `systemctl` that is briefly busy for exec is retried, not reported as a failed restart.
+    ///
+    /// This is the flake that prompted the change, reproduced deterministically. These tests write a
+    /// stub `systemctl` and exec it from parallel threads of one process; a fork in another test
+    /// duplicates the write handle to *this* stub into its child, and for a few microseconds the
+    /// kernel refuses to exec it. Holding a write handle here is the same condition, on purpose.
+    ///
+    /// On a board the consequence is worse than a red CI job: the same race reaches
+    /// `self_test_updaterd`, which execs a binary the update wrote moments earlier, and an `ETXTBSY`
+    /// there rolls back a release that was fine.
+    ///
+    /// Linux-only, and deliberately not made portable: macOS permits the exec, so on a Mac this
+    /// would pass without ever provoking the condition. `hooks.rs`'s
+    /// `a_hook_busy_forever_still_fails` is the control that keeps the pair honest — if the platform
+    /// stopped producing `ETXTBSY`, that test fails and this one becomes vacuous.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_systemctl_busy_for_exec_is_retried_rather_than_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = stub_recorder(dir.path(), "systemctl");
+
+        let holder = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // Well inside the ~100 ms budget, and long enough that the first attempts do fail.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(holder);
+        });
+
+        restart_one(path.to_str().unwrap(), "robotd")
+            .await
+            .expect("a transiently busy systemctl must be retried, not reported as a failure");
+
+        releaser.await.unwrap();
     }
 
     /// The other half, and the reason this is not just "ignore failures": a unit that exists and

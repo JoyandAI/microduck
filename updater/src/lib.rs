@@ -45,6 +45,7 @@ pub mod reconcile;
 pub use duck_ipc_proto as proto;
 pub mod robot;
 pub mod source;
+mod spawn;
 pub mod store;
 pub mod verify;
 
