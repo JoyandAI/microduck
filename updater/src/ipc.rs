@@ -544,6 +544,7 @@ impl Server {
                                 ApplyOptions {
                                     dry_run: params.options.dry_run,
                                     interrupt_sessions: params.options.interrupt_sessions,
+                                    from_dir: params.options.from_dir.map(std::path::PathBuf::from),
                                 },
                                 tx,
                             )

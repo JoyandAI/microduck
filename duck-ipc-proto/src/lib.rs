@@ -62,7 +62,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `current`, so it follows the new release immediately, while `updaterd` is mid-restart of itself.
 /// Retrying is the fix. A client that is *persistently* older is a copy taken from somewhere other
 /// than `/usr/local/bin/robotctl`. Both directions are named in the refusal — `updater/src/ipc.rs`.
-pub const API_VERSION: u32 = 6;
+/// # v7 — `ApplyOptions::from_dir`
+///
+/// First ships in 0.5.0, which is therefore the version a board has to be on before
+/// `robotctl update apply --from` can put anything there.
+///
+/// **It bumps even though `from_dir` is an optional field an older daemon would happily parse.**
+/// That is the reason to bump rather than a reason not to: serde ignores what it does not know, so a
+/// v6 `updaterd` would accept `update.apply --from /some/dir` and quietly install from its
+/// *configured* source instead — a mirror of the release the operator meant to sideload, or nothing
+/// at all. Refusing the call outright is what this constant is for.
+pub const API_VERSION: u32 = 7;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -931,6 +941,22 @@ pub struct ApplyOptions {
     /// signature, hash or compatibility — those have no override.
     #[serde(default)]
     pub interrupt_sessions: bool,
+    /// Take the release from this directory **on the robot** instead of the component's
+    /// configured source. The laptop-to-board path: `scripts/dev-push.sh`.
+    ///
+    /// Changes where the bytes come from, not what is trusted. The directory is read by
+    /// the same `LocalDir` source the tests and the offline installer use, so the
+    /// manifest signature, the artifact hash and the compatibility checks all still have
+    /// to pass — a locally built release installs because the dev key is in the robot's
+    /// trusted set, not because anything is skipped.
+    ///
+    /// A `String` rather than a `PathBuf` because this is a JSON wire type: a path that
+    /// is not UTF-8 cannot cross this socket in either form, and the plain type says so
+    /// instead of failing at serialisation. It is also interpreted by `updaterd`, whose
+    /// working directory is `/` — so a client sends an absolute path, and `robotctl`
+    /// resolves one before it gets here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2080,6 +2106,7 @@ mod tests {
                 options: ApplyOptions {
                     dry_run: true,
                     interrupt_sessions: false,
+                    from_dir: None,
                 },
             }),
             Call::Rollback(ComponentParams {
@@ -2202,6 +2229,7 @@ mod tests {
             options: ApplyOptions {
                 dry_run: true,
                 interrupt_sessions: false,
+                from_dir: None,
             },
         });
         let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
@@ -2209,6 +2237,37 @@ mod tests {
         assert!(line.contains(r#""jsonrpc":"2.0""#), "{line}");
         assert!(line.contains(r#""method":"update.apply""#), "{line}");
         assert!(line.contains(r#""dry_run":true"#), "{line}");
+        assert!(
+            !line.contains("from_dir"),
+            "an apply that names no directory must not mention one: {line}"
+        );
+    }
+
+    /// `from_dir` survives the wire, and only appears when it was asked for.
+    ///
+    /// The absence half is the load-bearing one. Every other client of this type — `btd`
+    /// relaying the app, the periodic scheduler — leaves it `None`, and an apply that
+    /// carried `"from_dir":null` would be a sideload request as far as a reader of the
+    /// journal or a future daemon is concerned.
+    #[test]
+    fn from_dir_round_trips_and_is_omitted_when_unset() {
+        let call = Call::Apply(ApplyParams {
+            component: ComponentId::new("daemon"),
+            target: Target::Latest,
+            options: ApplyOptions {
+                from_dir: Some("/var/tmp/duck-sideload".to_owned()),
+                ..Default::default()
+            },
+        });
+
+        let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
+        assert!(
+            line.contains(r#""from_dir":"/var/tmp/duck-sideload""#),
+            "{line}"
+        );
+
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.as_call().unwrap(), call);
     }
 
     /// An unknown method and unparseable parameters are different failures, and a client

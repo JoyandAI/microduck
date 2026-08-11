@@ -395,6 +395,50 @@ async fn apply_streams_progress_then_a_terminal_result() {
     }
 }
 
+/// `from_dir` has to survive the wire, because the wire is the whole path.
+///
+/// `robotctl update apply --from <dir>` is one JSON field: everything else about it — the
+/// source override, the exempted downgrade guard, the health gate that still runs — is on the
+/// daemon side of the socket, and reachable only if this field arrives. It is also the field a
+/// daemon one API version older would parse and silently ignore, installing from its
+/// configured source instead, which is why `API_VERSION` moved with it.
+#[tokio::test]
+async fn apply_from_a_directory_over_the_wire() {
+    let fx = Harness::new();
+    fx.publish("1.0.0", false);
+    let _server = fx.serve(fx.engine(true, Faults::none())).await;
+    let mut client = Client::connect(&fx.socket).await;
+    client.hello().await;
+
+    // A directory the configured source knows nothing about, as a laptop push would leave it.
+    let sideload = fx.root.join("var/tmp/duck-sideload");
+    std::fs::create_dir_all(&sideload).unwrap();
+    fx.publisher.release("1.1.0").dir(sideload.clone()).write();
+
+    let response = client
+        .call(
+            method::APPLY,
+            serde_json::json!({
+                "component": "daemon",
+                "target": "latest",
+                "options": { "from_dir": sideload },
+            }),
+        )
+        .await;
+
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result: proto::ApplyResult = response.result_as().unwrap();
+    assert!(
+        matches!(result, proto::ApplyResult::Applied { .. }),
+        "{result:?}"
+    );
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.1.0"),
+        "the release in the named directory is the one that must be live"
+    );
+}
+
 /// Error codes must survive the round trip: clients (and `robotctl`'s exit codes)
 /// branch on them.
 #[tokio::test]

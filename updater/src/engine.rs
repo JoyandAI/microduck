@@ -118,6 +118,20 @@ pub struct Engine {
 pub struct ApplyOptions {
     pub dry_run: bool,
     pub interrupt_sessions: bool,
+    /// Read the release from this directory instead of the component's configured source.
+    ///
+    /// The laptop-to-board path (`scripts/dev-push.sh`): build, sign with the dev key, copy
+    /// the directory over, apply. Served by [`Engine::apply`] and not by
+    /// `updaterd install --from`, which is the reason it exists — `install` has to force
+    /// `on_apply` and the health gate off, so it can only be used on a board with no live
+    /// release, and every use of it on a working robot silently gives up auto-rollback.
+    /// A dev board is exactly where a release most needs to be gated and rolled back.
+    ///
+    /// It changes where the bytes come from and nothing else: same `LocalDir` source as the
+    /// tests and the offline installer, so signature, hash and compatibility are checked
+    /// identically. A locally built release installs because the dev key is trusted on that
+    /// board, not because a check was skipped.
+    pub from_dir: Option<std::path::PathBuf>,
 }
 
 impl Engine {
@@ -380,7 +394,13 @@ impl Engine {
         emit: &impl Fn(Phase, Option<u8>),
     ) -> Result<ApplyResult, Error> {
         let installed = store.current()?;
-        let source = source::from_config(&cfg.source);
+        // A per-call source override, so the configured one stays in place: a dev board keeps
+        // reaching GitHub for `--ref <branch>`, `--staging` and a return to the release stream,
+        // and a laptop build is one flag rather than a config edit to undo afterwards.
+        let source = match &options.from_dir {
+            Some(dir) => Box::new(source::LocalDir::new(dir.clone())) as Box<dyn source::Source>,
+            None => source::from_config(&cfg.source),
+        };
 
         // 0. Environment preflight, *before* touching the network. The manifest
         //    fetch is HTTPS, and on a board with no battery-backed RTC it fails
@@ -442,7 +462,15 @@ impl Engine {
         // release, so the guard would rarely fire — but when it did, it would be refusing a
         // reinstall of the candidate a board had just rolled back from, which is exactly the
         // move someone reaches for while investigating that rollback.
+        //
+        // `from_dir` is exempt for the `Exact` reason. The guard defends against a *mirror*
+        // that has gone backwards, and a directory named on the command line by somebody with
+        // root is not a mirror — it is the same explicit statement of intent as naming a
+        // version. It also would not leave a usable flag: a locally built release is a
+        // prerelease of the version it precedes, so it sorts below whatever the board is on
+        // and every single laptop push would be refused as a downgrade.
         if matches!(target, crate::proto::Target::Latest)
+            && options.from_dir.is_none()
             && let Some(installed) = &installed
             && manifest.version < *installed
         {

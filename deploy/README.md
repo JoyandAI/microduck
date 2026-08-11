@@ -241,6 +241,10 @@ release before publishing it.
 
 ### Making it a dev board, so `--ref <branch>` works
 
+The same two conditions gate a build pushed straight from a laptop with
+`scripts/dev-push.sh` — it is signed with the same dev key, so a board that refuses branch
+builds refuses those too.
+
 A board refuses branch builds twice over: `allow_dev_keys` is false, and a trusted key only
 counts as a dev key if its filename ends `.dev.pub`. Both halves are needed, they are independent
 checks, and doing one without the other leaves a board that still refuses branch builds — with a

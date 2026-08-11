@@ -457,6 +457,10 @@ async fn install(
         dry_run,
         // Nothing can be streaming from a robot with no release on it.
         interrupt_sessions: false,
+        // `install --from` builds the source itself, below: this path forces `on_apply` and the
+        // health gate off, which is the difference between it and `apply --from`, and it must
+        // not be reachable by an option that leaves them on.
+        from_dir: None,
     };
 
     let result = engine

@@ -984,6 +984,18 @@ Cheap additions that slot into the same IPC / engine and pay off:
 - **Dev sideload path.** Accept an artifact signed with a distinct **dev key**
   (present in the trusted set but gated behind a flag / dev build) so the team
   can flash local builds without touching prod signing (see §5.4).
+  **Built.** `robotctl update apply --from <dir>` overrides the source for one call,
+  so the release comes off a directory on the board while everything else about the
+  apply is unchanged — preflight, signature, hash, compatibility, health gate,
+  auto-rollback. `scripts/dev-push.sh` is the whole path: cross-compile, package,
+  sign, copy, apply. Two things it does *not* do, both deliberate: it is not
+  `updaterd install --from`, which forces `on_apply` and the gate off and therefore
+  cannot be used on a live release; and it does not relax verification, which is why
+  it needs a dev key on the board rather than a flag that skips a check. The
+  downgrade guard stands aside for `--from` for the reason it stands aside for
+  `--version` — an operator naming a directory is not a mirror that has gone
+  backwards, and a local build is a prerelease that sorts below whatever the board is
+  running, so guarding it would refuse every push.
 - **BLE provisioning security.** Adjacent but important: wifi credentials pass
   over BLE during setup. That characteristic must be paired + encrypted, or it's
   a credential leak. Update artifacts are signed so a spoofed *trigger* is

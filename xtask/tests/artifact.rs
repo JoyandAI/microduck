@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 /// Where in the release CI stages the binaries it is about to package.
 const STAGED: &str = " staged/";
 
-/// Every workflow that packages an artifact a board can install.
+/// Every file that packages an artifact a board can install, by repository path.
 ///
 /// `dev.yml` first, deliberately: it is the one that runs on every push and the one whose output
 /// reaches a board during development.
@@ -63,7 +63,19 @@ const STAGED: &str = " staged/";
 /// both the staging and the stable path call, and `release.yml` is now only the entry point that
 /// decides between them. A constant that kept naming the old file would have left every assertion
 /// here vacuous — which is why the parse below fails loudly when it matches nothing.
-const PACKAGING_WORKFLOWS: [&str; 2] = ["dev.yml", "_build-release.yml"];
+///
+/// `scripts/dev-push.sh` is the third, and it is not a workflow — it is the laptop-to-board path,
+/// which assembles the same artifact from the same lists so that what a developer runs on a board
+/// is what a release would put there. Being a shell script changes nothing here: the parsers below
+/// read `cp … staged/` and `--include "src=dest"` lines, and the script writes them in the same
+/// literal form CI does precisely so this file covers it. Three hand-maintained copies is a worse
+/// drift risk than the two this file was written for, and the copy that drifts unnoticed is
+/// whichever one nobody is cutting a release from that week.
+const PACKAGING_SITES: [&str; 3] = [
+    ".github/workflows/dev.yml",
+    ".github/workflows/_build-release.yml",
+    "scripts/dev-push.sh",
+];
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -94,21 +106,25 @@ fn includes(workflow: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The text of one packaging site.
+fn recipe(site: &str) -> String {
+    std::fs::read_to_string(root().join(site)).unwrap_or_else(|e| panic!("{site}: {e}"))
+}
+
 /// Build the artifact a named workflow would build, and return its entries as
 /// `path -> (mode, bytes)`.
 ///
 /// Stub binaries rather than real ones: this is about what the packager places where, and
 /// cross-compiling four aarch64 daemons to assert the presence of `bin/robotd` would make the test
 /// too slow to keep. Their *names* are the load-bearing part, and those come from the workflow.
-fn packaged_release(workflow_name: &str) -> BTreeMap<String, (u32, Vec<u8>)> {
+fn packaged_release(site: &str) -> BTreeMap<String, (u32, Vec<u8>)> {
     let root = root();
-    let workflow = std::fs::read_to_string(root.join(".github/workflows").join(workflow_name))
-        .unwrap_or_else(|e| panic!("{workflow_name}: {e}"));
+    let workflow = recipe(site);
 
     let binaries = staged_binaries(&workflow);
     assert!(
         binaries.len() >= 4,
-        "{workflow_name} should stage several binaries, found {binaries:?} — the parsing above \
+        "{site} should stage several binaries, found {binaries:?} — the parsing above \
          has probably stopped matching the workflow's `cp` lines, which would make every \
          assertion in this file vacuous"
     );
@@ -163,7 +179,7 @@ fn packaged_release(workflow_name: &str) -> BTreeMap<String, (u32, Vec<u8>)> {
     let output = cmd.output().expect("run xtask package");
     assert!(
         output.status.success(),
-        "xtask package failed for {workflow_name}: {}",
+        "xtask package failed for {site}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -190,7 +206,7 @@ fn packaged_release(workflow_name: &str) -> BTreeMap<String, (u32, Vec<u8>)> {
 /// script is the consumer and its failure modes are what this is defending.
 #[test]
 fn the_artifact_carries_what_install_sh_reads() {
-    for workflow in PACKAGING_WORKFLOWS {
+    for workflow in PACKAGING_SITES {
         let entries = packaged_release(workflow);
 
         // install.sh dies outright without these two: "a robot without it has nothing to run".
@@ -254,7 +270,7 @@ fn the_artifact_carries_what_install_sh_reads() {
 /// installers copy there, so an `ExecStart` pointing at neither still fails.
 #[test]
 fn every_unit_in_the_artifact_can_exec_what_it_names() {
-    for workflow in PACKAGING_WORKFLOWS {
+    for workflow in PACKAGING_SITES {
         let entries = packaged_release(workflow);
 
         for (path, (_, bytes)) in entries
@@ -302,7 +318,7 @@ fn every_unit_in_the_artifact_can_exec_what_it_names() {
 /// installed there. Each of those is silent until a board needs the recovery it does not have.
 #[test]
 fn the_boot_recovery_net_is_packaged_whole() {
-    for workflow in PACKAGING_WORKFLOWS {
+    for workflow in PACKAGING_SITES {
         let entries = packaged_release(workflow);
 
         for path in [
@@ -345,7 +361,7 @@ fn the_boot_recovery_net_is_packaged_whole() {
 /// packager and is worth pinning where the packager actually runs.
 #[test]
 fn hooks_are_packaged_executable() {
-    for workflow in PACKAGING_WORKFLOWS {
+    for workflow in PACKAGING_SITES {
         let entries = packaged_release(workflow);
 
         let hooks: Vec<&String> = entries.keys().filter(|p| p.starts_with("hooks/")).collect();
@@ -379,9 +395,8 @@ fn hooks_are_packaged_executable() {
 /// dropped `--include` has no unit and no `ExecStart` to give it away.
 #[test]
 fn every_include_lands_where_the_workflow_says() {
-    for name in PACKAGING_WORKFLOWS {
-        let workflow = std::fs::read_to_string(root().join(".github/workflows").join(name))
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    for name in PACKAGING_SITES {
+        let workflow = recipe(name);
         let entries = packaged_release(name);
 
         for (src, dest) in includes(&workflow) {

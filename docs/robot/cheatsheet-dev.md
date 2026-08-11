@@ -99,6 +99,90 @@ sudo systemctl restart updaterd
 Editing the board's `updater.toml` is not needed — the restart set comes from the units the release
 ships. `../design/restart-order.md` is the full sequence, step by step.
 
+## From a laptop — build here, install on the board
+
+No push, no CI run, no tag. One command from a clone of this repo:
+
+```bash
+scripts/dev-push.sh radxa@<board>
+```
+
+```bash
+export DUCK_BOARD=radxa@<board>
+```
+
+```bash
+scripts/dev-push.sh
+```
+
+It cross-compiles for the board, packages the same artifact a release does, signs it with the dev
+key, copies it to `/var/tmp/duck-sideload` on the board and applies it there. Roughly a minute on
+an incremental build, against several for a push plus a CI run.
+
+Needs, once:
+
+```bash
+cargo install cargo-zigbuild --locked
+```
+
+```bash
+brew install zig
+```
+
+and `team.dev.key` at `~/.duck-keys/team.dev.key` — the secret half of the key CI signs branch
+builds with. Set `DUCK_DEV_SECRET_KEY` if yours lives elsewhere. The board must be a
+[dev board](install-dev.md); the artifact is signed with a dev key, so a customer robot refuses
+it exactly as it refuses `--ref`.
+
+### Or build in a container, with no toolchain to set up
+
+```bash
+scripts/dev-push.sh --docker radxa@<board>
+```
+
+Needs Docker running and nothing else — no zig, no `cargo-zigbuild`, and no board to copy
+libudev from, which is what makes it the answer before you have a board at all. It builds inside
+Debian Bookworm on arm64, so on an Apple Silicon Mac the target is the host: nothing is
+cross-compiled and libudev is just installed. Same artifact, same `--dry-run` and `--bootstrap`.
+
+Slower to start — a first build compiles the workspace inside the container, and the two modes
+keep separate `target/` directories, so switching costs one full rebuild. Reach for it when the
+zig path is not set up or has broken; the default is faster day to day and is what CI uses.
+
+Verify without installing:
+
+```bash
+scripts/dev-push.sh --dry-run radxa@<board>
+```
+
+**This is an ordinary update.** It goes through `robotctl update apply --from <dir>`, so the
+signature, the artifact hash, compatibility, the health gate and auto-rollback all run — a build
+that does not come up is reverted and the board is back on what it was running. The restart traps
+above still apply: `btd` and `updaterd` keep running the old binary until they are restarted.
+
+The version is `<crate>-dev.local.<epoch>.g<sha7>`, so `robotctl version` on the board says which
+push it is running and two pushes of the same dirty tree never collide.
+
+To install what is already in that directory, or to point at one you filled yourself:
+
+```bash
+sudo robotctl update apply daemon --from /var/tmp/duck-sideload
+```
+
+### The first push to a board below 0.5.0
+
+`apply --from` is part of the release being pushed: it needs API version 7, which first ships in
+0.5.0. A board running anything earlier has an `updaterd` that cannot be asked to use it, and says
+so — `robotctl` and `updaterd` report an API mismatch and refuse the call rather than quietly
+installing from the configured source instead. Deliver it once the ungated way, which stops
+`robotd` and gives up the health gate for that one install:
+
+```bash
+scripts/dev-push.sh --bootstrap radxa@<board>
+```
+
+Every push after that is the ordinary command.
+
 ## From a laptop — `btctl`
 
 A deliberately small subset of the robot API over Bluetooth LE — a test stand-in for the phone app,
