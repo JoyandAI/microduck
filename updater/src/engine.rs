@@ -778,7 +778,7 @@ impl Engine {
         // has none to restart — a model, or the bootstrap install, which forces it precisely
         // because nothing is installed yet and there is no running daemon to make stale.
         if matches!(cfg.on_apply, ApplyAction::Restart { .. }) {
-            self_test_updaterd(release_dir).await?;
+            self_test_updaterd(release_dir, self.config.loaded_from.as_deref()).await?;
         }
 
         emit(Phase::HealthGate, None);
@@ -1797,7 +1797,7 @@ const DEFERRED_RESTART_DELAY: &str = "5s";
 ///
 /// A release with no `updaterd` — a model component, or one predating the flag — passes. The point
 /// is to catch a broken replacement, not to require every artifact to contain one.
-async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
+async fn self_test_updaterd(release_dir: &Path, config: Option<&Path>) -> Result<(), Error> {
     let binary = release_dir.join("bin").join("updaterd");
     if !binary.is_file() {
         return Ok(());
@@ -1805,6 +1805,13 @@ async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
 
     let mut command = tokio::process::Command::new(&binary);
     command.arg("--self-test");
+    // The config *this* engine was loaded from, not the flag's default. Without it the probe reads
+    // `/etc/robot/updater.toml` whatever the running daemon was started with, so on any board using
+    // `--config` it validates a file that is not in use — and reports the release as broken when
+    // that file does not exist. Found by `scripts/systemd-test.sh` on its first run.
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
 
     // Through the retry, and this is the call that most needs it: the binary being exec'd was
     // written by *this update*, moments ago, while hooks and `systemctl` were spawning around it —
@@ -2210,7 +2217,7 @@ esac
             "#!/bin/sh\necho 'config error: unknown field `nope`' >&2\nexit 1\n",
         );
 
-        let err = self_test_updaterd(release.path()).await.unwrap_err();
+        let err = self_test_updaterd(release.path(), None).await.unwrap_err();
 
         assert!(
             matches!(err, Error::SelfTest(_)),
@@ -2225,7 +2232,7 @@ esac
     #[tokio::test]
     async fn a_replacement_updaterd_that_starts_passes() {
         let release = release_with_updaterd("#!/bin/sh\nexit 0\n");
-        assert!(self_test_updaterd(release.path()).await.is_ok());
+        assert!(self_test_updaterd(release.path(), None).await.is_ok());
     }
 
     /// Model components ship no `updaterd`, and neither do releases predating the flag. Requiring
@@ -2233,7 +2240,7 @@ esac
     #[tokio::test]
     async fn a_release_without_an_updaterd_passes() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(self_test_updaterd(dir.path()).await.is_ok());
+        assert!(self_test_updaterd(dir.path(), None).await.is_ok());
     }
 
     /// The two lists are one decision, and splitting them is how a daemon gets excluded from the

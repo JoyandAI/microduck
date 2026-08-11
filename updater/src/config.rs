@@ -14,6 +14,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// The file this was read from, when it was read from one.
+    ///
+    /// Not configuration — it is how the engine hands the *same* config to the release's own
+    /// `updaterd --self-test` before committing to it. That check exists to catch a new binary
+    /// which rejects the board's `updater.toml`, and it can only do that if it is pointed at the
+    /// file in use: `--config` has a default, so a self-test run without one silently validates
+    /// `/etc/robot/updater.toml` however the running daemon was started. It read as the release
+    /// being broken.
+    ///
+    /// `None` when the config came from text rather than a path — every test, and nothing on a
+    /// board.
+    #[serde(skip)]
+    pub loaded_from: Option<PathBuf>,
+
     /// Directory of trusted minisign public keys. A signature is valid if it
     /// verifies against *any* key in here.
     ///
@@ -333,7 +347,11 @@ impl Config {
             path: path.to_path_buf(),
             source: e,
         })?;
-        Self::from_toml(&text)
+        let mut config = Self::from_toml(&text)?;
+        // Absolute, because the self-test runs as a fresh process whose working directory is not
+        // this one's.
+        config.loaded_from = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        Ok(config)
     }
 
     /// Bounds applied when extracting an artifact.
