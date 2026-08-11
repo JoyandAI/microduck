@@ -51,6 +51,12 @@ fi
 
 FIXTURE=target/board-fixture
 
+# The installer checks work from a real artifact rather than a fixture release: staged binaries,
+# the packaged artifact, and the tree unpacked out of it.
+INSTALL_STAGED=target/board-install/staged
+INSTALL_DIST=target/board-install/dist
+INSTALL_RELEASE=target/board-install/release
+
 echo "==> cross-compiling for aarch64-unknown-linux-gnu (glibc <= $GLIBC_FLOOR)"
 # pkg-config has to be told it is allowed to answer for another architecture, and where
 # that architecture's .pc files live. Without both, libudev-sys (via gilrs, via padd)
@@ -72,6 +78,72 @@ echo "==> minting release fixtures"
 rm -rf "$FIXTURE"
 cargo run -q -p test-support --example fake-release -- "$FIXTURE" --prefix /tmp/duck \
     1.0.0 1.1.0 1.2.0:tamper 2.0.0 3.0.0 | sed 's/^./    &/'
+
+# A real artifact, for the installer checks at the end.
+#
+# `xtask package` from the binaries just cross-compiled, with the staging and `--include` lists
+# read out of the packaging workflow — so this is the artifact production builds, not an
+# approximation of one. The fixture releases above deliberately carry no systemd units, and units
+# are the whole subject of those checks.
+#
+# Unpacked here rather than in the container because the zstd *binary* is the one tool the
+# target image lacks, and an apt-get in the middle of a hermetic check buys a network
+# dependency to save nothing.
+echo "==> packaging a release for the installer checks"
+rm -rf "$INSTALL_STAGED" "$INSTALL_DIST" "$INSTALL_RELEASE"
+mkdir -p "$INSTALL_STAGED" "$INSTALL_RELEASE"
+
+# Both lists parsed from the workflow, for the reason xtask/tests/artifact.rs exists: a copy
+# kept here would be a third hand-maintained list to drift from the other two.
+#
+# `_build-release.yml`, because that is where the recipe lives: `release.yml` decides which channel
+# is being published and calls it, and holds no `cp` or `--include` line of its own. Parsing the
+# entry point instead produced an empty list and a failure two hundred lines later —
+# "the installed release has no systemd/updaterd.service" — so the emptiness is now checked here,
+# where it can name its own cause.
+PACKAGING_WORKFLOW=.github/workflows/_build-release.yml
+
+staged_binaries="$(grep -o -- 'release/[a-z]* staged/' "$PACKAGING_WORKFLOW" \
+    | sed 's|release/||; s| staged/||' | sort -u)"
+if [ -z "$staged_binaries" ]; then
+    echo "error: no staged binaries found in ${PACKAGING_WORKFLOW}." >&2
+    echo "       The parse has stopped matching its 'cp ... staged/' lines, so the artifact" >&2
+    echo "       would carry no binaries and the installer checks would fail 200 lines later" >&2
+    echo "       with 'the installed release has no systemd/updaterd.service'." >&2
+    exit 1
+fi
+
+for binary in $staged_binaries; do
+    cp "$TARGET_DIR/$binary" "$INSTALL_STAGED/"
+done
+
+# `set --` at the top level is safe: this script takes no arguments. It is how POSIX sh builds
+# an argument list without an array, and quoting each pair matters — a bare expansion splits
+# `docs/deploy.md=docs/deploy.md` on nothing and a path with a space on everything.
+set --
+while IFS= read -r pair; do
+    set -- "$@" --include "$pair"
+done <<INCLUDES
+$(grep -o -- '--include "[^"]*"' "$PACKAGING_WORKFLOW" | sed 's/--include //; s/"//g')
+INCLUDES
+
+if [ "$#" -eq 0 ]; then
+    echo "error: no --include pairs found in ${PACKAGING_WORKFLOW}." >&2
+    echo "       The artifact would carry no units, and the installer checks below are" >&2
+    echo "       entirely about units." >&2
+    exit 1
+fi
+
+# Level 1: this artifact is unpacked once and thrown away. The shipping default of 19 is
+# single-threaded and would cost more than every check below put together.
+cargo run -q -p xtask -- package \
+    --version "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
+    --bin-dir "$INSTALL_STAGED" \
+    --out "$INSTALL_DIST" \
+    --zstd-level 1 \
+    "$@" | sed 's/^/    /'
+
+zstd -dc "$INSTALL_DIST"/daemon-*.tar.zst | tar -x -C "$INSTALL_RELEASE"
 
 echo
 echo "==> what we built"
@@ -253,7 +325,7 @@ kill $DAEMON2 2>/dev/null || true
 # the point here is the socket, the authorisation and the outcome codes rather than D-Bus.
 mkdir -p /var/lib/robot/config
 setpriv --regid robot --clear-groups \
-    /bin/robot/configd --fake-net --socket /run/c.sock \
+    /bin/robot/configd --fake-net --fake-pads --socket /run/c.sock \
     --state-dir /var/lib/robot/config --allow-user member \
     >/tmp/c.log 2>&1 &
 CONFIGD=$!
@@ -323,6 +395,46 @@ su member -s /bin/sh -c \
 su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock system pin" \
     | grep -q "012345"
 echo "    [ok] a pairing PIN keeps its leading zero"
+
+# ── the gamepad, through the same socket ──
+#
+# `pad.*` is the surface that replaced pairing a controller by hand with bluetoothctl, and it is
+# mutating: a bonded pad can enable the walking policy afterwards. So the authorisation matters as
+# much as the outcome, and it is checked the same way — a named user may, a group member may not.
+#
+# `--fake-pads` serves an in-memory set: there is no bluetoothd in a container, and what is under
+# test here is the socket, the gating and the answers rather than BlueZ.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad status" \
+    | grep -q "none paired"
+echo "    [ok] pad status reports no pad on a fresh robot"
+
+code=0
+su bystander -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad pair" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 6 || { echo "    [FAIL] pairing a pad should be denied (6), got $code"; exit 1; }
+echo "    [ok] an unnamed group member cannot pair a pad (exit 6)"
+
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad pair" \
+    | grep -q "paired  Xbox Wireless Controller"
+echo "    [ok] a named user pairs the pad that is in pairing mode"
+
+# Trusted, not merely paired. An untrusted pad looks right and does not reconnect after a reboot,
+# because approving a reconnection needs an agent and at boot there is none.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad status --json" \
+    | grep -q "\"trusted\":true"
+echo "    [ok] the paired pad is trusted, so it reconnects by itself"
+
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \
+    | grep -q "forgot"
+echo "    [ok] a pad can be forgotten"
+
+# Forgetting again is not an error — the same contract as `net forget`, and a client must not
+# present it as a failure.
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \
+    | grep -q "was not paired"
+echo "    [ok] forgetting an unknown pad is not an error"
 
 # The passphrase must not be in the journal. NetConnectParams has a hand-written Debug that
 # redacts it, and this is the check that keeps it honest on the shipped binary rather than in
@@ -419,15 +531,33 @@ grep -q "^console=display$" /boot/armbianEnv.txt
 test "$(grep -c uart2-m0 /boot/armbianEnv.txt)" = 1
 echo "    [ok] setup-board is idempotent on a second run"
 
-# The gamepad settings, which are the kind that fail silently: a pad that pairs and drops, or
-# a padd that reads nothing because the user is not in `input`.
-grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
-echo "    [ok] setup-board sets Privacy = device for gamepad pairing"
+# The gamepad setting, which is the kind that fails silently — and which this script had
+# BACKWARDS until a board proved it. `Privacy = device` makes an Xbox controller reject LE Secure
+# Connections pairing with `DHKey check failed (0x0b)`, because that check covers both addresses
+# and privacy pairs from a resolvable private one. See `configure_bluetooth`.
+#
+# It is the only part of gamepad readiness left in this script: reading the pad belongs to
+# padd.service and its `input` group now, and pairing one is `robotctl pad pair`.
+#
+# No apostrophes and no single quotes anywhere in this string. It is passed to the container
+# single-quoted, so one would end it early and run the rest on the host — which is exactly what
+# happened once, and it presented as a grep failing on a file the fixture had just written.
+grep -qE "^Privacy = off$" /etc/bluetooth/main.conf
+echo "    [ok] setup-board sets Privacy = off, which is what lets a pad bond"
 
 # Idempotent too: the second run above must not have added a duplicate key, which BlueZ
 # would read as a conflicting setting.
 test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
 echo "    [ok] Privacy is set exactly once"
+
+# The upgrade case, which is every board provisioned so far: the wrong value is already in the
+# file and has to be corrected rather than left alone. An absent setting and a wrong one need
+# different work, and only the first was ever tested.
+sed -i "s|^Privacy = off|Privacy = device|" /etc/bluetooth/main.conf
+ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board3.log 2>&1
+grep -qE "^Privacy = off$" /etc/bluetooth/main.conf
+test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
+echo "    [ok] a board carrying Privacy = device is corrected to off"
 
 # ── the generated preinstall hook ──
 #
@@ -472,6 +602,248 @@ test "$code" -ne 0 || { echo "    [FAIL] hook passed an unusable runtime"; exit 
 grep -q "1.20.1 is below 1.23" /tmp/hook2.log
 grep -q "cannot download ONNX Runtime" /tmp/hook2.log
 echo "    [ok] preinstall refuses an old runtime it cannot replace, naming the fix"
+
+# ── installing a real artifact: scripts/install.sh and hooks/postinstall ──
+#
+# The gap docs/project/install-path-gap.md option B names. Everything above drives the engine, which
+# lands a release; nothing ran the 892 lines that turn a landed release into a working board,
+# and nothing ran the hook that does the same job unattended inside the update gate. Four bugs
+# reached a board through that, and the two file-placing scripts were the only part of the
+# install path with no coverage at all.
+#
+# Behavioural, like the setup-board checks above and for the same reason: systemctl is stubbed
+# to record its arguments, so this asserts what the scripts *do*. A grep over them would pass
+# on a script that installed a unit into the wrong directory.
+#
+# The release is a real artifact, built by xtask package from the cross-compiled binaries and
+# the include list read out of the packaging workflow. Not the fixture releases the engine uses:
+# those carry no systemd units by design, and units are the whole subject here.
+
+mkdir -p /stub
+
+# install.sh reaches the network twice before it touches anything local — the releases API, for
+# the bootstrap binary and the tag whose config it should pair with, and raw.githubusercontent
+# for the trusted keys. Both are answered out of the checkout.
+cat > /stub/curl <<"STUB"
+#!/bin/sh
+# Enough of curl for the two callers in install.sh: -fsSL [-H hdr] -o <dest> <url>.
+dest=""
+url=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) dest="$2"; shift 2 ;;
+        -H) shift 2 ;;
+        -*) shift ;;
+        *)  url="$1"; shift ;;
+    esac
+done
+case "$url" in
+    */releases/latest)
+        cp /stub/releases-latest.json "$dest" ;;
+    *raw.githubusercontent.com/*)
+        # Serve the repository copy of whatever was asked for. A path the checkout does not
+        # have must *fail* rather than produce an empty file: install.sh treats a missing spare
+        # key as a warning and a missing release-1 as fatal, and an empty file would look like
+        # a successful fetch of an unusable key.
+        path="${url#*raw.githubusercontent.com/}"
+        path="${path#*/}"
+        path="${path#*/}"
+        path="${path#*/}"
+        [ -f "/bin/$path" ] || exit 22
+        cp "/bin/$path" "$dest" ;;
+    *)
+        echo "stub curl: unexpected url $url" >&2
+        exit 22 ;;
+esac
+STUB
+
+# `id` and `name` must survive install.sh compacting this with `tr -d " \n" | tr "{" "\n"` and
+# then grepping one line for both. Hence the asset object opening its own brace with both
+# fields ahead of the nested uploader — the comment on resolve_bootstrap_asset records that
+# getting this shape wrong is how it failed against a real board.
+cat > /stub/releases-latest.json <<"JSON"
+{
+  "tag_name": "v9.9.9",
+  "assets": [
+    { "id": 4242, "name": "updaterd-bootstrap-aarch64", "uploader": { "login": "ci" } }
+  ]
+}
+JSON
+
+cat > /stub/systemctl <<"STUB"
+#!/bin/sh
+echo "$@" >> /stub/systemctl.log
+exit 0
+STUB
+chmod +x /stub/curl /stub/systemctl
+
+# The release, laid out exactly as the engine leaves one: a versioned directory under
+# releases/ with current pointing at it. By hand rather than through `updaterd install`,
+# because what is under test is the two things that run *after* a release is live, and the
+# engine install path is covered at the top of this file.
+REL=/opt/robot/daemon/releases/under-test
+mkdir -p "$REL"
+cp -a /bin/release/. "$REL"/
+ln -sfn releases/under-test /opt/robot/daemon/current
+
+# The operator files, pre-placed. install.sh never overwrites these — the behaviour that let a
+# board keep a stale on_apply list for months — so this takes the branch a re-install takes,
+# and substitutes the repository the way the fetch path would.
+mkdir -p /etc/robot
+sed "s|\"ORG/duck-daemon\"|\"pollen-robotics/microduck_daemon\"|" \
+    /bin/deploy/updater.toml > /etc/robot/updater.toml
+cp /bin/deploy/robotd.toml /etc/robot/robotd.toml
+
+# ── install.sh, the provisioning path ──
+#
+# The bootstrap download self-skips because a release is already live, which is the branch a
+# re-install takes and the reason no signing or network is needed here.
+PATH="/stub:$PATH" sh /bin/scripts/install.sh > /tmp/install.log 2>&1 || {
+    echo "    [FAIL] install.sh exited non-zero"
+    cat /tmp/install.log
+    exit 1
+}
+echo "    [ok] install.sh runs to completion on a board with a release already live"
+
+# Every unit the release ships, installed where systemd reads them. install.sh globs the
+# release directory rather than naming units, so this walks the same set rather than a list
+# that would need editing whenever a daemon is added.
+for src in "$REL"/systemd/*.service; do
+    name="$(basename "$src")"
+    test -f "/etc/systemd/system/${name}" \
+        || { echo "    [FAIL] ${name} was not installed"; exit 1; }
+    # Byte-identical: the unit belongs to the release, and an installer that wrote its own
+    # copy or an older one would still leave a plausible-looking file here.
+    cmp -s "$src" "/etc/systemd/system/${name}" \
+        || { echo "    [FAIL] ${name} differs from the one the release ships"; exit 1; }
+    test "$(stat -c %a "/etc/systemd/system/${name}")" = "644" \
+        || { echo "    [FAIL] ${name} is not mode 644"; exit 1; }
+done
+echo "    [ok] every unit the release ships is installed, unmodified, mode 644"
+
+# Accounts before units, or a unit naming a User= that does not exist fails to start and the
+# failure reads as a broken daemon.
+test -f /usr/lib/sysusers.d/robot.conf
+test -f /usr/lib/sysusers.d/btd.conf
+getent group robot >/dev/null \
+    || { echo "    [FAIL] the robot group was not created"; exit 1; }
+getent passwd btd >/dev/null \
+    || { echo "    [FAIL] the btd user was not created"; exit 1; }
+echo "    [ok] robot group and btd user exist, sysusers drop-ins installed"
+
+# Through `current`, not at a versioned directory: the symlink has to follow the active
+# release, or robotctl on PATH silently pins to whichever release installed it.
+link="$(readlink /usr/local/bin/robotctl)"
+case "$link" in
+    */current/bin/robotctl) ;;
+    *) echo "    [FAIL] robotctl points at ${link}, not through current"; exit 1 ;;
+esac
+test -e /usr/local/bin/robotctl \
+    || { echo "    [FAIL] the robotctl symlink does not resolve"; exit 1; }
+echo "    [ok] robotctl on PATH resolves through current"
+
+test -f /etc/systemd/journald.conf.d/10-robot.conf \
+    || { echo "    [FAIL] no journald drop-in, so logs will not survive a reboot"; exit 1; }
+grep -q "restart systemd-journald" /stub/systemctl.log
+echo "    [ok] journald drop-in installed and journald restarted"
+
+# daemon-reload before anything is enabled, or systemd enables the unit it had cached.
+grep -q "^daemon-reload$" /stub/systemctl.log
+for unit in updaterd robotd configd btd; do
+    grep -q "^enable --now ${unit}.service$" /stub/systemctl.log \
+        || { echo "    [FAIL] ${unit}.service was never enabled"; exit 1; }
+done
+reload_at="$(grep -n "^daemon-reload$" /stub/systemctl.log | head -1 | cut -d: -f1)"
+first_enable="$(grep -n "^enable --now" /stub/systemctl.log | head -1 | cut -d: -f1)"
+test "$reload_at" -lt "$first_enable" \
+    || { echo "    [FAIL] a unit was enabled before daemon-reload"; exit 1; }
+# configd before btd, because btd asks configd for the pairing PIN and a btd that starts first
+# refuses to pair until configd answers.
+configd_at="$(grep -n "^enable --now configd.service$" /stub/systemctl.log | cut -d: -f1)"
+btd_at="$(grep -n "^enable --now btd.service$" /stub/systemctl.log | cut -d: -f1)"
+test "$configd_at" -lt "$btd_at" \
+    || { echo "    [FAIL] btd was enabled before configd"; exit 1; }
+echo "    [ok] daemon-reload precedes every enable, and configd precedes btd"
+
+grep -q "keeping the existing /etc/robot/updater.toml" /tmp/install.log
+grep -q "keeping the existing /etc/robot/robotd.toml" /tmp/install.log
+echo "    [ok] the operator config files are preserved, not overwritten"
+
+# ── a second run must change nothing ──
+#
+# Provisioning gets re-run: a flaky download, a fresh key, an operator repeating a step. A
+# second pass that reported success while, say, appending to a config would be found on a
+# board and not here.
+find /etc/systemd/system /usr/lib/sysusers.d /etc/robot -type f | sort > /tmp/state1
+md5sum /etc/robot/updater.toml > /tmp/conf1
+PATH="/stub:$PATH" sh /bin/scripts/install.sh > /tmp/install2.log 2>&1 || {
+    echo "    [FAIL] the second install.sh exited non-zero"
+    cat /tmp/install2.log
+    exit 1
+}
+find /etc/systemd/system /usr/lib/sysusers.d /etc/robot -type f | sort > /tmp/state2
+cmp -s /tmp/state1 /tmp/state2 \
+    || { echo "    [FAIL] a second run changed which files exist"; diff /tmp/state1 /tmp/state2; exit 1; }
+md5sum -c /tmp/conf1 >/dev/null \
+    || { echo "    [FAIL] a second run modified updater.toml"; exit 1; }
+echo "    [ok] install.sh is idempotent"
+
+# ── a unit the script does not know must be installed and reported ──
+#
+# The release is the authority on what it contains, so an unrecognised unit is installed
+# anyway; but install.sh cannot know where it belongs in the start order, so it says so rather
+# than starting it blindly. That warning is how adding a daemon stays one line here instead of
+# a silent omission, and a refactor could drop it without any other test noticing.
+cp "$REL"/systemd/robotd.service "$REL"/systemd/sentinel.service
+PATH="/stub:$PATH" sh /bin/scripts/install.sh > /tmp/install3.log 2>&1
+test -f /etc/systemd/system/sentinel.service \
+    || { echo "    [FAIL] an unrecognised unit was not installed"; exit 1; }
+grep -q "sentinel.service was installed but not enabled" /tmp/install3.log \
+    || { echo "    [FAIL] an unrecognised unit was installed with no warning"; exit 1; }
+echo "    [ok] a unit install.sh does not recognise is installed and reported, not started"
+
+# ── hooks/postinstall, alone ──
+#
+# The other half, and the one that matters more: this runs unattended on every update, inside
+# the gate, with nobody watching. Its job is that a release adding a daemon arrives working
+# without anyone touching the board — so it is asserted on a box with no units at all, which is
+# the state that would otherwise need install.sh to be re-run by hand.
+#
+# Hooks run with the release directory as the working directory; the hook exits early without
+# one, so getting this wrong would make the whole check vacuous.
+rm -f /etc/systemd/system/*.service /usr/lib/sysusers.d/*.conf /stub/systemctl.log
+# The journald drop-in and the robotctl symlink go too, so the asymmetry asserted at the end is
+# a real absence rather than a leftover from the install above.
+rm -f /etc/systemd/journald.conf.d/10-robot.conf /usr/local/bin/robotctl
+( cd "$REL" && PATH="/stub:$PATH" sh "$REL"/hooks/postinstall > /tmp/hook.log 2>&1 ) || {
+    echo "    [FAIL] hooks/postinstall exited non-zero, which fails an update"
+    cat /tmp/hook.log
+    exit 1
+}
+for src in "$REL"/systemd/*.service; do
+    name="$(basename "$src")"
+    test -f "/etc/systemd/system/${name}" \
+        || { echo "    [FAIL] postinstall did not install ${name}"; exit 1; }
+    grep -q "^enable --now ${name}$" /stub/systemctl.log \
+        || { echo "    [FAIL] postinstall did not enable ${name}"; exit 1; }
+done
+test -f /usr/lib/sysusers.d/robot.conf
+grep -q "^daemon-reload$" /stub/systemctl.log
+echo "    [ok] postinstall alone installs and enables every unit the release ships"
+
+# The asymmetry, pinned because it is easy to assume otherwise: the hook places units and
+# accounts and nothing else. Both of these were deleted above and the hook did not restore
+# either, so a release that added a journald drop-in or moved robotctl delivers neither on an
+# update — only install.sh does those, and it runs once, by hand, at provisioning time.
+#
+# Asserted rather than merely documented because the reasonable next change to this hook is to
+# make it place everything install.sh places, and the person making it should find a test that
+# states the current contract instead of discovering it on a board.
+test ! -f /etc/systemd/journald.conf.d/10-robot.conf \
+    || { echo "    [FAIL] postinstall now installs the journald drop-in"; exit 1; }
+test ! -e /usr/local/bin/robotctl \
+    || { echo "    [FAIL] postinstall now creates the robotctl symlink"; exit 1; }
+echo "    [ok] postinstall covers units and accounts only, as documented"
 '
 
 for image in $IMAGES; do
@@ -482,6 +854,8 @@ for image in $IMAGES; do
         -v "$PWD/$FIXTURE:/bin/fixture:ro" \
         -v "$PWD/scripts:/bin/scripts:ro" \
         -v "$PWD/hooks:/bin/hooks:ro" \
+        -v "$PWD/deploy:/bin/deploy:ro" \
+        -v "$PWD/$INSTALL_RELEASE:/bin/release:ro" \
         "$image" sh -c "$CHECKS"
 done
 

@@ -10,8 +10,15 @@ an error, which killed the control thread and made `robot.health` blame the wron
 fixed: `duck-control::policy::catching_ort_panics` turns it into a `PolicyError`, so it takes
 the existing "hold the pose and report why" path.
 
-**Still not run on hardware:** the fix itself, and slice 2's loop rate with inference in the
-tick. The recipe for both is [Verifying on the board](#verifying-on-the-board) below.
+**Both are now closed on hardware.** The fix was exercised on the board by pointing `robotd` at
+a 1.20.1 runtime through `ORT_DYLIB_PATH`: the loop kept ticking and health named the version
+mismatch, instead of a dead control thread reporting "has not completed a cycle yet". Slice 2
+then ran with inference in the tick, and `0.2.0` — the first release containing any of it — was
+installed from the stable channel.
+
+Nothing links to this file any more. It is kept as the record of what the board actually said;
+the reusable half is the recipe below, and [`cheatsheet.md`](../robot/cheatsheet.md) is where a command
+someone needs again should end up.
 
 ## What already works, verified on the board
 
@@ -111,20 +118,15 @@ what closes it.
 
 ## Verifying on the board
 
-The board needs the dev key once, or `--ref` is refused:
+The board needs the dev key once, or `--ref` is refused. `install.sh` does both halves —
+installing the key and flipping `allow_dev_keys` — given the path to the public half:
 
 ```bash
-sudo cp team.dev.pub /etc/robot/trusted_keys/
-```
-```bash
-sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updater.toml
-sudo systemctl restart updaterd
+sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
 ```
 
-`team.dev.pub` is deliberately not in the repository — `deploy/trusted_keys/README.md` explains
-why. Get the public half from Pierre, or regenerate it from the secret with
-`minisign -R -s <secret> -p team.dev.pub`. Once #18 is merged, `install.sh` does both steps
-given `DUCK_DEV_KEY=/path/to/team.dev.pub`.
+`team.dev.pub` is committed at `deploy/dev-key/`, outside `trusted_keys/` so nothing installs it
+by default. The by-hand equivalent is in [`../deploy/README.md`](../../deploy/README.md).
 
 Then:
 

@@ -12,7 +12,7 @@ must be triggerable from a companion mobile app with a few taps.
 
 We need a way to update the shipped software safely in the field.
 
-Sequencing and milestones live in [`roadmap.md`](roadmap.md).
+Sequencing and milestones live in [`roadmap.md`](../project/roadmap.md).
 
 The surrounding system — service split, IPC, state ownership, the robot API and
 remote/WebRTC access — is covered in [`architecture.md`](architecture.md). This
@@ -105,8 +105,62 @@ survive a daemon crash to perform rollback.
 **Corollary — `updaterd` must be resident, and must exclude itself from the
 restart set.** `updaterd` and `btd` both ship *inside* the daemon artifact, so a
 naive "restart everything" would kill the executor mid-swap or mid-health-gate.
-`on_apply` therefore restarts `robotd` and `mediad` only; `updaterd` and `btd`
-pick up the new binary at the next boot or an explicit later restart.
+`on_apply` therefore restarts everything the release ships **except** those two, which pick up the
+new binary at the next boot or an explicit later restart.
+
+The set is derived from the release's own `systemd/*.service` files rather than read from the
+board's config, and the two exclusions live in code (`NEVER_RESTART`) rather than in configuration:
+they are properties of what those daemons *are*, not choices an operator should be able to get
+wrong. The earlier design put the list in `/etc/robot/updater.toml`, which `install.sh` preserves —
+so a board provisioned before a daemon existed never restarted it, and the update said success
+anyway (`install-path-gap.md` §4).
+
+**What this does not cover, and the shape of the answer.** Not restarting `updaterd` protects the
+*in-flight* update. It says nothing about whether the new `updaterd` works, and it defers finding out
+to the next boot — by which time the update is committed, nobody is watching, and recovery lives in
+`Engine::recover_on_start`, i.e. **inside the process that is failing to start**. `Restart=on-failure`
+then crash-loops a few times and gives up, leaving a robot with no update daemon and no way to update
+out of it. That contradicts the promise that recovery works when the robot is already broken.
+
+Two layers close it, and they catch different things. **The first is implemented**; the second is
+its own PR.
+
+1. **Self-test the new binary before committing**, and restart `updaterd` after the reply is sent.
+   A read-only mode — config loaded, engine constructed, exiting *before* recovery — catches a wrong
+   architecture, a missing library, an immediate panic, and the likely one: a new `updaterd` that
+   rejects the board's existing `updater.toml`, which is the operator's file and preserved across
+   installs. Failing there rolls back cheaply, with no reboot. The restart must be **detached**,
+   because the engine runs inside the `update.apply` RPC and would otherwise hand the client a broken
+   pipe instead of its outcome. The same "restart after replying" reasoning extends to `btd`.
+
+   Note what the *existing* `--check-only` is not: it runs `recover_on_start` for real before honouring
+   the flag, so it increments every armed trial's boot count and can revert an update. It is an
+   operator tool, not a probe, and using it mid-update would have a second engine mutating the store
+   the first one is working on.
+
+   As built: `self_test_updaterd` runs after the shipped units restart and before the health gate,
+   only where `on_apply` is a restart — a model component has no `updaterd`, and the bootstrap
+   install forces `on_apply=none` precisely because nothing is installed yet. `Error::SelfTest`
+   carries the binary's last line of stderr, so "config error: unknown field `foo`" reaches the
+   rollback reason rather than being flattened into "unreachable".
+
+   The restarts go through `systemd-run --on-active=5s`, and two details there are load-bearing. A
+   *child process* would sit in `updaterd`'s cgroup and be killed partway through restarting its own
+   parent; a transient unit is not. And the update lock is dropped **before** anything is spawned,
+   because a fork duplicates every open descriptor in the process — including locks held by other
+   engines in the same process, which surfaced as unrelated operations failing with `Busy` in the
+   test suite.
+
+2. **A boot-time net outside `updaterd`**, for what slips through. `OnFailure=` on a curated set of
+   units fires exactly when one exhausts its restarts, and a tiny oneshot swaps `current` to golden and
+   reboots. Four constraints make it a net rather than a footgun: the set is curated (`btd`
+   legitimately fails on a board whose radio has not appeared, and reverting a good release over that
+   is a poor trade); it reads a `golden` **symlink** rather than parsing config, because a release that
+   breaks the config parser must not also break its own rescue; it needs a loop guard and must not fire
+   when `current` is already golden; and it cannot fix hardware — a `robotd` that fails for want of
+   servo power fails identically on golden, the same distinction the health gate draws between
+   unhealthy and degraded. Golden rather than previous, deliberately: when the recovery path itself is
+   what broke, previous may be broken too.
 
 This is also why the update logic cannot live in `btd`: as a client of the
 update, `btd` cannot be the thing performing it — it would kill itself partway
@@ -261,7 +315,7 @@ Three things this table encodes, each easy to get wrong:
    against a leaked key file. ≥128 bits, e.g. `openssl rand -base64 24`.
 
 Releases are signed **in CI**, not locally — a deliberate choice, with the approval gate
-that compensates for it documented in [`ci-setup.md`](ci-setup.md).
+that compensates for it documented in [`ci-setup.md`](../project/ci-setup.md).
 
 The dev key is deliberately unencrypted: CI signs non-interactively, and a passphrase
 stored beside the key it protects adds little. Its real protection is structural — it is
@@ -962,7 +1016,7 @@ pass/fail + the update log. Repeatable because reset-to-golden and
 |---|---|
 | `ci.yml` | fmt, clippy, tests, plus `board-test.sh` — the only job that proves the binaries run on aarch64 Linux |
 | `release.yml` | on a `daemon-staging-v*` tag: cross-build, package, sign, **verify with the robot's own code path**, publish a prerelease |
-| `promote.yml` | manual: re-sign a *stable* manifest pointing at the staging artifact |
+| `promote.yml` | manual: re-sign a *stable* manifest, copy the validated artifact onto the stable release, retire staging |
 
 The publisher is a Rust `xtask` rather than a shell script for one reason: it reuses the
 exact `minisign`, `tar`, `zstd` and `sha2` crates the updater verifies with. A shell
@@ -973,9 +1027,19 @@ links the *full* `minisign` crate (which can sign) while the daemon links only
 
 Three properties worth stating, because each is asserted rather than assumed:
 
-- **Promotion never rebuilds.** The stable manifest carries the staging `sha256` and
-  points at the staging artifact URL, so the bytes clients receive are the bytes the
-  canary validated; a test asserts the digest is unchanged.
+- **Promotion never rebuilds.** The stable manifest carries the staging `sha256`, and
+  promotion copies the staging artifact onto the stable release after checking that
+  digest, so the bytes clients receive are the bytes the canary validated; a test asserts
+  the digest is unchanged.
+
+  The manifest used to point back at the *staging* release rather than copy, on the
+  reasoning that one set of bytes cannot diverge while two can. What that overlooked is
+  that the robot verifies `sha256` before installing, so a diverged copy could never
+  install silently — while a stable channel whose artifacts live under a tag named like
+  scaffolding is one cleanup away from breaking. It broke: deleting the
+  `daemon-staging-v0.1.x` releases left `daemon-v0.1.0`, `v0.1.1` and `v0.1.4` correctly
+  signed and pointing at a 404. Stable releases are now self-contained and staging is
+  retired by `promote.yml` itself.
 - **Artifacts are reproducible.** Fixed mtimes in the tar mean the same inputs produce
   the same archive, so a rebuild can be compared against what shipped; a test asserts two
   packages of the same inputs hash identically.
@@ -988,18 +1052,24 @@ doesn't match `Cargo.toml` (tagging without bumping), and `promote` refuses a ve
 that doesn't match the staging manifest.
 
 - Channels: `staging` → `stable`. CI publishes candidates to `staging`.
-- A canary robot takes a candidate **by explicit version**, not by tracking the channel:
+- A canary robot takes a candidate with **one flag, per command**:
 
   ```
-  sudo robotctl update apply daemon --version 0.2.0
+  sudo robotctl update apply daemon --staging
   ```
 
-  with `tag_prefix = "daemon-staging-v"` in its config, which resolves the tag directly. An
-  earlier draft said canaries "auto-pull staging", and that is not implementable as written:
+  An earlier draft said canaries "auto-pull staging", and that was not implementable as written:
   `newest_version` skips anything GitHub flags as a prerelease *and* anything carrying a semver
-  prerelease component, with no opt-out — which is exactly what keeps a customer robot off
-  candidate builds, so the filter stays and the sentence goes. Discovered by a board reporting
-  `no releases in … with tag prefix "daemon-staging-v"` against a staging release that existed.
+  prerelease component. That filter is exactly what keeps a customer robot off candidate builds,
+  so it stays, and `--staging` is its only opt-in — a second scan under `staging_tag_prefix`
+  which allows the *GitHub* flag while still excluding semver prereleases, so a branch build can
+  never be mistaken for a candidate. `latest_manifest` is untouched, so `auto_apply` and the
+  periodic check keep resolving stable: nothing drifts onto a candidate without a person and
+  root.
+
+  The first attempt at this was a board pointed at staging by editing `tag_prefix`, which
+  reported `no releases in … with tag prefix "daemon-staging-v"` against a candidate sitting
+  right there — the prefix said where to look, and the prerelease filter refused to look.
 - On green, **promote**: repoint `stable` at the *same bytes* already validated —
   re-sign the `stable` manifest to reference the identical tarball + hash. No
   rebuild, no re-flash, no hand-copying files. Promotion is one command / one

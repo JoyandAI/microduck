@@ -5,8 +5,8 @@
 //! through the CLI would conflate wire behaviour with argument parsing and output
 //! formatting.
 //!
-//! The properties under test come from `docs/architecture.md` §1.1 and
-//! `docs/updater-design.md` §7: the socket is group-restricted, `status` stays
+//! The properties under test come from `docs/design/architecture.md` §1.1 and
+//! `docs/design/updater-design.md` §7: the socket is group-restricted, `status` stays
 //! answerable while an update runs, a client disconnecting mid-update does not
 //! cancel it, and error codes survive the round trip so clients can branch on them.
 
@@ -134,6 +134,8 @@ health = {{ probe = "socket", timeout = "2s" }}
         ))
         .unwrap();
         let keys = KeyRing::load(&config.trusted_keys_dir, false).unwrap();
+        // `without_deferred_restarts` for the same reason as `apply.rs`: engines run in parallel here
+        // and a fork in one holds another's update lock until it execs.
         Engine::new(
             config,
             keys,
@@ -143,6 +145,7 @@ health = {{ probe = "socket", timeout = "2s" }}
             faults,
         )
         .unwrap()
+        .without_deferred_restarts()
     }
 
     /// Serve in the background and return once the socket accepts connections.

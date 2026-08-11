@@ -36,7 +36,7 @@ pub enum Route {
     To(Upstream),
     /// Answered by `btd` itself. Only `system.authenticate`: the PIN check belongs to the
     /// transport, because BLE cannot express a fixed printed passkey and the check therefore had
-    /// to move up a layer (`docs/app-path-design.md` §5).
+    /// to move up a layer (`docs/design/app-path-design.md` §5).
     Local,
     /// Not available over this transport.
     Refused,
@@ -94,6 +94,20 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // Unlike `resetToGolden` it discards nothing.
         SystemReboot => Some(Upstream::Config),
 
+        // ── the gamepad ─────────────────────────────────────────────────────
+        //
+        // Pairing a controller from the phone, which is where it belongs: whoever is holding the
+        // robot is holding the pad, and the alternative is an ssh session. The same physical-presence
+        // argument §4.2 makes for `net.connect` covers it — a pad has to be in the room, in pairing
+        // mode, in a fifteen-second window — and it is `configd` that does the work either way.
+        //
+        // `pad.pair` is the more consequential of the two, because a bonded pad can enable the
+        // policy afterwards. That is deliberate: it is the same authority as standing next to the
+        // robot with a controller, and the PIN gate is what stands in front of it.
+        PadStatus => Some(Upstream::Config),
+        PadPair(_) => Some(Upstream::Config),
+        PadForget(_) => Some(Upstream::Config),
+
         // Answered by `btd`, so it has no upstream. See `route_for`.
         SystemAuthenticate(_) => None,
 
@@ -131,6 +145,12 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // retransmitted (§5.2). A 20-byte notification budget and a link that does not exist for
         // the first ~73s of a boot is not a control transport.
         RobotMove(_) | RobotHead(_) | RobotEnable(_) => None,
+
+        // Power to the joints. A phone button that drops the robot on the floor is not one to
+        // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
+        // which wants the person doing it to be looking at the robot rather than at a screen. Both
+        // are `robotctl` on the robot, deliberately.
+        RobotInit | RobotRelax => None,
 
         // `robot.stop` deserves its own line, because refusing it looks wrong. An emergency stop
         // in the app is exactly what someone reaches for, and §6 does say local should preempt
@@ -207,8 +227,34 @@ mod tests {
                 proto::method::NET_FORGET,
                 proto::method::SYSTEM_SET_NAME,
                 proto::method::SYSTEM_REBOOT,
+                // Bonding a gamepad, which afterwards can enable the walking policy. Allowed for
+                // the same reason as provisioning: it takes a pad held in pairing mode next to the
+                // robot, so BLE's physical-presence claim (§4.2) is not being stretched — and the
+                // alternative is an ssh session, which is not a thing an owner has.
+                proto::method::PAD_PAIR,
+                proto::method::PAD_FORGET,
             ]
         );
+    }
+
+    /// Pairing a controller from the phone reaches `configd`, which is the service that owns the
+    /// radio's configuration. `btd` must not answer this itself: it owns nothing (§4.1).
+    #[test]
+    fn a_pad_can_be_paired_from_the_phone() {
+        for call in [
+            proto::Call::PadStatus,
+            proto::Call::PadPair(proto::PadPairParams::default()),
+            proto::Call::PadForget(proto::PadForgetParams {
+                mac: "78:86:2E:BB:13:28".into(),
+            }),
+        ] {
+            assert_eq!(
+                route_for(&call),
+                Route::To(Upstream::Config),
+                "{}",
+                call.method()
+            );
+        }
     }
 
     /// The PIN must never be readable or writable over the radio.
@@ -389,10 +435,17 @@ mod tests {
             }),
             proto::Call::RobotStop,
             proto::Call::RobotEnable(proto::EnableParams { on: true }),
+            proto::Call::RobotInit,
+            proto::Call::RobotRelax,
             proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
             proto::Call::SystemPairingPin,
             proto::Call::SystemSetPairingPin(proto::SetPairingPinParams {
                 pin: "000000".into(),
+            }),
+            proto::Call::PadStatus,
+            proto::Call::PadPair(proto::PadPairParams::default()),
+            proto::Call::PadForget(proto::PadForgetParams {
+                mac: "78:86:2E:BB:13:28".into(),
             }),
         ]
     }

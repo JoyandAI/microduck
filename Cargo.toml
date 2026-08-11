@@ -1,7 +1,7 @@
 # Workspace root for the robot daemon.
 #
 # One crate per service or tool, matching the service split in
-# docs/architecture.md §1. `robotd`, `btd` and `mediad` join as siblings.
+# docs/design/architecture.md §1. `robotd`, `btd` and `mediad` join as siblings.
 [workspace]
 resolver = "3"
 members = ["btd", "configd", "duck-control", "duck-ipc-proto", "padd", "updater", "robotctl", "robotd", "test-support", "xtask"]
@@ -18,7 +18,7 @@ floor  = "1.23"
 target = "1.28.0"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 # 1.89 for `std::fs::File::try_lock`, which is how the single-flight update lock works
 # without a dependency (updater/src/journal.rs). Edition 2024 needs 1.85, so this covers

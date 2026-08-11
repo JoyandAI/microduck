@@ -1,6 +1,6 @@
 //! End-to-end tests for the update state machine, over the `LocalDir` source.
 //!
-//! These are the Tier-1 mechanism tests from `docs/updater-design.md` §16.2: they
+//! These are the Tier-1 mechanism tests from `docs/design/updater-design.md` §16.2: they
 //! drive the **real engine code path** with no network and no robot, so they cannot
 //! drift from production behaviour. This is the suite that replaces manually
 //! reverting a robot, applying an update, and eyeballing the result.
@@ -230,7 +230,13 @@ health = {{ probe = "socket", timeout = "2s" }}
     fn engine(&self, robot: Box<dyn RobotClient>, faults: Faults, extra: &str) -> Engine {
         let config = self.config(extra);
         let keys = KeyRing::load(&config.trusted_keys_dir, config.allow_dev_keys).unwrap();
-        Engine::new(config, keys, robot, faults).unwrap()
+        // No deferred restarts: this file runs dozens of engines in parallel, and a `fork` in any one
+        // of them hands copies of the *others*' update locks to a child, which surfaced as
+        // `got Busy` in whichever test held a lock at that moment. See
+        // `Engine::without_deferred_restarts`.
+        Engine::new(config, keys, robot, faults)
+            .unwrap()
+            .without_deferred_restarts()
     }
 
     fn engine_healthy(&self) -> Engine {
@@ -1639,7 +1645,7 @@ async fn rollback_still_works_after_a_failed_select() {
     );
 }
 
-// ── installing by ref (the dev channel, `docs/roadmap.md` M2) ────────────────
+// ── installing by ref (the dev channel, `docs/project/roadmap.md` M2) ────────────────
 
 /// **A ref installs what that branch last built.**
 ///

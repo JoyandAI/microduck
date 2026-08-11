@@ -3,7 +3,7 @@
 Status: draft · Date: 2026-07-29 · Owner: pierre
 
 Implements the `robotd` row of [`architecture.md`](architecture.md) §1 and covers
-[`roadmap.md`](roadmap.md) M3. Scoped deliberately to the first two increments; everything
+[`roadmap.md`](../project/roadmap.md) M3. Scoped deliberately to the first two increments; everything
 beyond them is in §10.
 
 The prototype being absorbed is
@@ -310,7 +310,11 @@ a normal update carries the policy, and a dev points the path at their own `.onn
 iterates without cutting a release.
 
 Everything is validated at **load**, not at inference: observation width, action count, and
-whether ONNX Runtime is present at all. A warm-up inference runs before the loop starts,
+whether ONNX Runtime is present at all. Both files must be **61-input, 14-output** — every
+alpha policy is `obs[1,61] -> actions[1,14]`, checked at load rather than discovered
+mid-stride. `microduck_runtime` also ships a 51-D family, using the legacy 3-value command
+instead of the unified 13; those load only under its `--new-cmd-obs=false` path, and `robotd`
+refuses them with `observation width is 51, expected 61`. A warm-up inference runs before the loop starts,
 which both pays the first-call cost off the hot path — where it would look identical to a
 missed deadline — and proves the dylib resolved.
 
@@ -453,6 +457,61 @@ and any remote client is the one a developer exercises every day, so it cannot q
 For dev, `ssh -L /tmp/robotd.sock:/run/robotd.sock` gives pad-on-laptop, robot-on-board with
 no code.
 
+On the robot it is `padd.service`, running from boot and driving whatever pad connects — safe
+with no pad, because it sends nothing and the deadman holds the robot. It stays **unprivileged**,
+which is the load-bearing part of "the gamepad is a client": its `input` and `robot` group
+membership is all it has. Pairing a pad therefore belongs to `configd` (`architecture.md` §1),
+not here — bonding a device needs root and BlueZ, and a `padd` holding either would no longer be
+exercising the API the app will use.
+
+### 5.7.1 Enabling the policy brings the robot up
+
+`robot.enable` used to flip a flag and nothing else. Torque came from `robotd init`, a separate
+subcommand that opens the motor bus itself — so it needs the daemon stopped, it appeared in no
+documentation, and pressing Start on a fresh robot did nothing visible: the policy ran, the loop
+wrote positions, and the servos ignored them.
+
+So the loop has a bring-up state, and an explicit `robot.enable` is what advances it:
+
+```
+Limp ──enable (policy loaded, not fallen)──▶ Homing (torque on, 2s ramp) ──▶ Ready ──▶ policy drives
+```
+
+**The invariant the old rule protected is unchanged: nothing here happens because a process
+started.** A `robotd` restarted by an update finds `Limp`, asks for no torque, and leaves a standing
+robot standing — `a_restart_asks_for_no_torque` asserts exactly that, on the absence of any write
+rather than on a write of `false`. What changed is that "never touch torque" was a broader rule than
+the property it was defending, and it put a manual step in front of every drive.
+
+Three conditions gate the bring-up, each for its own reason:
+
+- **A loaded policy.** `enable` means "enable the policy"; powering the joints to run one that is
+  disabled or would not load would stand a robot up on a broken release and then hold it.
+- **Not fallen.** `Safety::apply` commands a fallen robot at limp gain and holds it, so a ramp there
+  would be writing a stand-up that cannot happen. `robot.enable` refuses in that state and says to
+  stand the robot up first; `robotd init`, with the daemon stopped, is still how.
+- **A fresh sample.** The ramp starts from where the joints are. Starting from a position nobody read
+  is the lurch the ramp exists to avoid.
+
+Torque is *not* dropped when the policy is disabled again: the robot holds its pose, which is what
+"a standing robot stays standing" means on this side too.
+
+`robot.init` and `robot.relax` are the same two transitions, asked for directly — because "stand up"
+and "let go" are decisions of their own, and until now the first was a subcommand that opens the motor
+bus itself and the second did not exist at all. Both are served by `robotd`, so neither needs the
+daemon stopped and neither can write to the bus while the control loop is doing the same. `init`
+deliberately needs no policy: standing up is reasonable to ask of a robot with no walking network, and
+it is what makes the bring-up testable at all, since CI has no ONNX Runtime.
+
+They arrive as a *request* the loop takes once per tick rather than a flag it keeps applying: one
+`set_torque` is a bus transaction per joint, so a level would put sixteen writes into every tick. The
+later request replaces an unread earlier one — asked to stand up and then to let go within 20 ms, the
+second is what was meant. And `relax` clears `enabled`, or the next tick would see a robot that was
+asked to drive and stand it straight back up.
+
+Neither is reachable over BLE. A phone button that drops the robot on the floor is not one to offer,
+and standing up moves every joint at once, which wants whoever asked to be looking at the robot.
+
 ### 5.8 `safeToRestart` becomes real
 
 False while the policy is enabled and the robot is moving. Restarting motor control
@@ -467,8 +526,9 @@ restarts it cleanly with the gate passing; and `--unhealthy` still rolls back.
 **Built, not yet run on hardware.** Nothing in slice 2 has met a robot: no policy has been
 loaded on a board, no observation has reached a real ONNX Runtime, and the fall and deadman
 paths have only been exercised against `FakeIo`. The tests establish that the logic is
-self-consistent — not that the robot walks. Note also that `padd` cannot run on the board
-yet (§11.4), so the first hardware driving will be from a laptop over a forwarded socket.
+self-consistent — not that the robot walks. (`padd` on the board was open when this was
+written and is not any more — §11.4 — so driving no longer has to come from a laptop over a
+forwarded socket.)
 
 ### 5.10 The tick, end to end
 
@@ -586,6 +646,10 @@ lets a wedged loop report itself unhealthy instead of hanging the caller.
 A TOML file read at startup, **not watched** — live reload comes later. It lives outside
 `releases/<ver>/` so it survives update *and* rollback, next to the updater's own config at
 `/etc/robot/robotd.toml`.
+
+Belonging to the board rather than the release is what makes a hand-edited policy path stick:
+the defaults point inside `releases/<ver>/`, so an ordinary update keeps a policy alongside
+the binaries trained against it, and deleting the override goes back to that.
 
 Roughly ten values, not 142: control rate, gains, action scale, low-pass alphas, deadzone,
 max velocities, deadman timeout, policy paths. The flag explosion in the runtime was mostly

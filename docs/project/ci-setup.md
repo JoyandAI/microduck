@@ -2,7 +2,7 @@
 
 Status: draft · Date: 2026-07-28 · Owner: pierre
 
-One-time setup for the release pipeline. See [`updater-design.md`](updater-design.md)
+One-time setup for the release pipeline. See [`updater-design.md`](../design/updater-design.md)
 §5.4 for key custody and §16.3 for the staging → stable model.
 
 ## Decision: two keys, two triggers, and no gate on this plan
@@ -160,23 +160,63 @@ no benefit.
 
 ## Cutting a release
 
+**The GitHub releases page is the entry point.** What you create decides what happens, and
+`release.yml` reads the tag to work it out:
+
+| you create | mode | what CI does |
+|---|---|---|
+| pre-release, tag `daemon-staging-v0.4.0` | `staging` | cross-builds for aarch64, packages, signs with `release-1`, verifies through the real engine, publishes a **prerelease** |
+| release, tag `daemon-v0.4.0`, staging 0.4.0 exists | `promote` | re-signs a stable manifest over **the same artifact bytes** staging validated; no rebuild; retires the staging release |
+| release, tag `daemon-v0.4.0`, no staging 0.4.0 | `stable` | builds 0.4.0 and publishes it straight to stable, with the notes saying it was never canaried |
+
+The run summary names which of the three ran, because "which one was it" is the first question when a
+release looks wrong.
+
+Pushing the tag from a terminal does the same thing — the release object is created for you:
+
 ```
-git tag daemon-staging-v0.2.0 && git push --tags
+git tag daemon-staging-v0.4.0 && git push --tags
 ```
 
-`release.yml` then cross-builds for aarch64, packages, signs, verifies through the real
-engine, and publishes a **prerelease**. Nothing reaches robots on `stable` yet.
+Bump the workspace version first: `xtask package` refuses a tag that disagrees with `Cargo.toml`.
 
-After a canary robot has run the on-device checks, promote:
+Two properties worth knowing, because they are what the split is *for*:
+
+- A prerelease is skipped by a plain `update apply`, so an unpromoted build cannot reach a robot that
+  did not ask for it with `--staging`. Both publish steps re-assert the flag on a release that already
+  exists — a staging release someone drafted without ticking the box would otherwise be installable by
+  the whole fleet, and a stable one flagged as a prerelease would ship to nobody.
+- Promotion never rebuilds. The stable release ends up self-contained (manifest, signature, artifact,
+  bootstrap binary), which is why the staging release can be deleted afterwards. Stable releases from
+  before that was true — `daemon-v0.3.0` — still point their `url` at their staging release, so
+  **those staging releases must not be deleted.**
+
+The manual promotion is the same recipe without a release to create first, and is where
+`min_supported` lives (§8.1 — it forces robots below that version to update without waiting for a
+client):
 
 ```
-gh workflow run promote --field version=0.2.0
+gh workflow run promote --field version=0.4.0
 ```
 
-`promote.yml` re-signs a stable manifest pointing at the **same artifact bytes** staging
-validated — no rebuild. Add `--field min_supported=0.2.0` only when remediating a bad
-release (§8.1); it forces robots below that version to update without waiting for a
-client.
+### The workflows
+
+```
+release.yml            the entry point: decides staging / promote / stable
+_build-release.yml     build · package · sign · verify · publish        (called)
+_promote-release.yml   copy bytes · verify sha · re-sign · retire staging (called)
+promote.yml            workflow_dispatch → _promote-release.yml
+dev.yml                every push: an unsigned-for-customers dev build, `team.dev` key
+```
+
+The recipe lives in the two called workflows so the staging and stable paths cannot drift apart in
+what they ship. `xtask`'s packaging tripwires read `_build-release.yml` and `dev.yml` for the
+`--include` list, so a unit, hook or sysusers file that is not packaged fails a test rather than a
+robot.
+
+Both publish steps create the release only if it is absent and then upload with `--clobber`, so a job
+that failed halfway can be re-run. That was not true before: a release job that died after creating
+its release could only be retried by deleting the release and the tag by hand.
 
 ## Rotating a key
 

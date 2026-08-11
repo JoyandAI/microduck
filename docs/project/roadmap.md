@@ -2,8 +2,8 @@
 
 Status: draft · Date: 2026-08-05 · Owner: pierre
 
-Companion to [`architecture.md`](architecture.md) (what we're building) and
-[`updater-design.md`](updater-design.md) (how it ships). This is *order and sequencing*
+Companion to [`architecture.md`](../design/architecture.md) (what we're building) and
+[`updater-design.md`](../design/updater-design.md) (how it ships). This is *order and sequencing*
 — it will change; the design docs shouldn't.
 
 ## Where we are
@@ -14,16 +14,16 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | `duck-control/` | robot model · bus · IMU · `RobotIo` · observations · ONNX policy · safety — **slices 1–2 done, and run on a robot**. A library: no tokio, no sockets, no systemd |
 | `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
 | `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done, and it walks on a board**; no kinematics |
-| `padd/` | gamepad → intents, as an ordinary socket client — **done**, ships in the release; needs libudev, installed by CI and the board cross-build |
-| `robotctl/` | the operator CLI — `update`, `health`, `version`, `monitor`, `net`, `system`, `completions`; depends on `duck-ipc-proto`, not `updater`, so it stays on the recovery path |
+| `padd/` | gamepad → intents, as an ordinary socket client — **done**, ships in the release and runs as its own unit from boot, so pairing a pad is the only step; needs libudev, installed by CI and the board cross-build |
+| `robotctl/` | the operator CLI — `update`, `health`, `version`, `monitor`, `net`, `system`, `pad`, `completions`; depends on `duck-ipc-proto`, not `updater`, so it stays on the recovery path |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
 | `.github/` | ci · release · promote — **all three run for real**: `0.2.0` was tagged to staging, verified through the engine, installed on a board and promoted to stable on 2026-08-05, byte-identical (§16.3) |
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
-| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](app-path-design.md) §5.5 |
+| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](../design/app-path-design.md) §5.5 |
 | `configd/` | wifi over NetworkManager, robot name, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
-| tests | **425 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
+| tests | **458 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | missing | `mediad`, app, SDK |
 | on hardware | walking through the intent API, the update path (install · health gate · commit · auto-rollback), a signed release installed from the stable channel, BLE provisioning of wifi. The loop held 50.0 Hz with `missed=3` in 15022 ticks before inference |
 | not on hardware | the numbers M4 exists for: thermals, eMMC write timing, battery under load, and whether logs survive a power cut. The 30s health-gate timeout is still a guess |
@@ -106,7 +106,7 @@ sudo robotctl update apply daemon --ref my-branch
 Two properties make this safe on every push, both enforced away from the workflow:
 
 - A dev build **cannot become `latest`** — the version is a semver prerelease, and
-  `version_from_tag` refuses to read a dev tag as a release version.
+  `version_under` refuses to read a dev tag as a release version.
 - A dev build **cannot install on a customer robot** — `allow_dev_keys` is false there, and a
   trusted key only counts as a dev key if its filename ends `.dev.pub`.
 
@@ -122,7 +122,7 @@ has none. See `updater-design.md` §6.1.
 
 ### M3 — `robotd` for real  ·  **done**, in two slices
 
-Designed in [`robotd-design.md`](robotd-design.md). `robotd` **replaces**
+Designed in [`robotd-design.md`](../design/robotd-design.md). `robotd` **replaces**
 `microduck_runtime`, by extracting its control core into `duck-control` rather than
 reimplementing it — so the prototype keeps running while the daemon grows, and parity
 arrives as a consequence of the extraction instead of as a race against a moving target.
@@ -224,7 +224,7 @@ bricked release recovers without a laptop.
 ```
 duck-ipc-proto/ wire types — serde/serde_json/semver only; btd/robotd/robotctl depend
                 on this, never on updater
-configd/        wifi (NetworkManager), robot name, pairing PIN, reboot
+configd/        wifi (NetworkManager), robot name, pairing PIN, reboot, gamepad pairing (BlueZ)
 updater/        engine + updaterd
 robotctl/       CLI
 robotd/         control, gait, safety — no kinematics yet

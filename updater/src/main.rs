@@ -9,7 +9,7 @@
 //! reverting by the time anything can ask it to do something else.
 //!
 //! This process must be resident and must exclude *itself* from the units it
-//! restarts — see `docs/updater-design.md` §4.
+//! restarts — see `docs/design/updater-design.md` §4.
 //!
 //! **Resident is about triggers, not about applying.** Applying an update is a library
 //! call, and mutual exclusion is a file lock in `state_dir` rather than a property of
@@ -40,15 +40,38 @@ struct Args {
     /// `robotd`'s socket, used for the safe-to-restart and health probes.
     ///
     /// Absent or silent is fine — the engine treats an unreachable `robotd` as a
-    /// normal state (`docs/architecture.md` §1.1).
+    /// normal state (`docs/design/architecture.md` §1.1).
     /// Overrides `robot_socket` in the config. For running two updaterd instances on one
     /// dev box, or pointing at a stub robotd; a real deployment sets it in the config.
     #[arg(long, global = true)]
     robot_socket: Option<PathBuf>,
 
-    /// Run boot recovery, report what it would do, and exit without serving.
+    /// Run boot recovery, then exit without serving.
+    ///
+    /// Note this **performs** recovery rather than reporting it: `record_boot` advances every armed
+    /// trial and reverts one that is exhausted. An operator tool, not a probe — see `--self-test`
+    /// for the read-only one, and `updater-design.md` §4 for why the distinction cost an
+    /// investigation.
     #[arg(long, global = true)]
     check_only: bool,
+
+    /// Load the config, construct the engine, and exit. Touches no state.
+    ///
+    /// The probe an update runs against the release it just swapped in, before committing to it.
+    /// `updaterd` never restarts itself during an update, so a replacement binary that cannot start
+    /// is otherwise discovered at the *next boot* — after the commit, with nobody watching, and with
+    /// recovery living inside the process that is failing to start.
+    ///
+    /// Deliberately stops short of `recover_on_start`: running that mid-update would have a second
+    /// engine advancing the in-flight trial's boot count against the same store, and reverting the
+    /// update the first one is still performing.
+    ///
+    /// What it does exercise is what actually breaks: the binary loads and is the right
+    /// architecture, its libraries resolve, it does not panic on startup, and — the likely one — it
+    /// accepts the board's existing `updater.toml`, which belongs to the operator and is preserved
+    /// across installs while a release is free to change what it expects.
+    #[arg(long, global = true)]
+    self_test: bool,
 
     /// Enable a fault injection point (repeatable). Test/bench only — refused
     /// unless the config allows it, and never set on a client robot.
@@ -140,7 +163,7 @@ async fn robot_is_answering(robot: &dyn updater::robot::RobotClient) -> bool {
 /// At `warn` so it survives `RUST_LOG=warn` on a long-running board: identifying the running
 /// build is not a debug-level concern. `exe` is here because after an update `updaterd` is
 /// still running the *previous* binary by design, so which release directory a process came
-/// from cannot be inferred (`docs/architecture.md` §8).
+/// from cannot be inferred (`docs/design/architecture.md` §8).
 fn log_startup_identity(service: &str) {
     tracing::warn!(
         service,
@@ -545,6 +568,12 @@ async fn serve(args: Args) -> ExitCode {
         }
     };
 
+    // Before recovery, not after: this must not touch state. See the flag's documentation.
+    if args.self_test {
+        tracing::info!("--self-test: config loaded and engine constructed; not serving");
+        return ExitCode::SUCCESS;
+    }
+
     // BEFORE serving. A robot that booted into a bad release has already begun
     // reverting by the time anything can ask it to do something else.
     match engine.recover_on_start().await {
@@ -755,6 +784,43 @@ mod tests {
             Some(Command::Install { force, .. }) => assert!(force),
             other => panic!("expected Install, got {other:?}"),
         }
+    }
+
+    /// A robot answering in a shape we cannot read is still a robot that is *running*.
+    ///
+    /// `robot_is_answering` guards `install --force`, which swaps a release with no health gate
+    /// behind it. Its own doc comment already states the rule — "anything other than
+    /// `Unreachable` means a robot is running and must not have the release swapped out from
+    /// under it" — but before `Health::Incompatible` existed the code could not keep it: an
+    /// unparseable reply became `Unreachable`, so a live robot whose health shape had drifted
+    /// read as absent and `--force` proceeded. Exactly the robot least worth guessing about.
+    #[tokio::test]
+    async fn a_robot_answering_unreadably_still_counts_as_answering() {
+        struct Unreadable;
+
+        #[async_trait::async_trait]
+        impl updater::robot::RobotClient for Unreadable {
+            async fn safe_to_restart(
+                &self,
+                _: std::time::Duration,
+            ) -> updater::robot::SafeToRestart {
+                updater::robot::SafeToRestart::Unreachable
+            }
+            async fn health(&self, _: std::time::Duration) -> updater::robot::Health {
+                updater::robot::Health::Incompatible("missing field `imu`".into())
+            }
+            async fn model_api(&self, _: std::time::Duration) -> Option<u32> {
+                None
+            }
+            async fn remote_session_active(&self, _: std::time::Duration) -> bool {
+                false
+            }
+        }
+
+        assert!(
+            robot_is_answering(&Unreadable).await,
+            "an unreadable answer is still an answer; --force must refuse"
+        );
     }
 
     /// The engine emits progress once per network chunk, so a single 3.6 MB download wrote

@@ -23,7 +23,7 @@
 //! method with another method's parameters.
 //!
 //! Why JSON-RPC, why a unix socket, and what was measured against both:
-//! `docs/architecture.md` §2.2.
+//! `docs/design/architecture.md` §2.2.
 //!
 //! Dependencies stay at serde, serde_json and semver. Every service speaks these types,
 //! including the ones on the recovery path, so nothing here may pull in http, tar, crypto
@@ -41,10 +41,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// v2 added `HelloResult::revision`. v3 added the `net.*` and `system.*` namespaces. v4 added
 /// `system.authenticate`, which a BLE client must now pass before anything else is served — a v3
-/// client would otherwise have every call refused with no idea why. During
+/// client would otherwise have every call refused with no idea why. v5 added the `pad.*`
+/// namespace, which is additive — a v4 client loses nothing by not knowing it — and bumps anyway,
+/// because the version's job is to say "these two peers were not built together". During
+/// v6 added `robot.init` and `robot.relax`, so powering the joints stops being a subcommand that
+/// fights the daemon for the motor bus. During
 /// prototyping the wire shape simply changes and this bumps; no accommodation is made for
 /// peers that predate a field, because there are none in the field yet.
-pub const API_VERSION: u32 = 4;
+pub const API_VERSION: u32 = 6;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -146,6 +150,30 @@ pub mod method {
     /// Turn policy execution on or off.
     pub const ROBOT_ENABLE: &str = "robot.enable";
 
+    // ── power to the joints ──────────────────────────────────────────────────
+    //
+    // The pair, and they are a pair: nothing else in this API turns the motors on or off.
+    // `robot.enable` is about the *policy* — it can bring a limp robot up as a side effect of
+    // being asked to drive, but "stand up" and "let go" are their own decisions and deserve
+    // their own names.
+    //
+    // Both belong to `robotd` rather than to a subcommand, which is the point of adding them:
+    // `robotd init` opens the motor bus itself, so it needs the daemon stopped, and two writers
+    // on one UART corrupt each other's replies. The daemon owns the bus; ask the daemon.
+
+    /// Power the joints and ramp to the home pose.
+    ///
+    /// Unlike [`ROBOT_ENABLE`] this needs no policy: "stand up" is a reasonable thing to ask of a
+    /// robot with no walking network at all, and it is what a bench robot needs before anything
+    /// else can be tested.
+    pub const ROBOT_INIT: &str = "robot.init";
+
+    /// Cut power to the joints. **The robot will collapse** if nothing is holding it.
+    ///
+    /// Named `relax` rather than `limp` because `gain_limp` already means something else — the soft
+    /// yield a fallen robot is commanded at, which keeps torque on. This is the register.
+    pub const ROBOT_RELAX: &str = "robot.relax";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -186,6 +214,24 @@ pub mod method {
     pub const SYSTEM_SET_PAIRING_PIN: &str = "system.setPairingPin";
     /// Prove knowledge of the pairing PIN. Answered by the transport, not by a service.
     pub const SYSTEM_AUTHENTICATE: &str = "system.authenticate";
+
+    // ── pad.* ────────────────────────────────────────────────────────────────
+    //
+    // A gamepad, as a *thing paired to the robot* rather than as a control transport. `padd`
+    // reads the pad and sends intents; this namespace only decides which pad the board knows
+    // about, which is a Bluetooth question and therefore `configd`'s (it is the service that
+    // already owns the radio's configuration side, and the one running as root).
+    //
+    // Pairing is deliberately not `padd`'s own job: `padd` is an *unprivileged intent client*,
+    // and the whole point of it having no privileged access is that it exercises the same API the
+    // phone app will. Letting it configure BlueZ would have undone that.
+
+    /// Which pads this robot knows, and whether `padd` is driving from one.
+    pub const PAD_STATUS: &str = "pad.status";
+    /// Pair the gamepad that is in pairing mode now.
+    pub const PAD_PAIR: &str = "pad.pair";
+    /// Forget a pad, so it stops reconnecting.
+    pub const PAD_FORGET: &str = "pad.forget";
 }
 
 /// JSON-RPC error codes.
@@ -271,6 +317,10 @@ pub enum Call {
     RobotHead(HeadParams),
     RobotStop,
     RobotEnable(EnableParams),
+    /// Power the joints and ramp to the home pose. No policy needed.
+    RobotInit,
+    /// Cut power to the joints. The robot collapses if nothing holds it.
+    RobotRelax,
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -295,8 +345,13 @@ pub enum Call {
     /// other call here. BLE cannot express a fixed, printed-on-the-robot passkey — the spec has
     /// the *displaying* side generate a random one, and a headless robot can display nothing — so
     /// the PIN check moved from the link layer to this one, where we define the rules. See
-    /// `docs/app-path-design.md` §5.
+    /// `docs/design/app-path-design.md` §5.
     SystemAuthenticate(AuthenticateParams),
+
+    // ── pad.* ────────────────────────────────────────────────────────────────
+    PadStatus,
+    PadPair(PadPairParams),
+    PadForget(PadForgetParams),
 }
 
 impl Call {
@@ -322,6 +377,8 @@ impl Call {
             Call::RobotHead(_) => method::ROBOT_HEAD,
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
+            Call::RobotInit => method::ROBOT_INIT,
+            Call::RobotRelax => method::ROBOT_RELAX,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -333,6 +390,9 @@ impl Call {
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
             Call::SystemSetPairingPin(_) => method::SYSTEM_SET_PAIRING_PIN,
             Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
+            Call::PadStatus => method::PAD_STATUS,
+            Call::PadPair(_) => method::PAD_PAIR,
+            Call::PadForget(_) => method::PAD_FORGET,
         }
     }
 
@@ -355,6 +415,11 @@ impl Call {
                 | Call::SystemSetName(_)
                 | Call::SystemReboot
                 | Call::SystemSetPairingPin(_)
+                // Bonding a pad to this robot changes what may drive it, which is the most
+                // consequential thing in this namespace — a paired pad can enable the policy.
+                // `pad.status` is a read and stays ungated.
+                | Call::PadPair(_)
+                | Call::PadForget(_)
         )
     }
 
@@ -398,18 +463,23 @@ impl Call {
             Call::SystemSetName(p) => encode(p),
             Call::SystemSetPairingPin(p) => encode(p),
             Call::SystemAuthenticate(p) => encode(p),
+            Call::PadPair(p) => encode(p),
+            Call::PadForget(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
-            | Call::RobotStop => Value::Object(serde_json::Map::new()),
+            | Call::RobotStop
+            | Call::RobotInit
+            | Call::RobotRelax => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
             | Call::SystemInfo
             | Call::SystemReboot
-            | Call::SystemPairingPin => Value::Object(serde_json::Map::new()),
+            | Call::SystemPairingPin
+            | Call::PadStatus => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -444,6 +514,8 @@ impl Call {
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
+            method::ROBOT_INIT => Call::RobotInit,
+            method::ROBOT_RELAX => Call::RobotRelax,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -455,6 +527,17 @@ impl Call {
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
             method::SYSTEM_SET_PAIRING_PIN => Call::SystemSetPairingPin(decode(params)?),
             method::SYSTEM_AUTHENTICATE => Call::SystemAuthenticate(decode(params)?),
+            method::PAD_STATUS => Call::PadStatus,
+            // The only method here whose parameters are *all* optional, so an absent `params`
+            // member has to mean "defaults" rather than a parse error: `{"method":"pad.pair"}` is
+            // the everyday call, and a hand-written client will send exactly that. Every other
+            // method either needs its parameters or takes none at all, which is why this is one
+            // line here rather than a change to `decode`.
+            method::PAD_PAIR => {
+                let empty = Value::Object(serde_json::Map::new());
+                Call::PadPair(decode(params.or(Some(&empty)))?)
+            }
+            method::PAD_FORGET => Call::PadForget(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -777,6 +860,22 @@ pub enum Target {
     /// install of one looks like a downgrade. Refusing them would make the flow useless,
     /// and an operator naming a ref is stating intent as explicitly as naming a version.
     Ref(String),
+    /// The newest **release candidate** — what `release.yml` published to `staging` and
+    /// nobody has promoted yet.
+    ///
+    /// A candidate is unreachable any other way. It is flagged as a prerelease on GitHub, so
+    /// [`Target::Latest`] skips it by design — that filter is what keeps a robot from drifting
+    /// onto a build no one has validated, and it has no opt-out. This variant is the opt-*in*:
+    /// an operator with root saying "the one being tested", once.
+    ///
+    /// The candidate carries the same version the promoted release will (`0.3.0`, not
+    /// `0.3.0-rc1`) and is signed with the same release key. What separates the two streams is
+    /// the tag it lives under, which is why resolving this needs its own prefix rather than a
+    /// flag on the existing one.
+    Staging,
+    /// A named candidate, when the newest is not the one wanted — reinstalling the candidate a
+    /// board already ran after a rollback, or comparing two of them.
+    StagingExact(semver::Version),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -901,6 +1000,37 @@ pub struct SetPairingPinParams {
     pub pin: String,
 }
 
+// ── pad.* parameters ─────────────────────────────────────────────────────────
+
+/// Pair the gamepad that is in pairing mode now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadPairParams {
+    /// Which pad, when the address is already known. **Omit it in the normal case**: the point of
+    /// this call is not having to find a MAC address first, so the robot looks for a pad that
+    /// is in pairing mode and takes it. Supplying one narrows the search to that address, which
+    /// is what a room with several pads in it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+
+    /// How long to look, in seconds. `None` means the service's own default.
+    ///
+    /// A parameter because the caller knows something the robot does not: whoever typed this is
+    /// standing there holding the pad's pairing button, and a phone app offering "keep looking"
+    /// needs a longer window than a script does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+/// Forget one pad, by address.
+///
+/// The address, not "the connected one": forgetting is what you do to a pad that is *not* in the
+/// room any more — a colleague's controller that still steals the bond on boot — so identifying it
+/// by its current connection state would name the wrong thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadForgetParams {
+    pub mac: String,
+}
+
 // ── results ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -914,7 +1044,7 @@ pub struct HelloResult {
 }
 
 /// Where an in-flight update has got to. Mirrors the state machine in
-/// `docs/updater-design.md` §7.
+/// `docs/design/updater-design.md` §7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -1137,7 +1267,12 @@ pub struct LoopHealth {
 }
 
 /// The motor bus, as the loop sees it.
+///
+/// `#[serde(default)]` for the reason spelled out on [`ImuHealth`], and it applies here even more
+/// plainly: these are failure counters whose zero the doc comments below already call meaningful.
+/// An older `robotd` that omits one is saying "no failures", not "unknown".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BusHealth {
     /// Consecutive failed reads; any success resets it. One is ordinary on a serial bus,
     /// which is why the cumulative count is not what is reported.
@@ -1149,7 +1284,23 @@ pub struct BusHealth {
 }
 
 /// The IMU board, which rides the motor bus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `#[serde(default)]` on the struct, not on each field, and for the same reason the parent
+/// [`HealthResult`] carries `Default`: **a field added here must not make a newer reader reject
+/// an older `robotd` outright.** It did once. `consecutive_stale_blocks` was added below and
+/// released, and a branch predating it sent an `imu` section without the field — so a resident
+/// `updaterd` failed to parse the whole reply, `health` collapsed it to `Unreachable`, and the
+/// gate reverted a release from a robot that was serving its socket and running its loop at
+/// 50 Hz. An hour to find, because nothing in "not healthy within 30s: unreachable" points at a
+/// missing JSON field.
+///
+/// Sound here because every zero is *honest*: not converged, no stale reads, no run. Each one
+/// reads as "nothing to report", which is exactly what an older sender is saying. That argument
+/// is what makes this safe, and it is why the sibling sections carrying measurements —
+/// [`Battery`], [`MotorThermal`], [`LoopHealth`] — do **not** get the same treatment: a
+/// defaulted `percent: 0.0` would render as a flat pack on a robot with a full one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ImuHealth {
     /// Has the orientation filter converged?
     pub ready: bool,
@@ -1478,6 +1629,94 @@ pub struct RebootResult {
     pub in_seconds: u64,
 }
 
+// ── pad.* results ────────────────────────────────────────────────────────────
+
+/// A gamepad this robot knows about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pad {
+    /// `78:86:2E:BB:13:28`. The identity everything else here is keyed on.
+    pub mac: String,
+    /// As the pad calls itself — "Xbox Wireless Controller". Empty when BlueZ has no name for it
+    /// yet, which happens between discovery and pairing.
+    pub name: String,
+    /// Bonded: keys exchanged, so it can reconnect without pairing again.
+    pub paired: bool,
+    /// Trusted: BlueZ accepts its connection **without anyone approving it**, which is what makes
+    /// the pad work after a reboot with nobody logged in. A paired-but-untrusted pad looks paired
+    /// and does not reconnect, which is why this is reported separately rather than folded in.
+    pub trusted: bool,
+    /// Connected right now. This is the one that answers "why is the robot not moving".
+    pub connected: bool,
+}
+
+/// Whether `padd` — the process that turns a pad into intents — is running.
+///
+/// Reported alongside the pads because a connected pad and a dead `padd` is the failure that looks
+/// like working hardware, and it is not otherwise visible without knowing to ask systemd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverState {
+    /// Running. With a connected pad, the robot is drivable.
+    Active,
+    /// The unit exists and is not running. Someone stopped it, or it is failed.
+    Inactive,
+    /// No `padd.service` on this board — a release older than the one that added it.
+    Absent,
+    /// Could not ask: no systemd, or the query failed. Distinct from `Absent`, because "I do not
+    /// know" must not read as "it is not installed".
+    Unknown,
+}
+
+/// Answer to [`Call::PadStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadStatusResult {
+    /// Every pad the robot is bonded to, connected first.
+    pub pads: Vec<Pad>,
+    pub driver: DriverState,
+}
+
+/// Why pairing a pad failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadPairFailure {
+    /// Nothing that looks like a gamepad turned up. Usually the pad is not in pairing mode — on an
+    /// Xbox controller that is the sync button, and the light flashes fast rather than slow.
+    NotFound,
+    /// Several pads were in pairing mode, so the robot refused to guess. Retry with `mac`.
+    Ambiguous,
+    /// Found and then lost: it appeared in discovery but did not finish bonding in time.
+    Timeout,
+    /// No Bluetooth adapter. On this board `hci0` does not exist until roughly 73 seconds after
+    /// power-on, so this is a real answer early in a boot and not necessarily broken hardware.
+    NoAdapter,
+    /// BlueZ refused the bond. The classic cause on this board is `Privacy = device` missing from
+    /// `/etc/bluetooth/main.conf` — the pad pairs and drops straight back out.
+    Rejected,
+    Other,
+}
+
+/// Answer to [`Call::PadPair`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PadPairResult {
+    Paired {
+        pad: Pad,
+    },
+    Failed {
+        reason: PadPairFailure,
+        /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
+        detail: Option<String>,
+    },
+}
+
+/// Answer to [`Call::PadForget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadForgetResult {
+    /// False when no such pad was bonded — not an error, and a client should not present it as
+    /// one. Same contract as [`ForgetResult`].
+    pub removed: bool,
+}
+
 /// Re-exported so consumers spell version types with the *same* `semver` this crate
 /// compiled against. Without it, a crate depending on `semver` separately can end up with
 /// two incompatible copies of `Version` and a type error that reads as nonsense.
@@ -1593,6 +1832,8 @@ mod tests {
             }),
             Call::RobotStop,
             Call::RobotEnable(EnableParams { on: true }),
+            Call::RobotInit,
+            Call::RobotRelax,
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
             Call::NetStatus,
             Call::NetScan,
@@ -1615,6 +1856,14 @@ mod tests {
             Call::SystemAuthenticate(AuthenticateParams {
                 pin: "000000".into(),
             }),
+            Call::PadStatus,
+            Call::PadPair(PadPairParams {
+                mac: Some("78:86:2E:BB:13:28".into()),
+                timeout_seconds: Some(20),
+            }),
+            Call::PadForget(PadForgetParams {
+                mac: "78:86:2E:BB:13:28".into(),
+            }),
         ]
     }
 
@@ -1626,9 +1875,22 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            30,
+            35,
             "a Call variant was added or removed — update every_call() and this count"
         );
+    }
+
+    /// `pad.pair` with nothing in it is the *normal* call — "pair whatever pad is in pairing
+    /// mode" — and its fields are `skip_serializing_if`, so it is different bytes on the wire from
+    /// the populated form `every_call` covers. Both shapes have to survive.
+    #[test]
+    fn pairing_a_pad_needs_no_parameters() {
+        let call = Call::PadPair(PadPairParams::default());
+        let params = call.params();
+        assert_eq!(params, Value::Object(serde_json::Map::new()), "{params}");
+        assert_eq!(Call::parse(call.method(), Some(&params)).unwrap(), call);
+        // And an omitted `params` entirely, which is what a hand-written client sends.
+        assert_eq!(Call::parse(call.method(), None).unwrap(), call);
     }
 
     /// Every call must survive the wire unchanged.
@@ -1731,6 +1993,11 @@ mod tests {
                 method::SYSTEM_SET_NAME,
                 method::SYSTEM_REBOOT,
                 method::SYSTEM_SET_PAIRING_PIN,
+                // Bonding a pad decides what may drive this robot. `pad.status` must stay off this
+                // list: reading which pads are paired is exactly the kind of inspection support
+                // needs on a robot it is not allowed to reconfigure.
+                method::PAD_PAIR,
+                method::PAD_FORGET,
             ]
         );
     }
@@ -1908,6 +2175,45 @@ mod tests {
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), bench);
     }
 
+    /// An `imu` section from a `robotd` that predates a field must still parse.
+    ///
+    /// The regression this exists for reverted a good release. `consecutive_stale_blocks` was
+    /// added below and released; a branch that had merged `main` before that sent the section
+    /// without it, and the resident `updaterd` rejected the whole reply — so a robot serving its
+    /// socket with the loop at 50 Hz was reported as "not healthy within 30s: unreachable".
+    ///
+    /// Literal JSON rather than a struct with a field omitted, because a struct cannot express
+    /// "this field does not exist", which is the entire failure.
+    #[test]
+    fn an_imu_section_missing_its_newest_field_still_parses() {
+        let answer: HealthResult =
+            serde_json::from_str(r#"{"healthy":true,"imu":{"ready":true,"stale_blocks":3}}"#)
+                .unwrap();
+
+        let imu = answer
+            .imu
+            .expect("the section was sent, so it must survive");
+        assert_eq!(imu.stale_blocks, 3, "what was sent must be kept");
+        assert_eq!(
+            imu.consecutive_stale_blocks, 0,
+            "and what was not sent reads as nothing to report"
+        );
+        assert!(
+            !imu.frozen(),
+            "a default run must never look like a dead IMU"
+        );
+    }
+
+    /// Same for the bus counters, where a missing counter means "no failures" by construction.
+    #[test]
+    fn a_bus_section_missing_a_counter_still_parses() {
+        let answer: HealthResult =
+            serde_json::from_str(r#"{"healthy":true,"bus":{"consecutive_errors":2}}"#).unwrap();
+
+        assert_eq!(answer.bus.consecutive_errors, 2);
+        assert_eq!(answer.bus.startup_failures, 0);
+    }
+
     /// An absent battery must stay absent, not become zero volts.
     ///
     /// This is the answer for the first second after startup, for a bus that cannot reply,
@@ -2033,7 +2339,7 @@ mod tests {
         assert!(!serde_json::to_string(&open).unwrap().contains("psk"));
     }
 
-    /// `Target` must survive the wire in all three forms, and the two that carry data must
+    /// `Target` must survive the wire in all five forms, and the three that carry data must
     /// not be confusable. `latest` is a bare string while the others are single-key objects,
     /// which is what an externally-tagged enum with `rename_all = "snake_case"` produces —
     /// pinned here because this JSON is a contract with `btd` and the app, not an
@@ -2047,6 +2353,11 @@ mod tests {
                 r#"{"exact":"1.2.3"}"#,
             ),
             (Target::Ref("my-branch".into()), r#"{"ref":"my-branch"}"#),
+            (Target::Staging, r#""staging""#),
+            (
+                Target::StagingExact(semver::Version::new(0, 3, 0)),
+                r#"{"staging_exact":"0.3.0"}"#,
+            ),
         ];
         for (target, expected) in cases {
             let line = serde_json::to_string(&target).unwrap();

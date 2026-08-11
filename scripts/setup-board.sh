@@ -41,23 +41,41 @@ MOTOR_PORT="${MOTOR_PORT:-/dev/ttyS2}"
 
 ENV_TXT=/boot/armbianEnv.txt
 
+# Boot args of the *running* kernel. A variable, like MOTOR_PORT and ENV_TXT above, so the
+# console check can be exercised against a fixture instead of only on a board that happens to
+# be misconfigured — which is the state you least want to discover the check is wrong in.
+CMDLINE="${CMDLINE:-/proc/cmdline}"
+
 BT_CONF=/etc/bluetooth/main.conf
 
-# Optionally pair a gamepad, e.g. PAD_MAC=78:86:2E:BB:13:28 sh setup-board.sh
-#
-# An environment variable rather than a flag, matching MOTOR_PORT and ONNX_VERSION above —
-# this script is usually run through `curl | sh`, where flags are awkward to pass.
-#
-# Optional because the MAC is per-pad and most of the value here is the two settings that
-# apply to every board regardless: the BlueZ privacy mode, and the `input` group.
-PAD_MAC="${PAD_MAC:-}"
+# A gamepad is paired with `sudo robotctl pad pair` on the installed release, with the pad held in
+# pairing mode. This script's part of it is the one BlueZ setting a pad needs, which is here because
+# it takes a reboot to apply — see `configure_bluetooth`.
 
 # Where this script puts itself so it is still around after the reboot it asks for.
 SELF=/usr/local/sbin/robot-setup-board
 
+# Where the sibling scripts come from, for the commands this prints. Same override names as
+# `install.sh`, so a fork or a pinned tag is one decision for the whole bring-up rather than
+# per script. Nothing here is fetched by this script — see `fetch_cmd`.
+REPO="${DUCK_REPO:-pollen-robotics/microduck_daemon}"
+REF="${DUCK_REF:-main}"
+RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
+
+# For a private repository: a token with read access to contents. Only ever interpolated into
+# the commands this prints, and by name (`$DUCK_TOKEN`) rather than by value — a bring-up log
+# gets pasted into chat, and a token that leaks that way cannot be rotated without touching
+# every board. What it decides is *which form* to print, not what to run.
+TOKEN="${DUCK_TOKEN:-}"
+
 # Wifi migration lives in its own script — see `check_network` for why. Named here so the
 # advice this prints and the thing it points at cannot drift apart.
-MIGRATE=migrate-network.sh
+#
+# A full path, not a bare filename: the advice is copy-pasted, and `sudo sh migrate-network.sh`
+# only works from whichever directory happens to hold it. /tmp is where the fetch this prints
+# puts it, and where an operator following the README already has it.
+MIGRATE_NAME=migrate-network.sh
+MIGRATE="/tmp/${MIGRATE_NAME}"
 # Where that script leaves itself once run, which is what to point at after a reboot: by then
 # the copy in /tmp is gone, and telling someone to run a file that no longer exists is worse
 # than telling them nothing.
@@ -76,6 +94,68 @@ persisted=0
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# The command that puts a sibling script on this board, as a string to *print*.
+#
+# This script downloads exactly one thing — the ONNX Runtime tarball, from a public
+# microsoft/onnxruntime release — so it never needs a token itself. Its siblings do, while
+# the repository is private, and every step of bring-up that told someone to fetch one
+# without a header sent them into a 404 that reads like a wrong URL.
+#
+# Two forms, keyed on whether this run was given a token, because the wrong one is worse than
+# no advice: a private repo not told to send one 404s, and a public one told to send an unset
+# or stale one gets an auth failure rather than the file. Printing the form that matches the
+# situation this script is actually in is the only version an operator can paste blind.
+#
+# `$DUCK_TOKEN` stays unexpanded so the printed line is safe to paste into a bug report.
+fetch_cmd() {
+    # $1 script name, e.g. migrate-network.sh
+    if [ -n "$TOKEN" ]; then
+        # shellcheck disable=SC2016  # $DUCK_TOKEN must stay literal — see above.
+        printf 'curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" %s/%s -o /tmp/%s' \
+            "$RAW" "$1" "$1"
+    else
+        printf 'curl -fsSL %s/%s -o /tmp/%s' "$RAW" "$1" "$1"
+    fi
+}
+
+# How to run the wifi migration *from where this board actually is*, as a string to print.
+#
+# Three states, and naming the wrong one wastes a round trip: once run it lives at a
+# persistent path, before that it is a file in /tmp, and on a board that has not fetched it
+# there is nothing to run at all — which is the state a fresh board is in, and the one the
+# advice used to ignore.
+migrate_advice() {
+    if [ -x "$MIGRATE_SELF" ]; then
+        printf 'sudo %s' "$MIGRATE_SELF"
+    elif [ -f "$MIGRATE" ]; then
+        printf 'sudo sh %s' "$MIGRATE"
+    else
+        printf '%s\n    sudo sh %s' "$(fetch_cmd "$MIGRATE_NAME")" "$MIGRATE"
+    fi
+}
+
+# Which serial port the *running* kernel prints to — bare tty name, no baud — or nothing.
+#
+# `case` globs rather than a regex: the two substitutions in `free_motor_port` are already
+# split for exactly this reason, since BRE alternation differs between sed dialects and fails
+# by matching nothing. A check that silently never fires is worse here than no check.
+#
+# ttyFIQ* counts. It is Rockchip's FIQ debugger rather than an 8250, but it is attached to the
+# SoC debug UART — uart2 on the RK3566, which is the motor bus — so a kernel printing there
+# lands on the same wires. Worth naming even though the caller then hedges on the mapping.
+kernel_console_tty() {
+    for arg in $(cat "$CMDLINE" 2>/dev/null || true); do
+        case "$arg" in
+            console=ttyS*|console=ttyAMA*|console=ttyFIQ*) ;;
+            *) continue ;;
+        esac
+        arg="${arg#console=}"
+        # console=ttyS2,1500000 — the baud is not part of the device name.
+        printf '%s' "${arg%%,*}"
+        return 0
+    done
+}
 
 # Leave a copy somewhere that survives a reboot.
 #
@@ -103,7 +183,9 @@ persist_self() {
 }
 
 check_environment() {
-    [ "$(id -u)" = 0 ] || die "run as root (sudo sh setup-board.sh)"
+    # No path in the message: whatever the operator just typed is what needs `sudo` in front,
+    # and naming a file here is how the advice drifted from where the file actually is.
+    [ "$(id -u)" = 0 ] || die "run as root — re-run that same command with sudo"
 
     arch="$(uname -m)"
     [ "$arch" = aarch64 ] || die "this targets aarch64 boards, and this box is ${arch}"
@@ -243,13 +325,7 @@ install_onnxruntime() {
 # still on netplan answers every `net.*` call with "no such device", which is a confusing
 # failure to meet later rather than named here.
 check_network() {
-    # Prefer the persisted copy when it exists: after the reboot the migration asks for, the
-    # one in /tmp is gone.
-    if [ -x "$MIGRATE_SELF" ]; then
-        migrate_cmd="sudo ${MIGRATE_SELF}"
-    else
-        migrate_cmd="sudo sh ${MIGRATE}"
-    fi
+    migrate_cmd="$(migrate_advice)"
 
     if ! command -v nmcli >/dev/null 2>&1; then
         warn "wifi is still netplan's, so configd cannot manage it. Migrate first:
@@ -321,14 +397,33 @@ free_motor_port() {
     fi
 }
 
-# Bluetooth settings a gamepad needs, and the group that lets a human read one.
+# The one Bluetooth setting a gamepad needs from this script.
 #
-# `Privacy = device` is the fix for an Xbox controller that pairs and then drops straight back
-# out — it presents as an endless connect/disconnect loop, or as
-# `disconnected with reason 3` / `AuthenticationCanceled` during pairing. Taken from
-# microduck_runtime, whose installer sets exactly this and whose notes record the same
-# symptom; several hours went into rediscovering it as a supposed BR/EDR or ERTM problem,
-# which it is not. BLE is fine.
+# `Privacy = off`, and it is the *opposite* of what this script used to set. The history matters,
+# because the old value is still on every board provisioned so far:
+#
+#   This script set `Privacy = device`, taken from microduck_runtime's installer, whose notes
+#   credit it with fixing an Xbox controller that pairs and then drops straight back out — an
+#   endless connect/disconnect loop, or `disconnected with reason 3` during pairing.
+#
+#   With that setting, an Xbox controller cannot bond with this board at all. `btmon` shows LE
+#   Secure Connections pairing reaching the last step and the *pad* rejecting it:
+#
+#       SMP: Pairing Public Key ×2 · Confirm · Random ×2 · DHKey Check
+#       > ACL Data RX: SMP: Pairing Failed — Reason: DHKey check failed (0x0b)
+#
+#   The DHKey check is computed over both devices' addresses, and `Privacy = device` makes the
+#   adapter pair from a resolvable private address rather than its public one. The two sides
+#   compute different values, and the pad refuses — every time, with no key on either side, and
+#   unaffected by retrying, by `JustWorksRepairing`, or by which side starts.
+#
+#   With `Privacy = off` the same pad pairs first time, is trusted, and reconnects by itself
+#   across a reboot. The drop-on-connect symptom the old value was meant to prevent has not
+#   returned.
+#
+# So this is a measurement replacing an inherited setting. If a pad ever does start dropping on
+# connect, the two are in genuine tension and the answer is to pair with privacy off and then
+# re-enable it — not to set `device` and lose the ability to pair at all.
 #
 # The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon on
 # this board left the kernel holding hci0 while bluetoothd reported "No default controller
@@ -340,72 +435,21 @@ configure_bluetooth() {
         return 0
     fi
 
-    if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
-        say "bluetooth Privacy already set to device"
+    # Written explicitly even though `off` is BlueZ's default: a board provisioned by an older
+    # copy of this script has `Privacy = device` in the file, and that line has to be *corrected*
+    # rather than left alone. An absent setting and a wrong one need different work.
+    if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*off' "$BT_CONF"; then
+        say "bluetooth Privacy already off"
     else
-        say "setting Privacy = device in ${BT_CONF}"
+        say "setting Privacy = off in ${BT_CONF} (a pad cannot bond otherwise)"
         if grep -Eq '^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF"; then
-            sed -i -E 's|^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=.*|Privacy = device|' "$BT_CONF"
+            sed -i -E 's|^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=.*|Privacy = off|' "$BT_CONF"
         elif grep -q '^\[General\]' "$BT_CONF"; then
-            sed -i '/^\[General\]/a Privacy = device' "$BT_CONF"
+            sed -i '/^\[General\]/a Privacy = off' "$BT_CONF"
         else
-            printf '\n[General]\nPrivacy = device\n' >> "$BT_CONF"
+            printf '\n[General]\nPrivacy = off\n' >> "$BT_CONF"
         fi
         needs_reboot=1
-    fi
-
-    add_operator_to_input_group
-    pair_pad
-}
-
-# A gamepad is read through /dev/input/event*, which is root:input mode 0660. Without this
-# `padd` starts, reports nothing, and silently sees no pad at all — the same shape of failure
-# as the `robot` group, and just as hard to guess from the outside.
-add_operator_to_input_group() {
-    operator="${SUDO_USER:-}"
-    if [ -z "$operator" ] || [ "$operator" = root ]; then
-        return 0
-    fi
-    if id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
-        return 0
-    fi
-    if usermod -aG input "$operator"; then
-        say "added ${operator} to the input group"
-        warn "${operator} must log out and back in before padd can read a gamepad."
-    else
-        warn "could not add ${operator} to the input group; padd will see no gamepad"
-    fi
-}
-
-# Trust and connect a known pad, when its MAC was supplied.
-#
-# Deliberately not a scan: discovery needs the pad held in pairing mode at the right moment,
-# which a provisioning script cannot arrange. Supplying the MAC of a pad already in pairing
-# mode is the part that can be automated; the rest stays a human at a keyboard.
-pair_pad() {
-    [ -n "$PAD_MAC" ] || return 0
-
-    if ! command -v bluetoothctl >/dev/null 2>&1; then
-        warn "bluetoothctl is not installed; cannot pair ${PAD_MAC}"
-        return 0
-    fi
-
-    say "pairing gamepad ${PAD_MAC} (hold it in pairing mode)"
-    # Discovery has to be running for a first-time connect to resolve the address.
-    bluetoothctl --timeout 15 scan on >/dev/null 2>&1 || true
-
-    # `connect` before `pair`, which is the order microduck_runtime's notes give and the one
-    # that works; leading with `pair` returns AuthenticationCanceled.
-    if bluetoothctl connect "$PAD_MAC" >/dev/null 2>&1; then
-        bluetoothctl trust "$PAD_MAC" >/dev/null 2>&1 || true
-        say "gamepad ${PAD_MAC} connected and trusted"
-    else
-        warn "could not connect ${PAD_MAC}. If Privacy was just changed, reboot first — it
-  does not take effect until then. Otherwise pair by hand:
-    sudo bluetoothctl
-    scan on            (hold the pad in pairing mode until it is listed by: devices)
-    connect ${PAD_MAC}
-    trust ${PAD_MAC}"
     fi
 }
 
@@ -426,20 +470,16 @@ report() {
   will not drive anything."
     fi
 
-    # Gamepad readiness, which is three separate things that each fail silently.
-    if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
-        printf '  %-22s %s\n' "bluetooth privacy" "device"
+    # Gamepad readiness. This board's part of it is one setting; who may read the pad is
+    # `padd.service`'s business now, and pairing one is `sudo robotctl pad pair`.
+    if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*off' "$BT_CONF"; then
+        printf '  %-22s %s\n' "bluetooth privacy" "off"
+    elif [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
+        # Named rather than lumped in with "not off": this is what older boards have, and it is
+        # the one value that makes pairing a pad impossible. See `configure_bluetooth`.
+        printf '  %-22s %s\n' "bluetooth privacy" "device — a pad CANNOT bond; re-run this script"
     else
-        printf '  %-22s %s\n' "bluetooth privacy" "NOT SET — a pad will drop on connect"
-    fi
-
-    operator="${SUDO_USER:-}"
-    if [ -z "$operator" ] || [ "$operator" = root ]; then
-        printf '  %-22s %s\n' "input group" "not applicable (no sudo user)"
-    elif id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx input; then
-        printf '  %-22s %s\n' "input group" "${operator} is a member"
-    else
-        printf '  %-22s %s\n' "input group" "${operator} NOT a member — padd sees no pad"
+        printf '  %-22s %s\n' "bluetooth privacy" "not set (BlueZ defaults to off, which works)"
     fi
 
     # The device node is what gilrs opens, so this is the only claim that matters.
@@ -471,11 +511,35 @@ report() {
         printf '  %-22s %s\n' "motor bus owner" "free"
     fi
 
-    if grep -qE '(^| )console=tty(S|AMA)' /proc/cmdline 2>/dev/null; then
-        printf '  %-22s %s\n' "kernel console" "still on a serial port"
-        warn "the kernel prints to a UART (see /proc/cmdline). If that is ${MOTOR_PORT},
-  kernel messages will corrupt servo traffic intermittently. Set console=display in
-  ${ENV_TXT} and reboot."
+    # `/proc/cmdline` is the kernel that is *running*; `free_motor_port` edits ${ENV_TXT} for
+    # the kernel that will run *next*. They cannot agree until a reboot — so on the very run
+    # that fixed this, an unqualified "still on a serial port / set console=display" reads as
+    # "the fix did not take", and costs a round trip to disprove. Three distinct states.
+    console_tty="$(kernel_console_tty)"
+    if [ -n "$console_tty" ]; then
+        if [ "/dev/${console_tty}" = "$MOTOR_PORT" ]; then
+            console_what="${console_tty} (the motor bus)"
+        else
+            console_what="${console_tty}"
+        fi
+
+        if [ -f "$ENV_TXT" ] && grep -q '^console=display$' "$ENV_TXT"; then
+            if [ "$needs_reboot" = 1 ]; then
+                # Already handled. Say which way it is going, and do not warn.
+                printf '  %-22s %s\n' "kernel console" "${console_what}, until the reboot"
+            else
+                printf '  %-22s %s\n' "kernel console" "${console_what} — CONFLICT"
+                warn "${ENV_TXT} says console=display, yet this boot still prints to
+  ${console_tty}. Something outside that line wins — an extraargs= in ${ENV_TXT}, or bootargs
+  baked into U-Boot. Find it in /proc/cmdline; editing console= again will not help."
+            fi
+        else
+            printf '  %-22s %s\n' "kernel console" "${console_what}"
+            warn "the kernel prints to ${console_tty} and ${ENV_TXT} does not say
+  console=display, so this script left it alone — it only rewrites console=both and
+  console=serial. Kernel messages on the motor UART corrupt servo replies intermittently,
+  which is an unpatterned bus fault. Set console=display in ${ENV_TXT} and reboot."
+        fi
     fi
 
     if [ -e "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
@@ -549,8 +613,11 @@ report() {
         if [ "$persisted" = 1 ]; then
             echo "  sudo ${SELF}"
         else
-            echo "  # then fetch and run this script again — it was not copied anywhere"
-            echo "  # persistent, so /tmp will have cleared it"
+            # Piped in, so there was no file to persist. Print the fetch rather than a comment
+            # saying one is needed — /tmp is cleared by the reboot this is asking for, and the
+            # operator has no shell history to recover the command from either.
+            printf '  %s\n' "$(fetch_cmd setup-board.sh)"
+            echo "  sudo sh /tmp/setup-board.sh"
         fi
         cat <<'EOF'
 
@@ -561,16 +628,28 @@ EOF
     fi
 
     say "board ready — install the daemon next"
-    cat <<'EOF'
+    echo
+    printf '  %s\n' "$(fetch_cmd install.sh)"
+    if [ -n "$TOKEN" ]; then
+        # Literal, not expanded: this line gets pasted around, and the value must not.
+        # shellcheck disable=SC2016
+        printf '  %s\n' 'sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/install.sh'
+        cat <<'EOF'
 
-  URL=https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh
-  curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" "$URL" -o /tmp/install.sh
-  sudo DUCK_TOKEN="$DUCK_TOKEN" sh /tmp/install.sh
-
-  While the repository is private, both halves need the token: raw.githubusercontent.com
-  404s without it, and sudo does not pass the variable through on its own. Once the
+  Both halves need the token while the repository is private: raw.githubusercontent.com 404s
+  without the header, and sudo does not pass the variable through on its own. Once the
   repository is public, drop the header and the prefix.
 EOF
+    else
+        echo "  sudo sh /tmp/install.sh"
+        cat <<'EOF'
+
+  If that 404s rather than downloading, the repository is private and needs a token — a 404
+  is what GitHub returns for a private path, so it looks like a wrong URL. Export DUCK_TOKEN
+  and re-run this script: it reprints these two lines with the header and the sudo prefix.
+  install.sh needs the token for the release assets as well, not only for the fetch.
+EOF
+    fi
 }
 
 main() {

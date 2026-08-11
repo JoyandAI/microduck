@@ -9,7 +9,7 @@
 //! `CARGO_BIN_EXE_robotd` and guarantee the binary is rebuilt first — see [`robotd_bin`].
 //!
 //! `on_apply = restart` is deliberately out of scope: there is no systemd in a container,
-//! and stubbing it would test the stub. That lands on hardware (`docs/roadmap.md` M4).
+//! and stubbing it would test the stub. That lands on hardware (`docs/project/roadmap.md` M4).
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -228,7 +228,10 @@ health = {{ probe = "socket", timeout = "3s" }}
         let robot: Box<dyn RobotClient> =
             Box::new(SocketRobotClient::new(config.robot_socket.clone()));
         let keys = KeyRing::load(&config.trusted_keys_dir, config.allow_dev_keys).unwrap();
-        Engine::new(config, keys, robot, Faults::none()).unwrap()
+        // As in the updater's own tests: no forks in a binary running engines in parallel.
+        Engine::new(config, keys, robot, Faults::none())
+            .unwrap()
+            .without_deferred_restarts()
     }
 }
 
