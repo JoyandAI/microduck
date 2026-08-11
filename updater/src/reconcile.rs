@@ -223,4 +223,106 @@ mod tests {
             Verdict::Current
         );
     }
+
+    /// Write what a daemon would have published, so the reader has a real file to read.
+    ///
+    /// Constructed rather than produced by `publish_identity`, which publishes *this* process — and
+    /// the test binary's own exe path names no release, so every unit would come back `Unknown` and
+    /// the test would pass while asserting nothing.
+    fn publish(root: &std::path::Path, service: &str, release: &str) {
+        let dir = root.join(service);
+        std::fs::create_dir_all(&dir).expect("a runtime dir");
+        let identity = proto::Identity {
+            service: service.to_owned(),
+            version: release.to_owned(),
+            revision: None,
+            built_at: None,
+            exe: Some(format!(
+                "/opt/robot/daemon/releases/{release}/bin/{service}"
+            )),
+            pid: 4242,
+        };
+        std::fs::write(
+            dir.join("identity.json"),
+            serde_json::to_vec(&identity).expect("serialising an identity"),
+        )
+        .expect("publishing");
+    }
+
+    /// A `systemctl` that records every call and refuses one named unit, so both the acting path and
+    /// the failure path are exercised by the same run.
+    fn stub_systemctl(dir: &std::path::Path, failing_unit: &str) -> std::path::PathBuf {
+        let path = dir.join("systemctl");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> \"$(dirname \"$0\")/calls\"\n\
+                 [ \"$2\" = {failing_unit} ] && {{ echo 'job failed' >&2; exit 1; }}\n\
+                 exit 0\n"
+            ),
+        )
+        .expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn verdict_of(findings: &[Finding], unit: &str) -> Verdict {
+        findings
+            .iter()
+            .find(|f| f.unit == unit)
+            .unwrap_or_else(|| panic!("no finding for {unit}: {findings:?}"))
+            .verdict
+    }
+
+    /// The whole function, over real files and a real subprocess — every verdict in one run.
+    ///
+    /// **One test rather than five, and that is about the environment variable rather than about
+    /// taste.** `DUCK_RUNTIME_DIR` is process-wide, so two tests setting it would race inside one
+    /// test binary and the loser would read the other's runtime directory. Driving every case through
+    /// a single root sidesteps that entirely, and costs only that the failures name a unit.
+    ///
+    /// Until this existed the module's tests covered `verdict_for` and nothing else — so what a
+    /// startup actually *did* about a stale unit, which is the point of the module, was unobserved.
+    #[tokio::test]
+    async fn every_verdict_over_real_files() {
+        let root = tempfile::tempdir().expect("a temp runtime root");
+        let bin = tempfile::tempdir().expect("a temp bin dir");
+        // SAFETY: set once, in a single test, and nothing else in this crate reads the variable.
+        unsafe { std::env::set_var("DUCK_RUNTIME_DIR", root.path()) };
+
+        let active = v("0.4.0");
+        publish(root.path(), "configd", "0.3.0"); // stale → restarted
+        publish(root.path(), "robotd", "0.4.0"); // already right → untouched
+        publish(root.path(), "updaterd", "0.3.0"); // stale, but is self → reported only
+        publish(root.path(), "btd", "0.3.0"); // stale, and its restart fails
+        // `padd` publishes nothing: stopped, or a build too old to say. Left alone either way.
+
+        let systemctl = stub_systemctl(bin.path(), "btd");
+        let units = ["btd", "configd", "padd", "robotd", "updaterd"]
+            .map(str::to_owned)
+            .to_vec();
+
+        let findings = check(systemctl.to_str().unwrap(), &active, "updaterd", units).await;
+
+        assert_eq!(verdict_of(&findings, "configd"), Verdict::Restarted);
+        assert_eq!(verdict_of(&findings, "robotd"), Verdict::Current);
+        assert_eq!(verdict_of(&findings, "updaterd"), Verdict::ReportedOnly);
+        assert_eq!(verdict_of(&findings, "btd"), Verdict::RestartFailed);
+        assert_eq!(verdict_of(&findings, "padd"), Verdict::Unknown);
+
+        // And what it actually asked systemd to do, which no assertion on verdicts can show.
+        let calls = std::fs::read_to_string(bin.path().join("calls")).unwrap_or_default();
+        assert!(calls.contains("restart configd"), "{calls}");
+        assert!(calls.contains("restart btd"), "{calls}");
+        // The three that must never be touched: the one that is current, the one that published
+        // nothing, and — most importantly — this process's own unit.
+        assert!(!calls.contains("restart robotd"), "{calls}");
+        assert!(!calls.contains("restart padd"), "{calls}");
+        assert!(!calls.contains("restart updaterd"), "{calls}");
+    }
 }
