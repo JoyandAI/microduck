@@ -1613,9 +1613,18 @@ async fn schedule_restarts_if_applied(enabled: bool, outcome: &Result<ApplyResul
         return;
     }
     if matches!(outcome, Ok(ApplyResult::Applied { .. })) {
-        schedule_deferred_restarts().await;
+        schedule_deferred_restarts(SYSTEMD_RUN).await;
     }
 }
+
+/// The program that schedules the deferred restarts.
+///
+/// A constant taken as a parameter below, for exactly the reason `SYSTEMCTL` is: a test needs to
+/// hand it a stub and assert what was asked. Hardcoded at the call site, this was the one command in
+/// the update path that no test could observe — `--on-active` could have been misspelled and every
+/// test would still have passed, while on a board the only symptom is a restart that silently never
+/// happens.
+const SYSTEMD_RUN: &str = "systemd-run";
 
 /// Restart the deferred units, detached, a few seconds from now.
 ///
@@ -1628,9 +1637,9 @@ async fn schedule_restarts_if_applied(enabled: bool, outcome: &Result<ApplyResul
 /// update that succeeded must not be reported as failed because a restart could not be scheduled.
 /// Swallowing them is affordable because they are not the last word: [`crate::reconcile`] checks at
 /// the next start that each unit is on the active release and restarts what is not.
-async fn schedule_deferred_restarts() {
+async fn schedule_deferred_restarts(systemd_run: &str) {
     for unit in RESTART_AFTER_REPLYING {
-        let mut command = tokio::process::Command::new("systemd-run");
+        let mut command = tokio::process::Command::new(systemd_run);
         command
             .arg(format!("--on-active={DEFERRED_RESTART_DELAY}"))
             .arg("--timer-property=AccuracySec=100ms")
@@ -2028,6 +2037,75 @@ esac
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("restart failed"), "{err:?}");
+    }
+
+    /// A stub that records its whole argument list and nothing else. `stub_systemctl` above answers
+    /// `show` and branches on units; here the argv *is* the thing under test, so recording it is all
+    /// this needs to do.
+    fn stub_recorder(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\n",
+        )
+        .expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// The deferred restarts, as an actual command line. Until this existed nothing in the repository
+    /// could observe that call: the program name was hardcoded, so `--on-active` could have been
+    /// wrong and every test would still pass — while on a board the only symptom is `btd` quietly
+    /// never restarting, which is the exact failure `RESTART_AFTER_REPLYING` was added to fix.
+    ///
+    /// Four claims, and each one is load-bearing rather than incidental:
+    #[tokio::test]
+    async fn the_deferred_restarts_are_scheduled_as_transient_timers() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemd_run = stub_recorder(dir.path(), "systemd-run");
+
+        schedule_deferred_restarts(systemd_run.to_str().unwrap()).await;
+
+        let log = calls(dir.path());
+        let lines: Vec<&str> = log.lines().collect();
+
+        // One transient unit per deferred unit, not one command naming both — the same lesson as
+        // `units_are_restarted_one_at_a_time`.
+        assert_eq!(lines.len(), RESTART_AFTER_REPLYING.len(), "{log}");
+
+        for (line, unit) in lines.iter().zip(RESTART_AFTER_REPLYING) {
+            // The delay is what lets the reply reach the client first. Without it the engine hands
+            // whoever asked a broken pipe instead of the outcome they waited minutes for.
+            assert!(
+                line.contains(&format!("--on-active={DEFERRED_RESTART_DELAY}")),
+                "{line}"
+            );
+            // `systemd-run … -- systemctl restart <unit>`: the transient unit *wraps* systemctl, so
+            // the restart runs outside updaterd's cgroup and survives its own parent being killed.
+            assert!(
+                line.ends_with(&format!("-- systemctl restart {unit}")),
+                "{line}"
+            );
+        }
+
+        // Both, and by name. A list that quietly lost one would leave that daemon on the old binary
+        // until the next `updaterd` start noticed.
+        assert!(log.contains("restart updaterd"), "{log}");
+        assert!(log.contains("restart btd"), "{log}");
+    }
+
+    /// Scheduling that fails must not propagate. The update is already committed and journalled by
+    /// this point, so an unschedulable restart cannot be allowed to report a good update as failed —
+    /// `reconcile` picks it up at the next start instead.
+    #[tokio::test]
+    async fn a_scheduler_that_cannot_be_run_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing at this path, so the spawn fails outright.
+        schedule_deferred_restarts(dir.path().join("absent").to_str().unwrap()).await;
     }
 
     /// One invocation per unit, which is the fix. `systemctl restart a b` fails as a whole when
