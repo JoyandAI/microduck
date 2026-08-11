@@ -63,26 +63,6 @@ struct Args {
     name: Option<String>,
 }
 
-/// The first line this daemon writes is its own identity, at `warn` so it survives
-/// `RUST_LOG=warn` on a long-running board (`architecture.md` §8.1).
-///
-/// `exe` earns its place: it says which release directory the process was actually launched
-/// from, which is the difference between "the update worked" and "the symlink moved but systemd
-/// is still running the old path".
-fn log_startup_identity(service: &str) {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_owned());
-
-    tracing::warn!(
-        service,
-        build = %duck_ipc_proto::build_info!(),
-        exe,
-        pid = std::process::id(),
-        "starting"
-    );
-}
-
 fn hostname() -> String {
     // /etc/hostname rather than the `hostname` crate or a libc call: one file read, no
     // dependency, and it is what the board is actually configured with.
@@ -120,7 +100,7 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
-    log_startup_identity("btd");
+    duck_ipc_proto::log_startup_identity!("btd");
 
     let sockets = Sockets {
         updater: args.update_socket,
@@ -149,12 +129,14 @@ async fn main() -> ExitCode {
 #[cfg(target_os = "linux")]
 async fn run(sockets: Sockets, name: String, require_pairing: bool) -> ExitCode {
     tokio::select! {
+        // `serve` retries the radio in place and is not expected to return at all: an adapter that
+        // is missing, unpowered or wedged is handled there rather than by dying and letting
+        // `Restart=always` do it. Both arms are therefore a bug in `serve`, not a radio fault — kept
+        // because the signature allows them, and non-zero because a `btd` that has stopped serving
+        // BLE must not look healthy.
         result = btd::bluez::serve(sockets, name, require_pairing) => match result {
-            // `serve` only returns when BlueZ closes the control stream, which means the
-            // adapter went away. Exiting non-zero lets systemd restart us into the retry loop
-            // rather than leaving a daemon that is advertising nothing.
             Ok(()) => {
-                tracing::error!("BLE service ended unexpectedly");
+                tracing::error!("the BLE service returned; it is supposed to retry instead");
                 ExitCode::FAILURE
             }
             Err(e) => {

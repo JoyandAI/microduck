@@ -1,14 +1,35 @@
 # Checks on every push and pull request.
 #
-# Split into two jobs deliberately: `check` is fast and catches most things, `board`
-# is slower and catches the class of problem that only appears off the dev machine
-# (cross-linking, glibc floors, unix-socket and permission semantics).
+# Split into three parallel jobs deliberately, so the wait is the slowest one rather than the
+# total: `check` is fast and catches most things, `board` catches the class of problem that only
+# appears off the dev machine (cross-linking, glibc floors, unix-socket and permission
+# semantics), and `coverage` needs its own instrumented build.
 name: ci
 
+# Documentation is excluded from all of it. Editing a markdown file used to cross-compile for
+# aarch64 under QEMU *and* build the workspace under instrumentation — minutes of waiting for a
+# change that cannot affect a single one of those results.
+#
+# Safe here specifically because `main` has no required status checks. A skipped job reports no
+# status at all, so filtering one that *was* required leaves every docs pull request permanently
+# pending, which is worse than the wait it removes. Re-check this before turning protection on.
+#
+# `paths-ignore` rather than `paths`, deliberately: the default stays "run". A new top-level
+# directory is tested because nobody remembered to list it, which is the right way round for a
+# filter whose failure mode is skipping everything.
+#
+# The list is written twice because GitHub Actions does not support YAML anchors, so `&docs`/`*docs`
+# is not available here however much this asks for it. Keep the two copies identical.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
 
 # Cancel superseded runs: during a hot iteration week the queue is otherwise mostly
 # obsolete builds.
@@ -53,19 +74,40 @@ jobs:
       #
       # `migrate-network.sh` was missing from this list while being the riskiest of them —
       # it is the one step that can make a headless board unreachable, and the one nobody
-      # re-runs once their own board is migrated. `board-test.sh` is deliberately absent:
-      # it runs in CI, so CI failing is already the feedback.
+      # re-runs once their own board is migrated. `robot-rescue` is here because it is the script
+      # that runs when a board cannot start its update daemon — the worst possible moment to find a
+      # typo, and it ships as text like the rest.
+      #
+      # `board-test.sh` is linted by the step below rather than here, because it needs two codes
+      # excluded. It used to be skipped entirely on the grounds that CI failing is already the
+      # feedback, which was true and too expensive: that feedback is four QEMU minutes away.
       #
       # POSIX sh, not bash: the script is piped to `sh` by the documented one-liner, and
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/dev-push.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.
             test -x "$script"
           done
+
+      # `board-test.sh` separately, because it needs different flags and was excluded for it.
+      #
+      # It builds the container-side checks as one enormous single-quoted string, so two codes fire on
+      # that construction itself and mean nothing: SC2037 reads `CHECKS='` as a command assignment,
+      # SC2016 objects to expressions that are *meant* not to expand until the container runs them.
+      #
+      # What is left is worth having, and is the failure that actually happens: an apostrophe inside
+      # that string closes it early, and everything after it is then expanded by this shell instead of
+      # the container's. It cost a full `board` run twice in one afternoon — four QEMU minutes to be
+      # told `unexpected EOF`, when SC2211 names the line. `sh -n` alone is not enough: two
+      # apostrophes balance, so the syntax is valid and the content is silently mangled.
+      - name: Lint the board checks
+        run: |
+          sh -n scripts/board-test.sh
+          shellcheck --shell=sh --exclude=SC2037,SC2016 scripts/board-test.sh
 
       # The publish tooling must keep working, or a release can't be cut. Cheap to
       # assert here rather than discovering it at tag time.
@@ -140,6 +182,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    env:
+      # The floor, in one place. It is both enforced and quoted in the comment, and two copies
+      # of a number are one copy and one thing to forget.
+      COVERAGE_FLOOR: 72
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -164,31 +210,21 @@ jobs:
       # a few points under today's ~77% so ordinary work does not trip it, while a genuine
       # collapse still fails. Lowering it should be a deliberate, explained commit.
       - name: Coverage
-        run: cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' --fail-under-lines 72 | tee "$RUNNER_TEMP/head.txt"
+        run: cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' --fail-under-lines "$COVERAGE_FLOOR" | tee "$RUNNER_TEMP/head.txt"
 
-      # The base branch, built separately, purely to get a number to subtract. Only on
-      # pull requests: a push to main has nothing to compare against, and paying for a
-      # second instrumented build there would be waste.
+      # There is deliberately no second run against the base branch. This job used to check
+      # the base out separately and build it instrumented a second time, purely to subtract
+      # one number from another and print a delta — doubling the slowest job on every pull
+      # request for a nicety, while `--fail-under-lines` above is the part that actually
+      # catches a regression.
       #
-      # A second checkout rather than a git worktree, so the two builds keep separate
-      # target directories and cannot poison each other's incremental state.
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request'
-        with:
-          ref: ${{ github.base_ref }}
-          path: base
-
-      - name: Coverage on the base branch
-        if: github.event_name == 'pull_request'
-        working-directory: base
-        # No `--fail-under-lines`: the base is a measurement, not a gate. If main is
-        # already below the floor that is main's problem, and failing here would block an
-        # unrelated pull request from merging.
-        run: cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' | tee "$RUNNER_TEMP/base.txt"
+      # What that costs is real and worth naming: a pull request that lowers coverage while
+      # staying over the floor no longer says so. The ratchet is the mechanism now — raise the
+      # floor when the number rises, and a collapse still fails the job.
 
       # Column 10 of the TOTAL row is line coverage. The whole table goes in the run
       # summary, where it renders without anyone opening a log; the comment carries the
-      # numbers that matter.
+      # number that matters.
       - name: Report
         if: always() && github.event_name == 'pull_request'
         env:
@@ -196,7 +232,6 @@ jobs:
         run: |
           pct() { awk '/^TOTAL/ {gsub("%","",$10); print $10}' "$1" 2>/dev/null; }
           head_pct=$(pct "$RUNNER_TEMP/head.txt")
-          base_pct=$(pct "$RUNNER_TEMP/base.txt")
           : "${head_pct:=unknown}"
 
           {
@@ -204,11 +239,8 @@ jobs:
             echo
             if [ "$head_pct" = "unknown" ]; then
               echo "The coverage run did not produce a total — it most likely failed before finishing."
-            elif [ -n "$base_pct" ]; then
-              delta=$(awk -v a="$head_pct" -v b="$base_pct" 'BEGIN { printf "%+.2f", a - b }')
-              echo "**${head_pct}% lines** on this branch, ${base_pct}% on \`${{ github.base_ref }}\` — **${delta}**."
             else
-              echo "**${head_pct}% lines** on this branch. No base measurement to compare against."
+              echo "**${head_pct}% lines** on this branch, against a floor of ${COVERAGE_FLOOR}%."
             fi
             echo
             echo "<details><summary>Per-file</summary>"

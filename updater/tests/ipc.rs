@@ -332,7 +332,30 @@ async fn hello_accepts_matching_version_and_refuses_a_mismatch() {
     let response = client
         .call(method::HELLO, serde_json::json!({ "api_version": 999 }))
         .await;
-    assert_eq!(response.error.unwrap().code, proto::code::PROTOCOL_MISMATCH);
+    let error = response.error.unwrap();
+    assert_eq!(error.code, proto::code::PROTOCOL_MISMATCH);
+    // Client newer than the daemon is what the seconds after an update look like, so the refusal
+    // has to say "retry" rather than leave an operator reinstalling a board that is already fine.
+    assert!(error.message.contains("newer release"), "{}", error.message);
+    assert!(
+        error.message.contains("systemctl restart updaterd"),
+        "{}",
+        error.message
+    );
+
+    // The other direction is a different situation with a different remedy, and a refusal naming
+    // only the two numbers made them look like one problem.
+    let response = client
+        .call(method::HELLO, serde_json::json!({ "api_version": 1 }))
+        .await;
+    let error = response.error.unwrap();
+    assert_eq!(error.code, proto::code::PROTOCOL_MISMATCH);
+    assert!(error.message.contains("older release"), "{}", error.message);
+    assert!(
+        error.message.contains("/usr/local/bin/robotctl"),
+        "{}",
+        error.message
+    );
 }
 
 #[tokio::test]

@@ -105,8 +105,20 @@ survive a daemon crash to perform rollback.
 **Corollary — `updaterd` must be resident, and must exclude itself from the
 restart set.** `updaterd` and `btd` both ship *inside* the daemon artifact, so a
 naive "restart everything" would kill the executor mid-swap or mid-health-gate.
-`on_apply` therefore restarts everything the release ships **except** those two, which pick up the
-new binary at the next boot or an explicit later restart.
+`on_apply` therefore restarts everything the release ships **except** those two.
+
+**Excluded from the in-flight restart is not the same as skipped**, and reading it that way was the
+bug. Deferring them to "the next boot or an explicit later restart" left both running the old binary
+indefinitely: a resident `updaterd` rejected a newer `robotctl` with "client speaks API v4, daemon
+speaks v3", and `btd` fixes were tested against binaries that had never been running. So
+`RESTART_AFTER_REPLYING` schedules each through a systemd transient timer 5 s after the outcome is on
+the wire — long enough for a single write, short enough that nobody is waiting. The reason for each
+exclusion expires at exactly that moment: the update is finished, and the reply `btd` was carrying
+has been delivered.
+
+Nothing here waits for a reboot, and `robotctl health`'s unit block is where to confirm it: it prints
+the release each process is *running from*, which is the only place a deferred restart that failed
+would show up.
 
 The set is derived from the release's own `systemd/*.service` files rather than read from the
 board's config, and the two exclusions live in code (`NEVER_RESTART`) rather than in configuration:
@@ -151,16 +163,14 @@ its own PR.
    engines in the same process, which surfaced as unrelated operations failing with `Busy` in the
    test suite.
 
-2. **A boot-time net outside `updaterd`**, for what slips through. `OnFailure=` on a curated set of
-   units fires exactly when one exhausts its restarts, and a tiny oneshot swaps `current` to golden and
-   reboots. Four constraints make it a net rather than a footgun: the set is curated (`btd`
-   legitimately fails on a board whose radio has not appeared, and reverting a good release over that
-   is a poor trade); it reads a `golden` **symlink** rather than parsing config, because a release that
-   breaks the config parser must not also break its own rescue; it needs a loop guard and must not fire
-   when `current` is already golden; and it cannot fix hardware — a `robotd` that fails for want of
-   servo power fails identically on golden, the same distinction the health gate draws between
-   unhealthy and degraded. Golden rather than previous, deliberately: when the recovery path itself is
-   what broke, previous may be broken too.
+2. **A boot-time net outside `updaterd`**, for what slips through: a timer three minutes into each
+   boot asks whether the release brought its daemons up, and a `/bin/sh` rescue in the installed base
+   swaps `current` to golden if it did not. It has to live outside this process and outside the
+   release, because the failure it exists for is an `updaterd` that does not start — at which point
+   `recover_on_start` and the boot counter below are both unreachable. It cannot fix hardware: a
+   `robotd` that fails for want of servo power fails identically on golden, the same distinction the
+   health gate draws between unhealthy and degraded. [`boot-recovery-net.md`](boot-recovery-net.md)
+   owns it.
 
 This is also why the update logic cannot live in `btd`: as a client of the
 update, `btd` cannot be the thing performing it — it would kill itself partway
@@ -508,8 +518,9 @@ fetch manifest ──► verify manifest signature ──► compare version, ch
 download artifact ──► verify sha256 ──► verify artifact signature
         │
         ▼
-extract to releases/<ver>.tmp/  ──► [pre_install hook]
-        │
+extract to releases/<ver>.tmp/  ──► orphaned-unit check (§7.3) ──► [pre_install hook]
+        │                                    │ (an installed unit execs a binary this release lacks)
+        │                                    └─► report + exit, nothing swapped
         ▼
 atomic symlink swap:  current → releases/<ver>        (rename(2), same fs)
         │
@@ -536,11 +547,16 @@ Any non-zero hook exit, failed health probe, or timeout is treated identically:
 /opt/robot/daemon/
 ├── releases/1.4.1/     ← previous (kept for rollback)
 ├── releases/1.4.2/     ← new
-└── current → releases/1.4.2     ← systemd units point at current/
+├── current → releases/1.4.2     ← systemd units point at current/
+└── golden  → releases/1.4.1     ← never pruned; what the rescue reads
 ```
 
 Atomicity is a single `rename(2)` of the symlink on the same filesystem. No
 half-written state is ever live.
+
+`golden` is written by `Engine::refresh_golden_links` on every start, from
+`ComponentConfig::golden`. It exists so that recovery outside this process needs no
+parser — see [`boot-recovery-net.md`](boot-recovery-net.md).
 
 ### 7.2 Preflight preconditions
 
@@ -567,6 +583,52 @@ side effects:
 - **Disk space.** Storage is eMMC (finite, wear less of a concern than SD, but
   space still is). Verify free space for download + extract + `keep_previous`
   before starting.
+
+### 7.3 Would this release orphan an installed unit?
+
+`hooks/postinstall` installs the units a release ships and leaves them behind on a
+rollback (§9). For a rollback that is right — the next successful update reinstalls
+whatever it ships. For a **downgrade past the release that introduced a daemon** it is
+not: the unit stays, its `ExecStart` names a binary the older release does not contain,
+systemd fails it with `203/EXEC`, and since that daemon is in the derived restart set
+the failed restart fails the update, which reverts. Observed on a board that resolved
+to stable `0.2.0`, which predates `configd`.
+
+So a candidate that lacks a binary some installed unit execs is refused —
+`updater/src/orphan.rs`, `Error::WouldOrphanUnit`. It reads `/etc/systemd/system/*.service`
+filtered to units whose `Exec*=` points into the component's `current` symlink: the live
+directory is the only place an orphan appears, since it outlived the release that
+installed it, and the filter is what keeps out units no release of ours shipped. Anything
+it cannot parse produces no finding — refusing an update over a unit file the parser
+merely did not understand is the worse failure.
+
+Three placement decisions worth keeping:
+
+- **Not preflight (§7.2).** Both preflight passes run before the artifact is downloaded,
+  so the candidate's file list does not exist yet. This runs after extraction and before
+  the swap, which is still "no side effects": staging is disposable, the boot counter is
+  unarmed, `current` has not moved. It costs a download to find out.
+- **Before the dry run returns**, because "will this downgrade work?" is what a dry run
+  is asked.
+- **No target is exempt**, unlike the `WouldDowngrade` guard which fires on `Latest`
+  alone. That one is about a mirror serving a stale manifest; this one is about a unit
+  that will not start, which does not care how the target was named — and `Ref` is how
+  the case was observed.
+
+Not on rollback, reset-to-golden or `select`: those move backwards deliberately and are
+how a board gets off a bad release, so nothing that can refuse belongs in the recovery
+path ([`architecture.md`](architecture.md) §1.1).
+
+The refusal names the unit, the missing binary, and the way past it — remove the unit:
+
+```
+systemctl disable --now configd.service && rm /etc/systemd/system/configd.service
+```
+
+Deliberately not a `--force` flag. Removing the unit is what the operator means anyway,
+since a board below the release that introduced a daemon should not be running that
+daemon; it makes the situation true rather than overriding a check that says it is not,
+and the next update that ships the unit reinstalls it.
 
 ## 8. Health gate & rollback
 

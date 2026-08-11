@@ -257,6 +257,41 @@ health = {{ probe = "socket", timeout = "2s" }}
         self.engine(Box::new(FakeRobot::healthy()), Faults::none(), "")
     }
 
+    /// A stand-in for `/etc/systemd/system`, which a test can neither read nor write meaningfully:
+    /// on a CI runner it holds whatever that machine has installed, and on a robot it holds the
+    /// real units.
+    fn unit_dir(&self) -> PathBuf {
+        let dir = self.root.join("etc/systemd/system");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Install a unit that execs `bin/<name>` through this component's `current` symlink — what
+    /// `hooks/postinstall` leaves on the board.
+    fn install_unit(&self, name: &str) {
+        std::fs::write(
+            self.unit_dir().join(format!("{name}.service")),
+            format!(
+                "[Service]\nExecStart={}/current/bin/{name}\n",
+                self.install.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A release carrying binaries, so a unit installed on the board has something to exec.
+    fn publish_with_binaries(&self, version: &str, binaries: &[&str]) {
+        let mut release = self.publisher.release(version);
+        for name in binaries {
+            release = release.file(&format!("bin/{name}"), b"#!/bin/true\n", 0o755);
+        }
+        release.write();
+    }
+
+    fn engine_seeing_units(&self) -> Engine {
+        self.engine_healthy().with_unit_dir(self.unit_dir())
+    }
+
     fn release_exists(&self, version: &str) -> bool {
         self.install.join("releases").join(version).is_dir()
     }
@@ -567,6 +602,89 @@ async fn refuses_when_disk_is_full() {
     let err = apply_latest(&mut engine).await.unwrap_err();
     assert!(matches!(err, updater::Error::Preflight(_)), "got {err:?}");
     assert_eq!(fx.live_version(), None, "must abort before downloading");
+}
+
+/// The case that motivated the check, as it happened: a board running a release with `configd`
+/// resolves to one that predates it, `configd.service` stays behind, and its binary is gone.
+///
+/// What it used to do — install, fail the restart with `203/EXEC`, roll back, and report a systemd
+/// error code — was the right outcome reached by the most expensive route, and named nothing.
+#[tokio::test]
+async fn refuses_a_release_that_would_orphan_an_installed_unit() {
+    let fx = Fixture::new();
+    fx.install_unit("robotd");
+    fx.install_unit("configd");
+    // The candidate predates `configd`: it still ships `robotd`, and that unit must not be
+    // reported — otherwise this would pass while refusing every release for the wrong reason.
+    fx.publish_with_binaries("1.0.0", &["robotd"]);
+
+    let mut engine = fx.engine_seeing_units();
+    let err = apply_latest(&mut engine).await.unwrap_err();
+
+    let updater::Error::WouldOrphanUnit(message) = &err else {
+        panic!("got {err:?}");
+    };
+    assert!(
+        message.contains("configd.service execs bin/configd"),
+        "{message}"
+    );
+    assert!(!message.contains("robotd.service"), "{message}");
+    // The refusal is only useful if the way past it is in the text.
+    assert!(
+        message.contains("systemctl disable --now configd.service"),
+        "{message}"
+    );
+
+    assert_eq!(fx.live_version(), None, "nothing may be installed");
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+/// The escape, pinned: removing the unit is the whole remedy, and there is no flag. An operator who
+/// follows the refusal text must end up with the release installed, or this is a bricked update
+/// path on a board where nothing else would get them off a bad release.
+#[tokio::test]
+async fn removing_the_orphaned_unit_lets_the_release_through() {
+    let fx = Fixture::new();
+    fx.install_unit("configd");
+    fx.publish_with_binaries("1.0.0", &["robotd"]);
+
+    let mut engine = fx.engine_seeing_units();
+    assert!(apply_latest(&mut engine).await.is_err());
+
+    std::fs::remove_file(fx.unit_dir().join("configd.service")).unwrap();
+
+    let result = apply_latest(&mut engine).await.unwrap();
+    assert!(matches!(result, ApplyResult::Applied { .. }), "{result:?}");
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+/// A dry run is how "will this downgrade work?" gets asked, so it has to answer — which is why the
+/// check runs before the dry run returns rather than at the swap.
+#[tokio::test]
+async fn a_dry_run_reports_the_orphan_rather_than_passing() {
+    let fx = Fixture::new();
+    fx.install_unit("configd");
+    fx.publish_with_binaries("1.0.0", &["robotd"]);
+
+    let mut engine = fx.engine_seeing_units();
+    let (tx, _rx) = progress_channel();
+    let err = engine
+        .apply(
+            "daemon",
+            Target::Latest,
+            ApplyOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, updater::Error::WouldOrphanUnit(_)),
+        "got {err:?}"
+    );
 }
 
 // ── rollback ─────────────────────────────────────────────────────────────────
@@ -1292,6 +1410,174 @@ async fn failed_transition_leaves_no_armed_trial() {
 
     // And a later boot must not invent a recovery from it.
     assert!(engine.recover_on_start().await.unwrap().is_empty());
+}
+
+/// `scripts/robot-rescue` runs when `updaterd` does not, so it cannot ask this process which
+/// release is golden and must not parse `updater.toml` to find out — a release whose `updaterd`
+/// rejects that file is the likeliest thing it exists to rescue. Every start publishes the answer
+/// as a symlink instead.
+#[tokio::test]
+async fn starting_up_publishes_golden_as_a_symlink() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    fx.publish("1.1.0", None);
+
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        r#"golden = "1.0.0""#,
+    );
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+    apply_latest(&mut engine).await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    engine.recover_on_start().await.unwrap();
+
+    assert_eq!(
+        std::fs::read_link(fx.install.join("golden")).unwrap(),
+        std::path::Path::new("releases/1.0.0"),
+        "golden must be published relative, like `current`, so the tree survives a moved mount"
+    );
+}
+
+/// `robot-rescue` swaps `current` and reboots with no daemon running, so this start is the first
+/// moment anything can write that down where it will be found — and the breadcrumb it left is also
+/// the rescue's loop guard, which stays shut until this clears it.
+#[tokio::test]
+async fn starting_up_records_a_rescue_and_releases_its_guard() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    fx.publish("1.1.0", None);
+
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        r#"golden = "1.0.0""#,
+    );
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+    apply_latest(&mut engine).await.unwrap();
+
+    // What the rescue leaves behind after putting the board back on golden.
+    let breadcrumb = fx.root.join("var/lib/robot/updater/rescued");
+    std::fs::write(
+        &breadcrumb,
+        format!(
+            "at=1786453421\ninstall_dir={}\nfrom=1.1.0\nto=1.0.0\nbecause=boot check: \
+             robotd.service (failed, 7 restarts)\n",
+            fx.install.display()
+        ),
+    )
+    .unwrap();
+
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        r#"golden = "1.0.0""#,
+    );
+    engine.recover_on_start().await.unwrap();
+
+    assert!(
+        !breadcrumb.exists(),
+        "the breadcrumb is the rescue's loop guard; not clearing it leaves the board unable to \
+         rescue itself again"
+    );
+
+    let entry = engine
+        .log(1)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("an entry in the update log");
+    assert_eq!(entry.component.0, "daemon", "matched by install_dir");
+    assert_eq!(entry.from, Some(semver::Version::new(1, 1, 0)));
+    assert_eq!(entry.to, Some(semver::Version::new(1, 0, 0)));
+    match entry.outcome {
+        updater::proto::Outcome::RolledBack { reason } => assert!(
+            reason.contains("robotd.service"),
+            "the reason the check gave has to survive into the log: {reason}"
+        ),
+        other => panic!("a rescue is a rollback, got {other:?}"),
+    }
+}
+
+/// A rescue outranks an armed trial, and the order inside `recover_on_start` is what enforces it.
+///
+/// The trial would revert to `previous`; the rescue already went further, to golden. Left armed, the
+/// boot counter would advance it and eventually move `current` *off* the release the rescue chose —
+/// the recovery net and the never-brick guarantee undoing each other, one boot apart.
+#[tokio::test]
+async fn a_rescue_supersedes_the_trial_it_interrupted() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+
+    let golden = r#"golden = "1.0.0""#;
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), golden);
+    apply_latest(&mut engine).await.unwrap();
+
+    // 1.1.0 goes in and the process dies after the swap, which is what arms a trial.
+    fx.publish("1.1.0", None);
+    let mut crashing = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults {
+            abort_after_swap: true,
+            ..Faults::none()
+        },
+        golden,
+    );
+    let _ = apply_latest(&mut crashing).await;
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+    assert!(fx.pending_file_exists(), "a trial should be armed");
+
+    // Now 1.1.0's daemons do not come up, and the rescue puts the board on golden without any of
+    // this code running: it swaps the symlink and leaves a breadcrumb.
+    let current = fx.install.join("current");
+    std::fs::remove_file(&current).unwrap();
+    std::os::unix::fs::symlink("releases/1.0.0", &current).unwrap();
+    std::fs::write(
+        fx.root.join("var/lib/robot/updater/rescued"),
+        format!(
+            "at=1786453421\ninstall_dir={}\nfrom=1.1.0\nto=1.0.0\nbecause=boot check\n",
+            fx.install.display()
+        ),
+    )
+    .unwrap();
+
+    // Two starts, because `exhausted` is `boots >= 2`: the first would only count, the second would
+    // act. Neither may move the release.
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), golden);
+    assert!(engine.recover_on_start().await.unwrap().is_empty());
+    assert!(
+        !fx.pending_file_exists(),
+        "the rescue already decided; leaving the trial armed lets the boot counter overrule it"
+    );
+    assert!(engine.recover_on_start().await.unwrap().is_empty());
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "the board must still be on the golden release the rescue chose"
+    );
+}
+
+/// A configured golden that was never installed is not a rollback target. A link pointing at it
+/// would tell the rescue otherwise, and swapping onto it leaves a board that can exec nothing.
+#[tokio::test]
+async fn a_golden_that_is_not_installed_is_not_published() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        r#"golden = "9.9.9""#,
+    );
+    apply_latest(&mut engine).await.unwrap();
+
+    engine.recover_on_start().await.unwrap();
+
+    assert!(
+        !fx.install.join("golden").exists(),
+        "a dangling golden link is worse than none"
+    );
 }
 
 /// **#7** `select` on a version that isn't installed reported UNKNOWN_COMPONENT,

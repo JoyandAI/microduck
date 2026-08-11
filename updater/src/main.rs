@@ -158,24 +158,6 @@ async fn robot_is_answering(robot: &dyn updater::robot::RobotClient) -> bool {
     )
 }
 
-/// The first line each daemon logs, before anything that can fail.
-///
-/// At `warn` so it survives `RUST_LOG=warn` on a long-running board: identifying the running
-/// build is not a debug-level concern. `exe` is here because after an update `updaterd` is
-/// still running the *previous* binary by design, so which release directory a process came
-/// from cannot be inferred (`docs/design/architecture.md` §8).
-fn log_startup_identity(service: &str) {
-    tracing::warn!(
-        service,
-        build = %updater::proto::build_info!(),
-        exe = %std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "unknown".into()),
-        pid = std::process::id(),
-        "starting"
-    );
-}
-
 /// A user name to a uid, and a group name to a gid.
 ///
 /// `SO_PEERCRED` reports numbers, so a name has to become one somewhere. Doing it here, once at
@@ -231,7 +213,7 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    log_startup_identity("updaterd");
+    duck_ipc_proto::log_startup_identity!("updaterd");
 
     match args.command {
         Some(Command::Install {
@@ -591,6 +573,23 @@ async fn serve(args: Args) -> ExitCode {
             // Not fatal: refusing to serve would remove the only way to fix it.
             tracing::error!(error = %e, "startup recovery failed; serving anyway");
         }
+    }
+
+    // After recovery, because recovery can change which release is active — checking before it
+    // would compare every unit against a version this robot is in the middle of abandoning.
+    //
+    // This is where a deferred restart that never happened gets caught. `updaterd` cannot observe
+    // its own restart, so the successor does it; see `updater::reconcile`.
+    let findings = engine.reconcile_running_units().await;
+    let stale = findings
+        .iter()
+        .filter(|f| f.verdict != updater::reconcile::Verdict::Current)
+        .count();
+    if stale == 0 {
+        tracing::info!(
+            units = findings.len(),
+            "every unit is on the active release"
+        );
     }
 
     if args.check_only {

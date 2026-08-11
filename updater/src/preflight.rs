@@ -124,13 +124,24 @@ impl Preflight<'_> {
     async fn check_robot_stopped(&self) -> CheckResult {
         let verdict = self.robot.safe_to_restart(self.robot_query_timeout).await;
         // Unreachable counts as safe: if the control loop isn't running, nothing is
-        // moving — and that is precisely the case where an update is the fix.
+        // moving — and that is precisely the case where an update is the fix. An answer
+        // that arrived and could not be read does not, because the loop *is* running.
         let passed = verdict.permits_restart();
         CheckResult {
             check: Check::RobotStopped,
             passed,
             detail: match &verdict {
                 SafeToRestart::No(reason) => Some(reason.clone()),
+                // Names the contract rather than the robot, and names the way out. Without the
+                // second half this is a refusal with no stated remedy, on a board where the
+                // remedy is not guessable: the robot looks fine, because it is.
+                SafeToRestart::Incompatible(detail) => Some(format!(
+                    "robotd answered in a shape this updaterd cannot read ({detail}), so whether \
+                     it is moving is unknown and a restart is refused. The robot may be perfectly \
+                     healthy and the contract is what disagrees — usually a release that added a \
+                     field. To update anyway, make it genuinely stopped rather than unreadable: \
+                     systemctl stop robotd"
+                )),
                 _ => None,
             },
         }
@@ -239,6 +250,54 @@ mod tests {
     async fn unreachable_robot_passes_preflight() {
         let report = preflight(&AbsentRobot, 0, 1_000).run().await.unwrap();
         assert!(report.passed(), "{:?}", report.first_failure());
+    }
+
+    /// The pair above and below are one decision, and it used to be made the wrong way: an
+    /// unreadable reply was mapped to `Unreachable`, which permits a restart, so a `robotd`
+    /// answering "I am walking" in a shape one field newer was read as "go ahead".
+    ///
+    /// Silence means the control loop is not running. An answer means it is. Those must not
+    /// share a verdict, whatever else changes here.
+    #[tokio::test]
+    async fn an_unreadable_answer_blocks_the_restart() {
+        let robot = FakeRobot {
+            safe: SafeToRestart::Incompatible("missing field `safe`".into()),
+            session: false,
+        };
+        let report = preflight(&robot, 0, 1_000).run().await.unwrap();
+
+        let failure = report.first_failure().expect("must not pass");
+        assert_eq!(failure.check, Check::RobotStopped);
+        let detail = failure.detail.as_deref().unwrap_or_default();
+        // The reason serde gave, so the field that broke it is in the message.
+        assert!(detail.contains("missing field"), "{detail}");
+        // And the way out, which is not guessable from a robot that looks healthy.
+        assert!(detail.contains("systemctl stop robotd"), "{detail}");
+    }
+
+    /// A refusal that cannot be escaped is a bricked update path, and the escape here is not a
+    /// flag: stopping `robotd` turns an unreadable answer into an absent one, which is the
+    /// honest version of "nothing is moving".
+    #[tokio::test]
+    async fn stopping_the_robot_is_the_way_past_it() {
+        let unreadable = FakeRobot {
+            safe: SafeToRestart::Incompatible("missing field `safe`".into()),
+            session: false,
+        };
+        assert!(
+            !preflight(&unreadable, 0, 1_000)
+                .run()
+                .await
+                .unwrap()
+                .passed()
+        );
+        assert!(
+            preflight(&AbsentRobot, 0, 1_000)
+                .run()
+                .await
+                .unwrap()
+                .passed()
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use configd::net::{FakeNet, Net};
 use configd::pad::{FakePads, Pads};
 use configd::power;
 use configd::store::Store;
-use configd::{driver, pad};
+use configd::{pad, units};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -158,19 +158,6 @@ struct Service {
     policy: PeerPolicy,
 }
 
-fn log_startup_identity(service: &str) {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_owned());
-    tracing::warn!(
-        service,
-        build = %proto::build_info!(),
-        exe,
-        pid = std::process::id(),
-        "starting"
-    );
-}
-
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_owned())
@@ -190,20 +177,26 @@ async fn main() -> ExitCode {
         .init();
 
     let args = Args::parse();
-    log_startup_identity("configd");
+    duck_ipc_proto::log_startup_identity!("configd");
 
+    // Neither backend is a reason to refuse to start. `configd` answers `net.*`, `pad.*` and
+    // `system.*`, and `system.pin` is where `btd` gets the PIN a phone authenticates with — so a
+    // `configd` that exits over one missing dependency turns "wifi is unavailable" into "the robot
+    // cannot be reached at all", on a board where the phone is the only way in.
+    //
+    // It is also what admits `configd` to the boot recovery net: a unit may join the set only if it
+    // waits for its dependency rather than exiting, so that a `failed` unit means a broken release
+    // and not a broken board (`docs/design/boot-recovery-net.md`).
     let net: Arc<dyn Net> = match backend(args.fake_net).await {
         Ok(net) => net,
         Err(e) => {
-            tracing::error!(error = %e, "no wifi backend");
-            return ExitCode::FAILURE;
+            tracing::error!(error = %e, "no wifi backend; net.* will report unavailable");
+            Arc::new(configd::net::UnavailableNet::new(e))
         }
     };
 
-    // Unlike wifi, an unreachable radio is **not** a reason to refuse to start. `configd` answers
-    // `net.*` and `system.*` too, and a board whose Bluetooth has not appeared yet — which on this
-    // one takes about 73 seconds — must not lose its wifi provisioning path over it. So a failure
-    // here degrades to "no pads" and says why.
+    // A board whose Bluetooth has not appeared yet — which on this one takes about 73 seconds —
+    // degrades to "no pads" and says why.
     let pads: Arc<dyn Pads> = match pad_backend(args.fake_pads).await {
         Ok(pads) => pads,
         Err(e) => {
@@ -252,18 +245,15 @@ async fn backend(fake: bool) -> Result<Arc<dyn Net>, String> {
         tracing::warn!("serving a FAKE wifi stack; nothing here touches a real network");
         return Ok(Arc::new(FakeNet::new()));
     }
-    // A failure here means NetworkManager is not on the bus at all, which on this board means
-    // the wifi migration was never run. Say that, rather than reporting a D-Bus error nobody
-    // can act on.
+    // `NetworkManager::new` opens the **system bus**; it does not look for NM on it. So a failure
+    // here is a board with no reachable D-Bus, not a board with no NetworkManager — and the advice
+    // to run `migrate-network.sh` belonged to the other case, which is diagnosed in `wifi_device`
+    // and already reports `Unavailable` without any of this. Naming the wrong cause sends whoever
+    // reads it to a script that will not help.
     configd::nm::NetworkManager::new()
         .await
         .map(|nm| Arc::new(nm) as Arc<dyn Net>)
-        .map_err(|e| {
-            format!(
-                "cannot reach NetworkManager on the system bus ({e}). If this board still runs \
-                 netplan, run scripts/migrate-network.sh first."
-            )
-        })
+        .map_err(|e| format!("cannot reach the system D-Bus ({e}); is dbus running?"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -429,6 +419,11 @@ async fn dispatch(
         }
         proto::Call::NetForget(params) => reply(id, service.net.forget(&params.ssid).await),
 
+        // Read-only, so not gated behind `may_mutate`: "which release is actually running" is the
+        // question support asks first, and needing privilege to ask it would put it out of reach of
+        // exactly the person diagnosing a robot.
+        proto::Call::SystemServices => proto::Response::ok(Some(id), &units::all().await),
+
         proto::Call::SystemInfo => proto::Response::ok(
             Some(id),
             &proto::SystemInfoResult {
@@ -481,7 +476,7 @@ async fn dispatch(
                 Some(id),
                 &proto::PadStatusResult {
                     pads,
-                    driver: driver::state().await,
+                    driver: units::state(units::PADD).await,
                 },
             ),
             Err(e) => {

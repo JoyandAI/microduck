@@ -8,10 +8,11 @@
 #   1. NO dependency on robotd. updaterd is the recovery path — if it only ran when
 #      the robot was healthy, it would be unavailable in exactly the situation a
 #      client needs it.
-#   2. updaterd is never in the restart set of an update it applies. `on_apply` in
-#      updater.toml restarts robotd/mediad only; this process picks up a new binary
-#      at the next boot. Restarting itself mid-swap would kill the executor at the
-#      most dangerous moment.
+#   2. updaterd is never in the restart set of an update it applies: restarting
+#      itself mid-swap would kill the executor at the most dangerous moment. It is
+#      not left on the old binary either — the engine schedules its restart through
+#      a systemd transient unit 5s after the outcome is on the wire, which is a
+#      transient unit precisely so it outlives this one's cgroup.
 
 [Unit]
 Description=Robot update daemon
@@ -61,10 +62,16 @@ RestartSec=10s
 # and not under any release directory. Matches `state_dir` in updater.toml.
 StateDirectory=robot/updater
 
-# No RuntimeDirectory: the socket lives at /run/updaterd.sock, which root creates
-# directly. An earlier version declared `RuntimeDirectory=robot` and then never used
-# /run/robot — dead config that implied a layout we don't have. updaterd removes a
-# stale socket on start and its own on clean shutdown.
+# The socket itself needs no RuntimeDirectory: it lives at /run/updaterd.sock, which root
+# creates directly, and updaterd removes a stale one on start and its own on clean shutdown.
+#
+# This directory is for something else, and unlike the `RuntimeDirectory=robot` an earlier
+# version declared and never used, it is read: /run/updaterd/identity.json, where this process
+# publishes which release it is running. `robotctl health` reports it and updaterd's own
+# startup check compares it — the one daemon that cannot restart itself into a new release is
+# the one whose identity matters most. systemd removes the directory with the unit, so a
+# stopped daemon leaves no identity behind claiming otherwise.
+RuntimeDirectory=updaterd
 
 # Modest hardening. Deliberately NOT ProtectSystem=strict: this process exists to
 # write /opt/robot and call systemctl.

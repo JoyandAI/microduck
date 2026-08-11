@@ -461,9 +461,10 @@ change fleet-wide.
 ## Versions, for support
 
 The question is always "what was running?", and on this robot it has **two answers at once**:
-`updaterd` never restarts itself during an update (`updater-design.md` §4.1), so the running
-binary legitimately lags the installed release until the next reboot. Anything reporting a single
-version number is therefore misleading.
+`updaterd` cannot restart itself mid-update (`updater-design.md` §4.1), so for a few seconds after
+one the running binary legitimately lags the installed release. Anything reporting a single version
+number is therefore misleading. If the lag outlives those seconds it is a fault, not the design —
+see `../docs/design/restart-order.md` §7.
 
 `robotctl version` reports both and flags the disagreement. It deliberately works when `updaterd`
 is **down**, reporting that as a line rather than exiting — that is when someone is most likely

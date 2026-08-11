@@ -15,7 +15,9 @@
 //!
 //!  - `Connect()` on a device BlueZ has never bonded with can answer
 //!    `br-connection-profile-unavailable` — there is no profile to connect to *yet*. Refusing there
-//!    would reject a pad that `Pair()` would have bonded a moment later, so it is soft-failed.
+//!    would reject a pad that `Pair()` would have bonded a moment later, so it is soft-failed. The
+//!    `br-` prefix is BlueZ trying BR/EDR first and finding nothing there; the pad this was seen
+//!    against bonds over LE, so that error names a transport which was never going to carry it.
 //!  - `Connect()` on a pad that *does* bond **returns before the bond has completed.** A HID profile
 //!    requires an encrypted link, so connecting triggers bonding, and it lands a moment afterwards.
 //!  - `Pair()` on a bond already in flight **never answers.** Not `AlreadyExists` — outstanding,
@@ -68,15 +70,48 @@
 //! it cost most of a day: retrying does not help, `JustWorksRepairing` does not help, and neither
 //! does clearing the bond on either side.
 //!
+//! It is also the first clue about which transport is in play: resolvable private addresses are an LE
+//! mechanism, so a setting that breaks bonding this way can only be breaking an LE bond.
+//!
+//! ## Which transport, and what that leaves untested
+//!
+//! Nothing here picks one. `StartDiscovery()` runs with no filter, so BlueZ's default `auto` sweeps
+//! BR/EDR and LE together, and every property `Snapshot` reads is optional partly because the two
+//! transports present different ones.
+//!
+//! But the pad all of this has been run against is **LE-only**. Its bond stores long-term keys and no
+//! `[LinkKey]`, and BlueZ reports no `Class` for it at all:
+//!
+//! ```text
+//! # /var/lib/bluetooth/<adapter>/<pad>/info
+//! SupportedTechnologies=LE;
+//! [IdentityResolvingKey]
+//! [PeripheralLongTermKey]
+//! ```
+//!
+//! So the BR/EDR half of this file comes from the specification rather than from a radio. That
+//! includes the class-of-device branch in [`looks_like_a_gamepad`], which cannot have fired — an LE
+//! pad has no class to match — and the `br-connection-profile-unavailable` soft-fail above.
+//!
+//! Discovery stays on `auto` regardless, because the pads the heuristic names that are *not* LE — a
+//! DualShock, a DualSense — are BR/EDR HID, and filtering to LE would make hardware this claims to
+//! recognise unreachable. The thing to know is which way the risk runs: dropping BR/EDR would cost
+//! nothing yet observed, and the first classic pad to arrive exercises that path for the first time.
+//!
 //! ## Where this has and has not run
 //!
 //! **Run against a real BlueZ on a Radxa Zero 3W with an Xbox Wireless Controller**, which is where
 //! everything above about asynchronous bonding comes from. What has been seen work: discovery finds
-//! the pad and the heuristic identifies it, the bond completes, `Trusted` sticks, the pad reconnects
-//! by itself across a reboot, `padd` drives from it, and `pad forget` drops it.
+//! the pad and the heuristic identifies it — on `Icon`, which BlueZ derived from the LE appearance —
+//! the bond completes, `Trusted` sticks, the pad reconnects by itself across a reboot, `padd` drives
+//! from it, and `pad forget` drops it.
 //!
-//! What has **not** been exercised on hardware: a DualSense, two pads in pairing mode at once, and
-//! pairing by explicit address.
+//! That reconnection is worth naming rather than assuming, because over LE the *robot* is the one
+//! that re-initiates: the adapter scans as a central for a bonded peripheral while `btd` advertises
+//! as a peripheral itself. Both roles at once hold on this board's radio.
+//!
+//! What has **not** been exercised on hardware: a pad that bonds over BR/EDR at all, a DualSense, two
+//! pads in pairing mode at once, and pairing by explicit address.
 //!
 //! And one case that cannot be fixed from here: `pad forget` removes only the robot's half of the
 //! bond. A pad that still holds its half will not pair again until it is put back into pairing mode

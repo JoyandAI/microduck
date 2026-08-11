@@ -80,5 +80,14 @@ Environment=RUST_LOG=info
 StandardOutput=journal
 StandardError=journal
 
+# Where this daemon publishes what it is running: /run/btd/identity.json, read by
+# `robotctl health` and by updaterd's startup check.
+#
+# `RuntimeDirectory=` rather than a path this unit is granted: it is the only mechanism that both
+# creates the directory owned by this unit's User= *and* survives ProtectSystem=strict, which
+# otherwise leaves the whole filesystem read-only. systemd also removes it when the unit stops, so a
+# stopped daemon cannot leave behind an identity claiming to be running.
+RuntimeDirectory=btd
+
 [Install]
 WantedBy=multi-user.target

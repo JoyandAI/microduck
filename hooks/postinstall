@@ -30,8 +30,21 @@ set -eu
 
 UNIT_DIR=/etc/systemd/system
 SYSUSERS_DIR=/usr/lib/sysusers.d
+SBIN_DIR=/usr/local/sbin
 
 # Hooks run with the release directory as their working directory.
+
+# The recovery scripts, copied out for the same reason as the units below and one more: they are what
+# runs when this release cannot start, so they must not be read through `current`. A warning and not
+# a failure — a release that cannot install them is still a release worth having, and `install.sh`
+# puts them there on a fresh board.
+for script in robot-rescue robot-boot-check; do
+    [ -f "scripts/${script}" ] || continue
+    mkdir -p "$SBIN_DIR"
+    install -m 755 "scripts/${script}" "${SBIN_DIR}/${script}" \
+        || echo "postinstall: cannot install ${script}; the board keeps the previous copy" >&2
+done
+
 [ -d systemd ] || exit 0
 
 # Users and groups before units: a unit naming a `User=` that does not exist fails to start, and
@@ -56,7 +69,7 @@ fi
 # release, and the supported way to customise one is a drop-in under
 # /etc/systemd/system/<unit>.d/, which this does not touch.
 units=""
-for unit in systemd/*.service; do
+for unit in systemd/*.service systemd/*.timer; do
     [ -f "$unit" ] || continue
     name="$(basename "$unit")"
     install -m 644 "$unit" "${UNIT_DIR}/${name}" \
@@ -84,7 +97,28 @@ systemctl daemon-reload || echo "postinstall: daemon-reload failed" >&2
 # Every failure is a warning. `on_apply` restarts the units in its own list moments after this, so
 # a unit that is merely slow is not a problem; and a unit that genuinely cannot start must not fail
 # an otherwise good update.
+#
+# Two exceptions, both about not running something *now* that is meant to run at boot:
+#
+#   - a unit with no `[Install]` section cannot be enabled at all, and the recovery net's oneshot
+#     has none on purpose. `enable --now` on it would run a rollback check in the middle of the
+#     update that installed it, with daemons legitimately mid-restart — which is exactly what a
+#     rollback check reads as a release that cannot start;
+#   - a timer is enabled but not started. An `OnBootSec=` timer started past its deadline fires
+#     immediately, and this hook runs mid-update. It arms on the next boot, which is the boot it is
+#     about.
 for name in $units; do
+    if ! grep -q '^\[Install\]' "${UNIT_DIR}/${name}"; then
+        echo "postinstall: ${name} installed; it has no [Install] and is started by something else" >&2
+        continue
+    fi
+    case "$name" in
+        *.timer)
+            systemctl enable "$name" \
+                || echo "postinstall: ${name} did not enable; it arms at the next boot" >&2
+            continue
+            ;;
+    esac
     systemctl enable --now "$name" \
         || echo "postinstall: ${name} did not start; check: journalctl -u ${name} -b" >&2
 done
