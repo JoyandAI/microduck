@@ -65,6 +65,121 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How many devices a failure lists before summarising the rest.
+///
+/// A scan in an office reports dozens, and a wall of earbuds is as unreadable as no list at all.
+/// Twelve fits a terminal; the count of what was dropped is printed rather than the list silently
+/// ending, because "that was everything" and "that was the first twelve" want different next moves.
+const LISTED_DEVICES: usize = 12;
+
+/// One peripheral the Mac reported, kept for the failure message.
+///
+/// The name is held as it arrived — `None` when the advertisement carried none — rather than as the
+/// address fallback the tiers use, because "reported without a name" is the diagnosis and the
+/// fallback hides it.
+struct Seen {
+    peripheral: Peripheral,
+    identity: String,
+    local_name: Option<String>,
+    services: usize,
+}
+
+/// Whatever names this device on this platform.
+///
+/// **CoreBluetooth never discloses a peripheral's address**, so on macOS every device reports
+/// `00:00:00:00:00:00` and a list keyed on it cannot tell one unnamed device from another — which is
+/// the case the list exists for. The per-Mac `id` is stable and does distinguish them, so it stands
+/// in. BlueZ reports the real address, and there it is the more useful of the two: it is what
+/// `pad pair --mac` and `bluetoothctl` take.
+fn identity(peripheral: &Peripheral, address: btleplug::api::BDAddr) -> String {
+    if address.into_inner() == [0; 6] {
+        peripheral.id().to_string()
+    } else {
+        address.to_string()
+    }
+}
+
+/// Why the scan came back empty, in terms of what the radio actually reported.
+///
+/// Without this, two failures print the same sentence and want opposite next moves: an empty list is
+/// a problem on *this* machine — Bluetooth off, the permission never granted, another scan holding
+/// the radio — while a list the robot is missing from points at the robot.
+///
+/// And the robot can be *in* that list, unrecognisable. `btd` advertises flags (3 bytes), a 128-bit
+/// service UUID (18) and the robot's name (2 + its length), which for any real hostname is past the
+/// 31 bytes a legacy advertisement holds — so the name travels in the scan response, a second
+/// exchange that can be missed on its own. A device reported with no name and no services is
+/// therefore a plausible robot, which is why the unnamed ones are listed rather than filtered out.
+async fn nothing_found(seen: &[Seen], wanted: Option<&str>) -> String {
+    if seen.is_empty() {
+        return format!(
+            "no robot found — and the Mac reported no BLE devices at all in {SCAN_TIME:?}, not one \
+             pair of earbuds. That points at this machine rather than the robot: is Bluetooth on, \
+             and has this terminal been granted the Bluetooth permission?"
+        );
+    }
+
+    // Named first, then by address: a device that reported a name is the line worth reading, and
+    // sorting keeps a re-run's output comparable with the last one.
+    let mut devices: Vec<&Seen> = seen.iter().collect();
+    devices.sort_by(|a, b| {
+        a.local_name
+            .is_none()
+            .cmp(&b.local_name.is_none())
+            .then(a.identity.cmp(&b.identity))
+    });
+
+    let mut lines: Vec<String> = Vec::new();
+    for device in devices.iter().take(LISTED_DEVICES) {
+        let mut notes: Vec<String> = Vec::new();
+        if device.services > 0 {
+            notes.push(format!("{} service(s)", device.services));
+        }
+        // Checked here rather than during the scan: it is one call per device once, instead of one
+        // per device per 250ms poll, and nothing before the failure needs the answer.
+        if device.peripheral.is_connected().await.unwrap_or(false) {
+            notes.push("connected".to_owned());
+        }
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", notes.join(", "))
+        };
+        lines.push(format!(
+            "{} {}{notes}",
+            device.identity,
+            device.local_name.as_deref().unwrap_or("(no name)"),
+        ));
+    }
+
+    let missed = match wanted {
+        Some(name) => format!(" and nothing was named {name:?}"),
+        None => String::new(),
+    };
+    // The count of unnamed devices is in the summary rather than left to be inferred from the list:
+    // named ones sort first, so truncation hides exactly the lines the robot could be hiding in, and
+    // "is it plausibly one of those" is the question this list is read to answer.
+    let anonymous = devices.iter().filter(|d| d.local_name.is_none()).count();
+    let mut message = format!(
+        "no robot found. Nothing advertised the duck service{missed}. The Mac saw {} device(s) in \
+         {SCAN_TIME:?}, {anonymous} of them with no name:\n  {}",
+        devices.len(),
+        lines.join("\n  ")
+    );
+    if devices.len() > LISTED_DEVICES {
+        message.push_str(&format!(
+            "\n  … and {} more",
+            devices.len() - LISTED_DEVICES
+        ));
+    }
+    message.push_str(
+        "\nIf the robot is one of the unnamed lines, it was reported without the name and the \
+         service UUID this matches on, and retrying usually finds it. If it is absent entirely, \
+         `journalctl -u btd -b` on the robot says whether the GATT application is registered.",
+    );
+    message
+}
+
 /// Run one step with a budget, naming it if the budget runs out.
 async fn step<T>(
     what: &str,
@@ -150,8 +265,24 @@ enum Wifi {
     Forget { ssid: String },
 }
 
+/// Print the error rather than returning it, and that is not a style preference.
+///
+/// A `main` returning `Err` is reported by Rust's `Termination` impl, which **`Debug`-formats** the
+/// error: every hint in this file is multi-line, and `Debug` on a string renders the newlines as
+/// literal `\n` and wraps the lot in quotes. So the guidance written to be read as lines arrived as
+/// one escaped blob — worst for the failure that lists what the radio saw, which is a dozen lines.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let manager = Manager::new().await?;
@@ -182,12 +313,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut advertised: Vec<(Peripheral, String)> = Vec::new();
     let mut named: Vec<(Peripheral, String)> = Vec::new();
     let mut connected: Vec<(Peripheral, String)> = Vec::new();
+    // Everything the Mac reported, kept only so a failure can say what was in range. `configd`
+    // learned this on the other side — a failed `pad pair` lists what the radio saw, because the
+    // escape hatch needs an address nobody has otherwise.
+    let mut seen: Vec<Seen> = Vec::new();
     let deadline = Instant::now() + SCAN_TIME;
 
     loop {
         advertised.clear();
         named.clear();
         connected.clear();
+        // Cleared with the tiers, and rebuilt from the same sweep: `peripherals()` reports
+        // everything known to this scan session rather than only what arrived since the last poll,
+        // so the final sweep is the fullest one.
+        seen.clear();
 
         for peripheral in adapter.peripherals().await? {
             let Some(properties) = peripheral.properties().await? else {
@@ -197,6 +336,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .local_name
                 .clone()
                 .unwrap_or_else(|| properties.address.to_string());
+
+            seen.push(Seen {
+                peripheral: peripheral.clone(),
+                identity: identity(&peripheral, properties.address),
+                local_name: properties.local_name.clone(),
+                services: properties.services.len(),
+            });
 
             if properties.services.contains(&SERVICE_UUID) {
                 advertised.push((peripheral, name));
@@ -247,19 +393,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if found.is_empty() {
-        return Err(
-            "no robot found. Is btd running, and is the robot in range?\n\
-                    If the Mac has paired with it before, it may not appear in a scan: pass \
-                    `--name <robot hostname>` to try it by name anyway."
-                .into(),
-        );
+        return Err(nothing_found(&seen, cli.name.as_deref()).await.into());
     }
 
     let (peripheral, name) = match &cli.name {
-        Some(wanted) => found
-            .into_iter()
-            .find(|(_, name)| name == wanted)
-            .ok_or_else(|| format!("no robot named {wanted:?} in range"))?,
+        Some(wanted) => {
+            // Collected before the search consumes `found`: robots *were* there, they just call
+            // themselves something else, and naming them beats "not in range" for a robot that has
+            // been renamed since whoever is typing last looked.
+            let others: Vec<String> = found.iter().map(|(_, name)| name.clone()).collect();
+            found
+                .into_iter()
+                .find(|(_, name)| name == wanted)
+                .ok_or_else(|| {
+                    format!(
+                        "no robot named {wanted:?} in range. These answered to the duck service: {}",
+                        others.join(", ")
+                    )
+                })?
+        }
         None => found.into_iter().next().expect("non-empty"),
     };
     eprintln!("connecting to {name}…");
