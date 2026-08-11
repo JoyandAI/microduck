@@ -152,53 +152,108 @@ two files agree with each other, not that the thing they produce is correct.
 
 ## What would close it
 
-Roughly in order of cost.
+Revised 2026-08-11, after the restart mechanisms below landed and with one constraint that was not
+stated the first time: **CI is already the slowest part of iterating, so the plan is judged on what it
+adds to the wait, not only on what it covers.** Everything here therefore names where it runs.
 
-**A. Assert the artifact's contents.** Run `xtask package` in a test, then inspect the tarball:
-every unit named by `install.sh` is present, and every unit's `ExecStart` binary is present. Cheap,
-and strictly stronger than the two current tests because it observes the artifact instead of the
-YAML that builds it. **Would have caught bugs 2 and 3.**
+### The budget, first
 
-Still open in the form described. There are now *three* source-reading tests rather than two — a
+CI runs on every push and every pull request, as four parallel jobs, so the wait for green is the
+*slowest* job — not the total. That single fact decides where new tests belong:
+
+| job | what makes it slow |
+|---|---|
+| `check` | fmt, clippy, `cargo test --workspace`, the installer lint, and a real `xtask package` |
+| `board` | `cargo install cargo-zigbuild` from source, plus QEMU emulation for aarch64 |
+| `coverage` | a full instrumented build — **twice** on a pull request, head and base, for a delta comment |
+
+So a millisecond-scale test added to `cargo test` costs nothing anybody notices, while anything that
+lands in `board` or `coverage` is paid on every push. Three rules follow, and they are the point of
+this section:
+
+- **The default `cargo test --workspace` takes only in-process tests.** No tarballs, no `systemd`, no
+  network, no sleeps.
+- **Anything that unpacks an artifact or drives a service runs on demand**, as a script or an
+  `#[ignore]`d test — never on the pull-request path.
+- **No new CI job.** If a check needs an artifact, it hangs off the `xtask package` step `check`
+  already runs, and reuses the tarball that step already built.
+
+There is also something to *remove*, which buys more iteration speed than anything below adds:
+`coverage` runs the whole instrumented suite a second time against the base branch to produce a
+delta. The absolute `--fail-under-lines` gate is the part that catches a regression; the delta is a
+comment. Dropping the second run roughly halves the job.
+
+### 1. Two tests that need no new machinery
+
+In-process, in `cargo test`, and they cover the acting half of the two mechanisms that exist to make
+an update self-healing — neither of which is observable by any test today.
+
+- **`systemd-run` is unobservable.** `schedule_deferred_restarts` hardcodes
+  `Command::new("systemd-run")`, while `SYSTEMCTL` two functions away is a `const` precisely so
+  `restart_tests` can substitute a stub script. Same treatment, and then assert what has never been
+  asserted: `--on-active=5s`, one invocation per unit, both `updaterd` and `btd` named. The flag could
+  be wrong today and every test would still pass.
+- **`reconcile::check` is never called by a test**, only its pure `verdict_for`. It already takes
+  `systemctl` as a parameter, and identities are read through `DUCK_RUNTIME_DIR` — a seam whose own
+  comment says it exists so this is testable. Write identity files into a temp runtime directory and
+  assert the four outcomes: stale is restarted, `updaterd` is reported and not restarted, a missing
+  identity file is left alone, a failed restart reports itself.
+
+### 2. Unpack the real artifact and run the real installer
+
+**As a step in the existing `check` job, not a new one.** That job already builds an artifact with
+`xtask package` and then asserts three filenames. Extend it: unpack that same tarball into a
+temporary directory treated as the filesystem root, put a stub `systemctl` on `PATH`, run
+`scripts/install.sh` and `hooks/postinstall` against it, and assert what landed — the units in
+`/etc/systemd/system`, the sysusers files, the `robotctl` symlink, the state directory, and that every
+unit's `ExecStart` binary is present in the release. Seconds of shell, no second build, no new job.
+
+This is the item that closes the gap in the title, and it subsumes the earlier "assert the artifact's
+contents" idea for free, because the tarball is already open. **Would have caught bugs 2 and 3.**
+
+What it replaces is the weaker form that exists today: *three* tests — a
 `every_hook_in_the_repo_is_packaged` was added so `hooks/postinstall` cannot silently stop shipping —
-but all three still assert that `.github/workflows/*.yml` agrees with `scripts/install.sh`. They cover
-the drift class; none of them observes a tarball.
+all of which assert that `.github/workflows/*.yml` agrees with `scripts/install.sh`. They cover the
+drift class between two source files; none of them observes a tarball.
 
-**B. Install the artifact in a container, with `systemctl` stubbed.** Extend `board-test.sh`: unpack
-into a fake root, run `install.sh` *and* `hooks/postinstall` against it, and assert what landed
-where — `/etc/systemd/system/*.service`, `/usr/lib/sysusers.d/`, the `robotctl` symlink, the state
-directory. `setup-board.sh` is already tested this way, so the pattern and the stub exist. Catches
-bugs 2 and 3 *and* file-placement regressions in `install.sh`, which nothing tests today.
+And nothing executes the installer at all. `scripts/install.sh` is ~900 lines that no test runs;
+`board-test.sh` carries a comment reading "the first install, which is the path `scripts/install.sh`
+takes on a bare board" above a line that runs `updaterd install --from` instead. The engine's hook
+tests use a stub hook built by `test-support`, so the real `hooks/postinstall` has never run in the
+repository either — and it is the more dangerous of the two, because it places files on a board
+unattended on every update, from inside the update gate, with nobody watching. A hook that installs a
+unit wrongly is worse than an installer that does.
 
-Still open, and untouched. `board-test.sh` has a comment reading "the first install, which is the path
-`scripts/install.sh` takes on a bare board" — the line beneath it runs `updaterd install --from`, not
-`scripts/install.sh`. Nothing in the repository executes `scripts/install.sh` or the real
-`hooks/postinstall`; the engine's hook tests use a stub hook built by `test-support`.
+The pattern already exists — `setup-board.sh` is tested this way, against a stubbed `systemctl`.
 
-The postinstall hook makes this more valuable, not less: it is now a second thing that places files
-on a board, it runs unattended on every update rather than once by hand, and its failures are inside
-the update gate. A hook that installs a unit wrongly is worse than an installer that does, because
-nobody is watching when it runs.
+### 3. One scripted scenario on a real board
 
-**C. Real systemd in a container.** `systemd-nspawn`, or a privileged container with systemd as
-pid 1. Full fidelity: units actually start, `on_apply` actually restarts, the health gate actually
-gates. **Would have caught bug 1** — the only one A and B miss. Real work: cgroup and privilege
-setup in CI, and slow.
+**On demand, before a promotion. Never in CI.** Depends on `scripts/dev-push.sh`, which builds here,
+signs with the dev key and applies to a board in about a minute: install the previous release, apply
+the new one, then assert every daemon's `/run/<service>/identity.json` names the new release, that
+`robotctl health` is clean, and that the update log holds one success.
 
-**D. A board as a self-hosted runner.** Highest fidelity, and the only thing that ever tests the
-motor bus, the radio and the timings. Ops cost, and a single point of failure for CI.
+That one pass is the only thing that observes the transient timer actually firing, `RuntimeDirectory=`
+behaving under `ProtectSystem=strict`, real unit states reaching `robotctl health`, and the startup
+reconciliation closing the loop for real. For the timing-dependent parts a board is *higher* fidelity
+than any container, and it is now cheaper than one.
 
-## Suggested first step
+### 4. Real systemd, locally, for failure injection only
 
-**A, then B.** Together they cover two of the three bugs and remove the "files agree with each
-other" weakness, for a fraction of C's cost. B is the better value of the two because it exercises
-`install.sh`, which is 500 lines that nothing currently runs.
+`systemd-nspawn` on a Linux box — **not** a privileged container in CI. After the three items above,
+what is left is a short list of things nobody should ask a board to do repeatedly: a unit that exists
+and will not start, `kill -9` between the swap and the commit, `systemd-run` itself failing,
+`enable --now` on a unit whose `User=` does not exist. **Would have caught bug 1**, which is the only
+one the items above miss — and it is also the only way to watch the postinstall hook do its real job
+of enabling and starting a unit, which no stub can show.
 
-C is worth revisiting when `on_apply` grows again — it is the only option that tests the restart and
-the gate, and it is now also the only way to observe the postinstall hook doing its real job
-(enabling and starting a unit), which no stub can show.
+Last for a reason beyond cost: it can only run on Linux, so never on the machine this is developed on,
+and a test that runs somewhere else stops being read.
 
-D is a separate conversation, and probably follows M4 rather than preceding it.
+### Not doing
+
+**A board as a self-hosted runner.** Ops cost, and a single point of failure for CI. Item 3 gets most
+of the value on demand, which is where a robot in a room belongs.
 
 ## A second, separate problem: version skew on the dev channel
 
@@ -283,8 +338,8 @@ breaking change for every client on the box.
 
 ### Why these are not install-path bugs
 
-Nothing in options A–D above would have caught either. The artifact was correct both times; what was
+Nothing in the plan above would have caught either. The artifact was correct both times; what was
 wrong was the *pair* of versions running at one moment, which only exists on a machine that has been
-updated. Option C (real systemd in a container) would catch the *health-gate* consequence of case 1
-if the container also ran an older `updaterd`, but constructing that skew deliberately is a different
-kind of test — closer to a compatibility matrix than to an install test, and worth keeping separate.
+updated. Item 4 (real systemd locally) would catch the *health-gate* consequence of case 1 if the
+container also ran an older `updaterd`, but constructing that skew deliberately is a different kind of
+test — closer to a compatibility matrix than to an install test, and worth keeping separate.
