@@ -16,6 +16,7 @@
 //!   systemd/fake-robotd.service       a stand-in for a daemon in the restart set
 //!   systemd/btd.service               a stand-in for the one daemon held back from that restart
 //!   bin/fake-btd                      what it runs: publishes an identity, then sleeps
+//!   systemd/recovery-check.service    a oneshot with no `[Install]`, which nothing may restart
 //!   systemd/broken.service            only in `:broken-unit`: ExecStart=/bin/false
 //!   systemd/needs-a-user.service      only in `:sysusers` and `:missing-user`, with `User=`
 //!   systemd/sysusers.d/duck-test.conf only in `:sysusers`, and what creates that user
@@ -129,6 +130,16 @@ const GHOST_USER_UNIT: &str = "[Unit]\nDescription=A unit whose user does not ex
      [Service]\nType=exec\nExecStart=/bin/sleep infinity\nUser=nosuchuser-duck\n\n\
      [Install]\nWantedBy=multi-user.target\n";
 
+/// A unit shaped like the recovery net's oneshot: triggered by a timer, never by an update.
+///
+/// **No `[Install]` section, which is the whole point.** The real one asks whether the release that
+/// booted came up and hands over to `robot-rescue` if not, so an update that restarts it points a
+/// rollback check at daemons that are legitimately mid-restart. It records each run, so the harness
+/// can assert it did not happen rather than assume.
+const RECOVERY_CHECK_UNIT: &str = "[Unit]\nDescription=Shaped like the boot recovery check\n\n\
+     [Service]\nType=oneshot\n\
+     ExecStart=/bin/sh -c 'echo ran >> /run/recovery-check.ran'\n";
+
 /// A unit that installs cleanly and cannot start. Bug 1 of `install-path-gap.md` in one file: the
 /// update must fail and name it, rather than reverting with "not healthy: unreachable".
 const BROKEN_UNIT: &str = "[Unit]\nDescription=A unit that will not start\n\n\
@@ -181,6 +192,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .file(
                 "systemd/fake-robotd.service",
                 FAKE_ROBOTD_UNIT.as_bytes(),
+                0o644,
+            )
+            .file(
+                "systemd/recovery-check.service",
+                RECOVERY_CHECK_UNIT.as_bytes(),
                 0o644,
             )
             .file("bin/fake-btd", FAKE_BTD.as_bytes(), 0o755)

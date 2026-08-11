@@ -161,6 +161,17 @@ robotd_after="$(main_pid fake-robotd)"
     || fail "fake-robotd was not restarted (pid $robotd_before throughout)"
 pass "on_apply restarted the daemon the release ships (pid $robotd_before -> $robotd_after)"
 
+# …and did not restart the one nothing but a timer may start.
+#
+# `recovery-check.service` is shaped like the boot recovery net's oneshot: no `[Install]`, triggered by
+# a timer, and it asks whether the release that booted came up. An update restarting it points a
+# rollback check at daemons that are legitimately mid-restart, and `robot-rescue` can act on that by
+# swapping to golden and rebooting. `hooks/postinstall` already declines to `enable --now` it; the
+# engine used to read every `*.service` and restart it a moment later regardless.
+in_container "test -f /run/recovery-check.ran" \
+    && { in_container "cat /run/recovery-check.ran"; fail "the update ran a unit only a timer may start"; }
+pass "and left the recovery check alone, which only a timer may start"
+
 # 2. The deferred restart. Scheduled five seconds after the reply, through a transient unit, so this
 #    is the one observation a child process could not make: `updaterd` is replaced *by systemd*
 #    after the operation it was performing has finished.

@@ -7,11 +7,16 @@ three different documents, and the answer decides how a skew is diagnosed.
 Everything here is read from the code, and each step names the function that owns it. Where a
 narrative comment elsewhere disagrees with this page, the comment is the bug.
 
-## 1. The five units
+## 1. The five daemons, and the unit that is not one
 
-A release ships five `systemd/*.service` files: `robotd`, `configd`, `btd`, `padd`, `updaterd`. All
-five `ExecStart` a path under `/opt/robot/daemon/current/bin/`, so all five are stale the instant the
-symlink moves, and each one is either restarted by the update or restarted after it.
+A release ships five daemons — `robotd`, `configd`, `btd`, `padd`, `updaterd` — each `ExecStart`ing a
+path under `/opt/robot/daemon/current/bin/`, so each is stale the instant the symlink moves, and each
+is either restarted by the update or restarted after it.
+
+It also ships `robot-boot-check.service`, which is **not** one of them and which an update must never
+restart: it asks whether the release that booted came up and hands over to `robot-rescue` if not, so
+running it mid-update points a rollback check at daemons that are legitimately mid-restart. It carries
+no `[Install]` section, and that is what keeps it out — see §1.1.
 
 | unit | restarted mid-update | restarted ~5 s after the reply |
 |---|---|---|
@@ -29,6 +34,22 @@ single most common stale claim about this system.
 
 And because scheduling a restart is not evidence that one happened, the next `updaterd` start checks
 each unit against the active release and restarts anything stale — §5.
+
+### 1.1 What counts as a unit an update starts
+
+A `systemd/*.service` file with an `[Install]` section. One without is triggered by something else — a
+timer, or another unit pulling it in — so its lifecycle is not the update's to drive, and
+`engine.rs::has_install_section` is where that is decided.
+
+The rule rather than a list of names, because there were already two places applying it and they
+disagreed: `hooks/postinstall` declines to `enable --now` a unit with no `[Install]`, saying so in as
+many words — *"`enable --now` on it would run a rollback check in the middle of the update that
+installed it, with daemons legitimately mid-restart"* — while the engine read every `*.service` and
+restarted it a moment later anyway. Keyed on the section, the two agree by construction and the next
+unit like it needs nobody to remember.
+
+An unreadable unit file counts as one to restart. That is more likely a permissions problem than a
+deliberately triggerless unit, and a restart failing loudly beats one skipped quietly.
 
 ### How the set is computed
 
@@ -214,7 +235,8 @@ restart fails the transition (`../project/install-path-gap.md`).
 
 ## 4. At boot
 
-systemd starts all five units from `multi-user.target`. There is **no ordering between the daemons**
+systemd starts the five daemons from `multi-user.target`, and `robot-boot-check.timer` arms the
+recovery check for 180 seconds in. There is **no ordering between the daemons**
 beyond `padd` after `robotd` (advisory — `padd` exits and retries every 5 s if the socket is absent)
 and `btd` after `dbus`/`bluetooth`. Nothing waits on `updaterd`, and `updaterd` waits on nothing but
 `network-online.target`, which is `Wants` rather than `Requires`.

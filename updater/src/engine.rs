@@ -2099,6 +2099,26 @@ fn units_shipped(release_dir: &Path, configured: &[String]) -> Vec<String> {
                 if path.extension().and_then(|e| e.to_str()) != Some("service") {
                     continue;
                 }
+                // A unit with no `[Install]` section is started by something else — a timer, or
+                // another unit pulling it in — so its lifecycle is not this engine's to drive.
+                //
+                // The recovery net's oneshot is exactly that, and deliberately: it asks whether the
+                // release that booted came up, and hands over to `robot-rescue` if not.
+                // `hooks/postinstall` already skips `enable --now` on it for that reason, in as many
+                // words — "`enable --now` on it would run a rollback check in the middle of the
+                // update that installed it, with daemons legitimately mid-restart". Reading every
+                // `*.service` then restarted it a moment later anyway, which is the same mistake
+                // one function further on.
+                //
+                // The rule rather than a name in `NEVER_RESTART`: `postinstall` and this now agree
+                // by construction, and the next unit like it needs nobody to remember.
+                if !has_install_section(&path) {
+                    tracing::debug!(
+                        unit = %path.display(),
+                        "no [Install] section, so something other than this update starts it"
+                    );
+                    continue;
+                }
                 if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
                     units.push(name.to_owned());
                 }
@@ -2122,6 +2142,21 @@ fn units_shipped(release_dir: &Path, configured: &[String]) -> Vec<String> {
     units.sort();
     units.dedup();
     units
+}
+
+/// Is this unit one systemd is asked to enable, or one something else triggers?
+///
+/// An unreadable file answers "yes", which errs towards restarting: a unit whose contents cannot be
+/// read is more likely a permissions or IO problem than a deliberately triggerless unit, and the
+/// restart failing loudly beats it being skipped quietly.
+fn has_install_section(path: &Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text.lines().any(|line| line.trim() == "[Install]"),
+        Err(e) => {
+            tracing::warn!(unit = %path.display(), error = %e, "cannot read this unit; treating it as one to restart");
+            true
+        }
+    }
 }
 
 /// The subset an update restarts in flight: everything shipped, less the two it cannot touch while
@@ -2323,9 +2358,11 @@ esac
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("systemd")).unwrap();
         for unit in units {
+            // With an `[Install]` section, because that is what makes a unit one an update starts.
+            // The unit without one has its own test.
             std::fs::write(
                 dir.path().join("systemd").join(format!("{unit}.service")),
-                "[Unit]\n",
+                "[Unit]\n\n[Install]\nWantedBy=multi-user.target\n",
             )
             .unwrap();
         }
@@ -2386,6 +2423,57 @@ esac
         assert_eq!(
             units_to_restart(release.path(), &overlapping),
             vec!["configd".to_owned(), "robotd".to_owned()]
+        );
+    }
+
+    /// **The recovery net's oneshot must not be restarted by an update.** It asks whether the release
+    /// that booted came up and hands over to `robot-rescue` if not, so running it mid-update points a
+    /// rollback check at daemons that are legitimately mid-restart — and `robot-rescue` can swap to
+    /// golden and reboot.
+    ///
+    /// `hooks/postinstall` already declines to `enable --now` it, for that reason and in those words.
+    /// Reading every `*.service` then restarted it a moment later anyway: two places applying one rule
+    /// to one unit and disagreeing. Keyed on `[Install]` rather than on the name, so the next unit
+    /// like it needs nobody to remember.
+    #[test]
+    fn a_unit_something_else_triggers_is_not_restarted_by_an_update() {
+        let release = release_shipping(&["robotd", "configd"]);
+        // As the real one is: a oneshot with no `[Install]`, armed by a timer.
+        std::fs::write(
+            release
+                .path()
+                .join("systemd")
+                .join("robot-boot-check.service"),
+            "[Unit]\nDescription=Did the release that booted come up?\n\n\
+             [Service]\nType=oneshot\nExecStart=/usr/local/sbin/robot-boot-check\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            units_to_restart(release.path(), &[]),
+            vec!["configd".to_owned(), "robotd".to_owned()],
+            "a unit with no [Install] is triggered by something else and is left to it"
+        );
+    }
+
+    /// The other half, so the rule cannot be satisfied by skipping everything: a unit that *is*
+    /// enabled stays in the set, and the timer beside the oneshot changes nothing — only `.service`
+    /// files were ever read.
+    #[test]
+    fn a_unit_with_an_install_section_is_still_restarted() {
+        let release = release_shipping(&["robotd"]);
+        std::fs::write(
+            release
+                .path()
+                .join("systemd")
+                .join("robot-boot-check.timer"),
+            "[Timer]\nOnBootSec=180\n\n[Install]\nWantedBy=timers.target\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            units_to_restart(release.path(), &[]),
+            vec!["robotd".to_owned()]
         );
     }
 
