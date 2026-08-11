@@ -456,8 +456,9 @@ drifted from it**:
 So the trait is not merely a testing seam; it is the only written form of the contract. The problem is
 the direction of the check — the suite verifies the fake against the contract, and nothing verifies NM
 against either. Both implement `Net`, so the same assertions *could* run against both; what stops it
-is that the NM side needs a real NetworkManager and a real radio, which means a board
-(`install-path-gap.md`, option D) rather than CI.
+is that the NM side needs a real NetworkManager and a real radio, which means a board rather than CI —
+see `install-path-gap.md` §"What would close it", where a board is on-demand by design and deliberately
+not a CI runner.
 
 Until that exists, the honest summary is: `configd`'s wifi behaviour is tested, and the code that runs
 on the robot is not. Every bug above was found by hand, on hardware, in the space of one session.

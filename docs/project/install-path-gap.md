@@ -182,67 +182,142 @@ behaviour above, and stays self-correcting.
 
 Not an accusation of the tests; they cover what they claim. The point is what nothing covers.
 
+This was written when the answer was "nothing", and the row that says so has since changed. Kept as
+the record of what was missing, with what each check covers **today**:
+
 | | covers | does not |
 |---|---|---|
-| `board-test.sh` | binaries executed on real aarch64 Linux from the *build directory*: engine behaviour, socket modes, `SO_PEERCRED`, the layered authorisation, `setup-board.sh` against a stubbed `systemctl` | unpacking an artifact, installing units, starting services |
+| `board-test.sh` | binaries executed on real aarch64 Linux, **and a real artifact unpacked and installed** by `install.sh` and `hooks/postinstall` against a stubbed `systemctl` — placements, modes, ordering, idempotence, and every unit's `ExecStart` binary being present | services actually starting, which needs real systemd |
 | `xtask` tests | the workflow YAML vs `install.sh`, and unit `ExecStart` vs staged binaries | whether the *built artifact* matches either — it reads source files |
 | `updater` tests | engine, journal, verification, rollback, with fakes | `install.sh` at all |
 | `shipped_config_is_safe_for_a_client_robot` | `deploy/updater.toml`'s content | that the config is installable |
 
-So: **no test takes a real artifact and installs it.** Every check either runs a binary that was
-never packaged, or reads a source file that describes packaging without observing it. The two
-`xtask` tests I added are strictly better than nothing and still the weaker form — they assert that
-two files agree with each other, not that the thing they produce is correct.
+What the first row used to say was "unpacking an artifact, installing units, starting services", and
+the sentence beneath it was: **no test takes a real artifact and installs it.** That was the finding
+this document exists for, and it is fixed — the `xtask` row is still the weaker form, asserting that
+two source files agree rather than observing what they produce, but it is no longer the only thing
+standing between a packaging mistake and a board.
 
 ## What would close it
 
-Roughly in order of cost.
+Revised 2026-08-11, after the restart mechanisms below landed and with one constraint that was not
+stated the first time: **CI is already the slowest part of iterating, so the plan is judged on what it
+adds to the wait, not only on what it covers.** Everything here therefore names where it runs.
 
-**A. Assert the artifact's contents.** Run `xtask package` in a test, then inspect the tarball:
-every unit named by `install.sh` is present, and every unit's `ExecStart` binary is present. Cheap,
-and strictly stronger than the two current tests because it observes the artifact instead of the
-YAML that builds it. **Would have caught bugs 2 and 3.**
+### The budget, first
 
-Still open in the form described. There are now *three* source-reading tests rather than two — a
-`every_hook_in_the_repo_is_packaged` was added so `hooks/postinstall` cannot silently stop shipping —
-but all three still assert that `.github/workflows/*.yml` agrees with `scripts/install.sh`. They cover
-the drift class; none of them observes a tarball.
+CI runs on every push and every pull request that touches code, as parallel jobs, so the wait for
+green is the *slowest* job — not the total. That single fact decides where new tests belong:
 
-**B. Install the artifact in a container, with `systemctl` stubbed.** Extend `board-test.sh`: unpack
-into a fake root, run `install.sh` *and* `hooks/postinstall` against it, and assert what landed
-where — `/etc/systemd/system/*.service`, `/usr/lib/sysusers.d/`, the `robotctl` symlink, the state
-directory. `setup-board.sh` is already tested this way, so the pattern and the stub exist. Catches
-bugs 2 and 3 *and* file-placement regressions in `install.sh`, which nothing tests today.
+| job | what makes it slow |
+|---|---|
+| `check` | fmt, clippy, `cargo test --workspace`, the installer lint, and a real `xtask package` |
+| `board` | `cargo install cargo-zigbuild` from source, plus QEMU emulation for aarch64 |
+| `coverage` | a full instrumented build |
 
-Still open, and untouched. `board-test.sh` has a comment reading "the first install, which is the path
-`scripts/install.sh` takes on a bare board" — the line beneath it runs `updaterd install --from`, not
-`scripts/install.sh`. Nothing in the repository executes `scripts/install.sh` or the real
-`hooks/postinstall`; the engine's hook tests use a stub hook built by `test-support`.
+So a millisecond-scale test added to `cargo test` costs nothing anybody notices, while anything that
+lands in `board` or `coverage` is paid on every push. Three rules follow, and they are the point of
+this section:
 
-The postinstall hook makes this more valuable, not less: it is now a second thing that places files
-on a board, it runs unattended on every update rather than once by hand, and its failures are inside
-the update gate. A hook that installs a unit wrongly is worse than an installer that does, because
-nobody is watching when it runs.
+- **The default `cargo test --workspace` takes only in-process tests.** No tarballs, no `systemd`, no
+  network, no sleeps.
+- **Anything that unpacks an artifact or drives a service runs on demand**, as a script or an
+  `#[ignore]`d test — never on the pull-request path.
+- **No new CI job.** If a check needs an artifact, it hangs off the `xtask package` step `check`
+  already runs, and reuses the tarball that step already built.
 
-**C. Real systemd in a container.** `systemd-nspawn`, or a privileged container with systemd as
-pid 1. Full fidelity: units actually start, `on_apply` actually restarts, the health gate actually
-gates. **Would have caught bug 1** — the only one A and B miss. Real work: cgroup and privilege
-setup in CI, and slow.
+Both of those numbers used to be worse, and the two removals that fixed them are the shape this
+section argues for — **taking work out of CI is worth more than any test below adds**:
 
-**D. A board as a self-hosted runner.** Highest fidelity, and the only thing that ever tests the
-motor bus, the radio and the timings. Ops cost, and a single point of failure for CI.
+- **`coverage` ran the whole instrumented suite twice** on a pull request, head and base, purely to
+  print a delta. Removed: `--fail-under-lines` is what catches a regression, and this job went from
+  over seven minutes to about two. The cost is stated rather than glossed — a change that lowers
+  coverage while staying over the floor no longer says so, and the floor is a ratchet now.
+- **A documentation-only change paid the whole bill.** `on:` had no path filter, so editing this file
+  cross-compiled for aarch64 under QEMU and built the workspace under instrumentation. Three
+  consecutive docs pull requests did exactly that while this plan was being written. Removed with a
+  `paths-ignore` for `docs/**` and `*.md`.
 
-## Suggested first step
+  That one has a trap attached, checked rather than assumed: a skipped job reports **no status at
+  all**, so filtering a check that is *required* for merge leaves docs pull requests permanently
+  pending. It is safe here because `main` has no required status checks — the branch-protection API
+  answers 403 on this plan. Turning protection on means revisiting it, and the shape then is a
+  filtered job plus a no-op job of the same name.
 
-**A, then B.** Together they cover two of the three bugs and remove the "files agree with each
-other" weakness, for a fraction of C's cost. B is the better value of the two because it exercises
-`install.sh`, which is 500 lines that nothing currently runs.
+### 1. Two tests that need no new machinery
 
-C is worth revisiting when `on_apply` grows again — it is the only option that tests the restart and
-the gate, and it is now also the only way to observe the postinstall hook doing its real job
-(enabling and starting a unit), which no stub can show.
+In-process, in `cargo test`, and they cover the acting half of the two mechanisms that exist to make
+an update self-healing — neither of which was observable by any test. Both are written; what follows
+is why they were the first thing to do.
 
-D is a separate conversation, and probably follows M4 rather than preceding it.
+- **`systemd-run` is unobservable.** `schedule_deferred_restarts` hardcodes
+  `Command::new("systemd-run")`, while `SYSTEMCTL` two functions away is a `const` precisely so
+  `restart_tests` can substitute a stub script. Same treatment, and then assert what has never been
+  asserted: `--on-active=5s`, one invocation per unit, both `updaterd` and `btd` named. The flag could
+  be wrong today and every test would still pass.
+- **`reconcile::check` is never called by a test**, only its pure `verdict_for`. It already takes
+  `systemctl` as a parameter, and identities are read through `DUCK_RUNTIME_DIR` — a seam whose own
+  comment says it exists so this is testable. Write identity files into a temp runtime directory and
+  assert the four outcomes: stale is restarted, `updaterd` is reported and not restarted, a missing
+  identity file is left alone, a failed restart reports itself.
+
+### 2. The artifact install — done, and what it left
+
+**This is no longer open, and the title of this document is no longer true.** `scripts/board-test.sh`
+packages a real release from the `--include` list in `_build-release.yml`, unpacks it, and runs
+`scripts/install.sh` *and* `hooks/postinstall` against it inside the container with a stubbed
+`systemctl` (PR #47, 2026-08-07). Eleven assertions: units installed byte-identical at mode 644,
+sysusers drop-ins, the `robotctl` symlink resolving through `current`, the journald drop-in,
+`daemon-reload` before any `enable` and `configd` before `btd`, operator config files preserved,
+idempotence on a second run, a unit `install.sh` does not recognise installed-but-not-started, and
+postinstall reproducing the lot on its own.
+
+That covers what this section used to ask for, and the "assert the artifact's contents" idea with it,
+because the tarball is open by then. **Bug 2 is closed against the artifact rather than against the
+YAML.**
+
+One gap was left, and it is bug 3 — the one class of the four with no strong test. Nothing asked
+whether the binary a unit `ExecStart`s is *in* the artifact that shipped the unit, which is exactly how
+`btd.service` came to fail with `203/EXEC` on a board where the release looked complete. The
+protection was `xtask/tests/artifact.rs`, comparing a workflow against `install.sh` — the
+two-files-agree form criticised above. Now asked directly, three lines, in the job that already has
+the tree unpacked and `current` pointing at it.
+
+Only `ExecStart` paths inside the release are checked: a unit may deliberately exec out of the base —
+the boot recovery net does, so that a broken release cannot break it — and requiring those to be
+packaged would be wrong rather than strict.
+
+**What is still genuinely missing here is nothing.** The remaining items are the two below, and they
+cover different things rather than more of this one.
+
+### 3. One scripted scenario on a real board
+
+**On demand, before a promotion. Never in CI.** Depends on `scripts/dev-push.sh`, which builds here,
+signs with the dev key and applies to a board in about a minute: install the previous release, apply
+the new one, then assert every daemon's `/run/<service>/identity.json` names the new release, that
+`robotctl health` is clean, and that the update log holds one success.
+
+That one pass is the only thing that observes the transient timer actually firing, `RuntimeDirectory=`
+behaving under `ProtectSystem=strict`, real unit states reaching `robotctl health`, and the startup
+reconciliation closing the loop for real. For the timing-dependent parts a board is *higher* fidelity
+than any container, and it is now cheaper than one.
+
+### 4. Real systemd, locally, for failure injection only
+
+`systemd-nspawn` on a Linux box — **not** a privileged container in CI. After the three items above,
+what is left is a short list of things nobody should ask a board to do repeatedly: a unit that exists
+and will not start, `kill -9` between the swap and the commit, `systemd-run` itself failing,
+`enable --now` on a unit whose `User=` does not exist. **Would have caught bug 1**, which is the only
+one the items above miss — and it is also the only way to watch the postinstall hook do its real job
+of enabling and starting a unit, which no stub can show.
+
+Last for a reason beyond cost: it can only run on Linux, so never on the machine this is developed on,
+and a test that runs somewhere else stops being read.
+
+### Not doing
+
+**A board as a self-hosted runner.** Ops cost, and a single point of failure for CI. Item 3 gets most
+of the value on demand, which is where a robot in a room belongs.
 
 ## A second, separate problem: version skew on the dev channel
 
@@ -339,8 +414,8 @@ actionable.
 
 ### Why these are not install-path bugs
 
-Nothing in options A–D above would have caught either. The artifact was correct both times; what was
+Nothing in the plan above would have caught either. The artifact was correct both times; what was
 wrong was the *pair* of versions running at one moment, which only exists on a machine that has been
-updated. Option C (real systemd in a container) would catch the *health-gate* consequence of case 1
-if the container also ran an older `updaterd`, but constructing that skew deliberately is a different
-kind of test — closer to a compatibility matrix than to an install test, and worth keeping separate.
+updated. Item 4 (real systemd locally) would catch the *health-gate* consequence of case 1 if the
+container also ran an older `updaterd`, but constructing that skew deliberately is a different kind of
+test — closer to a compatibility matrix than to an install test, and worth keeping separate.
