@@ -1150,6 +1150,49 @@ mod tests {
         assert!(rendered.contains("ONNX_TARGET=\"1.28.0\""));
     }
 
+    /// `board-test.sh` hands its whole container script to `sh -c` inside **one single-quoted
+    /// string**, so a single quote anywhere in it ends that string early.
+    ///
+    /// Both ways this fails are quiet. An apostrophe in a comment — "the oneshot's job" — leaves the
+    /// file syntactically broken, which at least fails loudly. Worse is a quoted argument:
+    /// `grep -q '^\[Install\]'` arrives at the container as `grep -q ^\[Install\]`, and the shell
+    /// there strips the backslashes, so grep is handed `^[Install]` — a bracket expression matching
+    /// one character from `I n s t a l`. It runs, it exits 0 or 1 for the wrong reason, and the
+    /// assertion built on it reports something that was never checked. That is how this test came to
+    /// exist, and finding it took a CI round trip and a while.
+    ///
+    /// Comments are *not* exempt, unlike the check below: the shell does not know it is reading one.
+    #[test]
+    fn the_board_test_container_script_contains_no_single_quotes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let script = std::fs::read_to_string(root.join("scripts/board-test.sh"))
+            .expect("scripts/board-test.sh must exist");
+
+        // The container script is assigned as `CHECKS='` … `'` at the start of a line.
+        let (_, rest) = script
+            .split_once("\nCHECKS='")
+            .expect("board-test.sh no longer assigns CHECKS with a single-quoted string");
+        let (checks, _) = rest
+            .split_once("\n'\n")
+            .expect("the CHECKS string is no longer closed by a lone quote on its own line");
+
+        let offenders: Vec<(usize, &str)> = checks
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains('\''))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "single quotes inside the CHECKS string end it early. Use double quotes for grep \
+             patterns (\"^\\\\[Install\\\\]\" survives; '^\\\\[Install\\\\]' does not) and reword \
+             any apostrophe. Offending lines, numbered from the start of CHECKS: {offenders:#?}"
+        );
+    }
+
     /// Advice the provisioning scripts print must be runnable from where the operator is
     /// standing, which is their home directory and not wherever the file was downloaded to.
     ///

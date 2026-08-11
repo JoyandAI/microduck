@@ -850,7 +850,7 @@ for src in "$REL"/systemd/*.service "$REL"/systemd/*.timer; do
     #   - a timer: enabled, not started. An `OnBootSec=` timer started past its deadline fires at
     #     once, and this hook runs mid-update;
     #   - everything else: enabled and started, which is the whole point of the hook.
-    if ! grep -q '^\[Install\]' "$src"; then
+    if ! grep -q "^\[Install\]" "$src"; then
         grep -q " ${name}$" /stub/systemctl.log \
             && { echo "    [FAIL] postinstall touched ${name}, which has no [Install]"; exit 1; }
         continue
