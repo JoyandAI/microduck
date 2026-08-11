@@ -300,17 +300,28 @@ packaged would be wrong rather than strict.
 **What is still genuinely missing here is nothing.** The remaining items are the two below, and they
 cover different things rather than more of this one.
 
-### 3. One scripted scenario on a real board
+### 3. The board check — done, inside `dev-push.sh`
 
-**On demand, before a promotion. Never in CI.** Depends on `scripts/dev-push.sh`, which builds here,
-signs with the dev key and applies to a board in about a minute: install the previous release, apply
-the new one, then assert every daemon's `/run/<service>/identity.json` names the new release, that
-`robotctl health` is clean, and that the update log holds one success.
+**Done, and not as a separate scenario script.** `dev-push.sh` used to end at "is live", which means
+the swap happened and the health gate passed — not that the five daemons are running what was swapped
+in. That gap is where an afternoon goes: four wifi fixes were once verified as broken against a
+`configd` that had never restarted.
 
-That one pass is the only thing that observes the transient timer actually firing, `RuntimeDirectory=`
-behaving under `ProtectSystem=strict`, real unit states reaching `robotctl health`, and the startup
-reconciliation closing the loop for real. For the timing-dependent parts a board is *higher* fidelity
-than any container, and it is now cheaper than one.
+So the check runs on every push rather than before a promotion. It reads the identity each daemon
+publishes at startup, compares the release named there against the board's `current`, and — separately,
+because everything agreeing on the *previous* release would otherwise pass — against the version this
+push built. `robotd`, `configd` and `padd` are expected to match at once; `updaterd` and `btd` are
+polled for up to 30 s, because they restart five seconds after the reply.
+
+This is the only thing that observes the whole restart mechanism end to end, and nothing in CI can
+replace it: the transient timer, the `RuntimeDirectory=` holding each identity, and the five-second
+delay are all systemd, on real timing. A stale unit fails the push and names what to look at.
+
+Two deliberate non-failures. A daemon that published nothing is reported and not failed — systemd
+removes the runtime directory when a unit stops, so it is also what a deliberately disabled `padd`
+looks like. And `robotctl health` only has to *answer*: a bench board with no servo power reports
+degraded, which is a fact about the bench rather than about the build, exactly as the health gate
+treats it.
 
 ### 4. Real systemd, locally, for failure injection only
 

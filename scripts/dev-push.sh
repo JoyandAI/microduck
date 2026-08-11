@@ -300,3 +300,102 @@ else
     fi
     exit "$status"
 fi
+
+# ── did every daemon actually move? ──
+#
+# The apply reporting success means the swap happened and the health gate passed. It does not mean
+# the five daemons are running the release that was swapped in, and the gap between those two is
+# where an afternoon goes: four wifi fixes were once verified as broken against a `configd` that
+# had never restarted. `robotd`, `configd` and `padd` restart during the update; `updaterd` and
+# `btd` restart five seconds after it replies, because the first cannot restart itself mid-update
+# and the second may be carrying the reply (docs/design/restart-order.md).
+#
+# So this is the one check that observes the whole mechanism end to end, on real systemd, with real
+# timing — and nothing else in the repository can. A container cannot: the transient timer, the
+# `RuntimeDirectory=` that holds each identity, and the five-second delay are all systemd.
+#
+# Polled rather than slept: a fixed sleep is either a wrong answer or a slow one, and the interesting
+# case is a restart that never happens, which no length of sleep improves.
+[ "$DRY_RUN" = no ] || exit 0
+
+echo "==> checking every daemon is running it"
+
+# Sent on stdin, so nothing here is expanded by this laptop's shell and the quoting stays readable.
+# The board derives what it expects from its own `current` symlink; the version this push built is
+# compared against that separately, below.
+if ssh "$BOARD" sh -s -- "$VERSION" <<'REMOTE'
+set -u
+pushed="${1:-}"
+current="$(readlink /opt/robot/daemon/current || true)"
+want="${current#releases/}"
+[ -n "$want" ] || { echo "    no release is live: current -> ${current:-nothing}"; exit 1; }
+echo "    current -> $want"
+
+# That the daemons agree with `current` is not enough on its own: they could all agree on the
+# release this push was supposed to replace. `apply` reported success, so this should be
+# impossible — which is the reason to check it rather than the reason not to.
+[ "$want" = "$pushed" ] || {
+    echo "    [FAIL] current is $want, but this push built $pushed"
+    exit 1
+}
+
+# The identity each daemon publishes at startup, which names the release directory it was launched
+# from. A file rather than a question, so this needs no socket and no privilege — and `btd` serves
+# no socket at all, so for that one it is the only answer available.
+deadline=$(($(date +%s) + 30))
+stale=""
+for svc in robotd configd padd updaterd btd; do
+    while :; do
+        if [ ! -f "/run/${svc}/identity.json" ]; then
+            state="silent"
+        elif grep -q "releases/${want}/bin/${svc}" "/run/${svc}/identity.json"; then
+            state="ok"
+        else
+            state="stale"
+        fi
+        # Only the two deferred ones are worth waiting for; the rest restarted before the reply, so
+        # a mismatch there is already a fault rather than a race.
+        case "$state:$svc" in
+            ok:*) break ;;
+            stale:updaterd|stale:btd|silent:updaterd|silent:btd)
+                [ "$(date +%s)" -lt "$deadline" ] || break
+                sleep 1
+                ;;
+            *) break ;;
+        esac
+    done
+
+    case "$state" in
+        ok) echo "    [ok] $svc" ;;
+        silent)
+            # Not treated as a failure: systemd removes the runtime directory when a unit stops, so
+            # this is also what a deliberately disabled `padd` looks like.
+            echo "    [--] $svc published nothing — stopped, or a build too old to say"
+            ;;
+        stale)
+            echo "    [FAIL] $svc is not running $want"
+            stale="${stale} ${svc}"
+            ;;
+    esac
+done
+
+[ -z "$stale" ] || {
+    echo
+    echo "  Stale:${stale}. The release is installed and those are not running it, which reads as"
+    echo "  a fix that did not work. What to look at:"
+    echo "    robotctl health                     # the units block names the release each one runs"
+    echo "    journalctl -u updaterd -b | tail    # 'restart scheduled', or why it could not be"
+    echo "    sudo systemctl restart <unit>       # and then why it needed doing by hand"
+    exit 1
+}
+
+# Answerable, not healthy. A bench board with no servo power reports degraded and that is a fact
+# about the bench, not about this build — the health gate draws the same distinction.
+robotctl health >/dev/null 2>&1 || echo "    [--] robotctl health did not answer cleanly; worth a look"
+REMOTE
+then
+    echo "==> every daemon on $BOARD is running $VERSION"
+else
+    echo "==> the release is live but not everything is running it" >&2
+    exit 1
+fi
