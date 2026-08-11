@@ -30,6 +30,13 @@ pub struct Faults {
     /// Make rollback itself fail, exercising the worst path: failed update *and*
     /// failed recovery, which must be reported loudly rather than silently.
     pub fail_rollback: bool,
+    /// Make the *apply action* fail while rolling back, with the swap succeeding.
+    ///
+    /// A different outcome from [`Self::fail_rollback`], and the distinction is the point: the
+    /// robot is back on the known-good release and one unit did not restart. Reachable without a
+    /// fault — a unit file left behind by the failed release does it — but only on a machine with
+    /// systemd, which is why there is a seam for it here.
+    pub fail_rollback_apply: bool,
 }
 
 impl Faults {
@@ -67,11 +74,12 @@ impl Faults {
                 "abort_after_swap" => faults.abort_after_swap = true,
                 "simulate_disk_full" => faults.simulate_disk_full = true,
                 "fail_rollback" => faults.fail_rollback = true,
+                "fail_rollback_apply" => faults.fail_rollback_apply = true,
                 other => {
                     return Err(crate::Error::Config(format!(
                         "unknown fault {other:?}; valid: corrupt_artifact, fail_post_hook, \
                          fail_health, hang_health, abort_after_swap, simulate_disk_full, \
-                         fail_rollback"
+                         fail_rollback, fail_rollback_apply"
                     )));
                 }
             }

@@ -832,6 +832,64 @@ async fn failed_rollback_is_reported_distinctly() {
     );
 }
 
+/// The case the one above used to swallow: the swap succeeded and the *restart* did not.
+///
+/// Reachable without a fault, and `scripts/systemd-test.sh` reaches it — `hooks/postinstall`
+/// overwrites unit files and by design does not put them back, so a release that fails *because* one
+/// of its units cannot start leaves that file behind, and the revert's own restart of a unit with the
+/// same name inherits the same failure.
+///
+/// Reporting that as `RollbackFailed` asserted the one thing that was false — the robot had been put
+/// back — and buried the one thing that was true, which is that a daemon is down. Both facts, in the
+/// outcome.
+#[tokio::test]
+async fn a_revert_whose_restart_fails_is_still_a_revert() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish("1.1.0", None);
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::unhealthy()),
+        Faults {
+            fail_rollback_apply: true,
+            ..Faults::none()
+        },
+        "",
+    );
+
+    let outcome = apply_latest(&mut engine)
+        .await
+        .expect("a revert that happened is not an error");
+
+    match outcome {
+        updater::proto::ApplyResult::RolledBack {
+            reverted_to,
+            reason,
+            ..
+        } => {
+            assert_eq!(
+                reverted_to.as_ref().map(ToString::to_string).as_deref(),
+                Some("1.0.0"),
+                "the release must be reported as reverted, because it was"
+            );
+            // Why the update failed comes first — that is what someone is looking for — and the
+            // daemon that did not come back is a second thing to act on rather than a correction.
+            assert!(reason.contains("not healthy"), "{reason}");
+            assert!(reason.contains("did not restart"), "{reason}");
+            assert!(reason.contains("is down"), "{reason}");
+        }
+        other => panic!("expected RolledBack, got {other:?}"),
+    }
+
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "and the tree must actually be back, which is the claim the outcome makes"
+    );
+}
+
 // ── crash recovery ───────────────────────────────────────────────────────────
 
 /// Simulates `kill -9` right after the symlink swap: the new release is live and

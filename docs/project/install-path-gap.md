@@ -355,9 +355,50 @@ binary with no `--config`, so it validated `/etc/robot/updater.toml` however the
 started — defeating the check's whole purpose, which is to catch a new binary that rejects *the
 board's* config file.
 
-Two injections named here are still worth adding now that the harness exists, and neither needs new
-machinery: `systemd-run` failing (the update must still succeed, and the successor must reconcile the
-stale unit), and `enable --now` on a unit whose `User=` does not exist.
+Both injections named here are in it too, and both landed assertions nothing else could make:
+
+- **`systemd-run` cannot be run.** The update still succeeds — scheduling is best-effort by design,
+  because the update is committed by then — the journal says so, and `btd` and `updaterd` are left on
+  the old release exactly as a missed timer leaves them. Then the next `updaterd` start reconciles the
+  stale `btd` onto the active release and does **not** restart itself, which in that process would be a
+  loop with no way out. That is `reconcile.rs` closing the loop for the first time outside a unit test.
+- **A unit whose `User=` the release brings with it.** `postinstall` installs `sysusers.d` files and
+  runs `systemd-sysusers` before the units, and its comment calls that ordering load-bearing. The
+  account exists and its unit runs. The other half — the same unit with nothing creating the user —
+  fails the update and names the unit rather than the account.
+
+### The gap the harness found on the way — fixed
+
+**A failed update reported a failed rollback for a robot it had successfully put back.** Reproduced by
+the missing-user release above, and `RollbackFailed` is the outcome the design calls the most serious
+one — so it was worth more than a note.
+
+The cause is not the rollback. `hooks/postinstall` overwrites unit files and, by design, does not put
+them back: the hook argues that a release which did not take leaves one service failing until the next
+one does, which is the same situation either way. That reasoning holds and is unchanged. What it did
+not anticipate is the unit being in the restart set of the release being reverted **to** — then the
+revert re-runs the same restart and inherits the same failure. Reachable by an ordinary bad release
+rather than only by the downgrade case above: two consecutive releases ship the same unit name and the
+newer one is broken.
+
+**The fix separates the swap from the apply action, because only one of them is the recovery.** Past
+`swap_to` and the trial being cleared, the robot *is* back on the release it came from; a unit that
+then fails to restart is a second fact, not a contradiction of the first. So `Error::RollbackFailed`
+keeps its meaning — the robot could not be put back at all — and a failed apply action during a revert
+is carried into the reported outcome and logged at `error`:
+
+```text
+not healthy within 30s: …; the release was reverted but a unit did not restart (…), so
+something on this robot is down
+```
+
+Both facts, in the order someone needs them: why the update failed first, then what is still down.
+
+The two rejected alternatives, since neither is obviously wrong. Making `postinstall` reversible is the
+change the hook explicitly declined; it needs state outside the release and adds a failure mode to the
+recovery path, which is the one place that has to stay boring. Tolerating a failed restart *everywhere*
+would weaken the distinction `restart_one` draws on purpose — a unit that exists and will not start is
+how a broken release is caught, and that is still fatal on the way *in*.
 
 ### Not doing
 
