@@ -38,6 +38,7 @@ pub mod ipc;
 pub mod journal;
 pub mod manifest;
 pub mod preflight;
+pub mod reconcile;
 /// The IPC contract, re-exported from the [`duck_ipc_proto`] crate. Re-exported under this
 /// path so the engine's own code and `updater::proto::*` users need not care where it lives.
 pub use duck_ipc_proto as proto;
