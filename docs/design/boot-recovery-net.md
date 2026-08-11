@@ -219,8 +219,13 @@ with a stub `systemctl` supplying unit states and recording whether a reboot was
 
 **systemd is not.** Whether the timer fires at `OnBootSec=180`, whether `Conflicts=shutdown.target`
 keeps the oneshot off the way down, and whether `NRestarts` reads the way the predicate assumes on a
-crash-looping unit are all unverified. That needs a privileged container with systemd as pid 1 —
-[`install-path-gap.md`](../project/install-path-gap.md) option C — and this is the second argument for
-building it: the recovery net is the code that must work when everything else does not.
+crash-looping unit are all unverified. Nothing short of real systemd — `systemd-nspawn`, or a
+privileged container with it as pid 1 — can answer any of them, and
+[`install-path-gap.md`](../project/install-path-gap.md) is where the case for that lives. This is a
+second argument for it: the recovery net is the code that must work when everything else does not, and
+the code least amenable to a test.
+
+Until then this mechanism is verified on a bench board or not at all, and the way to do that is to
+give a board a release whose `robotd` cannot start.
 
 None of it has run on hardware, where the interesting path needs a board whose release cannot start.
