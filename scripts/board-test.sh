@@ -765,6 +765,21 @@ test "$configd_at" -lt "$btd_at" \
     || { echo "    [FAIL] btd was enabled before configd"; exit 1; }
 echo "    [ok] daemon-reload precedes every enable, and configd precedes btd"
 
+# The boot recovery net, whose whole job is to be armed for the *next* boot.
+#
+# `enable`, never `enable --now`: an `OnBootSec=` timer started past its deadline fires at once, and
+# at once here is the middle of provisioning — daemons still being started by the lines above, on a
+# board that has no golden release yet anyway.
+grep -q "^enable robot-boot-check.timer$" /stub/systemctl.log \
+    || { echo "    [FAIL] the boot recovery timer was never enabled"; exit 1; }
+grep -q "^enable --now robot-boot-check" /stub/systemctl.log \
+    && { echo "    [FAIL] the boot recovery check was started during provisioning"; exit 1; }
+for script in robot-rescue robot-boot-check; do
+    test -x "/usr/local/sbin/${script}" \
+        || { echo "    [FAIL] ${script} is not installed, so a broken release has no way back"; exit 1; }
+done
+echo "    [ok] the recovery net is installed and armed for the next boot, not this one"
+
 grep -q "keeping the existing /etc/robot/updater.toml" /tmp/install.log
 grep -q "keeping the existing /etc/robot/robotd.toml" /tmp/install.log
 echo "    [ok] the operator config files are preserved, not overwritten"
@@ -811,7 +826,8 @@ echo "    [ok] a unit install.sh does not recognise is installed and reported, n
 #
 # Hooks run with the release directory as the working directory; the hook exits early without
 # one, so getting this wrong would make the whole check vacuous.
-rm -f /etc/systemd/system/*.service /usr/lib/sysusers.d/*.conf /stub/systemctl.log
+rm -f /etc/systemd/system/*.service /etc/systemd/system/*.timer /usr/lib/sysusers.d/*.conf \
+    /stub/systemctl.log
 # The journald drop-in and the robotctl symlink go too, so the asymmetry asserted at the end is
 # a real absence rather than a leftover from the install above.
 rm -f /etc/systemd/journald.conf.d/10-robot.conf /usr/local/bin/robotctl
@@ -820,16 +836,48 @@ rm -f /etc/systemd/journald.conf.d/10-robot.conf /usr/local/bin/robotctl
     cat /tmp/hook.log
     exit 1
 }
-for src in "$REL"/systemd/*.service; do
+for src in "$REL"/systemd/*.service "$REL"/systemd/*.timer; do
+    [ -f "$src" ] || continue
     name="$(basename "$src")"
     test -f "/etc/systemd/system/${name}" \
         || { echo "    [FAIL] postinstall did not install ${name}"; exit 1; }
+
+    # Three outcomes, not one, and which one a unit gets is a property of the unit file:
+    #
+    #   - no `[Install]` section: installed and left alone. The oneshot in the boot recovery
+    #     net is deliberately like this, because `enable --now` on it would run a rollback check in the
+    #     middle of the update that installed it, with daemons legitimately mid-restart;
+    #   - a timer: enabled, not started. An `OnBootSec=` timer started past its deadline fires at
+    #     once, and this hook runs mid-update;
+    #   - everything else: enabled and started, which is the whole point of the hook.
+    if ! grep -q "^\[Install\]" "$src"; then
+        grep -q " ${name}$" /stub/systemctl.log \
+            && { echo "    [FAIL] postinstall touched ${name}, which has no [Install]"; exit 1; }
+        continue
+    fi
+    case "$name" in
+        *.timer)
+            grep -q "^enable ${name}$" /stub/systemctl.log \
+                || { echo "    [FAIL] postinstall did not enable ${name}"; exit 1; }
+            grep -q "^enable --now ${name}$" /stub/systemctl.log \
+                && { echo "    [FAIL] postinstall started ${name}; it arms at the next boot"; exit 1; }
+            continue
+            ;;
+    esac
     grep -q "^enable --now ${name}$" /stub/systemctl.log \
         || { echo "    [FAIL] postinstall did not enable ${name}"; exit 1; }
 done
 test -f /usr/lib/sysusers.d/robot.conf
 grep -q "^daemon-reload$" /stub/systemctl.log
-echo "    [ok] postinstall alone installs and enables every unit the release ships"
+echo "    [ok] postinstall alone installs every unit, and starts the ones meant to start now"
+
+# The recovery scripts, which are what runs when a release cannot start — so they are copied into
+# /usr/local/sbin rather than read through `current`, and an update has to refresh them.
+for script in robot-rescue robot-boot-check; do
+    test -x "/usr/local/sbin/${script}" \
+        || { echo "    [FAIL] postinstall did not install ${script}"; exit 1; }
+done
+echo "    [ok] postinstall refreshes the recovery scripts in /usr/local/sbin"
 
 # The asymmetry, pinned because it is easy to assume otherwise: the hook places units and
 # accounts and nothing else. Both of these were deleted above and the hook did not restore

@@ -280,6 +280,35 @@ daemons are failing on golden itself, a rollback is not the answer and the journ
 journalctl -b -u robotd -u updaterd -u btd -u configd
 ```
 
+### The robot may have done this already
+
+Three minutes into every boot, a timer asks whether the release brought its daemons up, and falls back
+to golden if it did not. So a robot that rebooted on its own and is running an older release than you
+installed has probably rescued itself. What it did:
+
+```
+robotctl update log
+```
+
+The entry reads as a rollback, with the daemon that failed named in its reason. To see the decision
+being made rather than its result:
+
+```
+journalctl -b -u robot-boot-check
+```
+
+```
+sudo robot-boot-check --dry-run
+```
+
+It acts once. A second rescue is refused while the first is still on record — `updaterd` clears that
+when it next starts, so being refused means the daemons did not come up on golden either, and the
+answer is the journal rather than another reboot. Past it, if you have read the journal and decided:
+
+```
+sudo robot-rescue --force --reboot
+```
+
 ### Three things that are easy to get wrong
 
 **`rollback` needs a predecessor, but an update creates one.** A freshly provisioned board has

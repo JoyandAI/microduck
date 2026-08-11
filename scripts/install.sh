@@ -614,7 +614,7 @@ install_units() {
     #
     # The release is the authority on what it contains. This script's job is to install it.
     shipped=""
-    for src in "${unit_src}"/*.service; do
+    for src in "${unit_src}"/*.service "${unit_src}"/*.timer; do
         [ -f "$src" ] || continue
         unit="$(basename "$src")"
         install -m 644 "$src" "${UNIT_DIR}/${unit}"
@@ -638,19 +638,21 @@ install_units() {
     # purpose here: it is a tool an operator invokes, not a file systemd caches.
     ln -sfn "${INSTALL_DIR}/current/bin/robotctl" /usr/local/bin/robotctl
 
-    # `robot-rescue` on root's PATH, and *copied* — the opposite decision to `robotctl` above, for
-    # the same reason the units are copied. It exists for boards whose release cannot start, so
-    # reading it through `current` would route the rescue through the thing being rescued.
+    # The recovery scripts on root's PATH, and *copied* — the opposite decision to `robotctl` above,
+    # for the same reason the units are copied. They exist for boards whose release cannot start, so
+    # reading them through `current` would route the recovery through the thing being recovered.
     #
-    # Absent from releases predating it, which is every release on a first install from a branch.
-    src="${INSTALL_DIR}/current/scripts/robot-rescue"
-    if [ -f "$src" ]; then
-        mkdir -p /usr/local/sbin
-        install -m 755 "$src" /usr/local/sbin/robot-rescue
-    else
-        warn "the release carries no scripts/robot-rescue; a board whose daemons cannot start
-  has no recovery path that does not need updaterd. The next update installs it."
-    fi
+    # Absent from releases predating them, which is every release on a first install from a branch.
+    for script in robot-rescue robot-boot-check; do
+        src="${INSTALL_DIR}/current/scripts/${script}"
+        if [ -f "$src" ]; then
+            mkdir -p /usr/local/sbin
+            install -m 755 "$src" "/usr/local/sbin/${script}"
+        else
+            warn "the release carries no scripts/${script}; a board whose daemons cannot start
+  has less recovery than it should. The next update installs it."
+        fi
+    done
 
     install_completions
 
@@ -688,6 +690,21 @@ install_units() {
   The robot works without it — only the gamepad is unavailable."
     fi
 
+    # The boot-time recovery net: three minutes into each boot, ask whether this release brought
+    # its daemons up, and fall back to golden if it did not.
+    #
+    # `enable`, deliberately **without** `--now`. An `OnBootSec=` timer started later than its
+    # deadline fires at once, and "at once" here is the middle of provisioning — daemons still being
+    # started by the lines above, on a board that has no golden yet anyway. It is a boot check, so
+    # the first boot it should apply to is the next one.
+    #
+    # `robot-boot-check.service` is not enabled and must not be: it carries no `[Install]` section
+    # precisely so that nothing enables it, and the timer is what starts it.
+    if [ -f "${UNIT_DIR}/robot-boot-check.timer" ]; then
+        systemctl enable robot-boot-check.timer || warn "the boot recovery timer did not enable;
+  a release whose daemons cannot start will need robot-rescue by hand."
+    fi
+
     # Anything the release ships that this script does not know how to start. Reported rather
     # than started blindly: a unit may be a template, or something another unit pulls in, and
     # guessing is how a robot ends up running a service nobody chose. Named, so adding a daemon
@@ -695,6 +712,9 @@ install_units() {
     for unit in $shipped; do
         case "$unit" in
             updaterd.service|robotd.service|configd.service|btd.service|padd.service) ;;
+            robot-boot-check.timer) ;;
+            # Started by its timer, never enabled. See above.
+            robot-boot-check.service) ;;
             *) warn "${unit} was installed but not enabled — this script does not know where
   it belongs in the start order. Add it to install_units, or start it by hand." ;;
         esac
