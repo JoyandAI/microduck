@@ -73,6 +73,11 @@ const FLOOR_MTU: usize = 20;
 /// shouting is taken from the things the robot is for. A *range* rather than one value because a
 /// fixed interval can keep colliding with the same neighbour's, which the controller avoids by
 /// jittering inside the window.
+///
+/// Measured again with this installed, same Mac and same two minutes: **151 arrivals, one every
+/// 0.8 s, worst silence 3.8 s, and not one silence of 8 s or more.** The failure it was diagnosed
+/// from cannot happen at that spacing, which is the point — the margin against an eight-second scan
+/// is now a factor of two rather than a coin toss.
 const ADV_INTERVAL_MIN: Duration = Duration::from_millis(100);
 const ADV_INTERVAL_MAX: Duration = Duration::from_millis(150);
 

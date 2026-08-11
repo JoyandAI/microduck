@@ -313,9 +313,16 @@ is for.
 `btd/examples/advwatch.rs` is the measurement, kept because the claim is only checkable by re-running
 it: arrivals per device with signal strength, then the robot's silences.
 
-The diagnosis above is measured; **the interval that answers it is not yet confirmed on hardware.**
-Installing a release carrying it and re-running `advwatch` is the check, and the number to expect is a
-few hundred arrivals rather than sixteen.
+**Confirmed on the board.** With 100-150 ms installed, the same two-minute watch from the same Mac:
+
+| | arrivals in 120 s | mean spacing | worst silence | silences ≥ 8 s |
+|---|---|---|---|---|
+| 1.28 s, the default | 16 | 7.5 s | 30.8 s | 7 |
+| 100-150 ms | 151 | 0.8 s | 3.8 s | **0** |
+
+Nine times as often, and — the part that matters — nothing left within a factor of two of `btctl`'s
+eight-second window, so the failure it was diagnosed from cannot occur. The robot went from 34th of
+106 devices heard to 7th of 74.
 
 ## 5. Pairing: just-works, and a PIN the transport checks
 
