@@ -323,17 +323,41 @@ looks like. And `robotctl health` only has to *answer*: a bench board with no se
 degraded, which is a fact about the bench rather than about the build, exactly as the health gate
 treats it.
 
-### 4. Real systemd, locally, for failure injection only
+### 4. Real systemd — done, as `scripts/systemd-test.sh`
 
-`systemd-nspawn` on a Linux box — **not** a privileged container in CI. After the three items above,
-what is left is a short list of things nobody should ask a board to do repeatedly: a unit that exists
-and will not start, `kill -9` between the swap and the commit, `systemd-run` itself failing,
-`enable --now` on a unit whose `User=` does not exist. **Would have caught bug 1**, which is the only
-one the items above miss — and it is also the only way to watch the postinstall hook do its real job
-of enabling and starting a unit, which no stub can show.
+**Done, and it paid for itself before asserting anything.** `scripts/systemd-test.sh` boots systemd as
+pid 1, mints three signed releases carrying real units and a real `updaterd`, installs one, applies
+the next through the running daemon, and then applies one that ships a unit which cannot start.
 
-Last for a reason beyond cost: it can only run on Linux, so never on the machine this is developed on,
-and a test that runs somewhere else stops being read.
+Four things it observes that nothing else in the tree can, because everything else has a stub
+`systemctl`:
+
+- **`on_apply` really restarts** what the release ships — asserted on the unit's main PID changing,
+  not on the command having been issued;
+- **the deferred transient timer really fires and really replaces `updaterd`**, in about four
+  seconds, and the successor is running the new release. A child process could not do this: it would
+  sit in the cgroup being killed, which is the reason for `systemd-run` and was until now an
+  untested claim;
+- **`hooks/postinstall` really installs, enables and starts** a unit the board has never had;
+- **a unit that installs cleanly and cannot start fails the update and names itself** —
+  `restart failed: Job for broken.service failed` — rather than reverting with
+  `not healthy within 30s: unreachable`. That is bug 1, and it is the one class the items above
+  cannot reach.
+
+**Docker rather than `systemd-nspawn`**, which is a change from what this section used to propose.
+The objection to privileged containers *in CI* stands and this is not CI. What decided it is the
+argument this section itself made for ranking real systemd last: a check that can only run on a
+machine nobody develops on stops being read. Docker Desktop runs a privileged container with systemd
+as pid 1 on the laptop this is developed on; nspawn does not.
+
+It found a bug on its first run, in the code rather than in itself. `self_test_updaterd` ran the new
+binary with no `--config`, so it validated `/etc/robot/updater.toml` however the running daemon was
+started — defeating the check's whole purpose, which is to catch a new binary that rejects *the
+board's* config file.
+
+Two injections named here are still worth adding now that the harness exists, and neither needs new
+machinery: `systemd-run` failing (the update must still succeed, and the successor must reconcile the
+stale unit), and `enable --now` on a unit whose `User=` does not exist.
 
 ### Not doing
 
