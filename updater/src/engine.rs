@@ -1626,8 +1626,8 @@ async fn schedule_restarts_if_applied(enabled: bool, outcome: &Result<ApplyResul
 ///
 /// Failures are logged, never returned. This runs after the update is committed and journalled; an
 /// update that succeeded must not be reported as failed because a restart could not be scheduled.
-/// The cost of that is the situation we already have today — a daemon running an old binary until
-/// the next boot — which `robotctl version` reports.
+/// Swallowing them is affordable because they are not the last word: [`crate::reconcile`] checks at
+/// the next start that each unit is on the active release and restarts what is not.
 async fn schedule_deferred_restarts() {
     for unit in RESTART_AFTER_REPLYING {
         let mut command = tokio::process::Command::new("systemd-run");
@@ -1649,12 +1649,14 @@ async fn schedule_deferred_restarts() {
             Ok(status) => tracing::warn!(
                 unit,
                 %status,
-                "could not schedule the restart; it keeps the old binary until the next boot"
+                "could not schedule the restart; it keeps the old binary until the next updaterd \
+                 start notices"
             ),
             Err(e) => tracing::warn!(
                 unit,
                 error = %e,
-                "could not run systemd-run; the unit keeps the old binary until the next boot"
+                "could not run systemd-run; the unit keeps the old binary until the next updaterd \
+                 start notices"
             ),
         }
     }

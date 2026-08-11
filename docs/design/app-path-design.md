@@ -533,10 +533,12 @@ itself.
   revisiting if `bluer` grows a `zbus` backend.
 - **A vendored libdbus** is ours to keep current rather than the distro's. Acceptable for a library
   reached only over a local socket by a daemon we wrote.
-- **`btd` is deliberately absent from `on_apply`'s restart set**, so it runs the old binary until
-  the next reboot. It may be the *transport the update was requested over*: restarting it drops the
-  connection carrying `update.subscribe`, and the phone that started the update never learns the
-  outcome. Same reason `updaterd` does not restart itself (§8.3).
+- **`btd` is deliberately absent from `on_apply`'s restart set.** It may be the *transport the update
+  was requested over*: restarting it drops the connection carrying `update.subscribe`, and the phone
+  that started the update never learns the outcome. Same reason `updaterd` does not restart itself
+  mid-update. The cost is bounded rather than open-ended — the exclusion expires once the reply is on
+  the wire, so the engine restarts `btd` 5 s later and the next `updaterd` start verifies that it
+  happened (`restart-order.md` §1 and §5).
 
 ## 8. Next
 
@@ -592,12 +594,7 @@ Directions, roughly in dependency order:
 `hello` should refuse only when the client is *newer* than the daemon —
 `install-path-gap.md` covers it. Small, self-contained, and it has already cost an hour twice.
 
-### 8.4 Derive the restart set from the release
-
-`on_apply`'s unit list lives in the board's own `updater.toml`, so a release that adds a daemon never
-restarts it and reports success anyway. `install-path-gap.md` §4 has the full account and the fix.
-
-### 8.5 PIN attempts across reconnects
+### 8.4 PIN attempts across reconnects
 
 §5.6. Three wrong PINs close the session; nothing counts across reconnects, so a peer retries
 indefinitely at the cost of a bond per three guesses. Needs somewhere to keep per-address state.

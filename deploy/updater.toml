@@ -129,8 +129,8 @@ action = "restart"
 #     the progress stream and never learns the outcome. That is the whole app-driven flow, and
 #     it is why `updater/src/config.rs` has a test refusing to let btd appear here.
 #
-# Both therefore keep running the old binary until the next reboot. That is expected rather than
-# a fault, exactly as §8.3 describes for updaterd.
+# Neither waits for a reboot. Both are restarted 5s after the update replies, and the next updaterd
+# start checks that happened and fixes what did not (docs/design/restart-order.md §1 and §5).
 #
 # configd *is* restarted: it holds no long-lived session state, the progress stream a client
 # watches comes from updaterd rather than from it, and a config change that never takes effect
