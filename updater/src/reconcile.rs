@@ -146,10 +146,12 @@ fn running_release(unit: &str) -> Option<semver::Version> {
 }
 
 async fn restart(systemctl: &str, unit: &str) -> Result<(), String> {
-    let status = tokio::process::Command::new(systemctl)
-        .arg("restart")
-        .arg(unit)
-        .status()
+    let mut command = tokio::process::Command::new(systemctl);
+    command.arg("restart").arg(unit);
+    let status = crate::spawn::retrying_busy(&mut command)
+        .await
+        .map_err(|e| e.to_string())?
+        .wait()
         .await
         .map_err(|e| e.to_string())?;
     if status.success() {

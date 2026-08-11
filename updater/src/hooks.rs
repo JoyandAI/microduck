@@ -103,55 +103,6 @@ pub struct HookOutcome {
 /// the update log.
 const MAX_OUTPUT: usize = 8 * 1024;
 
-/// How many times to retry a spawn that fails with `ETXTBSY`, and how long to wait between.
-///
-/// Ten attempts over ~100 ms. The window this closes is the few microseconds between a
-/// `fork` and the child's `execve`, so the first retry almost always succeeds; the budget
-/// exists so a pathological case gives up rather than hanging an update.
-const BUSY_RETRIES: u32 = 10;
-const BUSY_BACKOFF: Duration = Duration::from_millis(10);
-
-/// `ETXTBSY`, which is not a real failure here.
-///
-/// The kernel refuses to `exec` a file that *any* process has open for writing. We extract a
-/// release — writing `hooks/preinstall` — and then exec it moments later, while also
-/// spawning other children around the same time: the other hook, `systemctl` for `on_apply`,
-/// a command-style health probe. A child inherits a duplicate of the whole fd table at fork
-/// and only drops `O_CLOEXEC` descriptors at its own `execve`, so for a few microseconds
-/// some unrelated child holds a write handle to the hook we are about to run, and the exec
-/// fails with "Text file busy".
-///
-/// Left unhandled that is a failed hook, which fails the update, which rolls back a release
-/// that was fine — rarely, unreproducibly, and reported on the robot as
-/// "failed at RunningPreHook" with nothing anyone can act on. It first showed up as a
-/// intermittently red CI job, which is the same bug wearing a costume.
-///
-/// Retrying is the remedy because nothing else addresses it: the offending descriptor
-/// belongs to a *different* process, so closing or syncing ours changes nothing, and
-/// `rename` keeps the same inode.
-async fn spawn_retrying_busy(
-    command: &mut tokio::process::Command,
-) -> std::io::Result<tokio::process::Child> {
-    for attempt in 1..=BUSY_RETRIES {
-        match command.spawn() {
-            Ok(child) => {
-                if attempt > 1 {
-                    tracing::debug!(attempt, "spawned after ETXTBSY");
-                }
-                return Ok(child);
-            }
-            // `raw_os_error`, not `kind`: ETXTBSY has no stable `ErrorKind` — it maps to
-            // `Uncategorized`, which is unstable to match on.
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempt < BUSY_RETRIES => {
-                tracing::debug!(attempt, "hook is busy for exec; retrying");
-                tokio::time::sleep(BUSY_BACKOFF).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!("the loop returns on the final attempt")
-}
-
 /// Run a hook if present.
 ///
 /// A missing hook is success (`ran: false`) — most releases won't have one. A
@@ -194,7 +145,7 @@ pub async fn run(
         command.env(key, value);
     }
 
-    let child = spawn_retrying_busy(&mut command)
+    let child = crate::spawn::retrying_busy(&mut command)
         .await
         .map_err(|e| Error::Hook {
             hook: hook_name.clone(),
