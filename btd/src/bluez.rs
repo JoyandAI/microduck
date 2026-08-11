@@ -53,6 +53,34 @@ use crate::upstream::Sockets;
 /// support — which is slower than necessary on a good link and correct on every link.
 const FLOOR_MTU: usize = 20;
 
+/// How often to advertise, and this is the difference between a robot that is found and one that is
+/// not.
+///
+/// Left unset, BlueZ takes the kernel's default of **1.28 s**, and that was measured against this
+/// board from a Mac scanning continuously for two minutes: the robot arrived once every 7.5 s on
+/// average with silences of 9 s, 14 s, 17 s and once 31 s. Every other radio in the room — a smart
+/// plug at −66 dBm, a beacon at −91 dBm — arrived 130 to 212 times over the same window, against the
+/// robot's 16, while the robot was the *strongest* signal there at −36 dBm. So it was not range,
+/// not interference and not the client: it simply spoke too rarely to be caught.
+///
+/// A central scans at a low duty cycle, which is what turns "6× slower" into "absent for seconds at
+/// a time" — an eight-second scan that lands in one of those silences finds nothing, and roughly
+/// half of them did. The large gaps came out as near-integer multiples of 1.28 s, which is what
+/// identified the interval from the arrivals rather than from a guess.
+///
+/// 100-150 ms is the range ordinary peripherals use, and it is 8-12× the default. Not the 20 ms
+/// floor the spec allows: one antenna carries this, a gamepad's LE link and wifi, so airtime spent
+/// shouting is taken from the things the robot is for. A *range* rather than one value because a
+/// fixed interval can keep colliding with the same neighbour's, which the controller avoids by
+/// jittering inside the window.
+///
+/// Measured again with this installed, same Mac and same two minutes: **151 arrivals, one every
+/// 0.8 s, worst silence 3.8 s, and not one silence of 8 s or more.** The failure it was diagnosed
+/// from cannot happen at that spacing, which is the point — the margin against an eight-second scan
+/// is now a factor of two rather than a coin toss.
+const ADV_INTERVAL_MIN: Duration = Duration::from_millis(100);
+const ADV_INTERVAL_MAX: Duration = Duration::from_millis(150);
+
 /// How long to wait between attempts to find a usable adapter.
 ///
 /// Measured on the board: `hci0` does not exist until roughly 73 seconds after power-on —
@@ -132,6 +160,8 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
         service_uuids: [SERVICE_UUID].into_iter().collect(),
         discoverable: Some(true),
         local_name: Some(name),
+        min_interval: Some(ADV_INTERVAL_MIN),
+        max_interval: Some(ADV_INTERVAL_MAX),
         ..Default::default()
     };
     let _adv = adapter.advertise(advertisement).await?;
