@@ -11,13 +11,17 @@ between a daemon that is already running and a release that has just been instal
 be caught by any amount of install testing, and they need their own fixes — kept here rather than in
 their own document because anyone investigating one will arrive believing it is the other.
 
-**Revision note.** All four bugs are fixed. What is still open is the *testing* gap the title names —
-no test installs a real artifact — plus four smaller decisions marked below. One change since the
-first draft moves enough of this document to call out here: `updaterd` and `btd` are now restarted a
-few seconds *after* the update replies (`RESTART_AFTER_REPLYING`), and the release's own `updaterd` is
-proved to start before the commit (`updaterd --self-test`). Two claims below were written against the
-old behaviour and are now false — both are corrected in place, and the second section's premise in
-particular no longer holds.
+**Revision note.** All four bugs are fixed, and so is the version-skew section that follows them:
+case 1's `serde(default)` discipline landed, case 2's handshake proposal was decided *against* with
+its reasoning written down, and the "units outlive the release that installed them" consequence is
+now a refusal rather than emergent behaviour. What is still open is the *testing* gap the title
+names — no test installs a real artifact — plus three smaller decisions marked below.
+
+One change since the first draft moves enough of this document to call out here: `updaterd` and
+`btd` are now restarted a few seconds *after* the update replies (`RESTART_AFTER_REPLYING`), and the
+release's own `updaterd` is proved to start before the commit (`updaterd --self-test`). Two claims
+below were written against the old behaviour and are now false — both are corrected in place, and
+the second section's premise in particular no longer holds.
 
 **Second revision note.** The skew half of §4 is now closed by code rather than by argument. Every
 daemon publishes what it is running (`duck_ipc_proto::publish_identity`), and `updaterd` compares each
@@ -251,15 +255,16 @@ until the next reboot, while everything else on the box moves to the new release
 the root cause of both instances below, and it is fixed — `updaterd` now restarts itself five seconds
 after the update replies. The skew window is seconds, not "until someone reboots".
 
-Read the two cases with that in mind. Neither is a live incident any more; what remains is that both
-were *diagnosed* badly, and one of the two fixes is still worth having on its own merits:
+Read the two cases with that in mind. Neither is a live incident any more, and **both are now
+closed** — case 1 by fixing what it proposed, case 2 by deciding against it:
 
-- Case 1's `serde(default)` fix is **not** made redundant by the shorter window. Version skew is only
-  the commonest way to hit it; any newer-parser-older-sender pair does, and the fields that caused it
-  still have no defaults.
-- Case 2's handshake fix is **mostly** made redundant, and drops from "the recovery command itself
-  stops working" to "a five-second window during which it does". It stays proposed on design grounds,
-  not urgency.
+- Case 1's `serde(default)` fix was **not** made redundant by the shorter window: version skew is
+  only the commonest way to hit it, and any newer-parser-older-sender pair does. Done, on the
+  sections where a defaulted zero is honest.
+- Case 2's handshake fix was **mostly** made redundant by it, dropping from "the recovery command
+  itself stops working" to "a five-second window during which it does" — and when the design
+  argument was finally written out, the premise it rested on did not survive. The exact `!=` stays;
+  what changed is the message. See below and #77.
 
 Two instances, both real, both cost about an hour.
 
@@ -272,24 +277,29 @@ reply for a missing field. `RobotIo::health` maps an unparseable answer to `Heal
 the gate reported `not healthy within 30s: unreachable` about a robot that was entirely healthy, and
 reverted a good release.
 
-Fixes, both small, and **both still open**:
+Fixes, both small, and **both done**:
 
 - **`#[serde(default)]` on new `HealthResult` fields**, so a newer `updaterd` can still parse an
-  older `robotd`. Every `--ref` install of a branch predating a health-field addition hits this
+  older `robotd`. Every `--ref` install of a branch predating a health-field addition hit this
   otherwise, which is the entire dev workflow.
 
-  Half-true today, and the wrong half is the one that bit. Every *top-level* `HealthResult` field
-  carries `#[serde(default)]`, including `imu`. The field that actually caused this —
-  `consecutive_stale_blocks` on the nested `ImuHealth` — does not, and neither do `LoopHealth`'s or
-  `BusHealth`'s. So the incident reproduces verbatim the next time a field is added to a nested health
-  struct, which is exactly how it happened the first time.
+  The half that bit was the nested one: every *top-level* field carried `#[serde(default)]`
+  already, including `imu`, while `consecutive_stale_blocks` on the nested `ImuHealth` did not.
+  `ImuHealth` and `BusHealth` now carry it at the container level, so a field added to either
+  defaults rather than failing the whole parse.
+
+  `LoopHealth`, `Battery` and `MotorThermal` deliberately do **not**, and the exception is the
+  useful part of the fix: those sections carry *measurements*, where a defaulted zero is a lie an
+  older sender never told — a defaulted `percent: 0.0` renders as a flat pack on a robot with a
+  full one. The rule is "default what an omission honestly means", not "default everything", and
+  `ImuHealth`'s doc comment argues it field by field.
 - **A distinct `Health::Incompatible`** rather than reusing `Unreachable`, so the reason reads
   "answered in a shape this updaterd does not understand" instead of implying the robot is down.
   Pure diagnostics, and it would have found the above in a minute.
 
-  Not done. `Health` still has four variants and `SocketRobotClient::health` still collapses an
-  unparseable reply to `Unreachable`. (`Error::Incompatible` exists and is a different thing — it is
-  about a *release* being refused, not a reply being unreadable.)
+  Done. It also turned up its own neighbour while being added: `safe_to_restart` was collapsing an
+  unreadable reply the same way, and `permits_restart` then read it as *safe* — the opposite of what
+  its own comment promised. That became `SafeToRestart::Incompatible` and #68.
 
 ### 2. `API_VERSION` skew between `robotctl` and `updaterd`
 
@@ -305,21 +315,27 @@ or to restart `updaterd` — neither of which is discoverable from the error.
 
 The handshake at least *caught* it and named both versions, which is more than case 1 managed.
 
-Proposed fix, **still open**, and the reason it is not already done is that it is a protocol-policy
-decision rather than a bug:
+The proposed fix was **`hello` should refuse only when the client is *newer* than the daemon** — a v3
+daemon serves a v2 client perfectly when v3 only *added* methods, so refusing that direction costs
+the ability to recover and buys nothing. It would also have made `API_VERSION` mean "the newest
+contract I understand" rather than "the only contract I will speak".
 
-- **`hello` should refuse only when the client is *newer* than the daemon.** A v3 daemon can serve a
-  v2 client perfectly, because v3 only *added* methods — refusing that direction costs the ability
-  to recover and buys nothing. Client-newer-than-daemon must stay a hard failure: there the client
-  may ask for something that genuinely is not there.
+**Decided against** (#77), because writing the argument out exposed the premise underneath it: that
+bumps are additive. They are not, and the constant does not distinguish them — v5 added `pad.*` and
+was additive, v4 made `system.authenticate` mandatory and was not. Accepting older clients would
+promise backward compatibility on every past and future bump, with nothing to enforce it and no way
+to make a non-additive change afterwards. With one user and one robot, the freedom to change the
+wire shape is worth more than a promise the protocol cannot keep. `API_VERSION`'s doc comment now
+states that outright, which is the part that was genuinely missing: the rule existed only as an
+`!=` in one file.
 
-  The handshake is still an exact `!=`. `API_VERSION` has since reached 5 — v5 added `pad.*`, which
-  is purely additive and still bumps — and the failure was observed at v4-against-v3, so this keeps
-  recurring on every additive bump, just for seconds at a time now instead of until a reboot.
-
-That change would also make `API_VERSION` mean what it should — "the newest contract I understand"
-rather than "the only contract I will speak" — and additive protocol growth would stop being a
-breaking change for every client on the box.
+What did change is the message, because the remaining cost was never leniency — it was that
+`client speaks API v2, daemon speaks v3` names no way out, on a board where the two halves are a
+symlink and a running process. The refusal now branches on direction: client newer is the seconds
+after an update, so retry and then `systemctl restart updaterd`; client older cannot happen through
+`/usr/local/bin/robotctl`, which is a symlink into `current`, so the answer is to use that one.
+`robotctl` correspondingly stopped appending "install matching versions", which was true and not
+actionable.
 
 ### Why these are not install-path bugs
 
