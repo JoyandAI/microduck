@@ -367,24 +367,38 @@ Both injections named here are in it too, and both landed assertions nothing els
   account exists and its unit runs. The other half — the same unit with nothing creating the user —
   fails the update and names the unit rather than the account.
 
-### The gap the harness found on the way
+### The gap the harness found on the way — fixed
 
-**A failed update can fail its own rollback**, and `RollbackFailed` is the outcome the design calls the
-most serious one. Reproduced by the missing-user release above, and asserted as current behaviour so
-that changing it is deliberate:
+**A failed update reported a failed rollback for a robot it had successfully put back.** Reproduced by
+the missing-user release above, and `RollbackFailed` is the outcome the design calls the most serious
+one — so it was worth more than a note.
 
-`hooks/postinstall` overwrites unit files and, by design, does not put them back on a rollback — the
-hook argues that a release which did not take leaves one service failing until the next one does, which
-is the same situation either way. That holds while the failing unit is only *failing*. It stops holding
-when the unit is in the restart set of the release being reverted **to**, because the revert re-runs
-the same restart and inherits the same failure.
+The cause is not the rollback. `hooks/postinstall` overwrites unit files and, by design, does not put
+them back: the hook argues that a release which did not take leaves one service failing until the next
+one does, which is the same situation either way. That reasoning holds and is unchanged. What it did
+not anticipate is the unit being in the restart set of the release being reverted **to** — then the
+revert re-runs the same restart and inherits the same failure. Reachable by an ordinary bad release
+rather than only by the downgrade case above: two consecutive releases ship the same unit name and the
+newer one is broken.
 
-Reachable by an ordinary bad release rather than only by the downgrade case this document already
-records: two consecutive releases ship the same unit name and the newer one is broken. The revert
-itself does happen — `current` goes back — so what is lost is the apply action, not the tree. Worth a
-decision rather than a patch, and the options are not symmetric: making `postinstall` reversible is the
-change the hook explicitly declined, while tolerating a failed restart *during a rollback* weakens the
-distinction `restart_one` draws on purpose.
+**The fix separates the swap from the apply action, because only one of them is the recovery.** Past
+`swap_to` and the trial being cleared, the robot *is* back on the release it came from; a unit that
+then fails to restart is a second fact, not a contradiction of the first. So `Error::RollbackFailed`
+keeps its meaning — the robot could not be put back at all — and a failed apply action during a revert
+is carried into the reported outcome and logged at `error`:
+
+```text
+not healthy within 30s: …; the release was reverted but a unit did not restart (…), so
+something on this robot is down
+```
+
+Both facts, in the order someone needs them: why the update failed first, then what is still down.
+
+The two rejected alternatives, since neither is obviously wrong. Making `postinstall` reversible is the
+change the hook explicitly declined; it needs state outside the release and adds a failure mode to the
+recovery path, which is the one place that has to stay boring. Tolerating a failed restart *everywhere*
+would weaken the distinction `restart_one` draws on purpose — a unit that exists and will not start is
+how a broken release is caught, and that is still fatal on the way *in*.
 
 ### Not doing
 

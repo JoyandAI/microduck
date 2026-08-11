@@ -735,8 +735,8 @@ impl Engine {
                 {
                     Some(reverted) => Ok(ApplyResult::RolledBack {
                         attempted: manifest.version.clone(),
-                        reverted_to: Some(reverted),
-                        reason: reason.to_string(),
+                        reason: reverted.describe(&reason.to_string()),
+                        reverted_to: Some(reverted.version),
                     }),
                     // Nothing was reverted, so saying "rolled back" would be a lie.
                     None => Ok(ApplyResult::Stuck {
@@ -832,13 +832,18 @@ impl Engine {
         })
     }
 
+    /// What a revert achieved: the release now live, and whatever went wrong after it was.
+    ///
+    /// Two facts rather than one, because they have different urgencies and used to be collapsed into
+    /// a single `RollbackFailed`. The version is the recovery; `apply_error` is a daemon that is down
+    /// on a robot which is otherwise back where it was.
     async fn rollback_to(
         &self,
         component: &str,
         cfg: &ComponentConfig,
         store: &Store,
         previous: Option<&semver::Version>,
-    ) -> Result<Option<semver::Version>, Error> {
+    ) -> Result<Option<Reverted>, Error> {
         if self.faults.fail_rollback {
             return Err(Error::RollbackFailed("injected rollback failure".into()));
         }
@@ -857,17 +862,53 @@ impl Engine {
             return Ok(None);
         };
 
+        // The swap and the trial are the recovery: past here the robot *is* back on the release it
+        // came from, and only these two failing mean it could not be put back.
         store
             .swap_to(previous)
             .map_err(|e| Error::RollbackFailed(e.to_string()))?;
         self.boot_counter
             .confirm(component)
             .map_err(|e| Error::RollbackFailed(e.to_string()))?;
-        self.run_apply_action(&cfg.on_apply, &store.release_dir(previous))
-            .await
-            .map_err(|e| Error::RollbackFailed(e.to_string()))?;
 
-        Ok(Some(previous.clone()))
+        // The apply action is not, and this used to be `RollbackFailed` too.
+        //
+        // It is reachable by an ordinary bad release: `hooks/postinstall` overwrites unit files and
+        // deliberately does not put them back, so a release that fails *because* one of its units
+        // cannot start leaves that file behind — and if the release being reverted to ships a unit of
+        // the same name, this restart inherits the same failure. `scripts/systemd-test.sh` reproduces
+        // exactly that.
+        //
+        // Reporting it as a failed rollback asserted the one thing that was not true — the swap had
+        // already happened — and buried the one thing that was: a daemon is down. So it is carried
+        // into the outcome instead, which says both. `RollbackFailed` keeps its meaning: the robot
+        // could not be put back at all.
+        let apply_error = if self.faults.fail_rollback_apply {
+            Some("injected apply-action failure during rollback".to_owned())
+        } else {
+            match self
+                .run_apply_action(&cfg.on_apply, &store.release_dir(previous))
+                .await
+            {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            }
+        };
+        if let Some(detail) = &apply_error {
+            // At error, because a reverted robot with a dead daemon needs someone to look at it even
+            // though the operation it belongs to reports an outcome rather than a failure.
+            tracing::error!(
+                component,
+                reverted_to = %previous,
+                error = %detail,
+                "reverted, but a unit did not restart — the release is back and something is down"
+            );
+        }
+
+        Ok(Some(Reverted {
+            version: previous.clone(),
+            apply_error,
+        }))
     }
 
     // ── explicit transitions ─────────────────────────────────────────────────
@@ -1018,8 +1059,8 @@ impl Engine {
                 {
                     Some(reverted) => Ok(ApplyResult::RolledBack {
                         attempted: to.clone(),
-                        reverted_to: Some(reverted),
-                        reason: reason.to_string(),
+                        reason: reverted.describe(&reason.to_string()),
+                        reverted_to: Some(reverted.version),
                     }),
                     None => Ok(ApplyResult::Stuck {
                         version: to.clone(),
@@ -1295,8 +1336,8 @@ impl Engine {
             let outcome = match reverted {
                 Some(reverted) => ApplyResult::RolledBack {
                     attempted: pending.version.clone(),
-                    reverted_to: Some(reverted),
-                    reason: reason.clone(),
+                    reason: reverted.describe(&reason),
+                    reverted_to: Some(reverted.version),
                 },
                 // Nothing to revert to. `rollback_to` has cleared the trial, so this
                 // is reported exactly once rather than on every subsequent boot.
@@ -1738,6 +1779,29 @@ impl Engine {
                 "manifest is for channel {:?}, expected {expected:?}",
                 manifest.channel
             )))
+        }
+    }
+}
+
+/// The outcome of a revert: where the robot ended up, and what did not come back with it.
+struct Reverted {
+    version: semver::Version,
+    /// The apply action's failure, when the swap succeeded and it did not.
+    apply_error: Option<String>,
+}
+
+impl Reverted {
+    /// The reason to report, which must carry both facts when there are two.
+    ///
+    /// Appended rather than replacing: why the update failed is what someone is looking for, and a
+    /// unit that then failed to restart is a second thing to act on, not a correction of the first.
+    fn describe(&self, why: &str) -> String {
+        match &self.apply_error {
+            None => why.to_owned(),
+            Some(detail) => format!(
+                "{why}; the release was reverted but a unit did not restart ({detail}), so \
+                 something on this robot is down"
+            ),
         }
     }
 }

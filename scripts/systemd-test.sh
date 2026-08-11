@@ -286,24 +286,21 @@ pass "the update failed and named the unit rather than the account"
 [ "$(live)" = 1.3.0 ] || fail "current is $(live) after the failed update, expected 1.3.0"
 pass "current went back to 1.3.0"
 
-# **A gap this harness found, pinned here rather than papered over.** The rollback *also* failed:
+# The revert happened *and* one unit did not come back with it. Two facts, reported as two — this was
+# a single `rollback failed after a failed update`, which asserted the one thing that was false (the
+# robot had not been put back) and buried the one thing that was true (a daemon is down).
 #
-#     rollback failed after a failed update: restart failed:
-#     Job for needs-a-user.service failed
-#
-# `hooks/postinstall` overwrote 1.3.0's good unit file with 1.4.0's broken one, and by design does not
-# put it back — the hook argues that a release which did not take leaves one service failing until the
-# next one does, which is the same situation either way. That reasoning holds while the failing unit is
-# only *failing*. It stops holding when the unit is in the restart set of the release being reverted
-# *to*, because then the revert re-runs the same restart and inherits the same failure — and
-# `RollbackFailed` is the outcome the design calls the most serious one.
-#
-# Reachable by an ordinary bad release, not only by the downgrade case `install-path-gap.md` records:
-# two consecutive releases ship the same unit name and the newer one is broken. Asserted as-is, so
-# that whatever is decided about it is a deliberate change rather than a surprise.
+# `hooks/postinstall` overwrote 1.3.0's good unit file with 1.4.0's broken one and by design does not
+# put it back, so the revert's own restart of a unit with that name inherits the same failure. The
+# hook's reasoning is unchanged and still holds: one service is failing until the next release fixes
+# it. What changed is that this no longer reads as the recovery having failed.
 grep -q "rollback failed" "$WORK/ghost.log" \
-    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the known rollback gap did not reproduce — if it is fixed, this check should be too"; }
-pass "the rollback failed too, which is the known gap: the bad unit file outlived the release"
+    && { sed 's/^/    /' "$WORK/ghost.log"; fail "a revert that happened is still reported as a failed rollback"; }
+grep -q "did not restart" "$WORK/ghost.log" \
+    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the outcome does not name the unit that did not come back"; }
+grep -q "is down" "$WORK/ghost.log" \
+    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the outcome does not say something is down"; }
+pass "reported as reverted and as having left something down, not as a failed rollback"
 
 # The rest of the robot is still up, which is what keeps this a gap rather than an outage.
 in_container "systemctl is-active --quiet fake-robotd" \
