@@ -106,10 +106,12 @@ fn identity(peripheral: &Peripheral, address: btleplug::api::BDAddr) -> String {
 /// the radio — while a list the robot is missing from points at the robot.
 ///
 /// And the robot can be *in* that list, unrecognisable. `btd` advertises flags (3 bytes), a 128-bit
-/// service UUID (18) and the robot's name (2 + its length), which for any real hostname is past the
-/// 31 bytes a legacy advertisement holds — so the name travels in the scan response, a second
-/// exchange that can be missed on its own. A device reported with no name and no services is
-/// therefore a plausible robot, which is why the unnamed ones are listed rather than filtered out.
+/// service UUID (18) and the robot's name (2 + its length), so a name of more than **8 characters**
+/// is past the 31 bytes a legacy advertisement holds — and the name travels in the scan response, a
+/// second exchange that can be missed on its own. `radxa-zero3` was 11, and the derived default
+/// `duck-c51b` is 9, so this is still the normal case rather than the edge one. A device reported
+/// with no name and no services is therefore a plausible robot, which is why the unnamed ones are
+/// listed rather than filtered out.
 async fn nothing_found(seen: &[Seen], wanted: Option<&str>) -> String {
     if seen.is_empty() {
         return format!(
@@ -204,6 +206,9 @@ async fn step<T>(
 )]
 struct Cli {
     /// Connect to this robot by advertised name. Without it, the first one found wins.
+    ///
+    /// The advertised name, which is what `system.info` reports and what `name` below sets: a
+    /// board that has never been renamed answers to its derived default, `duck-7f3a`.
     #[arg(long, global = true)]
     name: Option<String>,
 
@@ -385,7 +390,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if cli.verbose {
             eprintln!(
                 "nothing advertised the service; trying {} already-connected peripheral(s), which \
-                 may well be earbuds. `--name <robot hostname>` skips this guesswork",
+                 may well be earbuds. `--name <robot name>` skips this guesswork",
                 connected.len()
             );
         }

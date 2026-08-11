@@ -24,8 +24,10 @@
 //! drive a complete session over real unix sockets with no Bluetooth involved. [`upstream`]
 //! holds the connections to the services that own the answers.
 //!
-//! `net.*` and `system.*` — wifi, name, reboot — are not in [`route`] yet because `configd`
-//! does not exist yet. When it does they are one arm each, and nothing else here changes.
+//! `net.*` and `system.*` — wifi, name, reboot — go to `configd`, one arm each in [`route`]'s
+//! table. The robot's name is the one thing `btd` reads back rather than only forwarding: it has to
+//! advertise it, so [`bluez`] asks `configd` what the robot is called and keeps the advertisement
+//! in step with it.
 
 #[cfg(target_os = "linux")]
 pub mod bluez;

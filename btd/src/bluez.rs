@@ -44,7 +44,7 @@ use tokio::sync::mpsc;
 use crate::gatt::{RPC_UUID, SERVICE_UUID};
 use crate::link::Link;
 use crate::session;
-use crate::upstream::Sockets;
+use crate::upstream::{NameChoice, Sockets};
 
 /// Notification payload assumed for outbound chunks.
 ///
@@ -62,12 +62,33 @@ const FLOOR_MTU: usize = 20;
 /// waiting for the motor bus rather than giving up on it.
 const ADAPTER_RETRY: Duration = Duration::from_secs(5);
 
+/// How long to wait for `configd` to say what the robot is called.
+///
+/// Nothing is blocked on the answer — unlike the PIN, where BlueZ holds a pairing exchange open —
+/// so this is generous enough to survive a loaded board rather than tuned for a spinner.
+const NAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the advertised name is reconciled with `configd`'s.
+///
+/// **Polled rather than event-driven, deliberately.** `btd` forwards `system.setName` to `configd`
+/// without reading the reply (`upstream::Pool` merges lines for the client, and interpreting them
+/// here is exactly what this daemon avoids), so it does not learn a rename by watching. It could
+/// re-ask the moment it forwards one, but the write it just forwarded may not have been applied
+/// yet, and a second connection has no ordering guarantee against the first.
+///
+/// Reconciling instead is fewer moving parts and covers every rename path, including
+/// `robotctl system set-name` over the unix socket, which never crosses this process at all. The
+/// cost is a socket connect and one line every few seconds, forever, which is far below the noise
+/// floor of a daemon that already waits 73 seconds for a radio. A `system.*` notification from
+/// `configd` would be the tidier answer and is a protocol change nobody needs yet.
+const NAME_POLL: Duration = Duration::from_secs(5);
+
 /// Wait for an adapter, then advertise and serve until cancelled.
 ///
 /// `require_pairing` controls whether writing a request needs an authenticated, encrypted link.
 /// It defaults on, because §7 requires it for anything carrying wifi credentials and
 /// `net.connect` now does. The opt-out exists for bench work against a client that cannot pair.
-pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> bluer::Result<()> {
+pub async fn serve(sockets: Sockets, name: NameChoice, require_pairing: bool) -> bluer::Result<()> {
     let bt = bluer::Session::new().await?;
 
     let adapter = loop {
@@ -126,15 +147,15 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
     );
 
     // The advertised name is what someone sees in a phone's Bluetooth list, so it is the robot's
-    // name rather than the service's. `system.setName` will rewrite it once `configd` exists;
-    // until then it is the hostname, which is at least unique per board.
-    let advertisement = Advertisement {
-        service_uuids: [SERVICE_UUID].into_iter().collect(),
-        discoverable: Some(true),
-        local_name: Some(name),
-        ..Default::default()
+    // name rather than the service's — and `configd` owns it. Until this asked, the advertisement
+    // carried `/etc/hostname` while `system.setName` wrote a name nothing ever read: every board
+    // flashed from one image appeared as `radxa-zero3`, and renaming one changed nothing a phone
+    // could see, not even after a restart.
+    let mut advertised = match &name.pinned {
+        Some(pinned) => pinned.clone(),
+        None => ask_name(&sockets, &name.fallback).await,
     };
-    let _adv = adapter.advertise(advertisement).await?;
+    let mut handle = Some(advertise(&adapter, &advertised).await?);
 
     // **One session per subscription**, not one per daemon.
     //
@@ -154,6 +175,10 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
     let current: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>> = Arc::new(StdMutex::new(None));
     let for_write = current.clone();
     let for_notify = current.clone();
+
+    // The notify callback below takes ownership of `sockets` for the sessions it spawns, and the
+    // reconcile loop at the end outlives it.
+    let for_reconcile = sockets.clone();
 
     let app = Application {
         services: vec![Service {
@@ -336,8 +361,87 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
 
     tracing::info!("GATT application registered; waiting for a central");
 
-    // The advertisement and application handles deregister on drop, so this task must outlive
-    // the service.
-    std::future::pending::<()>().await;
-    Ok(())
+    // The advertisement and application handles deregister on drop, so what follows must never
+    // return: the loop below is what keeps this robot visible, not just what renames it.
+    if name.pinned.is_some() {
+        tracing::info!(name = %advertised, "--name pins the advertisement; not reconciling");
+        std::future::pending::<()>().await;
+    }
+
+    loop {
+        tokio::time::sleep(NAME_POLL).await;
+
+        let current = ask_name(&for_reconcile, &advertised).await;
+        // `handle` is `None` only after a failed re-advertise, and then the robot is invisible —
+        // so retry regardless of whether the name moved.
+        if current == advertised && handle.is_some() {
+            continue;
+        }
+
+        // Deregistered before the replacement is registered: BlueZ is being asked to change one
+        // advertisement, and holding two while swapping invites it to refuse the second. The gap is
+        // brief, and a central that is already connected does not notice — a connection is not an
+        // advertisement.
+        drop(handle.take());
+        match advertise(&adapter, &current).await {
+            Ok(new) => {
+                if current == advertised {
+                    tracing::info!(name = %current, "advertising again after a failure");
+                } else {
+                    tracing::info!(from = %advertised, to = %current, "renamed; advertising");
+                }
+                handle = Some(new);
+                advertised = current;
+            }
+            // Left for the next tick rather than fatal: a robot that stops advertising is
+            // unreachable, and exiting would take the recovery path down with it.
+            Err(e) => tracing::error!(error = %e, name = %current, "cannot advertise"),
+        }
+    }
+}
+
+/// Advertise the service under `name`.
+///
+/// The handle deregisters on drop, so the caller holds it for as long as the robot should be
+/// visible.
+async fn advertise(
+    adapter: &bluer::Adapter,
+    name: &str,
+) -> bluer::Result<bluer::adv::AdvertisementHandle> {
+    adapter
+        .advertise(Advertisement {
+            service_uuids: [SERVICE_UUID].into_iter().collect(),
+            discoverable: Some(true),
+            local_name: Some(name.to_owned()),
+            ..Default::default()
+        })
+        .await
+}
+
+/// What `configd` says the robot is called, or `fallback` if it will not say.
+///
+/// A failure is `debug` rather than `warn`: this runs every few seconds, and a `configd` that is
+/// restarting would otherwise fill the journal with a condition that resolves itself. The startup
+/// call is the one that matters, and it is logged by the caller through the name it ends up
+/// advertising.
+async fn ask_name(sockets: &Sockets, fallback: &str) -> String {
+    let socket = sockets.path(crate::route::Upstream::Config);
+    match crate::upstream::ask(
+        "configd",
+        socket,
+        &duck_ipc_proto::Call::SystemInfo,
+        NAME_TIMEOUT,
+    )
+    .await
+    .and_then(|response| {
+        response
+            .result_as::<duck_ipc_proto::SystemInfoResult>()
+            .map_err(|e| e.to_string())
+    }) {
+        Ok(info) => info.name,
+        Err(e) => {
+            tracing::debug!(error = %e, fallback, "configd would not say the robot's name");
+            fallback.to_owned()
+        }
+    }
 }

@@ -1468,7 +1468,9 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             println!("name    {}", info.name);
             println!(
                 "serial  {}",
-                info.serial.as_deref().unwrap_or("not provisioned")
+                // A board with no readable SoC serial, not a board nobody provisioned: the
+                // identity is derived from the hardware rather than assigned.
+                info.serial.as_deref().unwrap_or("unknown on this board")
             );
             println!("uptime  {}", format_uptime(info.uptime_seconds));
         }
@@ -1477,7 +1479,12 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             // The stored name, not what was asked for: trimming and truncation mean they can
             // differ, and showing the request would disagree with the robot.
             println!("name    {}", renamed.name);
-            println!("Bluetooth advertises the new name after:  systemctl restart btd");
+            // btd reconciles its advertisement against configd every few seconds, so this needs
+            // no restart. Said out loud because it used to need one, and because a phone shows
+            // the old name until it scans again — which reads as the rename not having worked.
+            println!(
+                "Bluetooth advertises it within a few seconds; a phone must re-scan to see it"
+            );
         }
         SystemCommand::Pin { .. } | SystemCommand::SetPin { .. } => {
             let pin: proto::PairingPinResult = decode(&result)?;

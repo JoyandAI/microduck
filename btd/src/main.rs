@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use btd::upstream::Sockets;
+use btd::upstream::{NameChoice, Sockets};
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -55,10 +55,11 @@ struct Args {
     #[arg(long, hide = true)]
     insecure_no_pairing: bool,
 
-    /// Name to advertise. Defaults to the hostname.
+    /// Pin the advertised name, instead of asking `configd` what the robot is called.
     ///
-    /// This is what someone sees in a phone's Bluetooth list. It becomes `system.setName`'s
-    /// business once `configd` exists; until then the hostname is at least unique per board.
+    /// Bench use. The name someone sees in a phone's Bluetooth list is `configd`'s — set with
+    /// `robotctl system set-name` or `system.setName` from an app — and passing this stops it being
+    /// reconciled, so a rename no longer takes effect until the flag is removed.
     #[arg(long)]
     name: Option<String>,
 }
@@ -127,7 +128,12 @@ async fn main() -> ExitCode {
         robot: args.robot_socket,
         config: args.config_socket,
     };
-    let name = args.name.unwrap_or_else(hostname);
+    // The hostname is only a last resort now: `configd` derives a distinguishable default from the
+    // board's SoC serial, so `radxa-zero3` appears only when `configd` cannot be reached at all.
+    let name = NameChoice {
+        pinned: args.name,
+        fallback: hostname(),
+    };
 
     if args.insecure_no_pairing {
         tracing::warn!(
@@ -147,7 +153,7 @@ async fn main() -> ExitCode {
 }
 
 #[cfg(target_os = "linux")]
-async fn run(sockets: Sockets, name: String, require_pairing: bool) -> ExitCode {
+async fn run(sockets: Sockets, name: NameChoice, require_pairing: bool) -> ExitCode {
     tokio::select! {
         result = btd::bluez::serve(sockets, name, require_pairing) => match result {
             // `serve` only returns when BlueZ closes the control stream, which means the
@@ -174,7 +180,7 @@ async fn run(sockets: Sockets, name: String, require_pairing: bool) -> ExitCode 
 /// The crate still builds and tests here, which is the point: `cargo test` on a laptop is the
 /// onboarding path, and only the radio is Linux-only.
 #[cfg(not(target_os = "linux"))]
-async fn run(_sockets: Sockets, _name: String, _require_pairing: bool) -> ExitCode {
+async fn run(_sockets: Sockets, _name: NameChoice, _require_pairing: bool) -> ExitCode {
     tracing::error!(
         "btd needs BlueZ, which is Linux-only. This binary exists here so the crate builds \
          and its tests run; it cannot serve BLE on this platform."

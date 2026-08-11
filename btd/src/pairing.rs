@@ -53,8 +53,12 @@
 //!
 //! So the security of this rests entirely on the PIN being per-robot, which makes it a
 //! provisioning obligation rather than a software one: something has to generate it, print it and
-//! record what was printed. That is `updater-design.md` §5.7's per-device state — the same slot
-//! that owes us a serial number, which is a reason to define it once.
+//! record what was printed. The robot does now have a per-device identity — `configd::identity`
+//! derives one from the SoC serial — but a PIN cannot be derived from it, and that is worth stating
+//! rather than rediscovering: the identity is *published*, in an advertisement anyone in range can
+//! collect, so a PIN computed from it would be public the moment the derivation is known. Only the
+//! name hangs off the identity. A secret still has to be generated, printed and recorded, which is
+//! `updater-design.md` §5.7's per-device state.
 //!
 //! Still open, and smaller: **no bond management.** Every paired phone stays paired and nothing
 //! revokes one; `bluetoothctl untrust` is the manual escape until there is an API for it.
@@ -62,8 +66,6 @@
 use std::time::Duration;
 
 use duck_ipc_proto as proto;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 /// How long to wait for `configd` to answer with the PIN.
 ///
@@ -84,40 +86,21 @@ const PIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// The PIN is never logged. It is barely a secret today, but a per-robot one is meant to be, and
 /// the journal is the wrong place for it.
 pub async fn pin(config_socket: &std::path::Path) -> Result<proto::PairingPinResult, String> {
-    tokio::time::timeout(PIN_TIMEOUT, fetch(config_socket))
-        .await
-        .map_err(|_| "configd did not answer in time".to_owned())?
-}
-
-async fn fetch(config_socket: &std::path::Path) -> Result<proto::PairingPinResult, String> {
-    let stream = UnixStream::connect(config_socket)
-        .await
-        .map_err(|e| format!("cannot reach configd at {}: {e}", config_socket.display()))?;
-    let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
-
-    let request = proto::Request::call(proto::Id::Number(1), &proto::Call::SystemPairingPin);
-    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
-    line.push(b'\n');
-    write.write_all(&line).await.map_err(|e| e.to_string())?;
-    write.flush().await.map_err(|e| e.to_string())?;
-
-    let reply = lines
-        .next_line()
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or("configd closed the connection without answering")?;
-
-    let response: proto::Response = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
-    if let Some(error) = response.error {
-        return Err(format!("configd refused: {error}"));
-    }
-    response.result_as().map_err(|e| e.to_string())
+    crate::upstream::ask(
+        "configd",
+        config_socket,
+        &proto::Call::SystemPairingPin,
+        PIN_TIMEOUT,
+    )
+    .await?
+    .result_as()
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     /// A PIN with leading zeros must reach BlueZ as the right *number*, since that is the only
     /// form a passkey has on the wire.

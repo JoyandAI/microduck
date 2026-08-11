@@ -156,6 +156,9 @@ struct Service {
     pads: Arc<dyn Pads>,
     store: Store,
     policy: PeerPolicy,
+    /// Read once at startup rather than per call: it comes from the SoC's fuses by way of the
+    /// bootloader, so it cannot change while this process is running.
+    serial: Option<String>,
 }
 
 fn log_startup_identity(service: &str) {
@@ -212,10 +215,28 @@ async fn main() -> ExitCode {
         }
     };
 
+    // The identity, and the name that hangs off it. A board with no readable serial keeps the old
+    // behaviour — the hostname — rather than losing its name over a missing devicetree property.
+    let serial = configd::identity::serial();
+    let default_name = match &serial {
+        Some(serial) => configd::identity::default_name(serial),
+        None => {
+            let name = hostname();
+            tracing::warn!(
+                default_name = %name,
+                "no SoC serial; falling back to the hostname, so boards flashed from one image \
+                 are indistinguishable until renamed"
+            );
+            name
+        }
+    };
+    tracing::info!(serial = ?serial, %default_name, "identity");
+
     let service = Arc::new(Service {
         net,
         pads,
-        store: Store::new(args.state_dir.join("config.json"), hostname()),
+        store: Store::new(args.state_dir.join("config.json"), default_name),
+        serial,
         policy: PeerPolicy {
             owner_uid: unsafe { libc::getuid() },
             allow_uids: args
@@ -433,17 +454,16 @@ async fn dispatch(
             Some(id),
             &proto::SystemInfoResult {
                 name: service.store.name(),
-                // No per-device identity exists yet; provisioning has to define one
-                // (`updater-design.md` §5.7). `None` rather than something invented.
-                serial: None,
+                serial: service.serial.clone(),
                 uptime_seconds: uptime_seconds(),
             },
         ),
         proto::Call::SystemSetName(params) => match service.store.set_name(&params.name) {
             Ok(name) => {
-                // The advertised BLE name does not change until btd restarts, and saying so is
-                // better than a client wondering why the phone still shows the old one.
-                tracing::info!(%name, "renamed; btd advertises the new name after a restart");
+                // `btd` reconciles the advertisement against this every few seconds, so a phone
+                // sees the new name on its next scan rather than after a restart. Logged because
+                // "a few seconds" is the difference between a client waiting and one retrying.
+                tracing::info!(%name, "renamed; btd advertises the new name within a few seconds");
                 proto::Response::ok(Some(id), &proto::SetNameResult { name })
             }
             Err(e) => proto::Response::err(

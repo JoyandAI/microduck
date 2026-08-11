@@ -27,6 +27,7 @@
 #[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod driver;
+pub mod identity;
 pub mod net;
 #[cfg(target_os = "linux")]
 pub mod nm;
