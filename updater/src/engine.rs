@@ -1082,6 +1082,46 @@ impl Engine {
     /// [`MAX_BOOT_ATTEMPTS`] boots, and delete staging leftovers. This is the path
     /// that catches a release which doesn't start at all — the in-process health
     /// gate can't, because it died with it.
+    /// Check that the restarts an update scheduled actually happened, and fix what did not.
+    ///
+    /// Runs at startup, beside [`Self::recover_on_start`], because that is the first moment the
+    /// answer exists: `updaterd` cannot watch its own replacement land, so the check belongs to the
+    /// successor. See [`crate::reconcile`] for why scheduling a restart is not evidence one
+    /// happened.
+    ///
+    /// Per component, since each has its own active release and ships its own units. Failures are
+    /// logged rather than returned, for the same reason the scheduling is: this must never be a
+    /// reason to refuse to serve.
+    pub async fn reconcile_running_units(&self) -> Vec<crate::reconcile::Finding> {
+        let mut findings = Vec::new();
+
+        for name in self.config.components.keys() {
+            let Ok(store) = self.store(name) else {
+                continue;
+            };
+            let Ok(Some(active)) = store.current() else {
+                // No active release: a component that has never been installed. Nothing to compare
+                // against, and nothing to fix.
+                continue;
+            };
+
+            let configured = match &self.config.components[name].on_apply {
+                ApplyAction::Restart { units } => units.clone(),
+                _ => Vec::new(),
+            };
+            // The *shipped* set rather than the restart set: `updaterd` and `btd` are excluded from
+            // an update's own restarts, which makes them the two this check exists for.
+            let units = units_shipped(&store.release_dir(&active), &configured);
+            if units.is_empty() {
+                continue;
+            }
+
+            findings.extend(crate::reconcile::check(SYSTEMCTL, &active, SELF_UNIT, units).await);
+        }
+
+        findings
+    }
+
     pub async fn recover_on_start(&mut self) -> Result<Vec<ApplyResult>, Error> {
         for name in self.config.components.keys().cloned().collect::<Vec<_>>() {
             if let Ok(store) = self.store(&name) {
@@ -1473,6 +1513,12 @@ impl Engine {
 /// The program that drives units. A constant so tests can substitute a stub for it.
 const SYSTEMCTL: &str = "systemctl";
 
+/// This process's own unit, which the reconciliation must recognise and never restart.
+///
+/// The bare name rather than `updaterd.service`, matching what [`units_shipped`] yields — it takes
+/// the file stem, and `systemctl` accepts either.
+const SELF_UNIT: &str = "updaterd";
+
 /// Restart one unit, skipping it if this board does not have it installed.
 ///
 /// `systemctl` is a parameter rather than hardcoded so a test can hand it a stub. That is the
@@ -1646,7 +1692,7 @@ const NEVER_RESTART: [&str; 2] = ["updaterd", "btd"];
 ///
 /// An unreadable or absent `systemd/` directory yields the configured list unchanged. Older releases
 /// predate the directory, and a rollback to one must still work.
-fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
+fn units_shipped(release_dir: &Path, configured: &[String]) -> Vec<String> {
     let mut units: Vec<String> = Vec::new();
 
     match std::fs::read_dir(release_dir.join("systemd")) {
@@ -1678,6 +1724,13 @@ fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
     // because the config and the release will usually name the same daemons.
     units.sort();
     units.dedup();
+    units
+}
+
+/// The subset an update restarts in flight: everything shipped, less the two it cannot touch while
+/// it is running.
+fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
+    let mut units = units_shipped(release_dir, configured);
     units.retain(|unit| !NEVER_RESTART.contains(&unit.as_str()));
     units
 }

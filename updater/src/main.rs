@@ -571,6 +571,23 @@ async fn serve(args: Args) -> ExitCode {
         }
     }
 
+    // After recovery, because recovery can change which release is active — checking before it
+    // would compare every unit against a version this robot is in the middle of abandoning.
+    //
+    // This is where a deferred restart that never happened gets caught. `updaterd` cannot observe
+    // its own restart, so the successor does it; see `updater::reconcile`.
+    let findings = engine.reconcile_running_units().await;
+    let stale = findings
+        .iter()
+        .filter(|f| f.verdict != updater::reconcile::Verdict::Current)
+        .count();
+    if stale == 0 {
+        tracing::info!(
+            units = findings.len(),
+            "every unit is on the active release"
+        );
+    }
+
     if args.check_only {
         tracing::info!("--check-only: recovery done, not serving");
         return ExitCode::SUCCESS;
