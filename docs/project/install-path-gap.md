@@ -138,17 +138,21 @@ observed.
 
 Not an accusation of the tests; they cover what they claim. The point is what nothing covers.
 
+This was written when the answer was "nothing", and the row that says so has since changed. Kept as
+the record of what was missing, with what each check covers **today**:
+
 | | covers | does not |
 |---|---|---|
-| `board-test.sh` | binaries executed on real aarch64 Linux from the *build directory*: engine behaviour, socket modes, `SO_PEERCRED`, the layered authorisation, `setup-board.sh` against a stubbed `systemctl` | unpacking an artifact, installing units, starting services |
+| `board-test.sh` | binaries executed on real aarch64 Linux, **and a real artifact unpacked and installed** by `install.sh` and `hooks/postinstall` against a stubbed `systemctl` — placements, modes, ordering, idempotence, and every unit's `ExecStart` binary being present | services actually starting, which needs real systemd |
 | `xtask` tests | the workflow YAML vs `install.sh`, and unit `ExecStart` vs staged binaries | whether the *built artifact* matches either — it reads source files |
 | `updater` tests | engine, journal, verification, rollback, with fakes | `install.sh` at all |
 | `shipped_config_is_safe_for_a_client_robot` | `deploy/updater.toml`'s content | that the config is installable |
 
-So: **no test takes a real artifact and installs it.** Every check either runs a binary that was
-never packaged, or reads a source file that describes packaging without observing it. The two
-`xtask` tests I added are strictly better than nothing and still the weaker form — they assert that
-two files agree with each other, not that the thing they produce is correct.
+What the first row used to say was "unpacking an artifact, installing units, starting services", and
+the sentence beneath it was: **no test takes a real artifact and installs it.** That was the finding
+this document exists for, and it is fixed — the `xtask` row is still the weaker form, asserting that
+two source files agree rather than observing what they produce, but it is no longer the only thing
+standing between a packaging mistake and a board.
 
 ## What would close it
 
@@ -213,32 +217,34 @@ is why they were the first thing to do.
   assert the four outcomes: stale is restarted, `updaterd` is reported and not restarted, a missing
   identity file is left alone, a failed restart reports itself.
 
-### 2. Unpack the real artifact and run the real installer
+### 2. The artifact install — done, and what it left
 
-**As a step in the existing `check` job, not a new one.** That job already builds an artifact with
-`xtask package` and then asserts three filenames. Extend it: unpack that same tarball into a
-temporary directory treated as the filesystem root, put a stub `systemctl` on `PATH`, run
-`scripts/install.sh` and `hooks/postinstall` against it, and assert what landed — the units in
-`/etc/systemd/system`, the sysusers files, the `robotctl` symlink, the state directory, and that every
-unit's `ExecStart` binary is present in the release. Seconds of shell, no second build, no new job.
+**This is no longer open, and the title of this document is no longer true.** `scripts/board-test.sh`
+packages a real release from the `--include` list in `_build-release.yml`, unpacks it, and runs
+`scripts/install.sh` *and* `hooks/postinstall` against it inside the container with a stubbed
+`systemctl` (PR #47, 2026-08-07). Eleven assertions: units installed byte-identical at mode 644,
+sysusers drop-ins, the `robotctl` symlink resolving through `current`, the journald drop-in,
+`daemon-reload` before any `enable` and `configd` before `btd`, operator config files preserved,
+idempotence on a second run, a unit `install.sh` does not recognise installed-but-not-started, and
+postinstall reproducing the lot on its own.
 
-This is the item that closes the gap in the title, and it subsumes the earlier "assert the artifact's
-contents" idea for free, because the tarball is already open. **Would have caught bugs 2 and 3.**
+That covers what this section used to ask for, and the "assert the artifact's contents" idea with it,
+because the tarball is open by then. **Bug 2 is closed against the artifact rather than against the
+YAML.**
 
-What it replaces is the weaker form that exists today: *three* tests — a
-`every_hook_in_the_repo_is_packaged` was added so `hooks/postinstall` cannot silently stop shipping —
-all of which assert that `.github/workflows/*.yml` agrees with `scripts/install.sh`. They cover the
-drift class between two source files; none of them observes a tarball.
+One gap was left, and it is bug 3 — the one class of the four with no strong test. Nothing asked
+whether the binary a unit `ExecStart`s is *in* the artifact that shipped the unit, which is exactly how
+`btd.service` came to fail with `203/EXEC` on a board where the release looked complete. The
+protection was `xtask/tests/artifact.rs`, comparing a workflow against `install.sh` — the
+two-files-agree form criticised above. Now asked directly, three lines, in the job that already has
+the tree unpacked and `current` pointing at it.
 
-And nothing executes the installer at all. `scripts/install.sh` is ~900 lines that no test runs;
-`board-test.sh` carries a comment reading "the first install, which is the path `scripts/install.sh`
-takes on a bare board" above a line that runs `updaterd install --from` instead. The engine's hook
-tests use a stub hook built by `test-support`, so the real `hooks/postinstall` has never run in the
-repository either — and it is the more dangerous of the two, because it places files on a board
-unattended on every update, from inside the update gate, with nobody watching. A hook that installs a
-unit wrongly is worse than an installer that does.
+Only `ExecStart` paths inside the release are checked: a unit may deliberately exec out of the base —
+the boot recovery net does, so that a broken release cannot break it — and requiring those to be
+packaged would be wrong rather than strict.
 
-The pattern already exists — `setup-board.sh` is tested this way, against a stubbed `systemctl`.
+**What is still genuinely missing here is nothing.** The remaining items are the two below, and they
+cover different things rather than more of this one.
 
 ### 3. One scripted scenario on a real board
 
