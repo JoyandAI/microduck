@@ -163,16 +163,14 @@ its own PR.
    engines in the same process, which surfaced as unrelated operations failing with `Busy` in the
    test suite.
 
-2. **A boot-time net outside `updaterd`**, for what slips through. `OnFailure=` on a curated set of
-   units fires exactly when one exhausts its restarts, and a tiny oneshot swaps `current` to golden and
-   reboots. Four constraints make it a net rather than a footgun: the set is curated (`btd`
-   legitimately fails on a board whose radio has not appeared, and reverting a good release over that
-   is a poor trade); it reads a `golden` **symlink** rather than parsing config, because a release that
-   breaks the config parser must not also break its own rescue; it needs a loop guard and must not fire
-   when `current` is already golden; and it cannot fix hardware — a `robotd` that fails for want of
-   servo power fails identically on golden, the same distinction the health gate draws between
-   unhealthy and degraded. Golden rather than previous, deliberately: when the recovery path itself is
-   what broke, previous may be broken too.
+2. **A boot-time net outside `updaterd`**, for what slips through: a timer three minutes into each
+   boot asks whether the release brought its daemons up, and a `/bin/sh` rescue in the installed base
+   swaps `current` to golden if it did not. It has to live outside this process and outside the
+   release, because the failure it exists for is an `updaterd` that does not start — at which point
+   `recover_on_start` and the boot counter below are both unreachable. It cannot fix hardware: a
+   `robotd` that fails for want of servo power fails identically on golden, the same distinction the
+   health gate draws between unhealthy and degraded. [`boot-recovery-net.md`](boot-recovery-net.md)
+   owns it.
 
 This is also why the update logic cannot live in `btd`: as a client of the
 update, `btd` cannot be the thing performing it — it would kill itself partway
@@ -549,11 +547,16 @@ Any non-zero hook exit, failed health probe, or timeout is treated identically:
 /opt/robot/daemon/
 ├── releases/1.4.1/     ← previous (kept for rollback)
 ├── releases/1.4.2/     ← new
-└── current → releases/1.4.2     ← systemd units point at current/
+├── current → releases/1.4.2     ← systemd units point at current/
+└── golden  → releases/1.4.1     ← never pruned; what the rescue reads
 ```
 
 Atomicity is a single `rename(2)` of the symlink on the same filesystem. No
 half-written state is ever live.
+
+`golden` is written by `Engine::refresh_golden_links` on every start, from
+`ComponentConfig::golden`. It exists so that recovery outside this process needs no
+parser — see [`boot-recovery-net.md`](boot-recovery-net.md).
 
 ### 7.2 Preflight preconditions
 

@@ -34,7 +34,7 @@ pub trait Net: Send + Sync {
 ///
 /// It is also what makes `configd` eligible for the boot recovery net: a unit may only join the set
 /// if it waits for its dependency rather than exiting, so that a `failed` unit means a broken
-/// release rather than a broken board (`docs/project/boot-recovery-net.md`).
+/// release rather than a broken board (`docs/design/boot-recovery-net.md`).
 ///
 /// `reason` is the bus error, carried into every reply rather than logged once at startup, because
 /// the person who needs it is holding a phone and cannot see the journal.

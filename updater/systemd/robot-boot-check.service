@@ -3,7 +3,7 @@
 # The last uncovered failure in the update path. `updaterd` cannot watch its own replacement start,
 # and its boot counter only advances when `updaterd` itself starts — so a release whose daemons do
 # not come up at boot leaves a board with a good release on disk, a trial armed to revert to it, and
-# nothing running that can act on either. See `docs/project/boot-recovery-net.md`.
+# nothing running that can act on either. See `docs/design/boot-recovery-net.md`.
 #
 # Started by `robot-boot-check.timer` and by nothing else. **There is deliberately no `[Install]`
 # section**: `scripts/install.sh` and `hooks/postinstall` `enable --now` every unit with one, and

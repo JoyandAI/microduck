@@ -11,8 +11,9 @@
 //! What that leaves uncovered is real and worth naming: **systemd itself**. Whether the timer fires
 //! at `OnBootSec=180`, whether the oneshot's `Conflicts=shutdown.target` keeps it off the way down,
 //! and whether `NRestarts` reads the way this assumes on a crash-looping unit — none of that is here.
-//! It needs a privileged container with systemd as pid 1 (`docs/project/install-path-gap.md` option
-//! C), which is the same infrastructure this argues for.
+//! It needs real systemd — `systemd-nspawn`, or a privileged container with it as pid 1 — which
+//! `docs/project/install-path-gap.md` makes the case for and `docs/design/boot-recovery-net.md` says
+//! why this mechanism in particular wants it.
 //!
 //! In `xtask` because these are *repository scripts* rather than any crate's behaviour, which is what
 //! the rest of this directory is for. `sh` and not `bash`: they run on a board where the interpreter
