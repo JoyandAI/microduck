@@ -243,6 +243,41 @@ health = {{ probe = "socket", timeout = "2s" }}
         self.engine(Box::new(FakeRobot::healthy()), Faults::none(), "")
     }
 
+    /// A stand-in for `/etc/systemd/system`, which a test can neither read nor write meaningfully:
+    /// on a CI runner it holds whatever that machine has installed, and on a robot it holds the
+    /// real units.
+    fn unit_dir(&self) -> PathBuf {
+        let dir = self.root.join("etc/systemd/system");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Install a unit that execs `bin/<name>` through this component's `current` symlink — what
+    /// `hooks/postinstall` leaves on the board.
+    fn install_unit(&self, name: &str) {
+        std::fs::write(
+            self.unit_dir().join(format!("{name}.service")),
+            format!(
+                "[Service]\nExecStart={}/current/bin/{name}\n",
+                self.install.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A release carrying binaries, so a unit installed on the board has something to exec.
+    fn publish_with_binaries(&self, version: &str, binaries: &[&str]) {
+        let mut release = self.publisher.release(version);
+        for name in binaries {
+            release = release.file(&format!("bin/{name}"), b"#!/bin/true\n", 0o755);
+        }
+        release.write();
+    }
+
+    fn engine_seeing_units(&self) -> Engine {
+        self.engine_healthy().with_unit_dir(self.unit_dir())
+    }
+
     fn release_exists(&self, version: &str) -> bool {
         self.install.join("releases").join(version).is_dir()
     }
@@ -553,6 +588,89 @@ async fn refuses_when_disk_is_full() {
     let err = apply_latest(&mut engine).await.unwrap_err();
     assert!(matches!(err, updater::Error::Preflight(_)), "got {err:?}");
     assert_eq!(fx.live_version(), None, "must abort before downloading");
+}
+
+/// The case that motivated the check, as it happened: a board running a release with `configd`
+/// resolves to one that predates it, `configd.service` stays behind, and its binary is gone.
+///
+/// What it used to do — install, fail the restart with `203/EXEC`, roll back, and report a systemd
+/// error code — was the right outcome reached by the most expensive route, and named nothing.
+#[tokio::test]
+async fn refuses_a_release_that_would_orphan_an_installed_unit() {
+    let fx = Fixture::new();
+    fx.install_unit("robotd");
+    fx.install_unit("configd");
+    // The candidate predates `configd`: it still ships `robotd`, and that unit must not be
+    // reported — otherwise this would pass while refusing every release for the wrong reason.
+    fx.publish_with_binaries("1.0.0", &["robotd"]);
+
+    let mut engine = fx.engine_seeing_units();
+    let err = apply_latest(&mut engine).await.unwrap_err();
+
+    let updater::Error::WouldOrphanUnit(message) = &err else {
+        panic!("got {err:?}");
+    };
+    assert!(
+        message.contains("configd.service execs bin/configd"),
+        "{message}"
+    );
+    assert!(!message.contains("robotd.service"), "{message}");
+    // The refusal is only useful if the way past it is in the text.
+    assert!(
+        message.contains("systemctl disable --now configd.service"),
+        "{message}"
+    );
+
+    assert_eq!(fx.live_version(), None, "nothing may be installed");
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+/// The escape, pinned: removing the unit is the whole remedy, and there is no flag. An operator who
+/// follows the refusal text must end up with the release installed, or this is a bricked update
+/// path on a board where nothing else would get them off a bad release.
+#[tokio::test]
+async fn removing_the_orphaned_unit_lets_the_release_through() {
+    let fx = Fixture::new();
+    fx.install_unit("configd");
+    fx.publish_with_binaries("1.0.0", &["robotd"]);
+
+    let mut engine = fx.engine_seeing_units();
+    assert!(apply_latest(&mut engine).await.is_err());
+
+    std::fs::remove_file(fx.unit_dir().join("configd.service")).unwrap();
+
+    let result = apply_latest(&mut engine).await.unwrap();
+    assert!(matches!(result, ApplyResult::Applied { .. }), "{result:?}");
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+/// A dry run is how "will this downgrade work?" gets asked, so it has to answer — which is why the
+/// check runs before the dry run returns rather than at the swap.
+#[tokio::test]
+async fn a_dry_run_reports_the_orphan_rather_than_passing() {
+    let fx = Fixture::new();
+    fx.install_unit("configd");
+    fx.publish_with_binaries("1.0.0", &["robotd"]);
+
+    let mut engine = fx.engine_seeing_units();
+    let (tx, _rx) = progress_channel();
+    let err = engine
+        .apply(
+            "daemon",
+            Target::Latest,
+            ApplyOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, updater::Error::WouldOrphanUnit(_)),
+        "got {err:?}"
+    );
 }
 
 // ── rollback ─────────────────────────────────────────────────────────────────

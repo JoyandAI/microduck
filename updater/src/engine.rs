@@ -17,7 +17,7 @@
 //!    health check is still recoverable. The reverse order would leave an
 //!    unrecorded bad release live.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{ApplyAction, ComponentConfig, Config, HealthCheck};
@@ -106,6 +106,12 @@ pub struct Engine {
     /// On a robot, always. Off only in the test binaries, and for a reason that is about processes
     /// rather than about restarts — see [`Engine::without_deferred_restarts`].
     deferred_restarts: bool,
+    /// Where systemd's installed unit files live, for the orphan check ([`crate::orphan`]).
+    ///
+    /// A field so a test can point it at a directory it owns, and **not** a config key, for the
+    /// reason `NEVER_RESTART` is not one: `/etc/systemd/system` is a property of the system rather
+    /// than a choice, and a board that got it wrong would silently stop checking.
+    unit_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -133,7 +139,18 @@ impl Engine {
             pins,
             faults,
             deferred_restarts: true,
+            unit_dir: PathBuf::from(UNIT_DIR),
         })
+    }
+
+    /// Look for orphaned units somewhere other than `/etc/systemd/system`.
+    ///
+    /// For tests, which cannot write to the real one — and must not, since the check reads whatever
+    /// the machine running them happens to have installed.
+    #[doc(hidden)]
+    pub fn with_unit_dir(mut self, dir: PathBuf) -> Self {
+        self.unit_dir = dir;
+        self
     }
 
     /// Stop this engine spawning anything when a release is applied.
@@ -573,6 +590,28 @@ impl Engine {
                 source: e,
             }
         })?;
+
+        // 5b. Would this release leave an installed unit with nothing to exec? See
+        //     [`crate::orphan`] — a downgrade past the release that introduced a daemon leaves
+        //     that daemon's unit behind, and it then fails with `203/EXEC`, which fails the
+        //     restart, which reverts the update.
+        //
+        //     Here rather than in `preflight` because the candidate's file list does not exist
+        //     until now, and before the dry run returns because "will this downgrade work?" is
+        //     exactly what a dry run is asked. Nothing has moved yet: staging is disposable, the
+        //     boot counter is unarmed, `current` still points where it did.
+        //
+        //     No target is exempt. `WouldDowngrade` above guards only `Latest`, because it is
+        //     about a mirror serving a stale manifest; this is about a unit that will not start,
+        //     which does not care how the target was named — and `Ref` is how the case was
+        //     observed.
+        let orphans = crate::orphan::would_orphan(&self.unit_dir, &store.link_path(), extract_dir);
+        if !orphans.is_empty() {
+            return Err(Error::WouldOrphanUnit(crate::orphan::refusal(
+                &manifest.version,
+                &orphans,
+            )));
+        }
 
         if options.dry_run {
             return Ok(ApplyResult::DryRunPassed {
@@ -1555,6 +1594,9 @@ impl Engine {
 
 /// The program that drives units. A constant so tests can substitute a stub for it.
 const SYSTEMCTL: &str = "systemctl";
+
+/// Where `hooks/postinstall` installs unit files, and so where the orphan check reads them.
+const UNIT_DIR: &str = "/etc/systemd/system";
 
 /// This process's own unit, which the reconciliation must recognise and never restart.
 ///

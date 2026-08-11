@@ -128,11 +128,24 @@ and said so. The outcome is right — a board should not silently downgrade belo
 introduced a daemon it is now running — but nothing states the rule, and the error names a systemd
 failure rather than the cause.
 
-Worth deciding rather than leaving as emergent behaviour, and **still open**: whether preflight should
-refuse a target that lacks a binary some installed unit execs, so the refusal arrives before the swap
-and names the real reason. Today the only downgrade guard is `Error::WouldDowngrade`, which fires on
-`Latest` alone — `Exact` and `Ref` bypass it deliberately, and `Ref` is precisely how this was
+**Now stated rather than emergent.** `updater/src/orphan.rs` refuses a candidate that lacks a binary
+some installed unit execs, and the refusal names the unit, the missing binary and the way past it —
+remove the unit, `systemctl disable --now configd.service && rm /etc/systemd/system/configd.service`.
+There is no override flag: removing the unit is what the operator means anyway, since a board below
+the release that introduced a daemon should not be running that daemon, and the next update that
+ships the unit reinstalls it.
+
+Two things about where it runs. It is **not** in preflight, which cannot see the candidate's file
+list — both preflight passes run before the artifact is downloaded — so it runs after extraction and
+before the swap, where staging is still disposable and nothing is armed. And **no target is exempt**,
+unlike `Error::WouldDowngrade`, which fires on `Latest` alone: that guard is about a mirror serving a
+stale manifest, this one is about a unit that will not start, and `Ref` is precisely how it was
 observed.
+
+It does not run on rollback, reset-to-golden or `select`. Those move backwards on purpose and are how
+a board gets off a bad release, so a check that can refuse must not sit in the recovery path
+(`docs/design/architecture.md` §1.1) — rolling back onto an orphaned unit stays the documented
+behaviour above, and stays self-correcting.
 
 ## Why the existing tests could not have caught them
 
