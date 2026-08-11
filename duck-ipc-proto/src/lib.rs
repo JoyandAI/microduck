@@ -1672,8 +1672,14 @@ pub struct ForgetResult {
 pub struct SystemInfoResult {
     /// The robot's name, as advertised over BLE and shown in an app.
     pub name: String,
-    /// Per-device identity, once provisioning defines one. `None` until then rather than a
-    /// fabricated value.
+    /// Per-device identity: the SoC serial, which the default name is derived from.
+    ///
+    /// The durable handle a client should key on. It outlives a rename, and it outlives a change of
+    /// Bluetooth address — which is not hypothetical, so an app that remembers a robot by its
+    /// peripheral identifier alone will lose it (`app-path-design.md` §8.6).
+    ///
+    /// `None` where there is none to read rather than a fabricated value; the robot then falls back
+    /// to its hostname for a name.
     pub serial: Option<String>,
     pub uptime_seconds: u64,
 }

@@ -472,9 +472,12 @@ rolled back for the state of the board it landed on.
 6. **Bond revocation over BLE.** Nothing un-pairs a phone; `bluetoothctl untrust` is the
    manual escape. Needs an API and a rule about who may call it
    ([`app-path-design.md`](app-path-design.md) §5).
-7. **Per-device provisioning state**, which now has two claimants rather than one: the robot's
-   serial (§5.7) and its per-robot pairing PIN. Both need generating, recording and printing at
-   manufacture, and defining that once is cheaper than twice.
+7. **Per-device provisioning state** — the per-robot pairing PIN, and nothing else now. The serial
+   was the other claimant and no longer needs a slot: it is fused into the SoC and read from
+   `/proc/device-tree/serial-number` (`updater-design.md` §5.6,
+   [`app-path-design.md`](app-path-design.md) §8.2). The PIN cannot share the identity, which was
+   the plan: the identity is published in an advertisement, so anything derived from it is public.
+   A secret still has to be generated, recorded and printed at manufacture.
 
 ## 10. Build order
 

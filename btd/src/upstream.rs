@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -26,6 +27,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Cap on a single write. A blocked write means the daemon has stopped reading, which is a
 /// dead peer rather than a slow one.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What to advertise the robot as.
+///
+/// The name belongs to `configd` (`architecture.md` §4.1) — an SDK should not have to go through
+/// Bluetooth to set it — so `btd` asks rather than decides. Here rather than in `bluez` so the
+/// crate's entry point has the same shape off-Linux, where there is no radio to advertise on.
+#[derive(Debug, Clone)]
+pub struct NameChoice {
+    /// `--name`, which pins the advertised name and turns reconciliation off. Bench use: it exists
+    /// so a board can be given a known name without touching its stored config.
+    pub pinned: Option<String>,
+    /// Used when `configd` cannot be reached. `btd` is on the recovery path and must answer when
+    /// the rest of the robot does not (`systemd/btd.service`), so an unreachable `configd` costs
+    /// the derived name and nothing more.
+    pub fallback: String,
+}
 
 /// Where each service listens.
 #[derive(Debug, Clone)]
@@ -43,6 +60,61 @@ impl Sockets {
             Upstream::Config => &self.config,
         }
     }
+}
+
+/// Ask one service one question, on `btd`'s own behalf.
+///
+/// A one-shot connection rather than a [`Pool`] entry, because this is not forwarding: nothing
+/// here belongs to a client's session. `btd` asks two questions of its own — the PIN during a
+/// pairing exchange, and the robot's name to advertise — and both want a single answer now rather
+/// than a merged stream of lines. With exactly one reply in flight there is nothing to correlate,
+/// so the `id` is a constant.
+///
+/// Timeout-bounded like everything else in this module. The caller picks the timeout because the
+/// deadlines differ by an order of magnitude: BlueZ holds a pairing exchange open while a phone
+/// shows a spinner, whereas nothing is waiting on a name.
+///
+/// Returns the response with its error already turned into `Err`, so a caller only has to
+/// deserialise the result it expected.
+pub async fn ask(
+    service: &str,
+    socket: &Path,
+    call: &proto::Call,
+    timeout: Duration,
+) -> Result<proto::Response, String> {
+    tokio::time::timeout(timeout, ask_now(service, socket, call))
+        .await
+        .map_err(|_| format!("{service} did not answer in time"))?
+}
+
+async fn ask_now(
+    service: &str,
+    socket: &Path,
+    call: &proto::Call,
+) -> Result<proto::Response, String> {
+    let stream = UnixStream::connect(socket)
+        .await
+        .map_err(|e| format!("cannot reach {service} at {}: {e}", socket.display()))?;
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+
+    let request = proto::Request::call(proto::Id::Number(1), call);
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    write.write_all(&line).await.map_err(|e| e.to_string())?;
+    write.flush().await.map_err(|e| e.to_string())?;
+
+    let reply = lines
+        .next_line()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{service} closed the connection without answering"))?;
+
+    let response: proto::Response = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
+    if let Some(error) = response.error {
+        return Err(format!("{service} refused: {error}"));
+    }
+    Ok(response)
 }
 
 /// The write half of a live connection. The read half lives in a spawned task.
@@ -146,5 +218,100 @@ impl Pool {
 
         tracing::debug!(upstream = ?upstream, path = %path.display(), "connected");
         Ok(Conn { write })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// A fake `configd` that answers one request with `response` and hangs up.
+    fn serve_once(path: &Path, response: proto::Response) -> tokio::task::JoinHandle<String> {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let request = BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+
+            let mut line = serde_json::to_vec(&response).unwrap();
+            line.push(b'\n');
+            write.write_all(&line).await.unwrap();
+            write.flush().await.unwrap();
+            request
+        })
+    }
+
+    /// The whole path `bluez` uses to learn what to advertise: ask `configd`, get a name back.
+    #[tokio::test]
+    async fn a_question_is_asked_and_the_answer_deserialised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("configd.sock");
+        let fake = serve_once(
+            &path,
+            proto::Response::ok(
+                Some(proto::Id::Number(1)),
+                &proto::SystemInfoResult {
+                    name: "duck-7f3a".into(),
+                    serial: Some("bb7b734a7717ac41".into()),
+                    uptime_seconds: 12,
+                },
+            ),
+        );
+
+        let info: proto::SystemInfoResult =
+            ask("configd", &path, &proto::Call::SystemInfo, TIMEOUT)
+                .await
+                .unwrap()
+                .result_as()
+                .unwrap();
+        assert_eq!(info.name, "duck-7f3a");
+
+        // And the method on the wire was the one asked for, not merely something that parsed.
+        let request = fake.await.unwrap();
+        assert!(request.contains(proto::method::SYSTEM_INFO), "{request}");
+    }
+
+    /// `btd` is on the recovery path and must come up when the rest of the robot has not, so an
+    /// absent `configd` is a reported error rather than a hang or a panic.
+    #[tokio::test]
+    async fn an_absent_service_is_an_error_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ask(
+            "configd",
+            &dir.path().join("absent.sock"),
+            &proto::Call::SystemInfo,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("cannot reach configd"), "{err}");
+    }
+
+    /// A service that refuses must not read as an answer: the caller would otherwise advertise
+    /// whatever `result_as` makes of a null result.
+    #[tokio::test]
+    async fn a_refusal_is_an_error_rather_than_an_empty_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("configd.sock");
+        let _fake = serve_once(
+            &path,
+            proto::Response::err(
+                Some(proto::Id::Number(1)),
+                proto::Error::new(proto::code::INTERNAL_ERROR, "no"),
+            ),
+        );
+
+        let err = ask("configd", &path, &proto::Call::SystemInfo, TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(err.contains("configd refused"), "{err}");
     }
 }

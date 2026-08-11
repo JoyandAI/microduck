@@ -56,6 +56,10 @@ pub struct Store {
     path: PathBuf,
     /// Used when the file has no name yet, so an unprovisioned robot still has an identity
     /// rather than an empty string in a phone's Bluetooth list.
+    ///
+    /// Supplied by the caller rather than computed here, because it is derived from the board —
+    /// [`crate::identity`] turns the SoC serial into `duck-7f3a` — and this type is a file, not a
+    /// place that knows about hardware.
     fallback: String,
 }
 

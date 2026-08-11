@@ -186,6 +186,10 @@ sudo robotctl system set-pin <six-digits>
 sudo robotctl system reboot
 ```
 
+Out of the box a robot calls itself `duck-` plus four characters derived from its own serial, so two
+boards flashed from the same image still look different in a phone's Bluetooth list. Renaming takes
+effect over Bluetooth within a few seconds — no restart — but a phone has to scan again to see it.
+
 The PIN is what a phone authenticates with over Bluetooth. The factory default is `000000`, which
 authenticates anyone who has read this repository.
 

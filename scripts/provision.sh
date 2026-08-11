@@ -12,6 +12,9 @@
 #
 # `DUCK_NO_REBOOT=1` keeps the old four-command shape: it stops and tells you what to run.
 #
+# `DUCK_NAME="Ducky"` names the robot at the end. Optional: without it the board names itself
+# `duck-<four hex>` from its SoC serial, which is already unique per board.
+#
 # This orchestrates `setup-board.sh`, `migrate-network.sh` and `install.sh`; it does not
 # duplicate them. They stay separately runnable, and they stay separate for the reasons each
 # one states — different lifetimes, different risks. What they never had is anything tying
@@ -62,6 +65,7 @@ ENV_REF="${DUCK_REF:-}"
 ENV_TOKEN="${DUCK_TOKEN:-}"
 ENV_DEV_KEY="${DUCK_DEV_KEY:-}"
 ENV_FORCE="${DUCK_FORCE_REINSTALL:-}"
+ENV_NAME="${DUCK_NAME:-}"
 
 REPO="${ENV_REPO:-pollen-robotics/microduck_daemon}"
 REF="${ENV_REF:-main}"
@@ -76,6 +80,14 @@ RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
 # so passing it through in phase 2 is what makes updates work after provisioning, not just
 # during it. `finish` says where it ended up.
 TOKEN="$ENV_TOKEN"
+
+# A name for this robot, or empty to let it name itself.
+#
+# Optional on purpose. Without one the robot derives `duck-7f3a` from its SoC serial, which is
+# already distinguishable from every other board flashed from the same image — so this improves on
+# a working default rather than supplying the only one. That is what keeps a hand-flashed board
+# usable, and it is why the default is derived rather than assigned here.
+NAME="$ENV_NAME"
 
 # Path to `team.dev.pub`, to make this a dev board. Usually somewhere under /tmp because it
 # arrived by `scp`, which is why phase 1 copies it somewhere that survives the reboot.
@@ -196,6 +208,7 @@ save_state() {
         printf 'DUCK_TOKEN=%s\n' "$TOKEN"
         printf 'DUCK_DEV_KEY=%s\n' "$1"
         printf 'DUCK_FORCE_REINSTALL=%s\n' "$FORCE_REINSTALL"
+        printf 'DUCK_NAME=%s\n' "$NAME"
         printf 'PROVISION_BOOT_ID=%s\n' "$(boot_id)"
     } > "$STATE"
 }
@@ -214,6 +227,7 @@ load_state() {
     TOKEN="${ENV_TOKEN:-${DUCK_TOKEN:-}}"
     DEV_KEY="${ENV_DEV_KEY:-${DUCK_DEV_KEY:-}}"
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
+    NAME="${ENV_NAME:-${DUCK_NAME:-}}"
     RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
     return 0
 }
@@ -496,7 +510,33 @@ phase_two() {
     fi
     sh "$tmp"
 
+    name_the_robot
+
     finish
+}
+
+# Give this board the name the operator asked for, if they asked for one.
+#
+# Through `configd`'s socket rather than by editing its file: one writer, `flock` for the write,
+# the same validation an app gets, and truncation to the 24 bytes a BLE advertisement has room
+# for. Editing `config.json` here would race the running daemon and skip all of it.
+#
+# After `install.sh`, because that is what enables `configd` — before it there is no socket to
+# talk to.
+name_the_robot() {
+    [ -n "$NAME" ] || return 0
+
+    if _stored="$(robotctl system set-name "$NAME" 2>&1)"; then
+        say "named this robot:
+${_stored}"
+    else
+        # Not fatal. The robot still answers to its derived default, so this costs a nicer name
+        # rather than a working one — but it is the one thing the operator typed that quietly did
+        # not happen, so it does not pass in silence.
+        warn "could not name this robot '${NAME}':
+  ${_stored}
+  It keeps its derived default. Retry with:  robotctl system set-name '${NAME}'"
+    fi
 }
 
 # Drop the state file, and account for the token that is *supposed* to stay.
