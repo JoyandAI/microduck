@@ -81,13 +81,15 @@ pub fn pair_timeout(requested: Option<u32>) -> Duration {
 ///
 ///  - **`icon`** is BlueZ's own classification, derived from the class or the appearance. When it
 ///    says `input-gaming` the question is settled, and this is the signal an Xbox controller
-///    actually presents on this board.
+///    actually presents on this board — from its LE appearance, since that pad has no class.
 ///  - **`class`** is the BR/EDR class-of-device: bits 8-12 are the major device class, and `0x05`
 ///    is Peripheral. Bits 6-7 of the minor field distinguish keyboard from pointing device from
 ///    gamepad — `0x01` in bits 2-5 with the keyboard/pointer bits clear is a joystick or gamepad.
-///    Present for a classic pad, absent for a BLE-only one.
+///    Present for a classic pad, absent for a BLE-only one — and every pad tried so far has been
+///    LE-only, so this arm is from the specification and has never fired on hardware.
 ///  - **`appearance`** is the BLE equivalent: category 15 (`0x03C0..=0x03C4`) is HID, and `0x03C4`
-///    is specifically Gamepad. Many pads never set it, which is why it cannot stand alone.
+///    is specifically Gamepad. Many pads never set it, which is why it cannot stand alone. Only the
+///    gamepad value counts, so an LE pad advertising generic HID falls through to its name.
 ///  - **the name**, last and deliberately: it is the signal that works when the other three are
 ///    absent, which for a pad still in pairing mode is common, and it is the one that can be wrong.
 ///
@@ -285,7 +287,8 @@ mod tests {
     }
 
     /// A classic pad, identified by class-of-device with no icon and no name — which is what
-    /// discovery reports before a device is queried.
+    /// discovery reports before a device is queried. Synthetic in a way the others are not: no pad
+    /// bonded to this robot has ever presented a class, so this arm is only ever exercised here.
     #[test]
     fn a_peripheral_joystick_class_is_a_gamepad() {
         // Major 0x05 (peripheral), minor 0x01 (joystick): 0x000504.
