@@ -11,7 +11,7 @@ use configd::net::{FakeNet, Net};
 use configd::pad::{FakePads, Pads};
 use configd::power;
 use configd::store::Store;
-use configd::{driver, pad};
+use configd::{pad, units};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -429,6 +429,11 @@ async fn dispatch(
         }
         proto::Call::NetForget(params) => reply(id, service.net.forget(&params.ssid).await),
 
+        // Read-only, so not gated behind `may_mutate`: "which release is actually running" is the
+        // question support asks first, and needing privilege to ask it would put it out of reach of
+        // exactly the person diagnosing a robot.
+        proto::Call::SystemServices => proto::Response::ok(Some(id), &units::all().await),
+
         proto::Call::SystemInfo => proto::Response::ok(
             Some(id),
             &proto::SystemInfoResult {
@@ -481,7 +486,7 @@ async fn dispatch(
                 Some(id),
                 &proto::PadStatusResult {
                     pads,
-                    driver: driver::state().await,
+                    driver: units::state(units::PADD).await,
                 },
             ),
             Err(e) => {

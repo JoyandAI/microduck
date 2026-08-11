@@ -105,8 +105,20 @@ survive a daemon crash to perform rollback.
 **Corollary — `updaterd` must be resident, and must exclude itself from the
 restart set.** `updaterd` and `btd` both ship *inside* the daemon artifact, so a
 naive "restart everything" would kill the executor mid-swap or mid-health-gate.
-`on_apply` therefore restarts everything the release ships **except** those two, which pick up the
-new binary at the next boot or an explicit later restart.
+`on_apply` therefore restarts everything the release ships **except** those two.
+
+**Excluded from the in-flight restart is not the same as skipped**, and reading it that way was the
+bug. Deferring them to "the next boot or an explicit later restart" left both running the old binary
+indefinitely: a resident `updaterd` rejected a newer `robotctl` with "client speaks API v4, daemon
+speaks v3", and `btd` fixes were tested against binaries that had never been running. So
+`RESTART_AFTER_REPLYING` schedules each through a systemd transient timer 5 s after the outcome is on
+the wire — long enough for a single write, short enough that nobody is waiting. The reason for each
+exclusion expires at exactly that moment: the update is finished, and the reply `btd` was carrying
+has been delivered.
+
+Nothing here waits for a reboot, and `robotctl health`'s unit block is where to confirm it: it prints
+the release each process is *running from*, which is the only place a deferred restart that failed
+would show up.
 
 The set is derived from the release's own `systemd/*.service` files rather than read from the
 board's config, and the two exclusions live in code (`NEVER_RESTART`) rather than in configuration:

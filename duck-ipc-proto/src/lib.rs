@@ -204,6 +204,8 @@ pub mod method {
 
     /// Name, serial, uptime.
     pub const SYSTEM_INFO: &str = "system.info";
+    /// What systemd says about each daemon, and which release each is running from.
+    pub const SYSTEM_SERVICES: &str = "system.services";
     /// Rename the robot. This is the name a phone sees.
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
@@ -330,6 +332,7 @@ pub enum Call {
 
     // ── system.* ─────────────────────────────────────────────────────────────
     SystemInfo,
+    SystemServices,
     SystemSetName(SetNameParams),
     SystemReboot,
     /// Read the pairing PIN.
@@ -385,6 +388,7 @@ impl Call {
             Call::NetConnect(_) => method::NET_CONNECT,
             Call::NetForget(_) => method::NET_FORGET,
             Call::SystemInfo => method::SYSTEM_INFO,
+            Call::SystemServices => method::SYSTEM_SERVICES,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
@@ -477,6 +481,7 @@ impl Call {
             Call::NetStatus
             | Call::NetScan
             | Call::SystemInfo
+            | Call::SystemServices
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::PadStatus => Value::Object(serde_json::Map::new()),
@@ -522,6 +527,7 @@ impl Call {
             method::NET_CONNECT => Call::NetConnect(decode(params)?),
             method::NET_FORGET => Call::NetForget(decode(params)?),
             method::SYSTEM_INFO => Call::SystemInfo,
+            method::SYSTEM_SERVICES => Call::SystemServices,
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
@@ -1649,22 +1655,56 @@ pub struct Pad {
     pub connected: bool,
 }
 
-/// Whether `padd` — the process that turns a pad into intents — is running.
+/// Whether one of the robot's units is running, as systemd sees it.
 ///
-/// Reported alongside the pads because a connected pad and a dead `padd` is the failure that looks
-/// like working hardware, and it is not otherwise visible without knowing to ask systemd.
+/// Named for the unit rather than for `padd`, which is where it started: the same four answers are
+/// what [`ServiceUnit`] needs about every daemon. The wire form is unchanged by that rename — these
+/// serialise as their own names, not as the type's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DriverState {
+pub enum UnitState {
     /// Running. With a connected pad, the robot is drivable.
     Active,
     /// The unit exists and is not running. Someone stopped it, or it is failed.
     Inactive,
-    /// No `padd.service` on this board — a release older than the one that added it.
+    /// No such unit on this board — a release older than the one that added it.
     Absent,
     /// Could not ask: no systemd, or the query failed. Distinct from `Absent`, because "I do not
     /// know" must not read as "it is not installed".
     Unknown,
+}
+
+/// One daemon, as systemd and `/proc` describe it. Answer element for [`Call::SystemServices`].
+///
+/// **This exists to answer "which version is actually running", which nothing else could.**
+/// `updaterd`, `robotd` and `configd` report their build over their own sockets, so a running
+/// daemon that did not restart into a new release is already visible for those three. `btd` and
+/// `padd` serve no socket, and asking them is not an option — the process that needs interrogating
+/// is by definition the *old* one, which cannot have learned a new way to answer.
+///
+/// So it is read from outside the process: systemd knows the PID, and `/proc/<pid>/exe` resolves to
+/// the real path the binary was executed from. Since a release installs to `…/releases/<version>/`
+/// and the unit points at a `current` symlink, that path names the release the process is running —
+/// including when it is not the installed one, which is the whole question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceUnit {
+    /// The systemd unit, e.g. `btd.service`.
+    pub unit: String,
+    pub state: UnitState,
+    /// The release the running process was started from, when its path names one.
+    ///
+    /// `None` for a stopped unit, and for a binary outside the release layout — a hand-built one
+    /// during development, say, which [`Self::binary`] then names in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<semver::Version>,
+    /// The resolved path of the running binary, so an answer `release` cannot express is not lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    /// The running binary is no longer on disk: it was replaced or pruned while the process kept
+    /// running. Worth its own field because it is the sharpest possible evidence that a restart did
+    /// not happen — the release this process came from has already been cleaned up.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// Answer to [`Call::PadStatus`].
@@ -1672,7 +1712,7 @@ pub enum DriverState {
 pub struct PadStatusResult {
     /// Every pad the robot is bonded to, connected first.
     pub pads: Vec<Pad>,
-    pub driver: DriverState,
+    pub driver: UnitState,
 }
 
 /// Why pairing a pad failed.
@@ -1845,6 +1885,7 @@ mod tests {
                 ssid: "Old Network".into(),
             }),
             Call::SystemInfo,
+            Call::SystemServices,
             Call::SystemSetName(SetNameParams {
                 name: "duck-01".into(),
             }),
@@ -1875,7 +1916,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            35,
+            36,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
