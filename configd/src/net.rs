@@ -24,6 +24,72 @@ pub trait Net: Send + Sync {
     async fn forget(&self, ssid: &str) -> NetResult<proto::ForgetResult>;
 }
 
+/// No wifi stack at all: every call answers, and every answer says why.
+///
+/// What `configd` serves when it cannot reach the system bus. Refusing to start was the obvious
+/// alternative and it is the wrong one — `configd` also answers `system.*`, which is where `btd`
+/// gets the pairing PIN, so a `configd` that exits takes BLE provisioning down with it. That turns
+/// "wifi is unavailable" into "the robot cannot be reached at all", on a board where the phone is
+/// the only way in.
+///
+/// It is also what makes `configd` eligible for the boot recovery net: a unit may only join the set
+/// if it waits for its dependency rather than exiting, so that a `failed` unit means a broken
+/// release rather than a broken board (`docs/project/boot-recovery-net.md`).
+///
+/// `reason` is the bus error, carried into every reply rather than logged once at startup, because
+/// the person who needs it is holding a phone and cannot see the journal.
+pub struct UnavailableNet {
+    reason: String,
+    mac: Option<String>,
+    iface: Option<String>,
+}
+
+impl UnavailableNet {
+    pub fn new(reason: String) -> Self {
+        Self {
+            reason,
+            mac: None,
+            iface: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Net for UnavailableNet {
+    /// `Unavailable` and not an error: "there is no wifi stack here" is a diagnosable answer, and
+    /// the state exists in the protocol precisely to distinguish a provisioning problem from a
+    /// network one. A client that gets an error instead cannot tell which it has.
+    async fn status(&self) -> NetResult<proto::NetStatusResult> {
+        Ok(proto::NetStatusResult {
+            state: proto::NetState::Unavailable,
+            ssid: None,
+            signal: None,
+            ip4: None,
+            ip6: None,
+            mac: self.mac.clone(),
+            iface: self.iface.clone(),
+        })
+    }
+
+    /// Empty rather than an error, for the same reason: a phone shows "no networks found", which is
+    /// true, next to a status that says why.
+    async fn scan(&self) -> NetResult<proto::NetScanResult> {
+        Ok(proto::NetScanResult {
+            networks: Vec::new(),
+        })
+    }
+
+    /// Joining *is* an error. Reporting success for a network it did not join would be a lie, and
+    /// silently doing nothing is worse than saying what is wrong.
+    async fn connect(&self, _ssid: &str, _psk: Option<&str>) -> NetResult<proto::ConnectResult> {
+        Err(self.reason.clone())
+    }
+
+    async fn forget(&self, _ssid: &str) -> NetResult<proto::ForgetResult> {
+        Err(self.reason.clone())
+    }
+}
+
 /// A wifi stack that exists only in memory.
 ///
 /// Used by every test and by `--fake`, which is how the whole `net.*` surface can be exercised
@@ -182,6 +248,26 @@ impl Net for FakeNet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of degrading rather than exiting: every call still answers. `status` and
+    /// `scan` report the truth, and only joining — which cannot be faked — is an error, carrying
+    /// the reason to a client that has no way to read the journal.
+    #[tokio::test]
+    async fn an_unavailable_stack_answers_everything_and_joins_nothing() {
+        let net = UnavailableNet::new("cannot reach the system D-Bus (no socket)".to_owned());
+
+        assert_eq!(
+            net.status().await.unwrap().state,
+            proto::NetState::Unavailable,
+            "an error here would leave a client unable to tell a provisioning problem from a \
+             network one"
+        );
+        assert!(net.scan().await.unwrap().networks.is_empty());
+
+        let err = net.connect("Pollen", Some("key")).await.unwrap_err();
+        assert!(err.contains("D-Bus"), "the reason has to travel: {err}");
+        assert!(net.forget("Pollen").await.is_err());
+    }
 
     #[tokio::test]
     async fn a_wrong_key_is_reported_as_a_wrong_key() {

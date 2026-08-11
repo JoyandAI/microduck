@@ -90,14 +90,59 @@ const ADV_INTERVAL_MAX: Duration = Duration::from_millis(150);
 /// waiting for the motor bus rather than giving up on it.
 const ADAPTER_RETRY: Duration = Duration::from_secs(5);
 
-/// Wait for an adapter, then advertise and serve until cancelled.
+/// Serve BLE for as long as this process lives, across an adapter that comes and goes.
+///
+/// Waiting for an adapter to *appear* was never enough. Everything after that wait — powering the
+/// adapter, registering the agent, advertising, publishing the GATT application — used to propagate
+/// its error out of this function and exit the process, so an adapter that appeared and then
+/// misbehaved took `btd` down where an adapter that never appeared did not. On a robot with no
+/// network that is the difference between "wifi is unavailable" and "unreachable".
+///
+/// So the whole bring-up retries in place, on the same 5s cadence as the wait it already did:
+///
+/// - **radio faults never leave this function.** A `failed` `btd` therefore means a broken binary,
+///   which is what admits it to the boot recovery net — see `docs/project/boot-recovery-net.md`;
+/// - **and it self-heals.** Exiting non-zero got the same retry from `Restart=always`, but only by
+///   spending a process death on it, and only until the day the unit gains a start limit.
 ///
 /// `require_pairing` controls whether writing a request needs an authenticated, encrypted link.
 /// It defaults on, because §7 requires it for anything carrying wifi credentials and
 /// `net.connect` now does. The opt-out exists for bench work against a client that cannot pair.
 pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> bluer::Result<()> {
+    loop {
+        match serve_on_an_adapter(&sockets, &name, require_pairing).await {
+            Ok(()) => tracing::warn!(
+                retry_in = ?ADAPTER_RETRY,
+                "the adapter is gone; waiting for it to come back"
+            ),
+            // Not fatal, deliberately: every failure reachable here is a property of the radio or
+            // of BlueZ, and none of them is fixed by dying. See this function's own doc comment.
+            Err(e) => tracing::warn!(
+                error = %e,
+                retry_in = ?ADAPTER_RETRY,
+                "BLE bring-up failed"
+            ),
+        }
+        tokio::time::sleep(ADAPTER_RETRY).await;
+    }
+}
+
+/// One bring-up: acquire an adapter, advertise, serve, and return when the adapter goes away.
+///
+/// The advertisement, GATT application and agent handles all deregister on drop, so returning here
+/// is what releases them before the next attempt registers its own.
+async fn serve_on_an_adapter(
+    sockets: &Sockets,
+    name: &str,
+    require_pairing: bool,
+) -> bluer::Result<()> {
+    let sockets = sockets.clone();
+    let name = name.to_owned();
     let bt = bluer::Session::new().await?;
 
+    // Kept as its own loop rather than folded into the caller's: "no adapter yet" is the ordinary
+    // state of a board for its first 73 seconds and reads as progress, while a failure after this
+    // point is a fault. Collapsing them would log a fault every 5s during a normal boot.
     let adapter = loop {
         match bt.default_adapter().await {
             Ok(adapter) => break adapter,
@@ -366,8 +411,40 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
 
     tracing::info!("GATT application registered; waiting for a central");
 
-    // The advertisement and application handles deregister on drop, so this task must outlive
-    // the service.
-    std::future::pending::<()>().await;
+    // The advertisement and application handles deregister on drop, so this must not return while
+    // the adapter is usable — which used to mean `pending()`, waiting forever. Forever was wrong in
+    // one direction: an adapter that disappeared left this task parked on a dead radio, holding
+    // handles to nothing and advertising nothing, with no way back short of a restart nobody knew
+    // to perform. Returning hands the caller a bring-up on the adapter's next appearance.
+    watch_adapter(&adapter).await;
     Ok(())
+}
+
+/// Return once the adapter stops being usable.
+///
+/// A poll, not an event stream. `bluer` can report adapter removal, but the failure this has to
+/// catch is broader than removal — an adapter still on the bus that answers nothing is the case
+/// that used to kill the process — and reading one property covers both without depending on which
+/// events BlueZ emits for a radio that is wedged rather than absent.
+///
+/// The interval is [`ADAPTER_RETRY`] because the cost of noticing late is exactly the cost of
+/// retrying late: BLE stays dark a few more seconds, on a daemon that is otherwise idle.
+async fn watch_adapter(adapter: &bluer::Adapter) {
+    loop {
+        tokio::time::sleep(ADAPTER_RETRY).await;
+        match adapter.is_powered().await {
+            Ok(true) => {}
+            // Powered off underneath us — by `bluetoothctl power off`, by a driver reset, or by a
+            // suspend. The next bring-up powers it again: on a robot whose only front door may be
+            // BLE, an unpowered adapter is not a state to preserve out of politeness.
+            Ok(false) => {
+                tracing::warn!("the adapter is no longer powered");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the adapter stopped answering");
+                return;
+            }
+        }
+    }
 }

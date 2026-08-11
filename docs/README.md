@@ -16,11 +16,20 @@ Start at the [README](../README.md) if you have a robot and want to use it.
 How it works and why. These change rarely; when behaviour and a design doc disagree, the doc is
 the bug.
 
+**One page owns a mechanism, and the others link to it.** The table below is that assignment: if a
+fact belongs to a page listed here, every other page says one sentence and points, rather than
+explaining it again. A fact written down in six places drifts in six directions, each of them locally
+reasonable — which is how six documents came to promise that `updaterd` and `btd` kept their old
+binaries until the next reboot, two releases after they stopped doing so, including the two pages
+someone reads while diagnosing exactly that. So when two documents disagree, the one that does not
+own the mechanism is the bug.
+
 | | |
 |---|---|
 | [`architecture.md`](design/architecture.md) | The service split, the IPC contract, state ownership, safety and authority. |
 | [`robotd-design.md`](design/robotd-design.md) | The control loop: model, bus, sensing, observations, policy, safety. |
 | [`updater-design.md`](design/updater-design.md) | The update engine: verification, atomic swap, health gate, rollback, release format. |
+| [`restart-order.md`](design/restart-order.md) | Which unit restarts, at which step, on every path that moves `current` — and at boot. |
 | [`app-path-design.md`](design/app-path-design.md) | `btd` and `configd` — how a phone configures a robot over BLE. |
 
 ## `project/` — you are running the project

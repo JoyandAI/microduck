@@ -123,7 +123,8 @@ manifest_asset = "manifest.json"
 #   - restarting itself would kill the executor mid-swap/mid-health-gate — the update
 #     would die at its most dangerous moment;
 #   - restarting `btd` would drop the connection reporting progress to the app.
-# Both pick up the new binary at the next boot, or an explicit later restart. This is
+# Neither waits for a reboot: both are restarted 5s after the update replies, and the next
+# updaterd start checks that happened (docs/design/restart-order.md §1 and §5). This is
 # why the updater must be resident and separate from `btd` (architecture.md §1.1).
 #
 # `mediad` is absent because it does not exist yet: naming a unit that isn't installed

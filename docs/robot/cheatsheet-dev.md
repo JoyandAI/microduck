@@ -58,17 +58,16 @@ filter's only opt-in, it applies to the one command, and it leaves nothing switc
 
 ## After an update — the part that bites
 
-Three things are true at once, and together they cost an afternoon if you do not know them:
-
-- **`btd` is never restarted by an update.** Deliberate: restarting it drops the BLE connection
-  carrying the update's own progress stream. So a `btd` fix needs a manual restart or a reboot.
-- **`configd` used to be restarted only if the board's `/etc/robot/updater.toml` listed it** — that
-  file belongs to the operator and is preserved across installs, so a board set up before `configd`
-  existed kept `units = ["robotd"]` and silently ran the old binary. Fixed: the restart set now comes
-  from the units the release ships. A board running an older `updaterd` still has the old behaviour
-  until it restarts, because `updaterd` never restarts itself.
-- **`robotctl update apply` then reports `already_current` and does nothing**, so the obvious
-  recovery command is a no-op.
+- **`robotd`, `configd` and `padd` restart during the update. `updaterd` and `btd` restart 5 seconds
+  after it replies** — the first cannot restart itself mid-update, and the second may be carrying the
+  reply. So a `btd` fix is live a few seconds later, with no manual step. Reconnect and it is there.
+- **If one of those two restarts does not happen, the next `updaterd` start fixes it.** Except
+  `updaterd` itself, which reports the disagreement rather than restarting itself — that one is a
+  `systemctl restart updaterd` by hand.
+- **A board running an `updaterd` older than 0.4.0 has none of that** and keeps both on the old binary
+  until you restart them. One update fixes it, and only the update after that behaves.
+- **`robotctl update apply` reports `already_current` and does nothing** if you try to reinstall the
+  same version, so it is not the command to reach for when a fix looks absent.
 
 The symptom is a fix that is definitely installed and definitely not working. Ask which release each
 daemon is running:
@@ -81,21 +80,21 @@ The `units` block prints one line per daemon with the release its process was la
 warning naming the restart when that disagrees with what is installed. `build unknown (old)` means
 that daemon predates the release which taught it to say — restart it and it will answer.
 
+If a daemon is genuinely stale, restart it — this should not be necessary, so it is worth reading the
+journal for why it was:
+
 ```
 sudo systemctl restart configd
 ```
 
-```
-sudo systemctl restart btd
-```
-
-Editing the board's `updater.toml` is no longer needed — the restart set is derived from the release.
-The one thing that still requires a manual step is `updaterd` itself, which never restarts itself, so
-the fix above only takes effect once it has:
+`updaterd` is the one that never fixes itself:
 
 ```
 sudo systemctl restart updaterd
 ```
+
+Editing the board's `updater.toml` is not needed — the restart set comes from the units the release
+ships. `../design/restart-order.md` is the full sequence, step by step.
 
 ## From a laptop — `btctl`
 
