@@ -72,7 +72,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// v6 `updaterd` would accept `update.apply --from /some/dir` and quietly install from its
 /// *configured* source instead — a mirror of the release the operator meant to sideload, or nothing
 /// at all. Refusing the call outright is what this constant is for.
-pub const API_VERSION: u32 = 7;
+///
+/// # v8 — the skill intents
+///
+/// `robot.do` (ground pick, kicks, sit↔stand), `robot.pose` (standing body pose),
+/// `robot.mouth`, `robot.shutdown` (sit, then power off) and `robot.mode` (walk vs roller),
+/// ported from `microduck_runtime`. Additive, and bumps anyway, per the rule above.
+pub const API_VERSION: u32 = 8;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -220,6 +226,33 @@ pub mod method {
     /// Named `relax` rather than `limp` because `gain_limp` already means something else — the soft
     /// yield a fallen robot is commanded at, which keeps torque on. This is the register.
     pub const ROBOT_RELAX: &str = "robot.relax";
+
+    // ── skills ───────────────────────────────────────────────────────────────
+    //
+    // One-shot scripted moves, ported from `microduck_runtime`. Each swaps a dedicated
+    // policy in for a fixed window (or, for sit, until toggled back); the observation
+    // layout is the same 61-D vector throughout, so a skill is a session choice plus a
+    // command-block encoding, not a new contract.
+
+    /// Run a one-shot skill, or toggle sit↔stand. Answered — a refusal names the
+    /// scripted move already holding the robot.
+    pub const ROBOT_DO: &str = "robot.do";
+    /// Standing body pose: z / roll / pitch offsets. Continuous; send as a notification.
+    ///
+    /// `active: false` snaps the pose back to nominal — that is the prototype's B-button
+    /// exit, which zeroes instantly rather than gliding.
+    pub const ROBOT_POSE: &str = "robot.pose";
+    /// Mouth opening, 0 (closed) to 1 (open). Continuous; send as a notification. The mouth
+    /// is not part of any policy — this is the only thing that moves it.
+    pub const ROBOT_MOUTH: &str = "robot.mouth";
+    /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
+    pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
+    /// Which drive mode this `robotd` was configured with: `walk` or `roller`.
+    ///
+    /// Constant for the life of the process — switching modes is a params edit plus a
+    /// restart. Exists so `padd` can shape its stick mapping to the mode without owning
+    /// config it has no business reading.
+    pub const ROBOT_MODE: &str = "robot.mode";
 
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
@@ -370,6 +403,16 @@ pub enum Call {
     RobotInit,
     /// Cut power to the joints. The robot collapses if nothing holds it.
     RobotRelax,
+    /// Run a one-shot skill, or toggle sit↔stand.
+    RobotDo(DoParams),
+    /// Standing body pose. Continuous. Send as a notification.
+    RobotPose(PoseParams),
+    /// Mouth opening. Continuous. Send as a notification.
+    RobotMouth(MouthParams),
+    /// Sit down, then power the machine off.
+    RobotShutdown,
+    /// Which drive mode this robotd runs: walk or roller.
+    RobotMode,
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -429,6 +472,11 @@ impl Call {
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
             Call::RobotInit => method::ROBOT_INIT,
             Call::RobotRelax => method::ROBOT_RELAX,
+            Call::RobotDo(_) => method::ROBOT_DO,
+            Call::RobotPose(_) => method::ROBOT_POSE,
+            Call::RobotMouth(_) => method::ROBOT_MOUTH,
+            Call::RobotShutdown => method::ROBOT_SHUTDOWN,
+            Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -466,6 +514,8 @@ impl Call {
                 | Call::SystemSetName(_)
                 | Call::SystemReboot
                 | Call::SystemSetPairingPin(_)
+                // Powering the machine off is at least as disruptive as rebooting it.
+                | Call::RobotShutdown
                 // Bonding a pad to this robot changes what may drive it, which is the most
                 // consequential thing in this namespace — a paired pad can enable the policy.
                 // `pad.status` is a read and stays ungated.
@@ -508,6 +558,9 @@ impl Call {
             Call::RobotMove(p) => encode(p),
             Call::RobotHead(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
+            Call::RobotDo(p) => encode(p),
+            Call::RobotPose(p) => encode(p),
+            Call::RobotMouth(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
@@ -524,7 +577,9 @@ impl Call {
             | Call::RobotRemoteSessionActive
             | Call::RobotStop
             | Call::RobotInit
-            | Call::RobotRelax => Value::Object(serde_json::Map::new()),
+            | Call::RobotRelax
+            | Call::RobotShutdown
+            | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
             | Call::SystemInfo
@@ -568,6 +623,11 @@ impl Call {
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             method::ROBOT_INIT => Call::RobotInit,
             method::ROBOT_RELAX => Call::RobotRelax,
+            method::ROBOT_DO => Call::RobotDo(decode(params)?),
+            method::ROBOT_POSE => Call::RobotPose(decode(params)?),
+            method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
+            method::ROBOT_SHUTDOWN => Call::RobotShutdown,
+            method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -844,6 +904,74 @@ pub struct HeadParams {
     pub head_roll: f64,
 }
 
+/// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
+///
+/// An enum rather than a free string so a typo is [`code::INVALID_PARAMS`] at the door,
+/// not a silently ignored request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Skill {
+    /// Phase-scripted pick from the ground. One shot, ~3 s.
+    GroundPick,
+    /// Left-leg kick. One shot, half a second, blind to any ball.
+    KickLeft,
+    /// Right-leg kick.
+    KickRight,
+    /// Sit if standing, stand if sitting. The daemon knows which; the client need not.
+    SitToggle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DoParams {
+    pub skill: Skill,
+}
+
+/// Standing body pose offsets. Continuous intent — see [`method::ROBOT_POSE`].
+///
+/// The trained ranges are small: z −0.025..+0.010 m, roll and pitch ±0.26 rad. The robot
+/// clamps nothing here — out-of-distribution values just produce a policy leaning on inputs
+/// it never saw, so the client should stay inside them.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoseParams {
+    /// Height offset, metres. Negative crouches.
+    pub z: f64,
+    pub roll: f64,
+    pub pitch: f64,
+    /// While true the pose targets above are glided toward; `false` snaps the body back to
+    /// nominal at once, which is the prototype's B-button exit.
+    pub active: bool,
+}
+
+impl Default for PoseParams {
+    fn default() -> Self {
+        Self {
+            z: 0.0,
+            roll: 0.0,
+            pitch: 0.0,
+            active: true,
+        }
+    }
+}
+
+/// Mouth opening. Continuous intent — see [`method::ROBOT_MOUTH`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MouthParams {
+    /// 0 closed, 1 fully open. Clamped by the robot.
+    pub open: f64,
+}
+
+/// Answer to [`Call::RobotMode`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModeResult {
+    /// `"walk"` or `"roller"`. A string rather than an enum so a client older than a new
+    /// mode reports it instead of failing to parse the answer.
+    pub mode: String,
+}
+
 /// How often a subscriber wants [`method::ROBOT_STATE`].
 ///
 /// Decimation is per-subscriber and happens server-side, so a dashboard asking for 10 Hz
@@ -885,6 +1013,16 @@ pub struct SubscribeResult {
     /// and both are invisible in a stream whose `policy` field just says `held`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable: Option<String>,
+    /// The skill networks this process loaded, as file names, same reasoning as `walk`.
+    /// Absent means that skill is not available on this robot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sitstand: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ground_pick: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kick_left: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kick_right: Option<String>,
 }
 
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].
@@ -2152,6 +2290,18 @@ mod tests {
             Call::RobotEnable(EnableParams { on: true }),
             Call::RobotInit,
             Call::RobotRelax,
+            Call::RobotDo(DoParams {
+                skill: Skill::GroundPick,
+            }),
+            Call::RobotPose(PoseParams {
+                z: -0.01,
+                roll: 0.05,
+                pitch: -0.1,
+                active: true,
+            }),
+            Call::RobotMouth(MouthParams { open: 0.5 }),
+            Call::RobotShutdown,
+            Call::RobotMode,
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
             Call::NetStatus,
             Call::NetScan,
@@ -2194,7 +2344,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            36,
+            41,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -2339,6 +2489,8 @@ mod tests {
                 method::RESET_TO_GOLDEN,
                 method::SELECT,
                 method::PIN,
+                // Powering the machine off is as consequential as rebooting it.
+                method::ROBOT_SHUTDOWN,
                 method::NET_CONNECT,
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,

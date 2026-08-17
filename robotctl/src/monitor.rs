@@ -1180,6 +1180,7 @@ mod tests {
                 walk: Some("alpha_walking.onnx".to_owned()),
                 stand: Some("alpha_stand.onnx".to_owned()),
                 unavailable: None,
+                ..Default::default()
             })))
             .is_ok()
         );
@@ -1209,6 +1210,7 @@ mod tests {
                 walk: Some("alpha_walking.onnx".to_owned()),
                 stand: None,
                 unavailable: None,
+                ..Default::default()
             })))
             .is_ok()
         );

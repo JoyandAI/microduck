@@ -244,7 +244,13 @@ cargo run -p xtask -- package \
     --include "docs/design/updater-design.md=docs/updater-design.md" \
     --include "deploy/README.md=docs/deploy.md" \
     --include "policies/alpha_walking.onnx=policies/alpha_walking.onnx" \
-    --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx"
+    --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx" \
+    --include "policies/alpha_sitstand.onnx=policies/alpha_sitstand.onnx" \
+    --include "policies/alpha_ground_pick.onnx=policies/alpha_ground_pick.onnx" \
+    --include "policies/ball_kick_left.onnx=policies/ball_kick_left.onnx" \
+    --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
+    --include "policies/roller.onnx=policies/roller.onnx" \
+    --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx"
 
 echo "==> signing with $KEY"
 cargo run -p xtask -- sign --dir dist --key "$KEY"

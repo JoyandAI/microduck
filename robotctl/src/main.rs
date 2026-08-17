@@ -303,6 +303,44 @@ enum RobotCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Run a one-shot skill: `ground-pick`, `kick-left`, `kick-right`, or `sit` (toggle).
+    ///
+    /// The same requests the gamepad's buttons send, for a bench without a pad. The policy
+    /// must be enabled and driving; a skill whose network is not on this robot is refused
+    /// with a reason.
+    Do {
+        #[arg(value_enum)]
+        skill: SkillArg,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Which drive mode this robotd runs: walk or roller. Changes nothing.
+    Mode {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum SkillArg {
+    GroundPick,
+    KickLeft,
+    KickRight,
+    /// Sit if standing, stand if sitting.
+    Sit,
+}
+
+impl SkillArg {
+    fn as_skill(self) -> proto::Skill {
+        match self {
+            SkillArg::GroundPick => proto::Skill::GroundPick,
+            SkillArg::KickLeft => proto::Skill::KickLeft,
+            SkillArg::KickRight => proto::Skill::KickRight,
+            SkillArg::Sit => proto::Skill::SitToggle,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1673,11 +1711,25 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     let (call, json) = match &command {
         RobotCommand::Init { json } => (proto::Call::RobotInit, *json),
         RobotCommand::Relax { json, .. } => (proto::Call::RobotRelax, *json),
+        RobotCommand::Do { skill, json } => (
+            proto::Call::RobotDo(proto::DoParams {
+                skill: skill.as_skill(),
+            }),
+            *json,
+        ),
+        RobotCommand::Mode { json } => (proto::Call::RobotMode, *json),
     };
 
     let result = result_of(client.call(&call)?)?;
     if json {
         println!("{}", compact(&result));
+        return Ok(());
+    }
+
+    // `mode` answers with a mode, not an intent result.
+    if let RobotCommand::Mode { .. } = command {
+        let mode: proto::ModeResult = decode(&result)?;
+        println!("{}", mode.mode);
         return Ok(());
     }
 
@@ -1693,6 +1745,8 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     match command {
         RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
         RobotCommand::Relax { .. } => println!("torque off"),
+        RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
+        RobotCommand::Mode { .. } => unreachable!("answered above"),
     }
     Ok(())
 }

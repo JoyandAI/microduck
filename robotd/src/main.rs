@@ -33,16 +33,21 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwapOption;
 use clap::{Parser, Subcommand};
 use duck_control::io::RobotIo;
-use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy};
+use duck_control::obs::{BodyPose, Command as PolicyCommand};
+use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyPaths};
 use duck_control::safety::{Safety, SafetyConfig};
 use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use control::{Controller, Tuning};
+use control::{Controller, SkillTuning, Tuning};
 use intents::Intents;
-use params::Params;
+use params::{Mode, Params};
+
+/// What to do when the shutdown sequence completes. Injected so the tests can observe the
+/// call instead of powering off the machine running them.
+type PowerOff = Arc<dyn Fn() + Send + Sync>;
 
 /// Model API version this build implements (`updater-design.md` §5.5). Bump when the
 /// sensor-input / actuator-output contract a model sees changes.
@@ -83,6 +88,35 @@ const HOME_RAMP: Duration = Duration::from_secs(2);
 /// reading swings while the pack is doing nothing unusual. Borrowed, with the figure, from
 /// `microduck_runtime`.
 const BATTERY_EMA_ALPHA: f64 = 0.1;
+
+/// How long the shutdown sit gets before torque is cut and the machine powers off. The
+/// sitstand descent is a deliberate ~2 s glide; the prototype gives it four seconds.
+const SHUTDOWN_SIT: Duration = Duration::from_secs(4);
+
+/// Fall recovery (`[safety] fall_recover`): the limp settle before the standing network
+/// engages, the stricter gravity threshold that counts as solidly upright, and how long it
+/// must hold. All three are the prototype's numbers.
+const RECOVERY_LIMP: Duration = Duration::from_millis(300);
+const RECOVERY_UPRIGHT_Z: f64 = -0.85;
+const RECOVERY_UPRIGHT_HOLD: Duration = Duration::from_secs(1);
+
+/// Mean leg-joint deviation from the home pose above which a boot counts as seated —
+/// hips and knees folded far from standing. The prototype's threshold.
+const SEATED_BOOT_RAD: f64 = 0.30;
+
+/// Where fall recovery is in its limp-then-stand sequence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Recovery {
+    Idle,
+    /// Settling at limp gain before the stand-up engages.
+    Limp {
+        since: Instant,
+    },
+    /// The standing network is driving a robot gravity may still call fallen.
+    Rising {
+        upright_for: Duration,
+    },
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "robotd", about = "Robot control daemon", version)]
@@ -215,6 +249,15 @@ struct RobotState {
     /// policy this release ships would not load".
     policy_walk: Option<String>,
     policy_stand: Option<String>,
+    /// The skill networks, same provenance. `None` doubles as "this robot cannot do that",
+    /// which is what lets `dispatch` refuse a `robot.do` for a skill that was never
+    /// configured instead of queueing a request the loop will drop.
+    policy_sitstand: Option<String>,
+    policy_ground_pick: Option<String>,
+    policy_kick_left: Option<String>,
+    policy_kick_right: Option<String>,
+    /// `walk` or `roller` — constant for the life of the process; `robot.mode` reports it.
+    mode: &'static str,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
     /// The policy is driving and has been asked for a non-zero velocity.
@@ -255,16 +298,16 @@ impl RobotState {
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             policy_error: ArcSwapOption::empty(),
-            policy_walk: params
-                .policy
-                .enabled
-                .then(|| file_name(&params.policy.walk))
-                .flatten(),
-            policy_stand: params
-                .policy
-                .enabled
-                .then(|| params.policy.stand.as_deref().and_then(file_name))
-                .flatten(),
+            policy_walk: {
+                let policy = params.policy.resolved();
+                policy.enabled.then(|| file_name(&policy.walk)).flatten()
+            },
+            policy_stand: named_policy(params, |p| p.stand.clone()),
+            policy_sitstand: named_policy(params, |p| p.sitstand.clone()),
+            policy_ground_pick: named_policy(params, |p| p.ground_pick.clone()),
+            policy_kick_left: named_policy(params, |p| p.kick_left.clone()),
+            policy_kick_right: named_policy(params, |p| p.kick_right.clone()),
+            mode: params.policy.mode.as_str(),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
@@ -488,14 +531,30 @@ async fn main() -> ExitCode {
 
     let intents = Arc::new(Intents::new());
 
-    let control =
-        match spawn_control_thread(&args, &params, Arc::clone(&state), Arc::clone(&intents)) {
-            Ok(handle) => handle,
-            Err(e) => {
-                tracing::error!(error = %e, "cannot start the control loop");
-                return ExitCode::FAILURE;
-            }
-        };
+    // The real thing. `setsid` detaches the command from this process's cgroup, so the
+    // poweroff proceeds while systemd is busy killing robotd itself.
+    let poweroff: PowerOff = Arc::new(|| {
+        let result = std::process::Command::new("setsid")
+            .args(["sh", "-c", "systemctl poweroff"])
+            .spawn();
+        if let Err(e) = result {
+            tracing::error!(error = %e, "cannot power off");
+        }
+    });
+
+    let control = match spawn_control_thread(
+        &args,
+        &params,
+        Arc::clone(&state),
+        Arc::clone(&intents),
+        poweroff,
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot start the control loop");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let serving = serve(
         Arc::clone(&state),
@@ -577,6 +636,7 @@ fn spawn_control_thread(
     params: &Params,
     state: Arc<RobotState>,
     intents: Arc<Intents>,
+    poweroff: PowerOff,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let period = params.period();
     let fake = args.fake;
@@ -605,6 +665,7 @@ fn spawn_control_thread(
                     intents,
                     params,
                     period,
+                    poweroff,
                 ));
                 return;
             }
@@ -617,7 +678,7 @@ fn spawn_control_thread(
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
                 if let Some(io) = open_bus_waiting(&port, &state).await {
-                    control_loop(io, state, intents, params, period).await;
+                    control_loop(io, state, intents, params, period, poweroff).await;
                 }
             });
         })
@@ -836,14 +897,16 @@ async fn control_loop<T: RobotIo>(
     intents: Arc<Intents>,
     params: Params,
     period: Duration,
+    poweroff: PowerOff,
 ) {
+    let policy_cfg = params.policy.resolved();
     let mut safety = Safety::new(
         io,
         SafetyConfig {
             fall_gravity_z: params.safety.fall_gravity_z,
             fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
             deadman: Duration::from_millis(params.safety.deadman_ms),
-            gain_running: params.policy.gain,
+            gain_running: policy_cfg.gain,
             gain_limp: params.safety.gain_limp,
         },
     );
@@ -852,33 +915,72 @@ async fn control_loop<T: RobotIo>(
         return;
     };
 
+    // Was the robot powered on already sitting? A seated duck has hips and knees folded
+    // far from the standing pose. If so, the first bring-up rises via the sitstand network
+    // instead of dragging the legs through the linear ramp — the ramp is for a robot that
+    // is roughly standing.
+    const LEG_JOINTS: [usize; 10] = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14];
+    let leg_deviation = LEG_JOINTS
+        .iter()
+        .map(|&j| (hold[j] - DEFAULT_POSITION[j]).abs())
+        .sum::<f64>()
+        / LEG_JOINTS.len() as f64;
+    let mut seated_boot = leg_deviation > SEATED_BOOT_RAD;
+    if seated_boot {
+        tracing::warn!(
+            deviation = format!("{leg_deviation:.2}"),
+            "seated boot detected — will stand up via the sitstand policy"
+        );
+    }
+
     // A policy that was *not wanted* is healthy; one that was wanted and could not be
     // loaded is not. Collapsing those two would either make a bench robot look broken or
     // let a release with an unusable bundle pass the health gate.
-    let mut controller = if !params.policy.enabled {
+    let mut controller = if !policy_cfg.enabled {
         tracing::warn!("policy disabled; holding the startup pose");
         None
     } else {
         let tuning = Tuning {
-            action_scale: params.policy.action_scale,
-            standing_action_scale: params.policy.standing_action_scale,
-            standing_gain_ratio: params.policy.standing_gain_ratio,
-            gain: params.policy.gain,
-            head_lowpass: params.policy.head_lowpass,
-            legs_lowpass: params.policy.legs_lowpass,
+            action_scale: policy_cfg.action_scale,
+            standing_action_scale: policy_cfg.standing_action_scale,
+            standing_gain_ratio: policy_cfg.standing_gain_ratio,
+            gain: policy_cfg.gain,
+            head_lowpass: policy_cfg.head_lowpass,
+            legs_lowpass: policy_cfg.legs_lowpass,
         };
-        match Policy::load(
-            &params.policy.walk,
-            params.policy.stand.as_deref(),
-            DEFAULT_STANDING_THRESHOLD,
-        ) {
-            Ok(policy) => {
+        let skills = SkillTuning {
+            ground_pick_period: policy_cfg.ground_pick_period,
+            ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
+            ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
+            kick_duration: policy_cfg.kick_duration,
+        };
+        let paths = PolicyPaths {
+            walk: policy_cfg.walk.clone(),
+            stand: policy_cfg.stand.clone(),
+            sitstand: policy_cfg.sitstand.clone(),
+            ground_pick: policy_cfg.ground_pick.clone(),
+            kick_left: policy_cfg.kick_left.clone(),
+            kick_right: policy_cfg.kick_right.clone(),
+        };
+        match Policy::load(&paths, DEFAULT_STANDING_THRESHOLD) {
+            Ok(mut policy) => {
+                // Roller mode has no standing network; fall recovery reserves it for
+                // getting up (and body pose). Either way, command magnitude stops
+                // selecting it.
+                if policy_cfg.mode == Mode::Roller || params.safety.fall_recover {
+                    policy.set_standing_disabled(true);
+                }
                 tracing::warn!(
-                    walk = %params.policy.walk.display(),
-                    stand = ?params.policy.stand.as_ref().map(|p| p.display().to_string()),
+                    mode = policy_cfg.mode.as_str(),
+                    walk = %policy_cfg.walk.display(),
+                    stand = ?policy_cfg.stand.as_ref().map(|p| p.display().to_string()),
+                    sitstand = ?policy_cfg.sitstand.as_ref().map(|p| p.display().to_string()),
+                    ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
+                    kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
+                    fall_recover = params.safety.fall_recover,
                     "policy loaded"
                 );
-                Some(Controller::new(policy, tuning))
+                Some(Controller::new(policy, tuning, skills))
             }
             Err(e) => {
                 tracing::error!(error = %e, "policy unavailable; holding the pose");
@@ -918,6 +1020,22 @@ async fn control_loop<T: RobotIo>(
     let mut was_driving = false;
     let mut bringup = Bringup::Limp;
 
+    // Command smoothing, per the prototype: `cmd += α × (target − cmd)` at the tick rate.
+    // A stick snap becomes a ramp the gait can follow; the state lives here because it is
+    // per-tick, which the intent slots must not be.
+    let dt = period.as_secs_f64();
+    let cmd_alpha = params.control.cmd_alpha.clamp(0.0, 1.0);
+    let head_alpha = params.control.head_alpha.clamp(0.0, 1.0);
+    let mut twist_ema = [0.0f64; 3];
+    let mut head_ema = [0.0f64; 4];
+    let mut body_ema = [0.0f64; 3];
+
+    // The sit-then-power-off sequence, and fall recovery.
+    let mut shutdown_sit: Option<Instant> = None;
+    let mut powered_off = false;
+    let mut recovery = Recovery::Idle;
+    let mut warned_imu_warming = false;
+
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
@@ -945,7 +1063,7 @@ async fn control_loop<T: RobotIo>(
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
 
         let snapshot = intents.snapshot();
-        let (command, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
+        let (gated, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
         let mut limits: Vec<duck_control::safety::Limit> = deadman.into_iter().collect();
 
         // An explicit `robot.init` / `robot.relax`, taken once.
@@ -960,11 +1078,23 @@ async fn control_loop<T: RobotIo>(
                 // anything else can be tested.
                 (Bringup::Limp, Some(sensors)) => match safety.set_torque(true) {
                     Ok(()) => {
-                        tracing::warn!(?HOME_RAMP, "robot.init: torque on, ramping to home");
-                        bringup = Bringup::Homing {
-                            from: sensors.positions,
-                            since: tick_start,
-                        };
+                        if seated_boot && controller.as_ref().is_some_and(|c| c.has_sitstand()) {
+                            seated_boot = false;
+                            tracing::warn!(
+                                "robot.init: seated boot — rising via the sitstand policy"
+                            );
+                            controller
+                                .as_mut()
+                                .expect("checked above")
+                                .begin_boot_rise();
+                            bringup = Bringup::Ready;
+                        } else {
+                            tracing::warn!(?HOME_RAMP, "robot.init: torque on, ramping to home");
+                            bringup = Bringup::Homing {
+                                from: sensors.positions,
+                                since: tick_start,
+                            };
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "cannot enable torque"),
                 },
@@ -985,6 +1115,176 @@ async fn control_loop<T: RobotIo>(
             },
             None => {}
         }
+
+        // One-shot skill requests, taken once per tick like the power request. They need a
+        // driving robot — the prototype's buttons likewise did nothing until the policy ran.
+        let requests = intents.take_skills();
+        if requests.any() {
+            match controller.as_mut() {
+                Some(controller)
+                    if snapshot.enabled
+                        && bringup == Bringup::Ready
+                        && !safety.fallen()
+                        && shutdown_sit.is_none() =>
+                {
+                    let outcome = |what: &str, result: Result<(), &'static str>| match result {
+                        Ok(()) => tracing::warn!(skill = what, "skill started"),
+                        Err(reason) => tracing::warn!(skill = what, reason, "skill refused"),
+                    };
+                    if requests.ground_pick {
+                        outcome("ground_pick", controller.start_ground_pick());
+                    }
+                    if requests.kick_left {
+                        outcome("kick_left", controller.start_kick(true));
+                    }
+                    if requests.kick_right {
+                        outcome("kick_right", controller.start_kick(false));
+                    }
+                    if requests.sit_toggle {
+                        match controller.sit_toggle() {
+                            Ok(direction) => tracing::warn!(direction, "sit toggle"),
+                            Err(reason) => tracing::warn!(reason, "sit toggle refused"),
+                        }
+                    }
+                }
+                _ => tracing::info!("skill request ignored: the policy is not driving"),
+            }
+        }
+
+        // The sit-then-power-off sequence: `robot.shutdown`, or a genuinely empty pack.
+        // The battery reading is a ~10 s EMA refreshed once a second, so a load sag cannot
+        // reach the floor — a pack that gets there is spent.
+        let battery_v = f64::from_bits(state.battery_v.load(Ordering::Relaxed));
+        let battery_empty = params.safety.battery_empty_shutdown
+            && battery_v > 0.0
+            && battery_v <= duck_control::model::BATTERY_EMPTY_V;
+        if !powered_off && shutdown_sit.is_none() && (intents.take_shutdown() || battery_empty) {
+            let can_sit = snapshot.enabled
+                && bringup == Bringup::Ready
+                && !safety.fallen()
+                && controller.as_ref().is_some_and(|c| c.has_sitstand());
+            if can_sit {
+                tracing::warn!(battery_empty, "shutdown: sitting down before power off");
+                controller
+                    .as_mut()
+                    .expect("can_sit checked the controller")
+                    .begin_shutdown_sit();
+                shutdown_sit = Some(tick_start);
+            } else {
+                tracing::warn!(battery_empty, "shutdown: cutting torque and powering off");
+                if let Err(e) = safety.set_torque(false) {
+                    tracing::warn!(error = %e, "cannot cut torque before power off");
+                }
+                intents.set_enabled(false);
+                powered_off = true;
+                poweroff();
+            }
+        }
+        if let Some(started) = shutdown_sit
+            && !powered_off
+            && tick_start.duration_since(started) >= SHUTDOWN_SIT
+        {
+            tracing::warn!("sit complete: cutting torque and powering off");
+            if let Err(e) = safety.set_torque(false) {
+                tracing::warn!(error = %e, "cannot cut torque before power off");
+            }
+            intents.set_enabled(false);
+            bringup = Bringup::Limp;
+            powered_off = true;
+            poweroff();
+        }
+
+        // Fall recovery (`[safety] fall_recover`): limp so the robot settles, then the
+        // standing network gets it up, then back to whatever was driving. The prototype's
+        // `--fall-detect`, minus its scripted-move opt-outs — a fall during a kick here
+        // waits for the kick window to lapse (they are half a second) rather than being
+        // ignored outright.
+        if params.safety.fall_recover && controller.is_some() && !powered_off {
+            match recovery {
+                Recovery::Idle => {
+                    if safety.fallen()
+                        && snapshot.enabled
+                        && bringup == Bringup::Ready
+                        && shutdown_sit.is_none()
+                        && controller
+                            .as_ref()
+                            .is_some_and(|c| !c.busy() && !c.is_sitting())
+                    {
+                        tracing::warn!("fallen — limp for 300 ms, then standing recovery");
+                        recovery = Recovery::Limp { since: tick_start };
+                    }
+                }
+                Recovery::Limp { since } => {
+                    if !safety.fallen() {
+                        // Someone righted it during the settle; nothing to recover from.
+                        recovery = Recovery::Idle;
+                    } else if tick_start.duration_since(since) >= RECOVERY_LIMP {
+                        tracing::warn!("limp done — standing policy engaged for recovery");
+                        safety.set_recovery(true);
+                        if let Some(controller) = controller.as_mut() {
+                            controller.force_standing = true;
+                            controller.reset();
+                        }
+                        recovery = Recovery::Rising {
+                            upright_for: Duration::ZERO,
+                        };
+                    }
+                }
+                Recovery::Rising { upright_for } => {
+                    // Hysteresis: solidly upright, stricter than the fall threshold, held
+                    // for a full second — so it does not bounce back to walking mid-standup.
+                    let upright = sensors
+                        .as_ref()
+                        .is_some_and(|s| s.imu.gravity[2] < RECOVERY_UPRIGHT_Z);
+                    let held = if upright {
+                        upright_for + period
+                    } else {
+                        Duration::ZERO
+                    };
+                    if held >= RECOVERY_UPRIGHT_HOLD {
+                        tracing::warn!("upright again — returning to the walking policy");
+                        safety.set_recovery(false);
+                        if let Some(controller) = controller.as_mut() {
+                            controller.force_standing = false;
+                        }
+                        recovery = Recovery::Idle;
+                    } else {
+                        recovery = Recovery::Rising { upright_for: held };
+                    }
+                }
+            }
+        }
+        let in_recovery = matches!(recovery, Recovery::Limp { .. } | Recovery::Rising { .. });
+
+        // Smooth the command. The recovery sequence holds the twist at zero outright — the
+        // prototype does the same — and leaving body-pose mode snaps the body back to
+        // nominal rather than gliding, which is its B-button exit.
+        let twist_target = if in_recovery { [0.0; 3] } else { gated.twist };
+        if in_recovery {
+            twist_ema = [0.0; 3];
+        }
+        for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
+            *ema += cmd_alpha * (target - *ema);
+        }
+        for (ema, target) in head_ema.iter_mut().zip(gated.head) {
+            *ema += head_alpha * (target - *ema);
+        }
+        if snapshot.pose.active {
+            for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
+                *ema += cmd_alpha * (target - *ema);
+            }
+        } else {
+            body_ema = [0.0; 3];
+        }
+        let command = PolicyCommand {
+            twist: twist_ema,
+            head: head_ema,
+            body: BodyPose {
+                z: body_ema[0],
+                roll: body_ema[1],
+                pitch: body_ema[2],
+            },
+        };
 
         // Bring the robot up when someone asks it to drive and it has no torque yet.
         //
@@ -1009,14 +1309,26 @@ async fn control_loop<T: RobotIo>(
         ) {
             match safety.set_torque(true) {
                 Ok(()) => {
-                    tracing::warn!(
-                        ?HOME_RAMP,
-                        "enabling the policy: torque on, ramping to home"
-                    );
-                    bringup = Bringup::Homing {
-                        from: sensors.positions,
-                        since: tick_start,
-                    };
+                    if seated_boot && controller.as_ref().is_some_and(|c| c.has_sitstand()) {
+                        // Seated boot: hold the seat and rise via the sitstand network —
+                        // the linear ramp would drag folded legs sideways through the floor.
+                        seated_boot = false;
+                        tracing::warn!("seated boot — rising via the sitstand policy");
+                        controller
+                            .as_mut()
+                            .expect("checked above")
+                            .begin_boot_rise();
+                        bringup = Bringup::Ready;
+                    } else {
+                        tracing::warn!(
+                            ?HOME_RAMP,
+                            "enabling the policy: torque on, ramping to home"
+                        );
+                        bringup = Bringup::Homing {
+                            from: sensors.positions,
+                            since: tick_start,
+                        };
+                    }
                 }
                 // Reported, not fatal, and it stays `Limp` so the next tick tries again: a bus that
                 // dropped one transaction is ordinary, and a robot that refused to ever come up
@@ -1037,16 +1349,31 @@ async fn control_loop<T: RobotIo>(
             .homed
             .store(bringup == Bringup::Ready, Ordering::Relaxed);
 
+        // The policy must not start on an unconverged orientation filter — the first
+        // seconds of projected gravity are whatever the filter is mid-way through deciding,
+        // and a gait stepping against that horizon is the prototype's "crazy start".
+        let imu_warm = safety.imu_ready();
+        if snapshot.enabled && !imu_warm && !warned_imu_warming {
+            tracing::warn!(
+                "IMU converging (keep the robot still) — the policy starts when it is ready"
+            );
+            warned_imu_warming = true;
+        }
+
         // Drive only with a sample to drive from: a tick whose read failed has no
         // observation to build, and inventing one would feed the policy a stale robot.
         //
         // And only once the ramp is done, or the policy's first step would come from wherever the
-        // robot was slumped.
+        // robot was slumped. A fallen robot is not driven — except by its own recovery,
+        // which is the one sanctioned exception and is marked inside safety itself.
         let driving = snapshot.enabled
             && bringup == Bringup::Ready
             && controller.is_some()
-            && !safety.fallen()
-            && sensors.is_some();
+            && (!safety.fallen() || safety.recovering())
+            && !matches!(recovery, Recovery::Limp { .. })
+            && sensors.is_some()
+            && imu_warm
+            && !powered_off;
 
         if driving && !was_driving {
             // Starting fresh: a stale previous action in the observation, or a filter
@@ -1064,19 +1391,30 @@ async fn control_loop<T: RobotIo>(
         }
         was_driving = driving;
 
-        let (targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+        // Voltage adaptation: the servos' effective kP tracks their supply, so scaling the
+        // action by (nominal / measured) holds the robot's response steady as the pack
+        // sags. The EMA is clamped to a plausible band so a bad reading cannot become a
+        // wild scale.
+        let scale_mult = if policy_cfg.voltage_adapt && battery_v > 0.0 {
+            policy_cfg.nominal_voltage / battery_v.clamp(6.0, 9.5)
+        } else {
+            1.0
+        };
+
+        let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
-                match controller.step(sensors, &command) {
+                match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
                     Ok(step) => (
                         step.targets,
                         step.gain,
-                        command.twist_magnitude() > 0.0,
-                        if step.standing { "stand" } else { "walk" },
+                        // A scripted move is motion whatever the twist says; so is walking.
+                        step.busy || command.twist_magnitude() > 0.0,
+                        step.label,
                     ),
                     Err(e) => {
                         tracing::warn!(error = %e, "inference failed; holding");
-                        (hold, params.policy.gain, false, "held")
+                        (hold, policy_cfg.gain, false, "held")
                     }
                 }
             }
@@ -1086,13 +1424,21 @@ async fn control_loop<T: RobotIo>(
                 bringup
                     .homing_target(tick_start)
                     .expect("just checked it is Some"),
-                params.policy.gain,
+                policy_cfg.gain,
                 true,
                 "homing",
             ),
-            _ => (hold, params.policy.gain, false, "held"),
+            _ => (hold, policy_cfg.gain, false, "held"),
         };
         state.moving.store(moving, Ordering::Relaxed);
+
+        // The mouth is not part of any policy; the intent is the only thing that moves it.
+        // Only while driving — a held or homing robot keeps whatever its hold pose says, so
+        // a restart cannot snap a mouth.
+        if driving {
+            targets[duck_control::model::MOUTH_INDEX] =
+                duck_control::model::mouth_target(snapshot.mouth);
+        }
 
         match safety.apply(targets, hold, gain) {
             Ok(applied) => limits.extend(applied.limits),
@@ -1185,6 +1531,19 @@ async fn control_loop<T: RobotIo>(
 /// which would read as "no policy".
 fn file_name(path: &std::path::Path) -> Option<String> {
     Some(path.file_name()?.to_string_lossy().into_owned())
+}
+
+/// One resolved optional policy slot as its reportable file name — `None` when the policy
+/// is disabled outright or the slot is not configured in this mode.
+fn named_policy(
+    params: &Params,
+    pick: impl Fn(&params::ResolvedPolicy) -> Option<std::path::PathBuf>,
+) -> Option<String> {
+    let policy = params.policy.resolved();
+    if !policy.enabled {
+        return None;
+    }
+    pick(&policy).as_deref().and_then(file_name)
 }
 
 fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
@@ -1421,6 +1780,17 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
             intents.set_head([p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll]);
             true
         }
+        proto::Call::RobotPose(p) => {
+            intents.set_pose(intents::PoseIntent {
+                body: [p.z, p.roll, p.pitch],
+                active: p.active,
+            });
+            true
+        }
+        proto::Call::RobotMouth(p) => {
+            intents.set_mouth(p.open);
+            true
+        }
         _ => false,
     }
 }
@@ -1432,10 +1802,50 @@ fn dispatch(
     call: &proto::Call,
 ) -> proto::Response {
     match call {
-        proto::Call::RobotMove(_) | proto::Call::RobotHead(_) => {
+        proto::Call::RobotMove(_)
+        | proto::Call::RobotHead(_)
+        | proto::Call::RobotPose(_)
+        | proto::Call::RobotMouth(_) => {
             apply_intent(intents, call);
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
+
+        // A skill request is queued for the loop's next tick. Refused here only for what
+        // this side can already know — the skill was never configured, or the robot is
+        // down; the loop still arbitrates against whatever move is mid-flight, exactly as
+        // the prototype's buttons did.
+        proto::Call::RobotDo(p) => {
+            let configured = match p.skill {
+                proto::Skill::GroundPick => state.policy_ground_pick.is_some(),
+                proto::Skill::KickLeft => state.policy_kick_left.is_some(),
+                proto::Skill::KickRight => state.policy_kick_right.is_some(),
+                proto::Skill::SitToggle => state.policy_sitstand.is_some(),
+            };
+            let result = if !configured {
+                proto::IntentResult::refused("no policy configured for that skill")
+            } else if state.fallen.load(Ordering::Relaxed) {
+                proto::IntentResult::refused("the robot is down; stand it up first")
+            } else {
+                intents.request_skill(p.skill);
+                proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // Sit, then power the machine off. Never refused for being inconvenient — a robot
+        // that cannot sit (no sitstand policy, not driving) cuts torque and powers off
+        // directly, which is still what was asked for.
+        proto::Call::RobotShutdown => {
+            intents.request_shutdown();
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        proto::Call::RobotMode => proto::Response::ok(
+            Some(id),
+            &proto::ModeResult {
+                mode: state.mode.to_owned(),
+            },
+        ),
 
         // Handled by the caller, which owns the connection; answering here keeps the
         // request/response pairing in one place.
@@ -1448,6 +1858,10 @@ fn dispatch(
                 accepted: true,
                 walk: state.policy_walk.clone(),
                 stand: state.policy_stand.clone(),
+                sitstand: state.policy_sitstand.clone(),
+                ground_pick: state.policy_ground_pick.clone(),
+                kick_left: state.policy_kick_left.clone(),
+                kick_right: state.policy_kick_right.clone(),
                 unavailable: state.policy_error.load_full().map_or_else(
                     || {
                         state
@@ -1576,6 +1990,12 @@ mod tests {
 
     fn state() -> RobotState {
         RobotState::new(&Params::default(), false, false)
+    }
+
+    /// A poweroff that powers nothing off — the loop under test must never reach the real
+    /// one, and a test that wants to observe the call builds its own counter.
+    fn noop_poweroff() -> PowerOff {
+        Arc::new(|| {})
     }
 
     /// Mark the loop as having just ticked, `ticks` times.
@@ -1751,6 +2171,132 @@ mod tests {
         .result_as()
         .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
         assert!(!session.active);
+
+        let mode: proto::ModeResult = dispatch(&s, &Intents::new(), id(), &proto::Call::RobotMode)
+            .result_as()
+            .expect("robot.mode must deserialize as ModeResult");
+        assert_eq!(mode.mode, "walk");
+    }
+
+    /// A skill whose network was never configured is refused at the door with a reason —
+    /// not queued for a loop that would silently drop it. And a configured one is queued:
+    /// the request must reach the intents for the loop to take.
+    #[test]
+    fn robot_do_refuses_what_is_not_configured_and_queues_what_is() {
+        let s = state(); // default params: every walk-mode skill configured
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+
+        let accepted: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: proto::Skill::GroundPick,
+            }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(accepted.accepted);
+        assert!(
+            intents.take_skills().ground_pick,
+            "the request must be queued"
+        );
+
+        // A roller robot has no kick networks; asking must refuse, not queue.
+        let mut params = Params::default();
+        params.policy.mode = params::Mode::Roller;
+        let roller = RobotState::new(&params, false, false);
+        let refused: proto::IntentResult = dispatch(
+            &roller,
+            &intents,
+            id(),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: proto::Skill::KickLeft,
+            }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(!refused.accepted);
+        assert!(!intents.take_skills().kick_left, "a refusal must not queue");
+
+        // A fallen robot is refused whatever is configured — same wall as robot.enable.
+        s.fallen.store(true, Ordering::Relaxed);
+        let down: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: proto::Skill::SitToggle,
+            }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(!down.accepted);
+    }
+
+    /// The pose and mouth intents land in their slots like move and head do — including via
+    /// the notification path, which is how they actually arrive at 50 Hz.
+    #[test]
+    fn pose_and_mouth_intents_reach_their_slots() {
+        let intents = Intents::new();
+        assert!(apply_intent(
+            &intents,
+            &proto::Call::RobotPose(proto::PoseParams {
+                z: -0.01,
+                roll: 0.1,
+                pitch: -0.2,
+                active: true,
+            }),
+        ));
+        assert!(apply_intent(
+            &intents,
+            &proto::Call::RobotMouth(proto::MouthParams { open: 0.5 }),
+        ));
+
+        let snap = intents.snapshot();
+        assert_eq!(snap.pose.body, [-0.01, 0.1, -0.2]);
+        assert!(snap.pose.active);
+        assert_eq!(snap.mouth, 0.5);
+    }
+
+    /// `robot.shutdown` on a robot that cannot sit (no policy driving) cuts torque and
+    /// powers off — the request must never be silently lost. The sit-first path needs a
+    /// policy and therefore ONNX Runtime, so it is exercised on a board rather than here.
+    #[tokio::test(start_paused = true)]
+    async fn a_shutdown_request_without_a_sit_cuts_torque_and_powers_off() {
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.request_shutdown();
+
+        let powered = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&powered);
+        let poweroff: PowerOff = Arc::new(move || observed.store(true, Ordering::Relaxed));
+
+        // The battery must read as healthy, or this would also exercise the empty-pack path.
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            FakeIo::at(DEFAULT_POSITION),
+            loop_state,
+            Arc::clone(&intents),
+            params,
+            Duration::from_millis(2),
+            poweroff,
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !powered.load(Ordering::Relaxed) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert!(
+            powered.load(Ordering::Relaxed),
+            "poweroff must have been asked for"
+        );
     }
 
     /// Subscribing answers with the policy this process is running.
@@ -1762,7 +2308,7 @@ mod tests {
     fn subscribing_names_the_policy() {
         let mut params = Params::default();
         params.policy.enabled = true;
-        params.policy.walk = "/opt/robot/releases/7/alpha_walking.onnx".into();
+        params.policy.walk = Some("/opt/robot/releases/7/alpha_walking.onnx".into());
         params.policy.stand = Some("/opt/robot/releases/7/alpha_stand.onnx".into());
         let s = Arc::new(RobotState::new(&params, false, false));
 
@@ -1919,7 +2465,7 @@ mod tests {
     #[tokio::test]
     async fn an_unloadable_policy_holds_the_pose_and_reports_why() {
         let mut params = Params::default();
-        params.policy.walk = PathBuf::from("/nonexistent/definitely-not-a-policy.onnx");
+        params.policy.walk = Some(PathBuf::from("/nonexistent/definitely-not-a-policy.onnx"));
         params.policy.stand = None;
 
         let resting = DEFAULT_POSITION;
@@ -1936,6 +2482,7 @@ mod tests {
             Arc::clone(&intents),
             params,
             Duration::from_millis(2),
+            noop_poweroff(),
         ));
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2004,6 +2551,7 @@ mod tests {
             Arc::clone(&intents),
             params,
             Duration::from_millis(2),
+            noop_poweroff(),
         ));
 
         let frame = tokio::time::timeout(Duration::from_secs(5), states.recv())
@@ -2054,6 +2602,7 @@ mod tests {
             Arc::new(Intents::new()),
             params,
             Duration::from_millis(2),
+            noop_poweroff(),
         ));
         while s.ticks.load(Ordering::Relaxed) < 5 {
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -2403,7 +2952,15 @@ mod tests {
                 self.0.slow_sensors()
             }
         }
-        control_loop(Borrowed(io), state, intents, Params::default(), period).await
+        control_loop(
+            Borrowed(io),
+            state,
+            intents,
+            Params::default(),
+            period,
+            noop_poweroff(),
+        )
+        .await
     }
 
     /// **A restart must not move the robot**, and that is the invariant the old "never touch torque"

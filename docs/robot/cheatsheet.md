@@ -113,9 +113,23 @@ Pairing is once per pad and has a page of its own —
 pad without forgetting the first, and what to do when it will not bond (`Privacy = device` is the
 answer more often than anything else).
 
-`padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. On the
-pad: **Start** toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks
-between body and head, **B**/circle stops.
+`padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. The
+mapping is the prototype's, so muscle memory carries over:
+
+| control | does |
+| --- | --- |
+| **Start** | toggle the policy — nothing moves until it is on |
+| **Y** / triangle | head mode: sticks pose the head (body holds still) |
+| **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
+| **A** / cross | ground pick |
+| **LB / RB** | left / right kick |
+| **DPad-Down** | sit ↔ stand |
+| **RT / LT** | mouth (either trigger) |
+| **Select**, held 2 s | sit down, then power off |
+
+There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
+if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
+shaping automatically — asymmetric push/brake, no strafe — and A triggers the crouch.
 
 `pad status` answers two questions separately, because a connected pad and a dead driver look
 identical from the outside:

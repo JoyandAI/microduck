@@ -100,6 +100,10 @@ pub struct Safety<T: RobotIo> {
     /// How long gravity has been past the threshold. Reset by any upright sample.
     falling_for: Duration,
     fallen: bool,
+    /// Fall recovery in progress: the caller is deliberately driving a robot that gravity
+    /// still calls fallen — the stand-up policy getting it back on its feet. See
+    /// [`Self::set_recovery`].
+    recovering: bool,
     /// Tracks the last gain written so an unchanged one is not rewritten every tick — that
     /// would be fifteen bus writes per tick for no reason.
     gain: Option<u16>,
@@ -112,6 +116,7 @@ impl<T: RobotIo> Safety<T> {
             config,
             falling_for: Duration::ZERO,
             fallen: false,
+            recovering: false,
             gain: None,
         }
     }
@@ -140,6 +145,24 @@ impl<T: RobotIo> Safety<T> {
 
     pub fn fallen(&self) -> bool {
         self.fallen
+    }
+
+    /// Let the caller drive a robot that gravity still calls fallen — fall recovery.
+    ///
+    /// This is the one deliberate exception to "fall → limp preempts everything", and it is
+    /// part of the safety policy rather than a bypass of it: in fall-recovery mode the loop
+    /// goes limp for the prototype's 0.3 s (this flag off — the ordinary fallen branch),
+    /// then engages the stand-up network with this flag on. While set, [`Self::apply`]
+    /// writes the caller's targets at the caller's gain instead of holding at limp gain.
+    ///
+    /// The caller clears it once the robot has been solidly upright again — and `fallen`
+    /// itself still tracks gravity throughout, so nothing else changes meaning.
+    pub fn set_recovery(&mut self, on: bool) {
+        self.recovering = on;
+    }
+
+    pub fn recovering(&self) -> bool {
+        self.recovering
     }
 
     /// Power the joints, so the positions this writes can actually be held.
@@ -233,8 +256,10 @@ impl<T: RobotIo> Safety<T> {
 
         // A fallen robot yields. This precedes everything else: whatever the policy
         // computed for a robot it believes is upright is not something to send to one that
-        // is on its side.
-        if self.fallen {
+        // is on its side. The one exception is an active recovery ([`Self::set_recovery`]),
+        // where the stand-up network is deliberately driving a robot gravity still calls
+        // fallen — its targets flow through the ordinary checks below.
+        if self.fallen && !self.recovering {
             applied.limits.push(Limit::Fallen);
             self.set_gain(self.config.gain_limp)?;
             self.io.write(&JointTargets::new(hold))?;
@@ -489,6 +514,46 @@ mod tests {
         assert_eq!(stale.twist, [0.0; 3], "velocity must stop");
         assert_eq!(stale.head, command.head, "head is harmless when stale");
         assert_eq!(limit, Some(Limit::Deadman));
+    }
+
+    /// Recovery is the one sanctioned way to drive a fallen robot: with the flag on, the
+    /// caller's targets and gain go through; with it off, the same tick would have been
+    /// held at limp gain. Both directions matter — the flag must also *stop* working when
+    /// cleared, or fall → limp would be silently dead after the first recovery.
+    #[test]
+    fn recovery_lets_the_caller_drive_a_fallen_robot() {
+        let mut s = safety();
+        for _ in 0..11 {
+            s.observe(&on_its_side(), Duration::from_millis(20));
+        }
+        assert!(s.fallen());
+
+        let mut wanted = DEFAULT_POSITION;
+        wanted[0] = 0.5;
+
+        s.set_recovery(true);
+        let applied = s.apply(wanted, DEFAULT_POSITION, 160).unwrap();
+        assert!(applied.limits.is_empty(), "{:?}", applied.limits);
+        assert_eq!(s.io().last_written.unwrap().positions, wanted);
+        assert_eq!(
+            s.io().last_gain,
+            Some(160),
+            "recovery runs at the caller's gain"
+        );
+
+        s.set_recovery(false);
+        let applied = s
+            .apply(
+                wanted,
+                DEFAULT_POSITION,
+                SafetyConfig::default().gain_running,
+            )
+            .unwrap();
+        assert!(
+            applied.limited_by(Limit::Fallen),
+            "cleared flag must restore limp"
+        );
+        assert_eq!(s.io().last_gain, Some(SafetyConfig::default().gain_limp));
     }
 
     /// The gain is written once per transition, not once per tick. At 50 Hz the naive

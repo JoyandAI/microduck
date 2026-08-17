@@ -54,6 +54,25 @@ pub const DEFAULT_POSITION: [f64; NUM_JOINTS] = [
     -0.4530, // right_ankle
 ];
 
+/// Mouth travel, radians: closed and fully open. The alpha reuses the v1.6 range,
+/// −5°..+30°, from `microduck_runtime`'s `variant.rs`.
+///
+/// The mouth is not part of any policy — every alpha network is 14 actions with this joint
+/// skipped — so these two numbers and [`mouth_target`] are the whole of mouth control.
+pub const MOUTH_CLOSED: f64 = -5.0 * std::f64::consts::PI / 180.0;
+pub const MOUTH_OPEN: f64 = 30.0 * std::f64::consts::PI / 180.0;
+
+/// Joint angle for a mouth opening fraction. 0 is closed, 1 is fully open; anything outside
+/// is clamped rather than fed to a servo as an out-of-travel target.
+pub fn mouth_target(open: f64) -> f64 {
+    let open = if open.is_finite() {
+        open.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    MOUTH_CLOSED + open * (MOUTH_OPEN - MOUTH_CLOSED)
+}
+
 /// The `imu_to_dxl` v2 board's Dynamixel ID. It rides the motor bus and is read in the
 /// same transaction as the servos ([`crate::bus`]).
 pub const IMU_DXL_ID: u8 = 200;
@@ -172,6 +191,17 @@ mod tests {
         assert_eq!(battery_percent(0.0), 0.0);
         assert_eq!(battery_percent(f64::NAN), 0.0);
         assert_eq!(battery_percent(-1.0), 0.0);
+    }
+
+    /// The mouth range is the prototype's: −5° closed, +30° open. A fraction outside 0..1
+    /// (or a NaN from a broken client) must clamp rather than command a servo past travel.
+    #[test]
+    fn mouth_target_spans_the_prototype_range() {
+        assert!((mouth_target(0.0) - (-5.0f64.to_radians())).abs() < 1e-12);
+        assert!((mouth_target(1.0) - 30.0f64.to_radians()).abs() < 1e-12);
+        assert_eq!(mouth_target(-3.0), mouth_target(0.0));
+        assert_eq!(mouth_target(7.0), mouth_target(1.0));
+        assert_eq!(mouth_target(f64::NAN), mouth_target(0.0));
     }
 
     /// The legs are mirrored: the roll/pitch/ankle pairs are equal and opposite. A sign
