@@ -124,6 +124,10 @@ It counts drops, and the gaps between the pad's input reports while it is connec
 kernel's reason: `0x08` is a supervision timeout, which means range or interference, and `0x13`
 means somebody switched the pad off.
 
+Putting the pad down is not a stall, and is not counted as one — but it is time the measurement
+learns nothing from, so the report says how much of the window you actually drove, and declines to
+judge a link it barely saw.
+
 Walking away from the robot while it watches is how you find the range.
 
 ---

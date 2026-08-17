@@ -19,8 +19,10 @@
 #
 # MOVE THE STICKS. An evdev device sends nothing when nothing changes, so a pad resting on a table
 # is indistinguishable from a link that has stopped delivering. Gaps are only evidence while someone
-# is driving. The script says so before it starts, and every gap number below has to be read that
-# way.
+# is driving. A silence longer than `IDLE_MS` is separated out rather than counted as a stall — that
+# much silence with the link still up can only be a pad at rest — but it is still measurement time
+# spent on nothing, so the report says how much of the window was actually driven and refuses to
+# reach a verdict when that is too little.
 #
 # Usage:  scripts/pad-link-test.sh [--seconds N] [--mac AA:BB:..]
 #         scripts/pad-link-test.sh --history [--since -7d]
@@ -40,6 +42,14 @@ DEADMAN_MS=500
 # Under this a stall is invisible to a driver; over it, it is the robot feeling sticky. Reported
 # separately from the deadman because they are different complaints with the same cause.
 NOTABLE_MS=100
+
+# Past this, silence is the operator rather than the radio. It is not a guess: a link that stopped
+# delivering for this long would have hit its supervision timeout and dropped, and a drop is counted
+# separately and loudly. So a five-second hole with the link still up means the sticks were at rest.
+#
+# Counting those as stalls made the first real run report three breaches of the deadman on a link
+# that never faltered — the longest of them 75 seconds, which is a pad on a table, not a radio.
+IDLE_MS=5000
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -327,9 +337,9 @@ window_cs=$((cs - start_cs))
 # SYN_DROPPED (type 0, code 3) means *this reader* fell behind and the kernel discarded events for
 # it. It says nothing about the radio, and it invalidates the gap either side of it, so it is
 # reported rather than silently folded in.
-stats="0 0 0 0 0"
+stats="0 0 0 0 0 0 0 0"
 if [ -n "$CADENCE" ] && [ -s "$raw" ]; then
-    stats="$(awk -v notable="$NOTABLE_MS" -v deadman="$DEADMAN_MS" '
+    stats="$(awk -v notable="$NOTABLE_MS" -v deadman="$DEADMAN_MS" -v idle="$IDLE_MS" '
         NF != 3 { prev = 0; next }
         $3 == 196608 { dropped++; prev = 0; next }
         $3 != 0 { next }
@@ -338,13 +348,22 @@ if [ -n "$CADENCE" ] && [ -s "$raw" ]; then
             n++
             if (prev > 0) {
                 d = t - prev
-                if (d > worst) worst = d
-                if (d > notable) over_notable++
-                if (d > deadman) over_deadman++
+                if (d > idle) {
+                    quiet++
+                    if (d > longest_quiet) longest_quiet = d
+                } else {
+                    driving += d
+                    if (d > worst) worst = d
+                    if (d > notable) over_notable++
+                    if (d > deadman) over_deadman++
+                }
             }
             prev = t
         }
-        END { printf "%d %d %d %d %d\n", n, worst, over_notable, over_deadman, dropped }
+        END {
+            printf "%d %d %d %d %d %d %d %d\n",
+                n, worst, over_notable, over_deadman, dropped, quiet, longest_quiet, driving
+        }
     ' "$raw")"
 fi
 
@@ -353,12 +372,22 @@ worst="$(echo "$stats" | cut -d' ' -f2)"
 over_notable="$(echo "$stats" | cut -d' ' -f3)"
 over_deadman="$(echo "$stats" | cut -d' ' -f4)"
 syn_dropped="$(echo "$stats" | cut -d' ' -f5)"
+quiet="$(echo "$stats" | cut -d' ' -f6)"
+longest_quiet="$(echo "$stats" | cut -d' ' -f7)"
+driving_ms="$(echo "$stats" | cut -d' ' -f8)"
+
+# Every arithmetic expression handed to printf is parenthesised, and has to be. `printf "%.1f", b > 0
+# ? x : y` reads the `>` as a redirection: awk writes the number to a *file* called 0 in the working
+# directory and prints an empty field, which is exactly what the first run on a board did.
+ratio() {
+    # $1 numerator, $2 denominator, $3 scale — empty when there is nothing to divide by
+    awk -v a="$1" -v b="$2" -v s="$3" 'BEGIN { printf "%.1f", (b > 0 ? s * a / b : 0) }'
+}
 
 echo
 echo "link"
 printf '  window       %s\n' "$(secs "$window_cs")"
-printf '  connected    %s  (%s%%)\n' "$(secs "$up_cs")" \
-    "$(awk -v a="$up_cs" -v b="$window_cs" 'BEGIN { printf "%.1f", b > 0 ? 100 * a / b : 0 }')"
+printf '  connected    %s  (%s%%)\n' "$(secs "$up_cs")" "$(ratio "$up_cs" "$window_cs" 100)"
 printf '  drops        %s\n' "$drops"
 if [ -s "$timeline" ]; then
     cat "$timeline"
@@ -367,21 +396,37 @@ fi
 if [ -n "$CADENCE" ]; then
     echo
     echo "input"
-    printf '  reports      %s  (%s/s while connected)\n' "$reports" \
-        "$(awk -v n="$reports" -v cs="$up_cs" 'BEGIN { printf "%.1f", cs > 0 ? n * 100 / cs : 0 }')"
+    # Rated against the time the sticks were actually moving, not the window. Against the window it
+    # reads as a catastrophically slow pad whenever someone pauses, which is every real session.
+    printf '  driving      %s of %s\n' "$(secs $((driving_ms / 10)))" "$(secs "$window_cs")"
+    printf '  reports      %s  (%s/s while driving)\n' "$reports" \
+        "$(ratio "$reports" "$driving_ms" 1000)"
     printf '  worst gap    %s ms\n' "$worst"
-    printf '  over %s ms   %s\n' "$NOTABLE_MS" "$over_notable"
-    printf '  over %s ms   %s   (robotd zeroes the velocity here)\n' "$DEADMAN_MS" "$over_deadman"
+    printf '  over %s ms  %s\n' "$NOTABLE_MS" "$over_notable"
+    printf '  over %s ms  %s   (robotd zeroes the velocity here)\n' "$DEADMAN_MS" "$over_deadman"
+    if [ "$quiet" -gt 0 ]; then
+        printf '  quiet        %s spells, longest %s   (the sticks at rest, not the link:\n' \
+            "$quiet" "$(secs $((longest_quiet / 10)))"
+        printf '               a link silent that long would have dropped, and none did)\n'
+    fi
     if [ "$syn_dropped" -gt 0 ]; then
         printf '  syn_dropped  %s   (this reader fell behind; gaps around it mean nothing)\n' \
             "$syn_dropped"
     fi
 fi
 
+# A verdict is only worth as much as the driving behind it. Ten seconds is not a standard, it is the
+# point below which saying "the link held" would be a claim about nothing.
+THIN_MS=10000
+
 echo
-if [ "$reports" -eq 0 ] && [ -n "$CADENCE" ]; then
+if [ -n "$CADENCE" ] && [ "$reports" -eq 0 ]; then
     echo "verdict  nothing arrived at all. If the sticks were moving, this is not a link that works;"
     echo "         if they were not, run it again and keep them moving."
+elif [ -n "$CADENCE" ] && [ "$driving_ms" -lt "$THIN_MS" ] && [ "$drops" -eq 0 ]; then
+    printf 'verdict  too little driving to judge: %s of stick movement in a %s window, and no drops.\n' \
+        "$(secs $((driving_ms / 10)))" "$(secs "$window_cs")"
+    echo "         Run it again and keep the sticks moving the whole time."
 elif [ "$drops" -eq 0 ] && [ "$over_deadman" -eq 0 ] && [ "$over_notable" -eq 0 ]; then
     echo "verdict  the link held, with nothing over ${NOTABLE_MS} ms."
 elif [ "$drops" -eq 0 ] && [ "$over_deadman" -eq 0 ]; then
