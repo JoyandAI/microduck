@@ -174,15 +174,32 @@ async fn device_list(mut devices: Vec<&Seen>) -> String {
     lines.join("\n")
 }
 
-/// What `scan` prints: the robots, and then everything else, because a robot can be in either half.
+/// Whether the devices that are not robots are listed, or only counted.
 ///
 /// The duck service UUID in the advertisement is the only evidence available to a listing —
 /// everything stronger needs a connection, and connecting to 43 devices to ask each whether it is a
-/// robot would be minutes of pairing prompts. So the second block is not padding: a robot already
-/// bonded with this Mac frequently advertises no services at all, and it is the reason `--name`
-/// exists. Naming that here is what turns "my robot is missing" into a next move.
-async fn listing(seen: &[Seen]) -> String {
+/// robot would be minutes of pairing prompts. So that block is not padding: a robot already bonded
+/// with this Mac frequently advertises no services at all, and it is the reason `--name` exists.
+///
+/// But `scan` is read to answer "which robots can I talk to", and a dozen lines of earbuds above
+/// the answer buries it. So the block is the diagnosis rather than the output, and it appears when
+/// it is one:
+///
+/// - `--verbose`, which is the flag for asking what the radio actually saw.
+/// - **No robot advertised the service**, verbose or not. That is precisely the case where the robot
+///   is plausibly in the other list and hiding the evidence would leave nothing to act on.
+///
+/// Otherwise it is a count and how to expand it, because "that was every device" and "that was the
+/// robots" want different next moves.
+fn lists_others(verbose: bool, robots: usize) -> bool {
+    verbose || robots == 0
+}
+
+/// What `scan` prints: the robots, and — per [`lists_others`] — everything else.
+async fn listing(seen: &[Seen], verbose: bool) -> String {
     let (robots, others): (Vec<&Seen>, Vec<&Seen>) = seen.iter().partition(|d| d.duck);
+    // Kept before `device_list` consumes the vector, since it decides the second block below.
+    let found = robots.len();
 
     let mut out = if robots.is_empty() {
         "no robot advertised the duck service.".to_owned()
@@ -195,14 +212,22 @@ async fn listing(seen: &[Seen]) -> String {
     };
 
     if !others.is_empty() {
-        let anonymous = others.iter().filter(|d| d.local_name.is_none()).count();
-        out.push_str(&format!(
-            "\n\n{} other device(s) in {SCAN_TIME:?}, {anonymous} with no name. A robot bonded with \
-             this Mac often stops advertising the service to it, so it can be one of these — \
-             `--name <its name>` connects to it anyway:\n{}",
-            others.len(),
-            device_list(others).await,
-        ));
+        if lists_others(verbose, found) {
+            let anonymous = others.iter().filter(|d| d.local_name.is_none()).count();
+            out.push_str(&format!(
+                "\n\n{} other device(s) in {SCAN_TIME:?}, {anonymous} with no name. A robot bonded \
+                 with this Mac often stops advertising the service to it, so it can be one of \
+                 these — `--name <its name>` connects to it anyway:\n{}",
+                others.len(),
+                device_list(others).await,
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n\n{} other device(s) in range, not listed. A robot bonded with this Mac can be \
+                 among them, advertising no service — `--verbose` lists them.",
+                others.len(),
+            ));
+        }
     }
     out
 }
@@ -288,7 +313,7 @@ struct Cli {
     #[arg(long = "name", id = "robot", value_name = "ROBOT_NAME", global = true)]
     name: Option<String>,
 
-    /// Print every line sent and received.
+    /// Print every line sent and received, and have `scan` list every device rather than the robots.
     #[arg(long, global = true)]
     verbose: bool,
 
@@ -479,7 +504,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if seen.is_empty() {
             return Err(nothing_found(&seen, None).await.into());
         }
-        println!("{}", listing(&seen).await);
+        println!("{}", listing(&seen, cli.verbose).await);
         return Ok(());
     }
 
@@ -831,6 +856,19 @@ mod tests {
         assert!(answers_to(reported, "radxa-zero3"), "the cached GAP name");
         assert!(answers_to(reported, reported), "copied from the failure");
         assert!(!answers_to(reported, "duck-ffff"));
+    }
+
+    /// `scan` is read to learn which robots are reachable, and a dozen lines of earbuds above the
+    /// answer bury it. The clause worth pinning is the second one: with nothing advertising the
+    /// service, the other devices *are* the answer — the robot is plausibly among them — so they are
+    /// listed whether or not `--verbose` was given, and gating them purely on the flag would leave
+    /// that failure with nothing to act on.
+    #[test]
+    fn other_devices_are_listed_when_they_are_the_diagnosis() {
+        assert!(!lists_others(false, 1), "the robot is the answer");
+        assert!(lists_others(true, 1), "--verbose asks what the radio saw");
+        assert!(lists_others(false, 0), "no robot: the list is all there is");
+        assert!(lists_others(true, 0));
     }
 
     /// `--name` says which robot to talk to and the `name` subcommand's positional says what to

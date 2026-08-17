@@ -209,6 +209,9 @@ btctl --name <robot-name> info
 btctl scan
 ```
 
+Robots only, with everything else in radio range counted rather than listed. Add `--verbose` to see
+that list, and read it when the robot you want is not in the first one.
+
 ```
 btctl --name <robot-name> info
 ```
@@ -251,7 +254,10 @@ btctl --name <robot-name> reboot
   giving always: it skips a slow fallback tier that tries every already-connected peripheral on the
   Mac, earbuds included.
 - `--pin <six-digits>` — defaults to `000000`. `robotctl system pin` on the robot shows the real one.
-- `--verbose` — print every line sent and received. The first thing to add when something hangs.
+- `--verbose` — print every line sent and received. The first thing to add when something hangs. It
+  also makes `scan` list every device the radio saw rather than only the robots, which is worth
+  having when a robot is missing from the list — a robot bonded with this Mac often stops
+  advertising the service to it, so it shows up as one of the other devices.
 
 ### Anything not wrapped above
 
