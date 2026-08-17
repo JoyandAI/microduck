@@ -37,11 +37,26 @@ robot     healthy
   cpu       52 °C
 
 software
-  updaterd  0.1.4 (rev abc1234)
-  robotd    0.1.5 (rev def5678)
-  daemon    0.1.5 installed
-            last update 0.1.4 → 0.1.5: applied
+  updaterd  0.5.0 (rev abc1234)
+  robotd    0.5.0 (rev abc1234)
+  configd   0.5.0 (rev abc1234)
+  daemon    0.5.0 installed
+            last update 0.4.1 → 0.5.0: applied
+
+units
+  updaterd  active · 0.5.0 (rev abc1234)
+  robotd    active · 0.5.0 (rev abc1234)
+  configd   active · 0.5.0 (rev abc1234)
+  btd       active · 0.5.0 (rev abc1234)
+  padd      active · 0.5.0 (rev abc1234)
 ```
+
+The two software blocks answer different questions. `software` is what each daemon that serves a
+socket says about itself, and what is installed on the board; `units` is what systemd says about
+every unit a release manages — including `btd` and `padd`, which serve no socket and can only be
+reported from outside — with the release each process was actually launched from. That second one
+is the question after an update: a daemon still running the old binary shows a release older than
+the installed one, and the report names the restart that fixes it.
 
 ## Drive it
 
