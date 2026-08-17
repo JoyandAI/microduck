@@ -933,11 +933,6 @@ fn render_health(report: &HealthReport) -> String {
             }
         }
     }
-    if !report.software.units.is_empty() {
-        let _ = writeln!(out, "\nunits");
-        out.push_str(&render_units(&report.software.units, 2));
-    }
-
     for component in &report.software.components {
         let _ = writeln!(
             out,
@@ -952,6 +947,14 @@ fn render_health(report: &HealthReport) -> String {
         if let Some(attempt) = &component.last_attempt {
             let _ = writeln!(out, "  {:<9} last update {attempt}", "");
         }
+    }
+
+    // After the installed lines rather than between them and the daemons above, because it has a
+    // heading and they do not: a block inserted there ends the `software` block early and adopts
+    // `daemon 0.5.0 installed` as one more unit — which reads as a systemd unit named `daemon`.
+    if !report.software.units.is_empty() {
+        let _ = writeln!(out, "\nunits");
+        out.push_str(&render_units(&report.software.units, 2));
     }
 
     // Same shape `robotctl version` uses, blank line and all: these are often multi-line —
@@ -2948,6 +2951,26 @@ mod tests {
         let out = render_health(&report);
         assert!(out.contains("pinned to 0.1.9"), "{out}");
         assert!(out.contains("ROLLED BACK"), "{out}");
+    }
+
+    /// The installed release stays in the `software` block, below the daemons and above `units`.
+    ///
+    /// The component lines carry no heading of their own, so whatever block is printed before them
+    /// takes them: with `units` in between, `daemon    0.2.0 installed` renders under it and reads
+    /// as a sixth systemd unit called `daemon`. Ordering is the whole of the fix, which is exactly
+    /// the kind of thing a later edit undoes without noticing.
+    #[test]
+    fn the_installed_release_is_not_rendered_as_a_unit() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.units = vec![
+            unit("robotd", proto::UnitState::Active, Some("0.2.0")),
+            unit("padd", proto::UnitState::Inactive, None),
+        ];
+
+        let out = render_health(&report);
+        let installed = out.find("daemon    0.2.0 installed").expect(&out);
+        let units = out.find("\nunits\n").expect(&out);
+        assert!(installed < units, "{out}");
     }
 
     /// The summary line for one update attempt, including the reason a revert happened —

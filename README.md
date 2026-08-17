@@ -37,11 +37,26 @@ robot     healthy
   cpu       52 °C
 
 software
-  updaterd  0.1.4 (rev abc1234)
-  robotd    0.1.5 (rev def5678)
-  daemon    0.1.5 installed
-            last update 0.1.4 → 0.1.5: applied
+  updaterd  0.5.0 (rev abc1234)
+  robotd    0.5.0 (rev abc1234)
+  configd   0.5.0 (rev abc1234)
+  daemon    0.5.0 installed
+            last update 0.4.1 → 0.5.0: applied
+
+units
+  updaterd  active · 0.5.0 (rev abc1234)
+  robotd    active · 0.5.0 (rev abc1234)
+  configd   active · 0.5.0 (rev abc1234)
+  btd       active · 0.5.0 (rev abc1234)
+  padd      active · 0.5.0 (rev abc1234)
 ```
+
+The two software blocks answer different questions. `software` is what each daemon that serves a
+socket says about itself, and what is installed on the board; `units` is what systemd says about
+every unit a release manages — including `btd` and `padd`, which serve no socket and can only be
+reported from outside — with the release each process was actually launched from. That second one
+is the question after an update: a daemon still running the old binary shows a release older than
+the installed one, and the report names the restart that fixes it.
 
 ## Drive it
 
@@ -201,6 +216,22 @@ sudo robotctl update rollback daemon
 
 `daemon` covers every binary. On a dev board this installs the latest *stable* release, which is
 usually a downgrade — use `--ref` below instead.
+
+A release candidate — published, not yet promoted — is flagged as a prerelease, and a plain `apply`
+skips those so no robot drifts onto a build nobody has validated. Ask for one by name:
+
+```bash
+sudo robotctl update apply --staging daemon
+```
+
+To pick a candidate rather than the newest one:
+
+```bash
+sudo robotctl update apply --staging --version 0.5.0 daemon
+```
+
+The flag applies to that one command and leaves nothing switched on, so the next `apply` is back
+on stable. This is what a canary robot runs before a promotion.
 
 ## Put your branch on the robot
 
