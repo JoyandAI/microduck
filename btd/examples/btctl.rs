@@ -278,7 +278,14 @@ struct Cli {
     ///
     /// The advertised name, which is what `system.info` reports and what `name` below sets: a
     /// board that has never been renamed answers to its derived default, `duck-7f3a`.
-    #[arg(long, global = true)]
+    //
+    // The id is spelled out rather than derived from the field, because clap keys arguments by id
+    // and the `name` subcommand has a positional argument that derives the same one. With both
+    // called `name` the positional won, so `--name duck-c51b name leduckpierre` searched for
+    // `leduckpierre` — the name it was about to set — and then reported the robot standing in
+    // front of it as out of range. `value_name` keeps the help line reading `--name <ROBOT_NAME>`
+    // rather than leaking the id into it.
+    #[arg(long = "name", id = "robot", value_name = "ROBOT_NAME", global = true)]
     name: Option<String>,
 
     /// Print every line sent and received.
@@ -311,7 +318,11 @@ enum Command {
     #[command(subcommand)]
     Wifi(Wifi),
     /// Rename the robot.
-    Name { name: String },
+    Name {
+        /// What to call it from now on. `--name` above still names the robot to rename.
+        #[arg(value_name = "NEW_NAME")]
+        name: String,
+    },
     /// Reboot it.
     Reboot,
     /// Send any method, for whatever is not wrapped above.
@@ -820,6 +831,27 @@ mod tests {
         assert!(answers_to(reported, "radxa-zero3"), "the cached GAP name");
         assert!(answers_to(reported, reported), "copied from the failure");
         assert!(!answers_to(reported, "duck-ffff"));
+    }
+
+    /// `--name` says which robot to talk to and the `name` subcommand's positional says what to
+    /// call it, and only an explicit id keeps the two apart. Parsing is pinned rather than left to
+    /// review because the failure did not look like a CLI bug: the tool scanned for the new name,
+    /// found nothing, and listed the robot it was talking to seconds earlier as merely in range.
+    #[test]
+    fn a_rename_still_selects_the_robot_by_the_name_it_has_now() {
+        let cli = Cli::try_parse_from(["btctl", "--name", "duck-c51b", "name", "leduckpierre"])
+            .expect("the rename form parses");
+
+        assert_eq!(cli.name.as_deref(), Some("duck-c51b"), "which robot");
+        let Command::Name { name } = &cli.command else {
+            panic!("the name subcommand");
+        };
+        assert_eq!(name, "leduckpierre", "what to call it");
+
+        // And the new name is what reaches the robot, not the one it was found by.
+        let (line, _) = request_line(&cli.command).expect("a request");
+        assert!(line.contains(r#""method":"system.setName""#), "{line}");
+        assert!(line.contains(r#""name":"leduckpierre""#), "{line}");
     }
 
     /// The split is a guess and it can be wrong: a robot whose own name ends in a bracket group is
