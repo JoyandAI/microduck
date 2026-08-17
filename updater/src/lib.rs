@@ -74,6 +74,31 @@ pub enum Error {
         candidate: semver::Version,
     },
 
+    /// `--staging` resolved to a candidate older than what the board is running, which means
+    /// the staging channel has nothing newer to offer.
+    ///
+    /// Distinct from [`Self::WouldDowngrade`] because the operator's next move is different.
+    /// That one is a rollback-attack guard: it says a *mirror* may have gone backwards, and
+    /// the right response is to distrust the source. This one says the source is fine and the
+    /// channel is simply behind — usually because the last releases were promoted straight to
+    /// stable and published no candidate. Answering "refusing to downgrade" sent the one
+    /// person who hit it looking for a broken mirror.
+    ///
+    /// Only [`crate::proto::Target::Staging`] reaches it. `StagingExact` is how someone names
+    /// an older candidate deliberately, so the message names that command as the way past.
+    #[error(
+        "the newest release candidate is {candidate}, and this board is already on \
+         {installed} — nothing more recent is available on the staging channel. A release \
+         promoted straight to stable publishes no candidate, so staging stays at the last \
+         version that had one. There is nothing here to test. To install this older candidate \
+         anyway, name it:\n  robotctl update apply {component} --staging --version {candidate}"
+    )]
+    StagingBehind {
+        component: String,
+        installed: semver::Version,
+        candidate: semver::Version,
+    },
+
     /// The candidate does not contain a binary an installed unit execs.
     ///
     /// Carries a preformatted message rather than its parts, because the useful half is the
@@ -148,6 +173,11 @@ impl Error {
             Error::UnknownComponent(_) => code::UNKNOWN_COMPONENT,
             Error::NotInstalled { .. } => code::NOT_INSTALLED,
             Error::WouldDowngrade { .. } => code::WOULD_DOWNGRADE,
+            // Shares the downgrade code rather than adding one, for the reason `WouldOrphanUnit`
+            // shares `INCOMPATIBLE` below: to a client this is the same answer — "refused, the
+            // target is older than what is installed" — and what a person needs is the message.
+            // A new code would be an `API_VERSION` bump for a refusal no client branches on.
+            Error::StagingBehind { .. } => code::WOULD_DOWNGRADE,
             Error::Busy => code::BUSY,
             Error::Network(_) => code::NETWORK,
             Error::Verification(_) => code::VERIFICATION_FAILED,

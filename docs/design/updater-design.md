@@ -1144,6 +1144,16 @@ that doesn't match the staging manifest.
   The first attempt at this was a board pointed at staging by editing `tag_prefix`, which
   reported `no releases in … with tag prefix "daemon-staging-v"` against a candidate sitting
   right there — the prefix said where to look, and the prerelease filter refused to look.
+
+  **`--staging` refuses when the channel is behind the board.** A release promoted straight to
+  stable publishes no candidate — a supported path, and the one `release.yml` labels "NOT
+  canaried" — so the staging scan keeps answering with the last version that did publish one.
+  On a board already past that version, `--staging` used to install it: verified, swapped, and
+  then reverted when a daemon the older release does not contain failed to start. The rollback
+  was right and said nothing about the cause, so the resolved candidate is now compared against
+  what is installed and the refusal names both versions. `--staging --version X` is unguarded and
+  is the way past — an operator naming a candidate is stating intent, which is also how the one
+  a board just rolled back from gets reinstalled.
 - On green, **promote**: repoint `stable` at the *same bytes* already validated —
   re-sign the `stable` manifest to reference the identical tarball + hash. No
   rebuild, no re-flash, no hand-copying files. Promotion is one command / one
