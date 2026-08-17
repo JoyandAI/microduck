@@ -217,6 +217,22 @@ sudo robotctl update rollback daemon
 `daemon` covers every binary. On a dev board this installs the latest *stable* release, which is
 usually a downgrade — use `--ref` below instead.
 
+A release candidate — published, not yet promoted — is flagged as a prerelease, and a plain `apply`
+skips those so no robot drifts onto a build nobody has validated. Ask for one by name:
+
+```bash
+sudo robotctl update apply --staging daemon
+```
+
+To pick a candidate rather than the newest one:
+
+```bash
+sudo robotctl update apply --staging --version 0.5.0 daemon
+```
+
+The flag applies to that one command and leaves nothing switched on, so the next `apply` is back
+on stable. This is what a canary robot runs before a promotion.
+
 ## Put your branch on the robot
 
 Make sure the board has been through the [dev install](docs/robot/install-dev.md) first — a board that
