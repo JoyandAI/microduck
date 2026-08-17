@@ -48,6 +48,21 @@ A robot that has never been renamed calls itself `duck-` plus four characters de
 serial, so `duck-c51b`. macOS often reports one robot under two names at once, as
 `radxa-zero3 [duck-c51b]` — either half works as `--name`.
 
+Without `--name`, the first robot found wins. With it, two robots answering to the same name is an
+error rather than a choice:
+
+```
+2 robots answer to "radxa-zero3": radxa-zero3, radxa-zero3
+```
+
+That happens on a board whose bootloader leaves its serial blank, because it is then named after
+its hostname and every board flashed from one image has the same one. Rename one from the robot
+itself and use the new name:
+
+```bash
+robotctl system set-name ducky
+```
+
 ## Identity
 
 ```bash
