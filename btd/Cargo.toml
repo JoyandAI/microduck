@@ -47,7 +47,7 @@ futures = "0.3"
 [dev-dependencies]
 tempfile = "3.27.0"
 
-# `btctl`, the laptop-side client in examples/. A dev-dependency on purpose: an example's deps
+# `duck-btctl`, the laptop-side client in examples/. A dev-dependency on purpose: an example's deps
 # never reach the shipped artifact, so btleplug is not on the robot.
 #
 # btleplug rather than bluer because this half runs on a developer's machine — CoreBluetooth on
@@ -58,8 +58,8 @@ futures = "0.3"
 serde_json = "1"
 
 # Cargo builds an example under `cargo test` but does not run its `#[test]`s unless the target
-# asks for it, and the name matching in `btctl` is worth pinning: the rule it encodes comes from
+# asks for it, and the name matching in `duck-btctl` is worth pinning: the rule it encodes comes from
 # how btleplug reports names on macOS, which no compiler catches if it changes.
 [[example]]
-name = "btctl"
+name = "duck-btctl"
 test = true

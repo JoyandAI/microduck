@@ -21,7 +21,7 @@ Companion to [`architecture.md`](../design/architecture.md) (what we're building
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
-| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](../design/app-path-design.md) §5.5 |
+| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `duck-btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](../design/app-path-design.md) §5.5 |
 | `configd/` | wifi over NetworkManager, robot name and the identity it derives from the SoC serial, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
 | tests | **458 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | missing | `mediad`, app, SDK |
@@ -239,7 +239,7 @@ robotctl/       CLI
 robotd/         control, gait, safety — no kinematics yet
 padd/           gamepad → intents; a client, with no privilege the app will not have
 mediad/         camera, encode, perception, WebRTC gateway  (not built yet)
-btd/            BLE transport adapter + btctl (dev client)
+btd/            BLE transport adapter + duck-btctl (dev client)
 xtask/          build/publish tooling — never ships
 ```
 

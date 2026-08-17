@@ -1,4 +1,4 @@
-//! `btctl` — talk to a robot over BLE from a laptop.
+//! `duck-btctl` — talk to a robot over BLE from a laptop.
 //!
 //! The phone app's stand-in, and the only way to test `btd` against a real radio.
 //!
@@ -15,12 +15,12 @@
 //! it a real test of the protocol rather than a reimplementation that could agree with itself.
 //!
 //! ```text
-//! cargo run -p btd --example btctl -- scan
-//! cargo run -p btd --example btctl -- status
-//! cargo run -p btd --example btctl -- wifi scan
-//! cargo run -p btd --example btctl -- wifi connect "Pollen" --psk secret
-//! cargo run -p btd --example btctl -- name "Ducky"
-//! cargo run -p btd --example btctl -- call robot.health
+//! cargo run -p btd --example duck-btctl -- scan
+//! cargo run -p btd --example duck-btctl -- status
+//! cargo run -p btd --example duck-btctl -- wifi scan
+//! cargo run -p btd --example duck-btctl -- wifi connect "Pollen" --psk secret
+//! cargo run -p btd --example duck-btctl -- name "Ducky"
+//! cargo run -p btd --example duck-btctl -- call robot.health
 //! ```
 
 use std::time::{Duration, Instant};
@@ -292,6 +292,9 @@ async fn step<T>(
 
 #[derive(Parser)]
 #[command(
+    // Spelled out because clap would otherwise take it from the crate, and `--version` on the
+    // installed binary answered `btd 0.5.1` — the daemon's name, for the laptop-side client.
+    name = "duck-btctl",
     version,
     about = "Talk to a robot over BLE — the phone app's stand-in",
     long_about = "Finds a robot advertising the duck GATT service and speaks the same JSON-RPC \
@@ -877,8 +880,9 @@ mod tests {
     /// found nothing, and listed the robot it was talking to seconds earlier as merely in range.
     #[test]
     fn a_rename_still_selects_the_robot_by_the_name_it_has_now() {
-        let cli = Cli::try_parse_from(["btctl", "--name", "duck-c51b", "name", "leduckpierre"])
-            .expect("the rename form parses");
+        let cli =
+            Cli::try_parse_from(["duck-btctl", "--name", "duck-c51b", "name", "leduckpierre"])
+                .expect("the rename form parses");
 
         assert_eq!(cli.name.as_deref(), Some("duck-c51b"), "which robot");
         let Command::Name { name } = &cli.command else {

@@ -7,8 +7,9 @@ Read-only commands need no privilege. Anything that **changes** the robot needs 
 `--allow-user`/`--allow-group` for `configd`, `allow_uids`/`allow_gids` in `updater.toml` for
 `updaterd`).
 
-Branch builds, release candidates, `btctl` and the restart traps after an update are in
-[`cheatsheet-dev.md`](cheatsheet-dev.md) — they need a dev board.
+Branch builds, release candidates and the restart traps after an update are in
+[`cheatsheet-dev.md`](cheatsheet-dev.md) — they need a dev board. The same robot over Bluetooth from
+a laptop, with no network and no ssh, is [`duck-btctl.md`](duck-btctl.md).
 
 ## On the robot — `robotctl`
 

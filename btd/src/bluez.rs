@@ -287,7 +287,7 @@ async fn serve_on_an_adapter(
                     write: true,
                     // Write-without-response as well: a chunked request needs no ATT
                     // acknowledgement per chunk. A client that wants a *refusal* to be visible
-                    // must use the acknowledged form, which is why `btctl` does.
+                    // must use the acknowledged form, which is why `duck-btctl` does.
                     write_without_response: true,
                     encrypt_write: require_pairing,
                     // No `.await` between receiving a chunk and enqueueing it. BlueZ dispatches
