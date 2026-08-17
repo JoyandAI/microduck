@@ -122,6 +122,24 @@ pub enum Error {
     #[error("network error: {0}")]
     Network(String),
 
+    /// The release exists but carries no assets, which is what every release looks like until
+    /// its build finishes uploading them.
+    ///
+    /// Distinct from [`Self::Network`] because the old answer — "has no asset named
+    /// \"manifest.json\" (has: )" under a "network error" prefix — describes a malformed
+    /// release and a broken link, and it is neither. The release is fine and the board is
+    /// online; the artifacts are minutes away. Both people who hit it went looking for the
+    /// wrong thing.
+    #[error(
+        "release {tag} has no assets yet, so there is nothing here to install. Its build has \
+         not finished uploading them — publishing a release creates it before that build \
+         starts, so the first few minutes of every release look like this and nothing is wrong \
+         with it. The release page lists the assets as they land:\n  \
+         https://github.com/{repo}/releases/tag/{tag}\nRun the same command again once they \
+         are there."
+    )]
+    ReleaseNotReady { repo: String, tag: String },
+
     /// Signature or hash mismatch. Never retried automatically — a failure here
     /// means the bytes are not ours.
     #[error("verification failed: {0}")]
@@ -180,6 +198,13 @@ impl Error {
             Error::StagingBehind { .. } => code::WOULD_DOWNGRADE,
             Error::Busy => code::BUSY,
             Error::Network(_) => code::NETWORK,
+            // Shares the network code rather than adding one, for the reason `StagingBehind`
+            // shares the downgrade code above — with a second reason here. To a client this is
+            // the same answer as any other fetch that came up empty, and the one behaviour a
+            // client should have is the one `NETWORK` already asks for: retry later. That is
+            // exactly right for a release whose upload is still in flight, so a new code would
+            // be an `API_VERSION` bump that changed no client's mind about what to do.
+            Error::ReleaseNotReady { .. } => code::NETWORK,
             Error::Verification(_) => code::VERIFICATION_FAILED,
             Error::Incompatible(_) => code::INCOMPATIBLE,
             // Shares the incompatible code rather than adding one, for the reason `SelfTest`
