@@ -136,6 +136,29 @@ sudo systemctl stop padd
 sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
 ```
 
+When the link itself is the suspect, copy the measurement over from a clone of this repo:
+
+```
+scp scripts/pad-link-test.sh radxa@<board>:/tmp/
+```
+
+Drops already in `padd`'s journal — no pad needed, and it answers immediately:
+
+```
+sudo sh /tmp/pad-link-test.sh --history
+```
+
+Or measure it now, keeping the sticks moving for the whole two minutes:
+
+```
+sudo sh /tmp/pad-link-test.sh
+```
+
+It counts drops against the kernel's own reason for each, and times the gaps between the pad's
+input reports — the failure `padd` cannot see, where the link stays up and the robot walks on a
+stale command. [`pair-a-gamepad.md`](pair-a-gamepad.md#when-it-drops-while-you-are-driving) reads
+the numbers.
+
 ### Wifi (`configd`)
 
 ```
