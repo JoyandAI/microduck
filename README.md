@@ -227,7 +227,7 @@ sudo robotctl update apply --staging daemon
 To pick a candidate rather than the newest one:
 
 ```bash
-sudo robotctl update apply --staging --version 0.5.0 daemon
+sudo robotctl update apply --staging --version 0.5.1 daemon
 ```
 
 The flag applies to that one command and leaves nothing switched on, so the next `apply` is back
@@ -274,6 +274,54 @@ It builds here, signs with the dev key, copies the release to the board and appl
 verification, same health gate, same auto-rollback, about a minute instead of a push and a CI run.
 Setup and the one-time first push are in the
 [dev board cheat sheet](docs/robot/cheatsheet-dev.md).
+
+## Cut a release
+
+Releases are built and signed in CI, never on a laptop. Two tags: the pre-release goes to a canary
+robot, and the release promotes exactly those bytes.
+
+Bump `version` under `[workspace.package]` in `Cargo.toml` first — 0.5.0 to 0.5.1 here. `xtask
+package` refuses a tag that disagrees with it, which is what stops a robot reporting a version it
+is not running. Then refresh the lockfile:
+
+```bash
+cargo update --workspace
+```
+
+Merge that, then from `main`:
+
+```bash
+git tag daemon-staging-v0.5.1 && git push --tags
+```
+
+CI builds it, signs it, verifies it through the real update engine and publishes it as a
+prerelease. Watch it:
+
+```bash
+gh run list --workflow release
+```
+
+Once it is green, on the canary robot:
+
+```bash
+sudo robotctl update apply --staging daemon
+```
+
+Drive it. When it holds up, from `main` again:
+
+```bash
+git tag daemon-v0.5.1 && git push --tags
+```
+
+That promotes the staging build rather than rebuilding it — the same bytes, re-signed with the key
+customer robots trust. Creating the release in the GitHub UI instead of pushing the tag does the
+same thing.
+
+A `daemon-v` tag with no staging build behind it is allowed and builds directly. Both are signed
+the same way, so the difference is validation rather than authenticity, and the release notes say
+which one happened. Key custody and the `promote` workflow — including `min_supported`, for forcing
+robots off a bad release — are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing) and
+[`docs/project/ci-setup.md`](docs/project/ci-setup.md).
 
 ## Where next
 
