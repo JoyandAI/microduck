@@ -99,6 +99,34 @@ fn identity(peripheral: &Peripheral, address: btleplug::api::BDAddr) -> String {
     }
 }
 
+/// Does this reported name answer to `wanted`?
+///
+/// **A peripheral can arrive under two names at once.** CoreBluetooth exposes the *cached GAP
+/// name* — `CBPeripheral.name`, learned by reading `0x2A00` on an earlier connection — separately
+/// from the local name in the advertisement, and btleplug reports them joined when they differ:
+/// `radxa-zero3 [duck-c51b]` (`corebluetooth/internal.rs`, `on_discovered_peripheral`).
+///
+/// They differ on every robot, because the two names come from different places. The GAP name is
+/// BlueZ's adapter alias, which is hostname-derived and therefore `radxa-zero3` on every board
+/// flashed from one image; the advertisement carries the name `configd` owns, `duck-c51b` or
+/// whatever `system.setName` last stored. Matching the joined string exactly meant **both**
+/// spellings a person would type were rejected — and the failure then listed the robot as evidence
+/// it was not in range.
+///
+/// So either half is accepted. The advertised half is the robot's real name, and the one the phone
+/// app has to match on; the GAP half is accepted because it is what macOS Bluetooth settings shows.
+fn answers_to(reported: &str, wanted: &str) -> bool {
+    if reported == wanted {
+        return true;
+    }
+    // `rsplit_once`, so a GAP name that itself contains a bracket keeps the *last* group as the
+    // advertised half — which is the one btleplug appended.
+    match reported.strip_suffix(']').and_then(|s| s.rsplit_once(" [")) {
+        Some((gap, advertised)) => gap == wanted || advertised == wanted,
+        None => false,
+    }
+}
+
 /// Why the scan came back empty, in terms of what the radio actually reported.
 ///
 /// Without this, two failures print the same sentence and want opposite next moves: an empty list is
@@ -351,7 +379,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             if properties.services.contains(&SERVICE_UUID) {
                 advertised.push((peripheral, name));
-            } else if cli.name.as_deref() == Some(name.as_str()) {
+            } else if cli.name.as_deref().is_some_and(|w| answers_to(&name, w)) {
                 named.push((peripheral, name));
             } else if cli.name.is_none() && peripheral.is_connected().await? {
                 // Last resort, and only without `--name`: an unfiltered scan sees every connected
@@ -409,10 +437,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let others: Vec<String> = found.iter().map(|(_, name)| name.clone()).collect();
             found
                 .into_iter()
-                .find(|(_, name)| name == wanted)
+                .find(|(_, name)| answers_to(name, wanted))
                 .ok_or_else(|| {
                     format!(
-                        "no robot named {wanted:?} in range. These answered to the duck service: {}",
+                        "no robot named {wanted:?} in range. These answered to the duck service: \
+                         {}\nA name of the form `alias [advertised]` is one robot reported under \
+                         two names, and either half works.",
                         others.join(", ")
                     )
                 })?
@@ -698,4 +728,39 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         "params": params,
     });
     Ok((serde_json::to_string(&request)?, timeout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ordinary case, and the only one on Linux: one name, reported as it was advertised.
+    #[test]
+    fn a_single_name_answers_to_itself() {
+        assert!(answers_to("duck-c51b", "duck-c51b"));
+        assert!(!answers_to("duck-c51b", "duck-ffff"));
+    }
+
+    /// The case that made `--name` unusable: the exact string a person types is *neither* of the
+    /// names macOS reported, so `wifi status` failed against a robot the same message listed.
+    #[test]
+    fn either_half_of_a_macos_composite_answers() {
+        let reported = "radxa-zero3 [duck-c51b]";
+        assert!(answers_to(reported, "duck-c51b"), "the advertised name");
+        assert!(answers_to(reported, "radxa-zero3"), "the cached GAP name");
+        assert!(answers_to(reported, reported), "copied from the failure");
+        assert!(!answers_to(reported, "duck-ffff"));
+    }
+
+    /// The split is a guess and it can be wrong: a robot whose own name ends in a bracket group is
+    /// indistinguishable from the composite, so its halves are accepted as well. Tolerated rather
+    /// than fixed — btleplug joins the two names before we see them, and the pair is gone — because
+    /// the cost is only that an explicit `--name` matches more, on names nobody gives a robot. What
+    /// has to hold is that the shape must actually be there.
+    #[test]
+    fn the_split_needs_the_shape_it_looks_for() {
+        assert!(answers_to("duck [1]", "duck [1]"));
+        assert!(!answers_to("[duck-c51b]", "duck-c51b"));
+        assert!(!answers_to("duck-c51b [", "duck-c51b"));
+    }
 }
