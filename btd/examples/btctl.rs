@@ -72,7 +72,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// ending, because "that was everything" and "that was the first twelve" want different next moves.
 const LISTED_DEVICES: usize = 12;
 
-/// One peripheral the Mac reported, kept for the failure message.
+/// One peripheral the Mac reported, kept for `scan` and for the failure message.
 ///
 /// The name is held as it arrived — `None` when the advertisement carried none — rather than as the
 /// address fallback the tiers use, because "reported without a name" is the diagnosis and the
@@ -82,6 +82,9 @@ struct Seen {
     identity: String,
     local_name: Option<String>,
     services: usize,
+    /// Whether this advertisement carried the duck service UUID, which is the only evidence a
+    /// listing has: everything better needs a connection, and `scan` deliberately makes none.
+    duck: bool,
 }
 
 /// Whatever names this device on this platform.
@@ -127,6 +130,83 @@ fn answers_to(reported: &str, wanted: &str) -> bool {
     }
 }
 
+/// Devices as indented lines: what names each one, what it calls itself, what it is doing.
+///
+/// Shared by `scan` and by the failure message, because identifying a robot in a list of earbuds is
+/// the same problem whether the list is the answer or the diagnosis — and two renderings of it would
+/// drift apart exactly where the reader is comparing one run against another.
+async fn device_list(mut devices: Vec<&Seen>) -> String {
+    // Named first, then by identity: a device that reported a name is the line worth reading, and
+    // sorting keeps a re-run's output comparable with the last one.
+    devices.sort_by(|a, b| {
+        a.local_name
+            .is_none()
+            .cmp(&b.local_name.is_none())
+            .then(a.identity.cmp(&b.identity))
+    });
+
+    let mut lines: Vec<String> = Vec::new();
+    for device in devices.iter().take(LISTED_DEVICES) {
+        let mut notes: Vec<String> = Vec::new();
+        if device.services > 0 {
+            notes.push(format!("{} service(s)", device.services));
+        }
+        // Checked here rather than during the scan: it is one call per device once, instead of one
+        // per device per 250ms poll, and nothing before the list is printed needs the answer.
+        if device.peripheral.is_connected().await.unwrap_or(false) {
+            notes.push("connected".to_owned());
+        }
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", notes.join(", "))
+        };
+        lines.push(format!(
+            "  {} {}{notes}",
+            device.identity,
+            device.local_name.as_deref().unwrap_or("(no name)"),
+        ));
+    }
+
+    if devices.len() > LISTED_DEVICES {
+        lines.push(format!("  … and {} more", devices.len() - LISTED_DEVICES));
+    }
+    lines.join("\n")
+}
+
+/// What `scan` prints: the robots, and then everything else, because a robot can be in either half.
+///
+/// The duck service UUID in the advertisement is the only evidence available to a listing —
+/// everything stronger needs a connection, and connecting to 43 devices to ask each whether it is a
+/// robot would be minutes of pairing prompts. So the second block is not padding: a robot already
+/// bonded with this Mac frequently advertises no services at all, and it is the reason `--name`
+/// exists. Naming that here is what turns "my robot is missing" into a next move.
+async fn listing(seen: &[Seen]) -> String {
+    let (robots, others): (Vec<&Seen>, Vec<&Seen>) = seen.iter().partition(|d| d.duck);
+
+    let mut out = if robots.is_empty() {
+        "no robot advertised the duck service.".to_owned()
+    } else {
+        format!(
+            "{} robot(s) advertising the duck service:\n{}",
+            robots.len(),
+            device_list(robots).await,
+        )
+    };
+
+    if !others.is_empty() {
+        let anonymous = others.iter().filter(|d| d.local_name.is_none()).count();
+        out.push_str(&format!(
+            "\n\n{} other device(s) in {SCAN_TIME:?}, {anonymous} with no name. A robot bonded with \
+             this Mac often stops advertising the service to it, so it can be one of these — \
+             `--name <its name>` connects to it anyway:\n{}",
+            others.len(),
+            device_list(others).await,
+        ));
+    }
+    out
+}
+
 /// Why the scan came back empty, in terms of what the radio actually reported.
 ///
 /// Without this, two failures print the same sentence and want opposite next moves: an empty list is
@@ -149,39 +229,6 @@ async fn nothing_found(seen: &[Seen], wanted: Option<&str>) -> String {
         );
     }
 
-    // Named first, then by address: a device that reported a name is the line worth reading, and
-    // sorting keeps a re-run's output comparable with the last one.
-    let mut devices: Vec<&Seen> = seen.iter().collect();
-    devices.sort_by(|a, b| {
-        a.local_name
-            .is_none()
-            .cmp(&b.local_name.is_none())
-            .then(a.identity.cmp(&b.identity))
-    });
-
-    let mut lines: Vec<String> = Vec::new();
-    for device in devices.iter().take(LISTED_DEVICES) {
-        let mut notes: Vec<String> = Vec::new();
-        if device.services > 0 {
-            notes.push(format!("{} service(s)", device.services));
-        }
-        // Checked here rather than during the scan: it is one call per device once, instead of one
-        // per device per 250ms poll, and nothing before the failure needs the answer.
-        if device.peripheral.is_connected().await.unwrap_or(false) {
-            notes.push("connected".to_owned());
-        }
-        let notes = if notes.is_empty() {
-            String::new()
-        } else {
-            format!(" — {}", notes.join(", "))
-        };
-        lines.push(format!(
-            "{} {}{notes}",
-            device.identity,
-            device.local_name.as_deref().unwrap_or("(no name)"),
-        ));
-    }
-
     let missed = match wanted {
         Some(name) => format!(" and nothing was named {name:?}"),
         None => String::new(),
@@ -189,19 +236,13 @@ async fn nothing_found(seen: &[Seen], wanted: Option<&str>) -> String {
     // The count of unnamed devices is in the summary rather than left to be inferred from the list:
     // named ones sort first, so truncation hides exactly the lines the robot could be hiding in, and
     // "is it plausibly one of those" is the question this list is read to answer.
-    let anonymous = devices.iter().filter(|d| d.local_name.is_none()).count();
+    let anonymous = seen.iter().filter(|d| d.local_name.is_none()).count();
     let mut message = format!(
         "no robot found. Nothing advertised the duck service{missed}. The Mac saw {} device(s) in \
-         {SCAN_TIME:?}, {anonymous} of them with no name:\n  {}",
-        devices.len(),
-        lines.join("\n  ")
+         {SCAN_TIME:?}, {anonymous} of them with no name:\n{}",
+        seen.len(),
+        device_list(seen.iter().collect()).await,
     );
-    if devices.len() > LISTED_DEVICES {
-        message.push_str(&format!(
-            "\n  … and {} more",
-            devices.len() - LISTED_DEVICES
-        ));
-    }
     message.push_str(
         "\nIf the robot is one of the unnamed lines, it was reported without the name and the \
          service UUID this matches on, and retrying usually finds it. If it is absent entirely, \
@@ -318,6 +359,12 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    // `scan` shares the discovery below and then stops, because a listing and a search look for the
+    // same thing and differ only in what they do with it. It connects to nothing at all: that is
+    // what makes it the safe command to reach for when a robot cannot be reached, and it is also why
+    // it can only report what an advertisement carries.
+    let list_only = matches!(cli.command, Command::Scan);
+
     let manager = Manager::new().await?;
     let adapter = manager
         .adapters()
@@ -370,14 +417,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .clone()
                 .unwrap_or_else(|| properties.address.to_string());
 
+            let duck = properties.services.contains(&SERVICE_UUID);
             seen.push(Seen {
                 peripheral: peripheral.clone(),
                 identity: identity(&peripheral, properties.address),
                 local_name: properties.local_name.clone(),
                 services: properties.services.len(),
+                duck,
             });
 
-            if properties.services.contains(&SERVICE_UUID) {
+            if list_only {
+                // A listing connects to nothing, so the tiers — which exist to choose what to
+                // connect to — have no work to do, and the `is_connected` call below would cost one
+                // round trip per device per poll for an answer nothing reads.
+                continue;
+            }
+
+            if duck {
                 advertised.push((peripheral, name));
             } else if cli.name.as_deref().is_some_and(|w| answers_to(&name, w)) {
                 named.push((peripheral, name));
@@ -393,9 +449,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Stop as soon as there is anything worth connecting to: a bonded robot may never
         // re-advertise the service to this Mac, so waiting out the deadline for a better candidate
         // would just be eight seconds of nothing.
-        if !advertised.is_empty()
-            || !named.is_empty()
-            || !connected.is_empty()
+        //
+        // A listing is the exception, and runs the deadline out: stopping at the first robot would
+        // report one and hide the second, which is the only question worth asking in a room with
+        // three of them.
+        if (!list_only && (!advertised.is_empty() || !named.is_empty() || !connected.is_empty()))
             || Instant::now() >= deadline
         {
             break;
@@ -403,6 +461,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(SCAN_POLL).await;
     }
     let _ = adapter.stop_scan().await;
+
+    if list_only {
+        // Nothing at all is a fault on this machine rather than a report about robots, and
+        // `nothing_found` is where that diagnosis lives. An error, so the exit status says so too.
+        if seen.is_empty() {
+            return Err(nothing_found(&seen, None).await.into());
+        }
+        println!("{}", listing(&seen).await);
+        return Ok(());
+    }
 
     let mut found = advertised;
     if found.is_empty() && !named.is_empty() {
@@ -683,7 +751,9 @@ fn characteristics(
 /// One command becomes one JSON-RPC line, plus how long to wait for it.
 fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::error::Error>> {
     let (method, params, timeout) = match command {
-        Command::Scan => unreachable!("handled before connecting"),
+        // `scan` returns from `run` as soon as the discovery loop ends, so it never reaches a
+        // request: there is no method to send, and connecting is the thing it exists not to do.
+        Command::Scan => unreachable!("scan returns before anything connects"),
         Command::Status => ("update.status", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Info => ("system.info", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Health => ("robot.health", serde_json::json!({}), REPLY_TIMEOUT),
