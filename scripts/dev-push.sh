@@ -38,9 +38,9 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-# Where the artifact lands on the board. World-writable parent, so no sudo to copy into it;
-# `updaterd` reads it as root.
-REMOTE_DIR="${DUCK_SIDELOAD_DIR:-/var/tmp/duck-sideload}"
+# Where the artifact lands on the board. Empty here and resolved after the board is known,
+# because the default is a path on *that* machine — see the block below the argument parsing.
+REMOTE_DIR="${DUCK_SIDELOAD_DIR:-}"
 
 # The secret half of `team.dev`, the same key `dev.yml` signs branch builds with. Named apart
 # from `DUCK_DEV_KEY`, which the provisioning scripts use for the *public* half.
@@ -70,6 +70,26 @@ if [ -z "$BOARD" ]; then
     echo "no board: pass one as an argument or set DUCK_BOARD" >&2
     echo "  scripts/dev-push.sh radxa@duck.local" >&2
     exit 2
+fi
+
+# ── where the artifact lands, and why it is not /var/tmp ───────────────────────────────
+#
+# The board user's home, not `/var/tmp/duck-sideload`, which is where this used to put it and
+# which cannot work: `updaterd.service` sets `PrivateTmp=yes`, so the unit gets a `/tmp` and a
+# `/var/tmp` of its own. The files land in the ones the shell sees, `updaterd` reads the ones the
+# namespace gave it, and `apply --from` fails with "no manifest for version ... in
+# /var/tmp/duck-sideload" against a directory whose `ls` lists that exact manifest. It cost an
+# afternoon to see, because every artifact was demonstrably where the error said it was not.
+#
+# The home directory has the property /var/tmp was picked for — writable by the ssh user, so no
+# sudo to copy into it — and is outside that namespace. `updaterd` sets no `ProtectHome=`, and
+# `xtask/tests/sideload.rs` fails if either half of that stops being true.
+#
+# Resolved on the board rather than written literally: `$HOME` here is this laptop's, and the
+# apply needs an absolute path because `updaterd`'s working directory is not the user's.
+if [ -z "$REMOTE_DIR" ]; then
+    REMOTE_DIR="$(ssh "$BOARD" 'echo "$HOME/duck-sideload"')"
+    [ -n "$REMOTE_DIR" ] || { echo "could not resolve a home directory on $BOARD" >&2; exit 1; }
 fi
 
 if [ "$DOCKER" = no ]; then

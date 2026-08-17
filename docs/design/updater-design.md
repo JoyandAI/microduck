@@ -996,6 +996,12 @@ Cheap additions that slot into the same IPC / engine and pay off:
   `--version` — an operator naming a directory is not a mirror that has gone
   backwards, and a local build is a prerelease that sorts below whatever the board is
   running, so guarding it would refuse every push.
+  One constraint on the directory, and it is systemd's rather than the engine's:
+  `updaterd.service` sets `PrivateTmp=yes`, which gives the unit its own `/tmp` **and**
+  its own `/var/tmp`, so a release copied to either from a shell is not the one the
+  daemon reads. That is why the sideload directory lives in the board user's home and
+  why `Check::SideloadDir` exists — without it the failure is a missing manifest in a
+  directory whose `ls` lists it, which is unfalsifiable from the outside.
 - **BLE provisioning security.** Adjacent but important: wifi credentials pass
   over BLE during setup. That characteristic must be paired + encrypted, or it's
   a credential leak. Update artifacts are signed so a spoofed *trigger* is

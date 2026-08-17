@@ -33,6 +33,20 @@ pub enum Check {
     NoRemoteSession,
     /// Room for download + extract + retained releases.
     DiskSpace,
+    /// The `--from` directory is one *this process* can read.
+    ///
+    /// `updaterd.service` sets `PrivateTmp=yes`, which gives the unit its own `/tmp` **and**
+    /// its own `/var/tmp`. A release copied to either from a shell — the obvious place to put
+    /// one, and where `scripts/dev-push.sh` used to put it — is therefore not the one this
+    /// process sees, and every message downstream is a lie: "no manifest for version X in
+    /// /var/tmp/duck-sideload", against a directory whose `ls` shows that exact manifest, its
+    /// signature and the artifact. Nothing in that output points at the namespace, and the
+    /// caller has done nothing wrong.
+    ///
+    /// So it is a named check rather than a better error message further down: it fails before
+    /// any lookup, it says which mount namespace is responsible, and a board that does not
+    /// privatise `/var/tmp` passes it without noticing it exists.
+    SideloadDir,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +80,9 @@ pub struct Preflight<'a> {
     /// Skip only the remote-session check. Never affects verification.
     pub interrupt_sessions: bool,
     pub robot_query_timeout: Duration,
+    /// The directory `apply --from <dir>` was pointed at, if any. `None` for every other
+    /// target, which reads its manifest from the configured source instead.
+    pub from_dir: Option<&'a std::path::Path>,
 }
 
 /// Clock floor: a system time before this cannot be right, and TLS would fail
@@ -87,6 +104,7 @@ impl Preflight<'_> {
 
         results.push(self.check_clock());
         results.push(self.check_disk());
+        results.push(self.check_sideload_dir());
         results.push(self.check_robot_stopped().await);
         results.push(self.check_no_remote_session().await);
 
@@ -117,6 +135,49 @@ impl Preflight<'_> {
                     "needs {} bytes free, only {} available",
                     self.required_bytes, self.available_bytes
                 )
+            }),
+        }
+    }
+
+    /// Whether `--from <dir>` names a directory this process can see.
+    ///
+    /// Two failures, and they need different sentences. A path under `/tmp` or `/var/tmp` is
+    /// almost certainly there for the caller and hidden from here by `PrivateTmp=yes`
+    /// ([`Check::SideloadDir`]), so the message names the namespace and where to put the
+    /// release instead. Anywhere else, a missing directory is a missing directory.
+    ///
+    /// `exists()` and not a permission check: this runs as root, which reads any path it can
+    /// reach, so what remains is reachability.
+    fn check_sideload_dir(&self) -> CheckResult {
+        let Some(dir) = self.from_dir else {
+            return CheckResult {
+                check: Check::SideloadDir,
+                passed: true,
+                detail: None,
+            };
+        };
+        if dir.exists() {
+            return CheckResult {
+                check: Check::SideloadDir,
+                passed: true,
+                detail: None,
+            };
+        }
+
+        let private = dir.starts_with("/tmp") || dir.starts_with("/var/tmp");
+        CheckResult {
+            check: Check::SideloadDir,
+            passed: false,
+            detail: Some(if private {
+                format!(
+                    "{} is not there for updaterd, whichever shell created it: this unit runs \
+                     with PrivateTmp=yes, so it has a /tmp and a /var/tmp of its own and neither \
+                     is the one you copied into. The release is fine — put it anywhere outside \
+                     those two (a home directory, or /var/lib) and install from there.",
+                    dir.display()
+                )
+            } else {
+                format!("{} does not exist", dir.display())
             }),
         }
     }
@@ -172,6 +233,8 @@ impl Preflight<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::robot::{AbsentRobot, Health, RobotClient};
 
@@ -206,6 +269,7 @@ mod tests {
             available_bytes: available,
             interrupt_sessions: false,
             robot_query_timeout: Duration::from_millis(50),
+            from_dir: None,
         }
     }
 
@@ -228,6 +292,65 @@ mod tests {
         let report = preflight(&robot, 5_000, 1_000).run().await.unwrap();
         assert!(!report.passed());
         assert_eq!(report.first_failure().unwrap().check, Check::DiskSpace);
+    }
+
+    /// The failure a `PrivateTmp=yes` unit gives for a directory the caller can see, and the
+    /// reason this check exists at all: without it the first error is "no manifest for version X
+    /// in /var/tmp/duck-sideload", which is unfalsifiable from a shell where `ls` lists the
+    /// manifest. The namespace has to be named, or there is nothing to act on.
+    #[tokio::test]
+    async fn a_sideload_dir_under_var_tmp_names_the_namespace() {
+        let robot = FakeRobot {
+            safe: SafeToRestart::Yes,
+            session: false,
+        };
+        let mut pf = preflight(&robot, 0, 1_000);
+        let dir = Path::new("/var/tmp/duck-sideload-does-not-exist");
+        pf.from_dir = Some(dir);
+
+        let report = pf.run().await.unwrap();
+        let failure = report.first_failure().expect("an invisible dir must fail");
+        assert_eq!(failure.check, Check::SideloadDir);
+        let detail = failure.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains("PrivateTmp=yes"), "{detail}");
+        assert!(detail.contains("duck-sideload-does-not-exist"), "{detail}");
+    }
+
+    /// Outside `/tmp`, the same missing directory is just missing — telling someone about mount
+    /// namespaces when they typo'd a path sends them after the wrong thing.
+    #[tokio::test]
+    async fn a_missing_dir_elsewhere_is_reported_plainly() {
+        let robot = FakeRobot {
+            safe: SafeToRestart::Yes,
+            session: false,
+        };
+        let mut pf = preflight(&robot, 0, 1_000);
+        pf.from_dir = Some(Path::new("/var/lib/robot/no-such-sideload"));
+
+        let report = pf.run().await.unwrap();
+        let failure = report.first_failure().expect("a missing dir must fail");
+        assert_eq!(failure.check, Check::SideloadDir);
+        let detail = failure.detail.as_deref().unwrap_or_default();
+        assert!(!detail.contains("PrivateTmp"), "{detail}");
+        assert!(detail.contains("does not exist"), "{detail}");
+    }
+
+    /// A directory that is there passes, including one under `/var/tmp`: this check is about
+    /// what the process can read, not about a policy on where a release may live. `updaterd`
+    /// running as a CLI (`updaterd install --from`) is outside the unit's namespace and sees
+    /// `/var/tmp` normally — refusing it there would break the bootstrap path.
+    #[tokio::test]
+    async fn a_visible_dir_passes_wherever_it_is() {
+        let robot = FakeRobot {
+            safe: SafeToRestart::Yes,
+            session: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut pf = preflight(&robot, 0, 1_000);
+        pf.from_dir = Some(dir.path());
+
+        let report = pf.run().await.unwrap();
+        assert!(report.passed(), "{:?}", report.first_failure());
     }
 
     #[tokio::test]

@@ -48,14 +48,14 @@ scripts/dev-push.sh
 ```
 
 It cross-compiles the workspace, packages the same artifact a release does, signs it with the dev
-key, copies it to `/var/tmp/duck-sideload` on the board, and applies it there through
+key, copies it to `~/duck-sideload` on the board, and applies it there through
 `robotctl update apply --from`. Then it waits for the five daemons to report the new release:
 
 ```
 ==> building 0.5.1-dev.local.1763400000.g7fc1444 for the board (zigbuild)
 ==> packaging
 ==> signing with /Users/you/.duck-keys/team.dev.key
-==> copying to radxa@192.168.1.42:/var/tmp/duck-sideload
+==> copying to radxa@192.168.1.42:/home/radxa/duck-sideload
 ==> applying on radxa@192.168.1.42
 ==> 0.5.1-dev.local.1763400000.g7fc1444 is live on radxa@192.168.1.42
 ==> checking every daemon is running it
@@ -170,11 +170,11 @@ rebuild. The default is faster day to day and is what CI uses.
 
 ## Re-install what is already on the board
 
-The push leaves the artifact in `/var/tmp/duck-sideload`, so a board can install it again without
+The push leaves the artifact in `~/duck-sideload` on the board, so it can be installed again without
 building anything:
 
 ```bash
-sudo robotctl update apply daemon --from /var/tmp/duck-sideload
+sudo robotctl update apply daemon --from ~/duck-sideload
 ```
 
 The same command takes any directory holding a release — a USB stick, for instance. Each push
@@ -226,6 +226,14 @@ rm -rf ~/.cache/duck-cross/aarch64
 **`apply failed (exit 2)`, with `robotctl` and `updaterd` reporting an API mismatch** — the board's
 installed release predates `apply --from`. Use `--bootstrap` once.
 
+**`preflight check failed: SideloadDir: ... is not there for updaterd`** — the release is under
+`/tmp` or `/var/tmp`, which happens if `DUCK_SIDELOAD_DIR` or a hand-written `--from` points there.
+`updaterd.service` sets `PrivateTmp=yes`, so the daemon has its own `/tmp` and `/var/tmp` and
+neither is the one your shell copied into. Any other path works; the default, `~/duck-sideload`,
+is one. On a board whose release predates that check, the same mistake reads as
+`no manifest for version <version> in <dir>` — for a directory whose `ls` lists exactly that
+manifest.
+
 **`verification failed: signature did not verify against any of N usable trusted key(s)`** — reads
 like a corrupt release, and usually means the board is not a dev board: the dev key never landed, or
 `allow_dev_keys` is off, either of which leaves that key out of the usable set. On the board:
@@ -272,7 +280,7 @@ This should not have been necessary, so it is worth reading the journal for why 
 |---|---|
 | `DUCK_BOARD` | The board, instead of an argument. `radxa@192.168.1.42`. |
 | `DUCK_DEV_SECRET_KEY` | The dev signing key. Default `~/.duck-keys/team.dev.key`. |
-| `DUCK_SIDELOAD_DIR` | Where the artifact lands on the board. Default `/var/tmp/duck-sideload`. |
+| `DUCK_SIDELOAD_DIR` | Where the artifact lands on the board. Default `~/duck-sideload` there. Never under `/tmp` or `/var/tmp`: `updaterd` has private copies of both and would read those. |
 | `DUCK_CROSS_SYSROOT` | The cached libudev copy. Default `~/.cache/duck-cross/aarch64`. |
 
 ## What this deliberately does not do
