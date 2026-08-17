@@ -98,6 +98,34 @@ sudo btmon -t > /tmp/btmon.log 2>&1 &
 Pair, then `sudo pkill btmon` and look for `SMP: Pairing Failed` and the reason beside it. That is
 the one instrument that distinguishes a board setting from a pad that is not listening.
 
+## When it drops while you are driving
+
+Copy the measurement onto the board, from a clone of this repo:
+
+```bash
+scp scripts/pad-link-test.sh radxa@<board>:/tmp/
+```
+
+What has already happened, out of `padd`'s journal — no pad needed, and it answers immediately:
+
+```bash
+sudo sh /tmp/pad-link-test.sh --history
+```
+
+To measure the link now, with the pad on and `padd` running. **Keep the sticks moving for the whole
+two minutes**: a pad at rest sends nothing, and silence reads exactly like a stalled link.
+
+```bash
+sudo sh /tmp/pad-link-test.sh
+```
+
+It counts drops, and the gaps between the pad's input reports while it is connected. A gap past
+500 ms is the robot stopping — `robotd` zeroes the velocity there. Every drop is followed by the
+kernel's reason: `0x08` is a supervision timeout, which means range or interference, and `0x13`
+means somebody switched the pad off.
+
+Walking away from the robot while it watches is how you find the range.
+
 ---
 
 Driving — the controls, the speed limits, and running `padd` from a laptop over a forwarded socket —
