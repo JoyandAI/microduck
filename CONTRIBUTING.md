@@ -57,7 +57,7 @@ padd/           gamepad → intents — an ordinary socket client, no privileged
 updater/        engine + updaterd
 robotd/         control daemon
 configd/        wifi · robot name · pairing PIN · reboot · gamepad pairing
-btd/            the BLE front door, plus btctl (a laptop client, never shipped)
+btd/            the BLE front door, plus duck-btctl (a laptop client, never shipped)
 robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald

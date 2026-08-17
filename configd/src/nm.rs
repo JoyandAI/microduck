@@ -67,7 +67,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long to wait for a requested scan to complete before answering with what NM already has.
 ///
 /// A sweep of both bands takes a few seconds on this radio. The cap matters because a client is
-/// blocked on the reply: `btctl` allows 60s for a scan, so this must stay well inside that.
+/// blocked on the reply: `duck-btctl` allows 60s for a scan, so this must stay well inside that.
 const SCAN_WAIT: Duration = Duration::from_secs(10);
 /// How often `LastScan` is re-read while waiting.
 const SCAN_POLL: Duration = Duration::from_millis(250);

@@ -331,7 +331,7 @@ robots off a bad release — are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing)
 |---|---|
 | [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: wifi, updates, rollback, pinning, logs. |
 | [Dev board cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, and the restart traps after an update. |
-| [`btctl` cheat sheet](docs/robot/btctl.md) | Every `btctl` command: the robot over Bluetooth, from a laptop, with no network. |
+| [`duck-btctl` cheat sheet](docs/robot/duck-btctl.md) | Every `duck-btctl` command: the robot over Bluetooth, from a laptop, with no network. |
 | [Setting up a dev board](docs/robot/install-dev.md) | From nothing, and the fix when `--ref` is refused. |
 | [How it works](docs/design/) | The control loop, the update engine, the service split, the BLE path. |
 

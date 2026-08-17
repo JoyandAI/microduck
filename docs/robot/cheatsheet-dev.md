@@ -183,7 +183,7 @@ scripts/dev-push.sh --bootstrap radxa@<board>
 
 Every push after that is the ordinary command.
 
-## From a laptop — `btctl`
+## From a laptop — `duck-btctl`
 
-Reaching the robot over Bluetooth LE, with no network and no ssh: [`btctl.md`](btctl.md) has every
-command.
+Reaching the robot over Bluetooth LE, with no network and no ssh:
+[`duck-btctl.md`](duck-btctl.md) has every command.
