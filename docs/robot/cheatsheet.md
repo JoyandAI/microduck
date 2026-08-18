@@ -54,7 +54,9 @@ report. A robot with no policy says so, and one whose policy would not load says
 which the stream's `held` cannot distinguish.
 
 `q` quits; `↑`/`↓` scroll the joint list on a window too short for all of it; `u` switches the
-angles between degrees and radians. Angles are degrees on screen — joints, head and the yaw rate.
+angles between degrees and radians; `p` opens the pad's raw input stream — every evdev report from
+the gamepad, with the gaps between them, which is the only place a stalled radio is visible
+([pair a gamepad](pair-a-gamepad.md#when-it-drops-while-you-are-driving)). Angles are degrees on screen — joints, head and the yaw rate.
 Redirected or piped it prints one line per tick instead, so `> run.log` and `| grep FALLEN`
 behave, and those numbers stay radians whatever the screen is set to. The joint vectors are in
 `--json`, which carries the whole state, one object per line:
@@ -136,7 +138,8 @@ sudo systemctl stop padd
 sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
 ```
 
-When the link itself is the suspect, copy the measurement over from a clone of this repo:
+When the link itself is the suspect, watch it live — `robotctl monitor`, then `p`. For a verdict
+over a window instead, copy the measurement over from a clone of this repo:
 
 ```
 scp scripts/pad-link-test.sh radxa@<board>:/tmp/

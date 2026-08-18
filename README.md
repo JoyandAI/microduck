@@ -53,8 +53,8 @@ units
 
 The two software blocks answer different questions. `software` is what each daemon that serves a
 socket says about itself, and what is installed on the board; `units` is what systemd says about
-every unit a release manages — including `btd` and `padd`, which serve no socket and can only be
-reported from outside — with the release each process was actually launched from. That second one
+every unit a release manages — including `btd` and `padd`, which answer no version query and can
+only be reported from outside — with the release each process was actually launched from. That second one
 is the question after an update: a daemon still running the old binary shows a release older than
 the installed one, and the report names the restart that fixes it.
 
@@ -163,6 +163,13 @@ gravity and the fall verdict drawn from it, and the achieved loop rate as a trac
 that has already recovered is still visible. The bottom border names the policy that is loaded,
 because `walk` is a mode two releases with different gaits both report — and "which network is
 this?" is the first question when comparing them.
+
+`p` opens the gamepad's raw input: every evdev report from the pad `padd` is driving from, the
+sticks and buttons as the kernel delivered them, and the gaps between reports as a trace. That last
+part is the reason it exists — `padd` resends the last stick value at 50 Hz, so a radio that has
+stopped delivering still looks like a live driver in the `asked` column above it, and the robot walks
+on a command nobody is giving. Reading it is in
+[pair a gamepad](docs/robot/pair-a-gamepad.md#when-it-drops-while-you-are-driving).
 
 `q` quits, `↑`/`↓` scroll the joint list, `u` switches the angles between degrees and radians.
 Angles are degrees on screen — joints, head and the yaw rate. Redirected or piped it prints one
