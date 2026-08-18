@@ -251,6 +251,66 @@ fn resolve_pin(flag: Option<String>, var: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_PIN.to_owned())
 }
 
+/// Which of the candidates to talk to, given what was asked for.
+///
+/// Generic over the payload so the rule can be tested: a `Peripheral` cannot be constructed off a
+/// radio, and this is the one place where getting it wrong means acting on the wrong robot.
+///
+/// **A name that matches more than one candidate is refused, not resolved.** The two are
+/// indistinguishable from here, so there is nothing to prefer and picking either means a write
+/// landing on whichever the scan happened to report first — `net.connect` puts a wifi password on
+/// that robot. `identity.rs` names the way this happens with nobody doing anything wrong: a board
+/// whose bootloader leaves `serial-number` empty falls back to the hostname, so every board flashed
+/// from one image answers to `radxa-zero3`.
+///
+/// Without a name the first candidate still wins. That path is unchanged on purpose — choosing
+/// between robots nobody named is exactly what omitting `--name` asks for, and making it an error
+/// would break the shorthand on any bench with two boards on it.
+///
+/// Both failures carry [`Target::provenance`]: a name from `DUCK_ROBOT` is a name nobody on this
+/// command line typed, and that is worth saying most where the message is about which robot the
+/// command would have landed on.
+fn choose<T>(found: Vec<(T, String)>, target: &Target) -> Result<(T, String), String> {
+    let Some(wanted) = target.wanted() else {
+        // `run` returns early on an empty `found`, so there is at least one.
+        return found
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no candidates, which `run` should have reported already".to_owned());
+    };
+
+    // Collected before the filter consumes `found`: robots *were* there, they just call themselves
+    // something else, and naming them beats "not in range" for a robot that has been renamed since
+    // whoever is typing last looked.
+    let others: Vec<String> = found.iter().map(|(_, name)| name.clone()).collect();
+    let mut matching: Vec<(T, String)> = found
+        .into_iter()
+        .filter(|(_, name)| answers_to(name, wanted))
+        .collect();
+
+    if matching.len() > 1 {
+        let names: Vec<String> = matching.iter().map(|(_, name)| name.clone()).collect();
+        return Err(format!(
+            "{} robots answer to {wanted:?}: {}\nRefusing to guess between them — whichever the \
+             scan reported first is not a choice. Rename one from the robot itself (`robotctl \
+             system set-name`) and use the new name here.{}",
+            names.len(),
+            names.join(", "),
+            target.provenance(),
+        ));
+    }
+
+    matching.pop().ok_or_else(|| {
+        format!(
+            "no robot named {wanted:?} in range. These answered to the duck service: {}\nA name of \
+             the form `alias [advertised]` is one robot reported under two names, and either half \
+             works.{}",
+            others.join(", "),
+            target.provenance(),
+        )
+    })
+}
+
 /// Devices as indented lines: what names each one, what it calls itself, what it is doing.
 ///
 /// Shared by `scan` and by the failure message, because identifying a robot in a list of earbuds is
@@ -691,27 +751,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(nothing_found(&seen, &target).await.into());
     }
 
-    let (peripheral, name) = match target.wanted() {
-        Some(wanted) => {
-            // Collected before the search consumes `found`: robots *were* there, they just call
-            // themselves something else, and naming them beats "not in range" for a robot that has
-            // been renamed since whoever is typing last looked.
-            let others: Vec<String> = found.iter().map(|(_, name)| name.clone()).collect();
-            found
-                .into_iter()
-                .find(|(_, name)| answers_to(name, wanted))
-                .ok_or_else(|| {
-                    format!(
-                        "no robot named {wanted:?} in range. These answered to the duck service: \
-                         {}\nA name of the form `alias [advertised]` is one robot reported under \
-                         two names, and either half works.{}",
-                        others.join(", "),
-                        target.provenance(),
-                    )
-                })?
-        }
-        None => found.into_iter().next().expect("non-empty"),
-    };
+    let (peripheral, name) = choose(found, &target)?;
     eprintln!("connecting to {name}…");
 
     step(
@@ -1033,6 +1073,95 @@ mod tests {
         assert!(lists_others(true, 1), "--verbose asks what the radio saw");
         assert!(lists_others(false, 0), "no robot: the list is all there is");
         assert!(lists_others(true, 0));
+    }
+
+    /// Named candidates, as `choose` takes them.
+    fn candidates(names: &[&str]) -> Vec<(usize, String)> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (i, (*name).to_owned()))
+            .collect()
+    }
+
+    /// A name typed on the command line, which is the ordinary way to reach `choose`.
+    fn asked_for(name: &str) -> Target {
+        Target::new(Some(name.to_owned()), None)
+    }
+
+    /// The ordinary case: one name, one robot, and the composite spelling still resolves.
+    #[test]
+    fn a_name_selects_the_one_robot_that_answers_to_it() {
+        let (which, _) = choose(
+            candidates(&["duck-aaaa", "duck-c51b"]),
+            &asked_for("duck-c51b"),
+        )
+        .expect("the named robot");
+        assert_eq!(which, 1);
+
+        let (which, _) = choose(
+            candidates(&["duck-aaaa", "radxa-zero3 [duck-c51b]"]),
+            &asked_for("duck-c51b"),
+        )
+        .expect("either half of a composite");
+        assert_eq!(which, 1);
+    }
+
+    /// **The safety rule.** Two robots answering to one name is not rare or hypothetical: a board
+    /// whose bootloader leaves `serial-number` empty is named from its hostname, so a bench flashed
+    /// from one image is full of `radxa-zero3`. Whichever the scan reported first is not a choice,
+    /// and the command that lands on it may be `net.connect` with someone's wifi password.
+    #[test]
+    fn a_name_matching_two_robots_is_refused_rather_than_guessed() {
+        let error = choose(
+            candidates(&["radxa-zero3", "radxa-zero3", "duck-c51b"]),
+            &asked_for("radxa-zero3"),
+        )
+        .expect_err("a collision is an error");
+
+        assert!(error.contains("2 robots"), "{error}");
+        // Both are named, so the reader can tell which two collided.
+        assert!(error.contains("radxa-zero3, radxa-zero3"), "{error}");
+        assert!(error.contains("set-name"), "the way out: {error}");
+    }
+
+    /// A collision on a name from the environment says so. This is the failure where provenance
+    /// matters most: nothing on the command line named the robot, and the message is about which of
+    /// two the command would otherwise have written to.
+    #[test]
+    fn a_collision_on_a_default_says_where_the_name_came_from() {
+        let from_env = Target::new(None, Some("radxa-zero3".to_owned()));
+        let error = choose(candidates(&["radxa-zero3", "radxa-zero3"]), &from_env)
+            .expect_err("a collision is an error whoever named it");
+
+        assert!(error.contains("2 robots"), "{error}");
+        assert!(error.contains("DUCK_ROBOT"), "{error}");
+    }
+
+    /// Omitting `--name` is a request to pick one, and it stays one. Making the ambiguity an error
+    /// on this path would break the shorthand on every bench with two boards on it.
+    #[test]
+    fn without_a_name_the_first_candidate_still_wins() {
+        let (which, _) = choose(
+            candidates(&["duck-aaaa", "duck-c51b"]),
+            &Target::new(None, None),
+        )
+        .expect("the first one");
+        assert_eq!(which, 0);
+    }
+
+    /// A name nobody answers to lists what was there, because the usual cause is a robot that has
+    /// been renamed since whoever is typing last looked.
+    #[test]
+    fn a_name_nobody_answers_to_lists_the_robots_that_were_there() {
+        let error = choose(
+            candidates(&["duck-aaaa", "duck-bbbb"]),
+            &asked_for("duck-c51b"),
+        )
+        .expect_err("not in range");
+
+        assert!(error.contains("no robot named"), "{error}");
+        assert!(error.contains("duck-aaaa, duck-bbbb"), "{error}");
     }
 
     /// `--name` says which robot to talk to and the `name` subcommand's positional says what to
