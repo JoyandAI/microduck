@@ -63,6 +63,7 @@ xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
 scripts/        provision-board.sh · dev-push.sh + dev-build.Dockerfile (from your machine) ·
                 provision.sh → setup-board.sh · migrate-network.sh · install.sh (on the board) ·
+                pad-link-test.sh · pad-stack-report.sh (gamepad radio, on the board) ·
                 board-test.sh (CI)
 docs/           robot/ (using one) · design/ (how it works) · project/ (roadmap, records)
 ```

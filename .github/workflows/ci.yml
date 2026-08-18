@@ -82,11 +82,19 @@ jobs:
       # excluded. It used to be skipped entirely on the grounds that CI failing is already the
       # feedback, which was true and too expensive: that feedback is four QEMU minutes away.
       #
+      # `pad-link-test.sh` is a diagnostic rather than a step anything depends on, and is here for
+      # the same reason as the rest: it is typed by someone whose pad is already misbehaving, and
+      # `set -eu` turns a stray `[ x ] && y` into an exit two minutes into a measurement.
+      #
+      # `pad-stack-report.sh` for a sharper version of the same: nearly every line of it reads a
+      # tool that may not be installed, and an unquoted or unguarded one of those is an exit
+      # partway through a report that then looks complete.
+      #
       # POSIX sh, not bash: the script is piped to `sh` by the documented one-liner, and
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.

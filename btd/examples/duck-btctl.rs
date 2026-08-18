@@ -22,6 +22,9 @@
 //! cargo run -p btd --example duck-btctl -- name "Ducky"
 //! cargo run -p btd --example duck-btctl -- call robot.health
 //! ```
+//!
+//! `DUCK_ROBOT` and `DUCK_PIN` in the environment are the defaults for `--name` and `--pin`, for
+//! the machine that talks to the same robot every day. See [`Target`].
 
 use std::time::{Duration, Instant};
 
@@ -130,18 +133,200 @@ fn answers_to(reported: &str, wanted: &str) -> bool {
     }
 }
 
+/// The default PIN, which every robot has until somebody sets one.
+const DEFAULT_PIN: &str = "000000";
+
+/// Which robot to talk to, and whether anybody typed it.
+///
+/// A laptop reaches the same robot nearly every time, so the name belongs in the environment rather
+/// than in every command line: `export DUCK_ROBOT=duck-c51b`, and `--name` stops being something to
+/// remember. `--pin` gets the same treatment through `DUCK_PIN`, which a robot with a real PIN needs
+/// more than this does.
+///
+/// **An empty value means unset**, and that is the reason this is not clap's own `env` support.
+/// clap reads the variable with `env::var_os` and treats `DUCK_ROBOT=` as a value, so a variable
+/// exported in a shell profile could only be escaped by unsetting it — and the command that needs
+/// escaping is the one being typed now, on a bench that has somebody else's robot on it. Empty means
+/// unset, so `DUCK_ROBOT= duck-btctl scan` is the escape hatch, in the shape a shell already has.
+///
+/// **Provenance is carried rather than recomputed.** A default makes the tool *stricter*: it
+/// suppresses the already-connected fallback tier, and turns "the first robot found wins" into "no
+/// robot named duck-c51b in range" — a confusing failure six weeks after editing a shell profile,
+/// especially when the same message lists a robot sitting right there. So every message about a
+/// robot nobody named says where the name came from.
+struct Target {
+    /// The name to look for, if any. Empty is not a name.
+    name: Option<String>,
+    /// Whether [`Self::name`] came from the environment rather than from `--name`.
+    from_env: bool,
+}
+
+impl Target {
+    /// `--name` if it was given, otherwise `DUCK_ROBOT` if it says anything.
+    fn new(flag: Option<String>, var: Option<String>) -> Self {
+        match flag {
+            // An empty `--name` is still `--name`. The flag beats the environment in every case
+            // including this one, so beating it with nothing is the second escape hatch: a command
+            // line can drop the default without touching the shell it runs in.
+            Some(name) => Self {
+                name: Some(name).filter(|name| !name.is_empty()),
+                from_env: false,
+            },
+            None => {
+                let name = var.filter(|name| !name.is_empty());
+                Self {
+                    from_env: name.is_some(),
+                    name,
+                }
+            }
+        }
+    }
+
+    /// The name to match on, for the tiers and the search.
+    fn wanted(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Is this the device the name points at? Answers the question a listing is read to ask.
+    fn marks(&self, local_name: Option<&str>) -> bool {
+        match (self.wanted(), local_name) {
+            (Some(wanted), Some(reported)) => answers_to(reported, wanted),
+            _ => false,
+        }
+    }
+
+    /// What to blame for the name, in a line that points at one device.
+    fn source(&self) -> &'static str {
+        if self.from_env {
+            "DUCK_ROBOT"
+        } else {
+            "--name"
+        }
+    }
+
+    /// Where the name came from, appended to a failure about a robot nobody asked for by name.
+    ///
+    /// Empty when `--name` was typed: whoever typed it does not need telling.
+    fn provenance(&self) -> String {
+        match &self.name {
+            Some(name) if self.from_env => format!(
+                "\n\nNothing on this command line said {name:?} — `DUCK_ROBOT` in this shell's \
+                 environment did. `DUCK_ROBOT= duck-btctl …` ignores it for one command, and \
+                 `unset DUCK_ROBOT` for the shell."
+            ),
+            _ => String::new(),
+        }
+    }
+
+    /// The note after a rename that leaves `DUCK_ROBOT` naming a robot that no longer answers.
+    ///
+    /// The rename works and then every later command searches for the old name and fails, which
+    /// looks like a robot that went away rather than a variable that went stale. Only for the
+    /// environment: a `--name` typed once is not still in effect.
+    fn stale_after_rename(&self, command: &Command) -> Option<String> {
+        let Command::Name { name: new } = command else {
+            return None;
+        };
+        let old = self
+            .name
+            .as_deref()
+            .filter(|old| self.from_env && *old != new.as_str())?;
+        Some(format!(
+            "note: this robot now answers to {new:?}, and `DUCK_ROBOT` still says {old:?}. Every \
+             later command looks for {old:?} until that changes."
+        ))
+    }
+}
+
+/// `--pin`, then `DUCK_PIN`, then the factory default.
+///
+/// Empty means unset here too, for the reason in [`Target`]: a `DUCK_PIN=` left over from a script
+/// would otherwise authenticate with an empty string and be reported as a wrong PIN.
+///
+/// Unlike `--name`, an empty value is *skipped* rather than final. There is no "no PIN" state to
+/// express — every request carries one — so `--pin ''` can only mean "not this one".
+fn resolve_pin(flag: Option<String>, var: Option<String>) -> String {
+    flag.filter(|pin| !pin.is_empty())
+        .or(var.filter(|pin| !pin.is_empty()))
+        .unwrap_or_else(|| DEFAULT_PIN.to_owned())
+}
+
+/// Which of the candidates to talk to, given what was asked for.
+///
+/// Generic over the payload so the rule can be tested: a `Peripheral` cannot be constructed off a
+/// radio, and this is the one place where getting it wrong means acting on the wrong robot.
+///
+/// **A name that matches more than one candidate is refused, not resolved.** The two are
+/// indistinguishable from here, so there is nothing to prefer and picking either means a write
+/// landing on whichever the scan happened to report first — `net.connect` puts a wifi password on
+/// that robot. `identity.rs` names the way this happens with nobody doing anything wrong: a board
+/// whose bootloader leaves `serial-number` empty falls back to the hostname, so every board flashed
+/// from one image answers to `radxa-zero3`.
+///
+/// Without a name the first candidate still wins. That path is unchanged on purpose — choosing
+/// between robots nobody named is exactly what omitting `--name` asks for, and making it an error
+/// would break the shorthand on any bench with two boards on it.
+///
+/// Both failures carry [`Target::provenance`]: a name from `DUCK_ROBOT` is a name nobody on this
+/// command line typed, and that is worth saying most where the message is about which robot the
+/// command would have landed on.
+fn choose<T>(found: Vec<(T, String)>, target: &Target) -> Result<(T, String), String> {
+    let Some(wanted) = target.wanted() else {
+        // `run` returns early on an empty `found`, so there is at least one.
+        return found
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no candidates, which `run` should have reported already".to_owned());
+    };
+
+    // Collected before the filter consumes `found`: robots *were* there, they just call themselves
+    // something else, and naming them beats "not in range" for a robot that has been renamed since
+    // whoever is typing last looked.
+    let others: Vec<String> = found.iter().map(|(_, name)| name.clone()).collect();
+    let mut matching: Vec<(T, String)> = found
+        .into_iter()
+        .filter(|(_, name)| answers_to(name, wanted))
+        .collect();
+
+    if matching.len() > 1 {
+        let names: Vec<String> = matching.iter().map(|(_, name)| name.clone()).collect();
+        return Err(format!(
+            "{} robots answer to {wanted:?}: {}\nRefusing to guess between them — whichever the \
+             scan reported first is not a choice. Rename one from the robot itself (`robotctl \
+             system set-name`) and use the new name here.{}",
+            names.len(),
+            names.join(", "),
+            target.provenance(),
+        ));
+    }
+
+    matching.pop().ok_or_else(|| {
+        format!(
+            "no robot named {wanted:?} in range. These answered to the duck service: {}\nA name of \
+             the form `alias [advertised]` is one robot reported under two names, and either half \
+             works.{}",
+            others.join(", "),
+            target.provenance(),
+        )
+    })
+}
+
 /// Devices as indented lines: what names each one, what it calls itself, what it is doing.
 ///
 /// Shared by `scan` and by the failure message, because identifying a robot in a list of earbuds is
 /// the same problem whether the list is the answer or the diagnosis — and two renderings of it would
 /// drift apart exactly where the reader is comparing one run against another.
-async fn device_list(mut devices: Vec<&Seen>) -> String {
-    // Named first, then by identity: a device that reported a name is the line worth reading, and
-    // sorting keeps a re-run's output comparable with the last one.
+async fn device_list(mut devices: Vec<&Seen>, target: &Target) -> String {
+    // The named robot first, then named devices, then by identity: a device that reported a name is
+    // the line worth reading, and sorting keeps a re-run's output comparable with the last one.
+    //
+    // The default's own line leads, because this list is truncated at `LISTED_DEVICES` and an office
+    // holds more devices than that: sorted by identity alone, the one line the reader is looking for
+    // lands in "… and 6 more" as often as not, and a marker nobody can see is not an answer.
     devices.sort_by(|a, b| {
-        a.local_name
-            .is_none()
-            .cmp(&b.local_name.is_none())
+        (!target.marks(a.local_name.as_deref()))
+            .cmp(&!target.marks(b.local_name.as_deref()))
+            .then(a.local_name.is_none().cmp(&b.local_name.is_none()))
             .then(a.identity.cmp(&b.identity))
     });
 
@@ -161,8 +346,16 @@ async fn device_list(mut devices: Vec<&Seen>) -> String {
         } else {
             format!(" — {}", notes.join(", "))
         };
+        // The line the reader is looking for, marked. `scan` with a default set is read to answer
+        // "is my robot here", and that is otherwise a string comparison done by eye against a list
+        // of hex — worse on macOS, where the robot is reported under two names joined together.
+        let mark = if target.marks(device.local_name.as_deref()) {
+            format!("  ← {}", target.source())
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "  {} {}{notes}",
+            "  {} {}{notes}{mark}",
             device.identity,
             device.local_name.as_deref().unwrap_or("(no name)"),
         ));
@@ -196,7 +389,7 @@ fn lists_others(verbose: bool, robots: usize) -> bool {
 }
 
 /// What `scan` prints: the robots, and — per [`lists_others`] — everything else.
-async fn listing(seen: &[Seen], verbose: bool) -> String {
+async fn listing(seen: &[Seen], verbose: bool, target: &Target) -> String {
     let (robots, others): (Vec<&Seen>, Vec<&Seen>) = seen.iter().partition(|d| d.duck);
     // Kept before `device_list` consumes the vector, since it decides the second block below.
     let found = robots.len();
@@ -207,7 +400,7 @@ async fn listing(seen: &[Seen], verbose: bool) -> String {
         format!(
             "{} robot(s) advertising the duck service:\n{}",
             robots.len(),
-            device_list(robots).await,
+            device_list(robots, target).await,
         )
     };
 
@@ -219,7 +412,7 @@ async fn listing(seen: &[Seen], verbose: bool) -> String {
                  with this Mac often stops advertising the service to it, so it can be one of \
                  these — `--name <its name>` connects to it anyway:\n{}",
                 others.len(),
-                device_list(others).await,
+                device_list(others, target).await,
             ));
         } else {
             out.push_str(&format!(
@@ -245,7 +438,7 @@ async fn listing(seen: &[Seen], verbose: bool) -> String {
 /// `duck-c51b` is 9, so this is still the normal case rather than the edge one. A device reported
 /// with no name and no services is therefore a plausible robot, which is why the unnamed ones are
 /// listed rather than filtered out.
-async fn nothing_found(seen: &[Seen], wanted: Option<&str>) -> String {
+async fn nothing_found(seen: &[Seen], target: &Target) -> String {
     if seen.is_empty() {
         return format!(
             "no robot found — and the Mac reported no BLE devices at all in {SCAN_TIME:?}, not one \
@@ -254,7 +447,7 @@ async fn nothing_found(seen: &[Seen], wanted: Option<&str>) -> String {
         );
     }
 
-    let missed = match wanted {
+    let missed = match target.wanted() {
         Some(name) => format!(" and nothing was named {name:?}"),
         None => String::new(),
     };
@@ -266,8 +459,11 @@ async fn nothing_found(seen: &[Seen], wanted: Option<&str>) -> String {
         "no robot found. Nothing advertised the duck service{missed}. The Mac saw {} device(s) in \
          {SCAN_TIME:?}, {anonymous} of them with no name:\n{}",
         seen.len(),
-        device_list(seen.iter().collect()).await,
+        device_list(seen.iter().collect(), target).await,
     );
+    // Before the generic advice, because "why is it looking for that name" comes first for a reader
+    // who did not type one.
+    message.push_str(&target.provenance());
     message.push_str(
         "\nIf the robot is one of the unnamed lines, it was reported without the name and the \
          service UUID this matches on, and retrying usually finds it. If it is absent entirely, \
@@ -302,10 +498,14 @@ async fn step<T>(
                   rather than a binary, so it never ships to a robot."
 )]
 struct Cli {
-    /// Connect to this robot by advertised name. Without it, the first one found wins.
+    /// Connect to this robot by advertised name. Without it, `DUCK_ROBOT`; without that, the first
+    /// robot found wins.
     ///
     /// The advertised name, which is what `system.info` reports and what `name` below sets: a
     /// board that has never been renamed answers to its derived default, `duck-7f3a`.
+    ///
+    /// `export DUCK_ROBOT=duck-c51b` in a shell profile makes that the robot every command talks
+    /// to. `DUCK_ROBOT= duck-btctl …` ignores it for one command.
     //
     // The id is spelled out rather than derived from the field, because clap keys arguments by id
     // and the `name` subcommand has a positional argument that derives the same one. With both
@@ -320,13 +520,17 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
-    /// The robot's pairing PIN.
+    /// The robot's pairing PIN. Defaults to `DUCK_PIN`, then to `000000`.
     ///
     /// Six digits, shown by `robotctl system pin` on the robot. The factory default is `000000`
     /// and authenticates anyone who has read this repository, which is why a shipped robot needs a
-    /// per-robot one.
-    #[arg(long, global = true, default_value = "000000")]
-    pin: String,
+    /// per-robot one — and why `export DUCK_PIN=…` is worth more than the name is.
+    //
+    // No `default_value`, because the default has to be applied *after* the environment or it would
+    // shadow it: clap fills a `default_value` in and nothing downstream can then tell `000000` typed
+    // from `000000` assumed. It is spelled out in the help text above instead.
+    #[arg(long, global = true)]
+    pin: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -397,6 +601,11 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // Read once, here, so everything below asks `target` rather than the environment: which robot
+    // was chosen and who chose it is one decision, and a second reader of `DUCK_ROBOT` could
+    // disagree with the first.
+    let target = Target::new(cli.name.clone(), std::env::var("DUCK_ROBOT").ok());
+    let pin = resolve_pin(cli.pin.clone(), std::env::var("DUCK_PIN").ok());
 
     // `scan` shares the discovery below and then stops, because a listing and a search look for the
     // same thing and differ only in what they do with it. It connects to nothing at all: that is
@@ -412,6 +621,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("no Bluetooth adapter on this machine")?;
 
+    // Disclosed before the eight seconds rather than in the failure afterwards: a search nobody
+    // typed is worth saying out loud, and this is also how somebody who set `DUCK_ROBOT` months ago
+    // finds out it is still in force.
+    if let Some(name) = target.wanted().filter(|_| target.from_env) {
+        eprintln!("looking for {name:?} — `DUCK_ROBOT` in this shell's environment");
+    }
     eprintln!("scanning for up to {SCAN_TIME:?}…");
     // **Unfiltered on purpose.** This used to pass `ScanFilter { services: [SERVICE_UUID] }`, on the
     // theory that a busy office would otherwise drown the robot in headphones. But CoreBluetooth
@@ -474,10 +689,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             if duck {
                 advertised.push((peripheral, name));
-            } else if cli.name.as_deref().is_some_and(|w| answers_to(&name, w)) {
+            } else if target.wanted().is_some_and(|w| answers_to(&name, w)) {
                 named.push((peripheral, name));
-            } else if cli.name.is_none() && peripheral.is_connected().await? {
-                // Last resort, and only without `--name`: an unfiltered scan sees every connected
+            } else if target.wanted().is_none() && peripheral.is_connected().await? {
+                // Last resort, and only without a name: an unfiltered scan sees every connected
                 // peripheral on the Mac, so this tier is full of keyboards and earbuds. Each one
                 // costs a connect and a service discovery before it can be ruled out, which is why
                 // an explicit name suppresses the tier entirely rather than being merged into it.
@@ -505,9 +720,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Nothing at all is a fault on this machine rather than a report about robots, and
         // `nothing_found` is where that diagnosis lives. An error, so the exit status says so too.
         if seen.is_empty() {
-            return Err(nothing_found(&seen, None).await.into());
+            return Err(nothing_found(&seen, &target).await.into());
         }
-        println!("{}", listing(&seen, cli.verbose).await);
+        println!("{}", listing(&seen, cli.verbose, &target).await);
         return Ok(());
     }
 
@@ -525,7 +740,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if cli.verbose {
             eprintln!(
                 "nothing advertised the service; trying {} already-connected peripheral(s), which \
-                 may well be earbuds. `--name <robot name>` skips this guesswork",
+                 may well be earbuds. `--name <robot name>`, or `DUCK_ROBOT`, skips this guesswork",
                 connected.len()
             );
         }
@@ -533,29 +748,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if found.is_empty() {
-        return Err(nothing_found(&seen, cli.name.as_deref()).await.into());
+        return Err(nothing_found(&seen, &target).await.into());
     }
 
-    let (peripheral, name) = match &cli.name {
-        Some(wanted) => {
-            // Collected before the search consumes `found`: robots *were* there, they just call
-            // themselves something else, and naming them beats "not in range" for a robot that has
-            // been renamed since whoever is typing last looked.
-            let others: Vec<String> = found.iter().map(|(_, name)| name.clone()).collect();
-            found
-                .into_iter()
-                .find(|(_, name)| answers_to(name, wanted))
-                .ok_or_else(|| {
-                    format!(
-                        "no robot named {wanted:?} in range. These answered to the duck service: \
-                         {}\nA name of the form `alias [advertised]` is one robot reported under \
-                         two names, and either half works.",
-                        others.join(", ")
-                    )
-                })?
-        }
-        None => found.into_iter().next().expect("non-empty"),
-    };
+    let (peripheral, name) = choose(found, &target)?;
     eprintln!("connecting to {name}…");
 
     step(
@@ -631,7 +827,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "jsonrpc": "2.0",
         "id": 0,
         "method": "system.authenticate",
-        "params": { "pin": cli.pin },
+        "params": { "pin": pin },
     });
     let auth = serde_json::to_string(&auth)?;
     if cli.verbose {
@@ -705,6 +901,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return if value.get("error").is_some() {
                     Err("the robot returned an error".into())
                 } else {
+                    // After the reply, and only for one that succeeded: a rename that the robot
+                    // refused leaves nothing stale.
+                    if let Some(note) = target.stale_after_rename(&cli.command) {
+                        eprintln!("{note}");
+                    }
                     Ok(())
                 };
             }
@@ -874,6 +1075,95 @@ mod tests {
         assert!(lists_others(true, 0));
     }
 
+    /// Named candidates, as `choose` takes them.
+    fn candidates(names: &[&str]) -> Vec<(usize, String)> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (i, (*name).to_owned()))
+            .collect()
+    }
+
+    /// A name typed on the command line, which is the ordinary way to reach `choose`.
+    fn asked_for(name: &str) -> Target {
+        Target::new(Some(name.to_owned()), None)
+    }
+
+    /// The ordinary case: one name, one robot, and the composite spelling still resolves.
+    #[test]
+    fn a_name_selects_the_one_robot_that_answers_to_it() {
+        let (which, _) = choose(
+            candidates(&["duck-aaaa", "duck-c51b"]),
+            &asked_for("duck-c51b"),
+        )
+        .expect("the named robot");
+        assert_eq!(which, 1);
+
+        let (which, _) = choose(
+            candidates(&["duck-aaaa", "radxa-zero3 [duck-c51b]"]),
+            &asked_for("duck-c51b"),
+        )
+        .expect("either half of a composite");
+        assert_eq!(which, 1);
+    }
+
+    /// **The safety rule.** Two robots answering to one name is not rare or hypothetical: a board
+    /// whose bootloader leaves `serial-number` empty is named from its hostname, so a bench flashed
+    /// from one image is full of `radxa-zero3`. Whichever the scan reported first is not a choice,
+    /// and the command that lands on it may be `net.connect` with someone's wifi password.
+    #[test]
+    fn a_name_matching_two_robots_is_refused_rather_than_guessed() {
+        let error = choose(
+            candidates(&["radxa-zero3", "radxa-zero3", "duck-c51b"]),
+            &asked_for("radxa-zero3"),
+        )
+        .expect_err("a collision is an error");
+
+        assert!(error.contains("2 robots"), "{error}");
+        // Both are named, so the reader can tell which two collided.
+        assert!(error.contains("radxa-zero3, radxa-zero3"), "{error}");
+        assert!(error.contains("set-name"), "the way out: {error}");
+    }
+
+    /// A collision on a name from the environment says so. This is the failure where provenance
+    /// matters most: nothing on the command line named the robot, and the message is about which of
+    /// two the command would otherwise have written to.
+    #[test]
+    fn a_collision_on_a_default_says_where_the_name_came_from() {
+        let from_env = Target::new(None, Some("radxa-zero3".to_owned()));
+        let error = choose(candidates(&["radxa-zero3", "radxa-zero3"]), &from_env)
+            .expect_err("a collision is an error whoever named it");
+
+        assert!(error.contains("2 robots"), "{error}");
+        assert!(error.contains("DUCK_ROBOT"), "{error}");
+    }
+
+    /// Omitting `--name` is a request to pick one, and it stays one. Making the ambiguity an error
+    /// on this path would break the shorthand on every bench with two boards on it.
+    #[test]
+    fn without_a_name_the_first_candidate_still_wins() {
+        let (which, _) = choose(
+            candidates(&["duck-aaaa", "duck-c51b"]),
+            &Target::new(None, None),
+        )
+        .expect("the first one");
+        assert_eq!(which, 0);
+    }
+
+    /// A name nobody answers to lists what was there, because the usual cause is a robot that has
+    /// been renamed since whoever is typing last looked.
+    #[test]
+    fn a_name_nobody_answers_to_lists_the_robots_that_were_there() {
+        let error = choose(
+            candidates(&["duck-aaaa", "duck-bbbb"]),
+            &asked_for("duck-c51b"),
+        )
+        .expect_err("not in range");
+
+        assert!(error.contains("no robot named"), "{error}");
+        assert!(error.contains("duck-aaaa, duck-bbbb"), "{error}");
+    }
+
     /// `--name` says which robot to talk to and the `name` subcommand's positional says what to
     /// call it, and only an explicit id keeps the two apart. Parsing is pinned rather than left to
     /// review because the failure did not look like a CLI bug: the tool scanned for the new name,
@@ -894,6 +1184,129 @@ mod tests {
         let (line, _) = request_line(&cli.command).expect("a request");
         assert!(line.contains(r#""method":"system.setName""#), "{line}");
         assert!(line.contains(r#""name":"leduckpierre""#), "{line}");
+    }
+
+    /// The point of the whole thing: a robot named by nobody who is typing. The environment has to
+    /// reach the same search `--name` does, and say so, since a default that silently redirects
+    /// every command is worse than no default.
+    #[test]
+    fn the_environment_names_the_robot_when_the_flag_does_not() {
+        let target = Target::new(None, Some("duck-c51b".to_owned()));
+
+        assert_eq!(target.wanted(), Some("duck-c51b"));
+        assert!(target.from_env);
+        assert_eq!(target.source(), "DUCK_ROBOT");
+        let provenance = target.provenance();
+        assert!(
+            provenance.contains("DUCK_ROBOT"),
+            "names the variable: {provenance}"
+        );
+        assert!(
+            provenance.contains("DUCK_ROBOT= "),
+            "and the way out: {provenance}"
+        );
+    }
+
+    /// A command line beats a shell profile, and whoever typed `--name` does not need telling where
+    /// the name came from.
+    #[test]
+    fn the_flag_beats_the_environment() {
+        let target = Target::new(Some("duck-ffff".to_owned()), Some("duck-c51b".to_owned()));
+
+        assert_eq!(target.wanted(), Some("duck-ffff"));
+        assert!(!target.from_env);
+        assert_eq!(target.source(), "--name");
+        assert!(target.provenance().is_empty(), "nothing to disclose");
+    }
+
+    /// Empty is unset, which is why clap's own `env` support is not used: it treats `DUCK_ROBOT=` as
+    /// a value, and a variable exported in a shell profile could then only be escaped by unsetting
+    /// it — for a command being typed on a bench that has somebody else's robot on it.
+    #[test]
+    fn an_empty_value_is_no_default_at_all() {
+        let escaped = Target::new(None, Some(String::new()));
+        assert_eq!(escaped.wanted(), None, "`DUCK_ROBOT= duck-btctl …`");
+        assert!(
+            escaped.provenance().is_empty(),
+            "no name, nothing to explain"
+        );
+
+        let overridden = Target::new(Some(String::new()), Some("duck-c51b".to_owned()));
+        assert_eq!(
+            overridden.wanted(),
+            None,
+            "`--name ''` drops the default too"
+        );
+    }
+
+    /// The rename works, and then every later command searches for a name nothing answers to — which
+    /// reads as a robot that went away rather than a variable that went stale.
+    #[test]
+    fn a_rename_says_when_it_leaves_the_default_stale() {
+        let rename = Command::Name {
+            name: "leduckpierre".to_owned(),
+        };
+        let from_env = Target::new(None, Some("duck-c51b".to_owned()));
+
+        let note = from_env
+            .stale_after_rename(&rename)
+            .expect("the environment still says the old name");
+        assert!(note.contains("duck-c51b"), "what to change: {note}");
+        assert!(note.contains("leduckpierre"), "what it is now: {note}");
+
+        let typed = Target::new(Some("duck-c51b".to_owned()), None);
+        assert!(
+            typed.stale_after_rename(&rename).is_none(),
+            "a `--name` typed once is not still in force"
+        );
+        assert!(
+            from_env
+                .stale_after_rename(&Command::Name {
+                    name: "duck-c51b".to_owned()
+                })
+                .is_none(),
+            "renamed to the name it already answers to"
+        );
+        assert!(
+            from_env.stale_after_rename(&Command::Info).is_none(),
+            "nothing was renamed"
+        );
+    }
+
+    /// `scan` with a default set is read to answer one question — is my robot here — and otherwise
+    /// leaves it as a string comparison done by eye against a column of hex.
+    #[test]
+    fn a_listing_marks_the_robot_the_default_names() {
+        let target = Target::new(None, Some("duck-c51b".to_owned()));
+
+        assert!(target.marks(Some("duck-c51b")));
+        assert!(
+            target.marks(Some("radxa-zero3 [duck-c51b]")),
+            "the macOS pair"
+        );
+        assert!(!target.marks(Some("duck-ffff")));
+        assert!(
+            !target.marks(None),
+            "an unnamed device is not the named one"
+        );
+        assert!(
+            !Target::new(None, None).marks(Some("duck-c51b")),
+            "with no default there is nothing to mark"
+        );
+    }
+
+    /// The PIN matters more than the name does — a robot with a real one needs it on every
+    /// command — and an empty `DUCK_PIN` left over from a script must not become the PIN, or the
+    /// robot answers "wrong PIN" for a PIN nobody chose.
+    #[test]
+    fn the_pin_falls_back_through_the_environment_to_the_factory_default() {
+        let six = |pin: &str| Some(pin.to_owned());
+
+        assert_eq!(resolve_pin(six("111111"), six("222222")), "111111");
+        assert_eq!(resolve_pin(None, six("222222")), "222222");
+        assert_eq!(resolve_pin(None, None), DEFAULT_PIN);
+        assert_eq!(resolve_pin(None, Some(String::new())), DEFAULT_PIN);
+        assert_eq!(resolve_pin(Some(String::new()), six("222222")), "222222");
     }
 
     /// The split is a guess and it can be wrong: a robot whose own name ends in a bracket group is

@@ -100,6 +100,27 @@ is. The raw ssh error for this is a wall of text about a possible attack.
 This matters more than it sounds, because DHCP leases get reused — the address that was one
 board last week is a different board today, with a different key.
 
+## When the board comes back at a different address
+
+The wifi cutover in the middle of provisioning can leave the board on a different lease than the
+one you gave. `provision-board.sh` goes looking: while it waits for ssh it also asks the robot over
+Bluetooth what address it ended up with, and adopts the answer.
+
+```
+  bluetooth: the robot reports 192.168.1.57, and 192.168.1.42 was its old lease.
+```
+
+Nothing to do — the rest of the run is addressed there.
+
+Three things stop it working, and it says which:
+
+- It needs `cargo` and this clone, because `duck-btctl` is an example rather than an installed binary.
+- It can only ask once `btd` is running, which on a board being provisioned for the first time is a
+  few minutes into phase 2.
+- The robot reports its **wifi** address, so a board you reach over ethernet is not covered.
+
+`--no-ble` turns it off. A robot that has been given its own pairing PIN needs it in `DUCK_PIN`.
+
 ## Making an existing board take dev builds
 
 For a board provisioned some other way, or one set up before you had the key. Both halves are

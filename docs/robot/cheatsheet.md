@@ -136,6 +136,45 @@ sudo systemctl stop padd
 sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
 ```
 
+When the link itself is the suspect, copy the measurement over from a clone of this repo:
+
+```
+scp scripts/pad-link-test.sh radxa@<board>:/tmp/
+```
+
+Drops already in `padd`'s journal — no pad needed, and it answers immediately:
+
+```
+sudo sh /tmp/pad-link-test.sh --history
+```
+
+Or measure it now, keeping the sticks moving for the whole two minutes:
+
+```
+sudo sh /tmp/pad-link-test.sh
+```
+
+It counts drops against the kernel's own reason for each, and times the gaps between the pad's
+input reports — the failure `padd` cannot see, where the link stays up and the robot walks on a
+stale command. [`pair-a-gamepad.md`](pair-a-gamepad.md#when-it-drops-while-you-are-driving) reads
+the numbers.
+
+When two boards behave differently with the same pad, the difference is in the stack under it:
+
+```
+scp scripts/pad-stack-report.sh radxa@<board>:/tmp/
+```
+
+```
+sudo sh /tmp/pad-stack-report.sh
+```
+
+Kernel, BlueZ, controller firmware, LE or BR/EDR, and the pad's own firmware revision — printed and
+saved to `/tmp/pad-stack-<host>-<when>.log`. `--fingerprint` prints only the values that must match
+between two boards, for `diff`.
+[`pair-a-gamepad.md`](pair-a-gamepad.md#is-this-board-running-the-same-stack-as-that-one) has the
+comparison.
+
 ### Wifi (`configd`)
 
 ```

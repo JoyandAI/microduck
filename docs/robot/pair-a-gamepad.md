@@ -98,6 +98,83 @@ sudo btmon -t > /tmp/btmon.log 2>&1 &
 Pair, then `sudo pkill btmon` and look for `SMP: Pairing Failed` and the reason beside it. That is
 the one instrument that distinguishes a board setting from a pad that is not listening.
 
+## When it drops while you are driving
+
+Copy the measurement onto the board, from a clone of this repo:
+
+```bash
+scp scripts/pad-link-test.sh radxa@<board>:/tmp/
+```
+
+What has already happened, out of `padd`'s journal — no pad needed, and it answers immediately:
+
+```bash
+sudo sh /tmp/pad-link-test.sh --history
+```
+
+To measure the link now, with the pad on and `padd` running. **Keep the sticks moving for the whole
+two minutes**: a pad at rest sends nothing, and silence reads exactly like a stalled link.
+
+```bash
+sudo sh /tmp/pad-link-test.sh
+```
+
+It counts drops, and the gaps between the pad's input reports while it is connected. A gap past
+500 ms is the robot stopping — `robotd` zeroes the velocity there. Every drop is followed by the
+kernel's reason: `0x08` is a supervision timeout, which means range or interference, and `0x13`
+means somebody switched the pad off.
+
+Putting the pad down is not a stall, and is not counted as one — but it is time the measurement
+learns nothing from, so the report says how much of the window you actually drove, and declines to
+judge a link it barely saw.
+
+Walking away from the robot while it watches is how you find the range.
+
+## Is this board running the same stack as that one
+
+A pad that stalls on one robot and not on its twin is usually not the pad. Two boards built weeks
+apart run different kernels, different BlueZ, different controller firmware, and pads on different
+pad firmware — and none of that is visible in `pad status`.
+
+Copy the report onto each board, from a clone of this repo:
+
+```bash
+scp scripts/pad-stack-report.sh radxa@<board>:/tmp/
+```
+
+```bash
+sudo sh /tmp/pad-stack-report.sh
+```
+
+It prints the whole stack and saves the same text to `/tmp/pad-stack-<host>-<when>.log`: kernel,
+BlueZ, the adapter's HCI version, which radio it is and the firmware the kernel loaded for it at
+boot, what is carrying HID, which keys the bond holds, the transport in use right now, and the pad's
+own firmware revision. It runs without root, and says `unreadable` for the three things that need
+it.
+
+To compare two boards, ask each for only the values that have to match:
+
+```bash
+ssh radxa@<board-a> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/a.fp
+```
+
+```bash
+ssh radxa@<board-b> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/b.fp
+```
+
+```bash
+diff /tmp/a.fp /tmp/b.fp
+```
+
+No output means the same stack. The fingerprint carries no timestamps and no addresses, so anything
+`diff` prints is a real difference.
+
+Two lines to read before the rest. `transport` is `LE` on every pad tried so far, and a board that
+says `BR/EDR` is putting the pad through the kernel's classic HID path instead of BlueZ's — a
+different driver, different button numbering. `input` is the `Bus`/`Vendor`/`Product`/`Version`
+quadruple that SDL and `gilrs` hash into a mapping GUID: two boards differing there have different
+axis and button mappings, whatever else matches.
+
 ---
 
 Driving — the controls, the speed limits, and running `padd` from a laptop over a forwarded socket —
