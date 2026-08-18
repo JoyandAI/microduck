@@ -14,7 +14,7 @@
 //! arrive on the socket, and a UI that can only notice a keystroke when the robot happens
 //! to send a frame stops responding the moment the robot does.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
@@ -63,6 +63,51 @@ const HEADER_HEIGHT: u16 = 8;
 /// Request id for the subscribe call, so its answer can be told apart from the stream that
 /// follows it on the same connection.
 const SUBSCRIBE_ID: u64 = 1;
+
+/// Rows the pad block occupies while it is open: two borders, the cadence, the gap trace, three
+/// rows of axes and the buttons.
+///
+/// Fixed, like the header and for the same reason — but *only while open*. Toggling it is a
+/// deliberate act, and everything below moving then is what the reader asked for.
+const PAD_HEIGHT: u16 = 8;
+
+/// Rows of axis cells the pad block draws.
+///
+/// Three fits every axis of an Xbox pad from 80 columns up, and the caption says how many were left
+/// out when they do not fit — a grid that stops where the room ran out, with nothing saying so, is
+/// a pad drawn as though it had fewer axes than it has.
+const AXIS_ROWS: usize = 3;
+
+/// Columns one axis cell needs: six for the name, nine of bar, eight for the raw value, and the
+/// space that separates it from the cell before it.
+const AXIS_CELL: u16 = 24;
+
+/// Full height of the gap trace, milliseconds.
+///
+/// The point where a late report starts to be felt, **not** the deadman. Drawn to the deadman a
+/// healthy link is a blank row — an 8 ms gap is 1.6% of 500 and rounds away — and a trace that is
+/// empty while everything works cannot be told from one that is not being fed. At this scale an
+/// ordinary report is a low bar, sticky is full height, and a stall past the deadman saturates: its
+/// size is on the cadence line, where a number can say 620 without needing 620 rows.
+const GAP_FULL_SCALE_MS: u64 = proto::pad_link::NOTABLE_MS;
+
+/// How many report gaps the pad trace keeps. As with the loop trace, more than any terminal is
+/// wide, so the window is bounded by the display.
+const GAP_SAMPLES: usize = 600;
+
+/// How long to wait before reaching for `padd`'s tap again.
+///
+/// Longer than the socket's own restart delay would be pointless precision — `padd.service` waits
+/// five seconds between attempts, so this will usually catch it on the second or third try — and
+/// short enough that a pad tap started after the monitor turns up while somebody is still watching.
+const PAD_RETRY: Duration = Duration::from_secs(2);
+
+/// Gaps the cadence figure is averaged over.
+///
+/// A rate from the whole history answers "how has this link been", which the trace already shows.
+/// The number beside it should answer "how is it now", and a second of reports is what a hand on a
+/// stick can feel.
+const CADENCE_WINDOW: usize = 100;
 
 /// Which unit the angles on screen are drawn in.
 ///
@@ -132,13 +177,21 @@ impl Units {
     }
 }
 
-/// What the reader thread has to say.
+/// What a reader thread has to say.
 enum Update {
     State(Box<proto::RobotState>),
     /// The subscribe acknowledgement, which names the policy this `robotd` is running.
     Policy(Box<proto::SubscribeResult>),
     /// The stream ended. Carries the sentence to exit with.
     Ended(String),
+    /// One report from `padd`'s raw pad tap.
+    Pad(Box<proto::PadReport>),
+    /// The tap is not there, or stopped.
+    ///
+    /// **Not fatal, unlike [`Self::Ended`].** The pad tap is a second connection to a second
+    /// daemon, and a monitor that quit because `padd` was stopped would be a monitor that stops
+    /// working on every robot nobody has paired a pad to.
+    PadLost(String),
 }
 
 /// Subscribe to `robot.state` and render it until interrupted.
@@ -146,7 +199,7 @@ enum Update {
 /// Never returns `Ok` on its own: `q`/`Ctrl-C` is the exit in the live view, Ctrl-C alone in
 /// the piped one. A closed socket is an error either way — that is what `robotd` restarting
 /// mid-update looks like, and it is worth seeing rather than hanging through.
-pub fn run(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> {
+pub fn run(robot_socket: &Path, pad_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> {
     let mut client = Client::connect_to("robotd", robot_socket)?;
     let call = proto::Call::RobotSubscribe(proto::SubscribeParams {
         hz: (hz > 0).then_some(hz),
@@ -166,7 +219,13 @@ pub fn run(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> {
     let _writer = writer;
 
     let (tx, rx) = mpsc::channel();
+    let pad_tx = tx.clone();
+    let pad_socket = pad_socket.to_path_buf();
     thread::spawn(move || read_states(reader, &tx));
+    // Its own thread and its own connection, for the same reason the robot's stream has one: a
+    // blocking read on either socket must not be able to hold up the other, and `padd`'s tap goes
+    // quiet for minutes at a time whenever nobody is touching the sticks.
+    thread::spawn(move || read_pad(&pad_socket, &pad_tx));
 
     let mut terminal = ratatui::init();
     let outcome = live(&mut terminal, &rx, hz);
@@ -287,6 +346,84 @@ fn decode(line: &str) -> Option<Update> {
         .map(|r| Update::Policy(Box::new(r)))
 }
 
+/// Read `padd`'s raw pad tap on a thread of its own, reconnecting for as long as the view lives.
+///
+/// Every way this ends is a sentence for the pad block rather than an error for the process. The tap
+/// is a debug facility on a second daemon: it is absent on a robot with no pad paired, absent while
+/// `padd` is stopped, and absent on a release older than the one that added it — and none of those is
+/// a reason for `robotctl monitor` to stop showing the robot.
+///
+/// **It retries, because `padd` restarting is routine rather than exceptional.** Its unit is
+/// `Restart=always`, and it exits deliberately whenever `robotd`'s socket is not there — during
+/// every update, for one. A reader that gave up on the first refusal would leave a monitor session
+/// that outlived one restart permanently blind to the pad, with a stale sentence explaining why.
+fn read_pad(socket: &Path, tx: &mpsc::Sender<Update>) {
+    loop {
+        // The reason is reported on every attempt rather than only when it changes: the block is
+        // where it is read, and it is read whenever someone presses `p`, which may be long after.
+        if let Err(why) = subscribe_to_pad(socket, tx)
+            && tx.send(Update::PadLost(why)).is_err()
+        {
+            return; // the UI is gone
+        }
+        thread::sleep(PAD_RETRY);
+    }
+}
+
+/// One connection to the tap, from its subscribe to whatever ended it.
+fn subscribe_to_pad(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), String> {
+    let mut client = Client::connect_to("padd", socket).map_err(|e| e.message)?;
+    client
+        .send(&proto::Request::call(
+            proto::Id::Number(SUBSCRIBE_ID),
+            &proto::Call::PadInput,
+        ))
+        .map_err(|e| e.message)?;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        return Err(match client.reader.read_line(&mut line) {
+            Err(e) => format!("the pad tap stopped: {e}"),
+            Ok(0) => "padd closed the pad tap".to_owned(),
+            Ok(_) => match decode_pad(&line) {
+                // A refusal, which `padd` gives only where it cannot read input devices at all.
+                Some(Err(refused)) => refused,
+                Some(Ok(report)) => {
+                    if tx.send(Update::Pad(Box::new(report))).is_err() {
+                        return Ok(()); // the UI is gone
+                    }
+                    continue;
+                }
+                None => continue,
+            },
+        });
+    }
+}
+
+/// One line of the tap: a report, a refusal, or something this build has no use for.
+fn decode_pad(line: &str) -> Option<Result<proto::PadReport, String>> {
+    if let Ok(request) = serde_json::from_str::<proto::Request>(line)
+        && let Some(report) = request.as_pad_report()
+    {
+        return Some(Ok(report));
+    }
+    let response = serde_json::from_str::<proto::Response>(line).ok()?;
+    if response.id != Some(proto::Id::Number(SUBSCRIBE_ID)) {
+        return None;
+    }
+    if let Some(error) = response.error {
+        return Some(Err(error.message));
+    }
+    match response.result_as::<proto::PadInputResult>() {
+        Ok(result) if !result.accepted => Some(Err(result
+            .reason
+            .unwrap_or_else(|| "padd refused the subscription".to_owned()))),
+        // Accepted. The pad itself arrives as `PadReport::Attached`, so there is nothing to say.
+        _ => None,
+    }
+}
+
 /// The live view's loop: absorb whatever has arrived, honour the keyboard, repaint.
 fn live(terminal: &mut DefaultTerminal, rx: &Receiver<Update>, hz: u32) -> Result<(), Failure> {
     // A frame every `1/hz`, so waiting a fifth of a period keeps the keyboard responsive
@@ -334,6 +471,12 @@ fn live(terminal: &mut DefaultTerminal, rx: &Receiver<Update>, hz: u32) -> Resul
                         view.toggle_units();
                         fresh = true;
                     }
+                    // The pad's own event stream. Off by default: it is worth eight rows only to
+                    // someone asking about the pad, and those rows come out of the joints table.
+                    KeyCode::Char('p') => {
+                        view.toggle_pad();
+                        fresh = true;
+                    }
                     _ => {}
                 },
                 // A resize changes what fits, and the next frame may be a whole period away.
@@ -376,6 +519,189 @@ fn terminal_failure(e: std::io::Error) -> Failure {
     Failure::new(exit::FAILED, format!("terminal error: {e}"))
 }
 
+/// The pad's own event stream, as the monitor accumulates it.
+///
+/// **Everything here is derived from raw reports, and nothing here is `padd`'s opinion.** That is
+/// the point of the tap: `padd` is the process whose view of the pad is already known to be
+/// misleading — it resends the last stick value at 50 Hz, so a link that has stopped delivering
+/// still looks like a driver with a hand on the stick from everywhere downstream.
+#[derive(Default)]
+struct PadView {
+    /// Why there is nothing to show, when there is nothing: no tap on this robot, `padd` stopped,
+    /// or a pad that has gone away. Never left blank — a pad block that is simply empty is the one
+    /// failure mode a debug view must not have.
+    trouble: Option<String>,
+    /// The device the reports are coming from. Every number below is read against it.
+    device: Option<proto::PadInputDevice>,
+    /// Where each axis is now, by evdev code. Seeded from the device so an untouched stick has a
+    /// position rather than a blank.
+    axes: HashMap<u16, i32>,
+    held: HashSet<u16>,
+    /// When the last report arrived *here*.
+    ///
+    /// The monitor's own clock, deliberately: [`proto::PadFrame::at_us`] is the robot's, and this
+    /// view is often running on a laptop whose clock has no relationship to it. Sub-millisecond
+    /// socket latency is noise against a gap that matters.
+    arrived: Option<Instant>,
+    reports: u64,
+    /// Gaps between reports while the sticks were moving, newest first, milliseconds.
+    gaps: VecDeque<u64>,
+    worst_ms: u64,
+    over_notable: u64,
+    over_deadman: u64,
+    /// Spells of silence past [`proto::pad_link::IDLE_MS`]: a pad at rest, not a link that stopped.
+    quiet: u64,
+    /// Reports the kernel discarded because `padd` fell behind — `SYN_DROPPED`. Says nothing about
+    /// the radio, and makes the gap around it meaningless.
+    after_drops: u64,
+    /// Reports dropped between `padd` and here, because this monitor fell behind.
+    socket_dropped: u64,
+    /// Times the robot's realtime clock stepped backwards between two reports. Expected exactly
+    /// once on a board with no RTC, when its first NTP reply lands.
+    clock_steps: u64,
+}
+
+impl PadView {
+    /// Take one report.
+    fn absorb(&mut self, report: proto::PadReport) {
+        match report {
+            proto::PadReport::Attached { device } => {
+                // A new device is a new measurement: the counters and the trace describe *a link*,
+                // and carrying the old ones over would blame this pad for the last one's stalls.
+                let device = *device;
+                self.axes = device.axes.iter().map(|a| (a.code, a.value)).collect();
+                self.held = device
+                    .buttons
+                    .iter()
+                    .filter(|b| b.pressed)
+                    .map(|b| b.code)
+                    .collect();
+                self.device = Some(device);
+                self.trouble = None;
+                self.arrived = None;
+                self.reports = 0;
+                self.gaps.clear();
+                self.worst_ms = 0;
+                self.over_notable = 0;
+                self.over_deadman = 0;
+                self.quiet = 0;
+                self.after_drops = 0;
+                self.socket_dropped = 0;
+                self.clock_steps = 0;
+            }
+            proto::PadReport::Detached { why } => {
+                // The device goes, the counters stay: they are what someone reads *after* the pad
+                // dropped, and clearing them here would erase the evidence at the moment it
+                // became interesting.
+                self.device = None;
+                self.trouble = Some(why);
+            }
+            proto::PadReport::Frame(frame) => self.frame(frame),
+        }
+    }
+
+    fn frame(&mut self, frame: proto::PadFrame) {
+        self.reports += 1;
+        self.arrived = Some(Instant::now());
+        self.socket_dropped += frame.socket_dropped;
+        if frame.after_drop {
+            self.after_drops += 1;
+        }
+
+        for event in &frame.events {
+            if event.is_axis() {
+                self.axes.insert(event.code, event.value);
+            } else if event.is_button() {
+                // Non-zero, not `== 1`: a repeat arrives as 2, and treating it as a release would
+                // show a held button letting go while it is being held down.
+                if event.value != 0 {
+                    self.held.insert(event.code);
+                } else {
+                    self.held.remove(&event.code);
+                }
+            }
+        }
+
+        let Some(since_us) = frame.since_us else {
+            return; // the first report after attaching: nothing to measure from
+        };
+        if since_us < 0 {
+            self.clock_steps += 1;
+            return;
+        }
+        // The gap after a `SYN_DROPPED` spans events the kernel threw away, so it measures this
+        // reader falling behind rather than the link. Counted as neither a stall nor a quiet spell.
+        if frame.after_drop {
+            return;
+        }
+
+        let ms = (since_us / 1_000) as u64;
+        if ms > proto::pad_link::IDLE_MS {
+            self.quiet += 1;
+            return;
+        }
+        if self.gaps.len() == GAP_SAMPLES {
+            self.gaps.pop_back();
+        }
+        self.gaps.push_front(ms);
+        self.worst_ms = self.worst_ms.max(ms);
+        if ms > proto::pad_link::NOTABLE_MS {
+            self.over_notable += 1;
+        }
+        if ms > proto::pad_link::DEADMAN_MS {
+            self.over_deadman += 1;
+        }
+    }
+
+    /// Reports per second while the sticks are moving, over the last [`CADENCE_WINDOW`] gaps.
+    ///
+    /// Against elapsed time this would read as a catastrophically slow pad the moment anyone pauses,
+    /// which is every real session — the same trap `scripts/pad-link-test.sh` rates against driving
+    /// time to avoid.
+    fn cadence(&self) -> Option<f64> {
+        let window: Vec<u64> = self.gaps.iter().copied().take(CADENCE_WINDOW).collect();
+        if window.is_empty() {
+            return None;
+        }
+        let mean = window.iter().sum::<u64>() as f64 / window.len() as f64;
+        (mean > 0.0).then(|| 1_000.0 / mean)
+    }
+
+    /// How long since a report, and what that silence means.
+    fn silence(&self) -> Option<(Duration, Silence)> {
+        let age = self.arrived?.elapsed();
+        let ms = age.as_millis() as u64;
+        let verdict = if ms > proto::pad_link::IDLE_MS {
+            Silence::Idle
+        } else if ms > proto::pad_link::DEADMAN_MS {
+            Silence::PastTheDeadman
+        } else if ms > proto::pad_link::NOTABLE_MS {
+            Silence::Notable
+        } else {
+            Silence::Arriving
+        };
+        Some((age, verdict))
+    }
+}
+
+/// What the time since the last report means.
+///
+/// The distinction between the last two is the whole difficulty of measuring a pad link, and
+/// getting it wrong is not hypothetical: counting quiet as a stall is how the first measurement on
+/// this robot reported three breaches of the deadman — the longest 75 seconds — on a link that
+/// never faltered. A pad on a table sends nothing, and nothing is what a dead radio sends too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Silence {
+    /// Reports are arriving.
+    Arriving,
+    /// Late enough to feel sticky.
+    Notable,
+    /// Late enough that `robotd` has zeroed the velocity — if the sticks were moving.
+    PastTheDeadman,
+    /// Longer than any link stays up while silent, so it is the sticks at rest.
+    Idle,
+}
+
 /// Everything on screen, plus the little history the trace needs.
 struct View {
     /// Requested rate, for judging whether the stream has stalled.
@@ -404,6 +730,11 @@ struct View {
     /// What every angle on screen is drawn in. Degrees to start with: this view is read while
     /// looking at the robot, and a leg is a picture in degrees and arithmetic in radians.
     units: Units,
+    /// The pad's raw event stream. Accumulated whether or not it is on screen, so opening the block
+    /// shows a link's history rather than starting a measurement from the keypress.
+    pad: PadView,
+    /// Is the pad block open? Closed to begin with — see [`PAD_HEIGHT`].
+    show_pad: bool,
 }
 
 impl View {
@@ -419,11 +750,17 @@ impl View {
             scroll: 0,
             visible: 0,
             units: Units::Degrees,
+            pad: PadView::default(),
+            show_pad: false,
         }
     }
 
     fn toggle_units(&mut self) {
         self.units = self.units.toggled();
+    }
+
+    fn toggle_pad(&mut self) {
+        self.show_pad = !self.show_pad;
     }
 
     /// Move the joint window. Clamped on render, where the number of rows that fit is known.
@@ -448,6 +785,17 @@ impl View {
             Update::Policy(policy) => {
                 self.policy = Some(*policy);
                 Ok(true)
+            }
+            Update::Pad(report) => {
+                self.pad.absorb(*report);
+                // A repaint even while the block is closed would be a redraw per report, at up to
+                // 125 a second, for something nobody is looking at.
+                Ok(self.show_pad)
+            }
+            Update::PadLost(why) => {
+                self.pad.device = None;
+                self.pad.trouble = Some(why);
+                Ok(self.show_pad)
             }
             Update::State(state) => {
                 if self.trace.len() == TRACE_SAMPLES {
@@ -491,12 +839,18 @@ impl View {
         // scrolled off the bottom is still reachable, whereas a missing loop rate is the one
         // number that says whether the others can be trusted at all. Capped at six because a
         // mostly-flat rate drawn twenty rows tall is a wall of ink, not more information.
+        //
+        // The pad block, when open, sits directly under the header rather than at the bottom: it is
+        // the *source* of the command the header reports, and the frame then reads top to bottom in
+        // the order the robot does — sticks, command, joints, loop rate.
+        let pad_height = if self.show_pad { PAD_HEIGHT } else { 0 };
         let trace_height = area
             .height
-            .saturating_sub(HEADER_HEIGHT + rows as u16 + 3)
+            .saturating_sub(HEADER_HEIGHT + pad_height + rows as u16 + 3)
             .clamp(3, 6);
-        let [header, joints, trace] = Layout::vertical([
+        let [header, pad, joints, trace] = Layout::vertical([
             Constraint::Length(HEADER_HEIGHT),
+            Constraint::Length(pad_height),
             Constraint::Min(4),
             Constraint::Length(trace_height),
         ])
@@ -510,6 +864,9 @@ impl View {
         let state = self.latest.as_ref().expect("a state, checked above");
 
         self.render_header(frame, header, state);
+        if self.show_pad {
+            self.render_pad(frame, pad);
+        }
         frame.render_stateful_widget(
             self.joints(state, rows, visible),
             joints,
@@ -540,8 +897,13 @@ impl View {
                 // The units key is named next to the others because a reader who does not know
                 // it exists has no way to discover that the numbers could be radians instead.
                 Line::from(format!(
-                    " q quits · ↑↓ scrolls · u {} ",
-                    self.units.toggled().name()
+                    " q quits · ↑↓ scrolls · u {} · p {} ",
+                    self.units.toggled().name(),
+                    if self.show_pad {
+                        "hides the pad"
+                    } else {
+                        "the raw pad"
+                    }
                 ))
                 .dim()
                 .right_aligned(),
@@ -841,6 +1203,325 @@ impl View {
         )
     }
 
+    /// The pad's own event stream: what the sticks are doing, and whether the reports carrying
+    /// that are arriving.
+    ///
+    /// The second half is the reason this exists. A stick position is also visible in the header's
+    /// `asked` column, one layer of interpretation later; the *cadence* of the reports behind it is
+    /// visible nowhere else, and it is what fails when a robot walks on a command nobody is giving.
+    fn render_pad(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        // Before the block, because the caption has to say how many axes fit and the block is built
+        // once. Two columns of border come off the width the cells get.
+        let columns = usize::from(area.width.saturating_sub(2) / AXIS_CELL).max(1);
+        let axis_count = self.pad.device.as_ref().map_or(0, |d| d.axes.len());
+
+        let block = Block::bordered()
+            .title(Line::from(self.pad_title()))
+            .title_bottom(Line::from(self.pad_caption(columns, axis_count)).dim())
+            .title_bottom(Line::from(self.pad_alarms()).right_aligned());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(device) = self.pad.device.as_ref() else {
+            frame.render_widget(Paragraph::new(self.pad_absence()), inner);
+            return;
+        };
+
+        // Fixed rows, in the order the questions arrive: is it arriving, has it been arriving, and
+        // what is it saying.
+        let [cadence, gaps, axes, held] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(AXIS_ROWS as u16),
+            Constraint::Length(1),
+        ])
+        .areas::<4>(inner);
+
+        frame.render_widget(self.pad_cadence(), cadence);
+        // A label beside the trace rather than a title above it: a bordered block for one row of
+        // sparkline would cost three rows to draw one.
+        let [label, trace] =
+            Layout::horizontal([Constraint::Length(10), Constraint::Min(8)]).areas::<2>(gaps);
+        frame.render_widget(Paragraph::new(Line::from(" gap ms").dim()), label);
+        frame.render_widget(self.pad_gaps(), trace);
+        frame.render_widget(Paragraph::new(self.pad_axes(device, columns)), axes);
+        frame.render_widget(Paragraph::new(self.pad_held(device)), held);
+    }
+
+    /// Which pad, on which node, over what.
+    fn pad_title(&self) -> Vec<Span<'static>> {
+        let Some(device) = self.pad.device.as_ref() else {
+            return vec![Span::raw(" pad · raw input ")];
+        };
+        let mut title = vec![
+            Span::raw(" pad "),
+            Span::styled(
+                device.name.clone(),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" · {} ", device.node)).dim(),
+        ];
+        if let Some(unique) = device.unique.as_deref() {
+            // The address, because it is the join key: a `btmon` capture of the same minutes is
+            // keyed on it, and this stream's timestamps are the kernel's, on the same clock.
+            title.push(Span::raw(format!("· {unique} ")).dim());
+        }
+        if !device.over_bluetooth() {
+            // A pad on a cable has no link to measure. Saying so beats reporting a flawless one —
+            // `pad-link-test.sh` refuses to run at all in this case.
+            title.push(Span::styled(
+                "· on USB, so there is no radio here ",
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        title
+    }
+
+    /// What the trace is drawn to, and how much of a link is behind it.
+    ///
+    /// On the border rather than in a row of its own, and always present: a sparkline with no stated
+    /// scale is a shape, not a measurement, and the reader cannot tell a low bar from a short one.
+    fn pad_caption(&self, columns: usize, axes: usize) -> Vec<Span<'static>> {
+        // Terse on purpose. A bottom border is clipped from the right, and the count of what is
+        // hidden sits at the end — so every word spent on the scale is a word that can push the
+        // notice off a narrow screen. "Newest right" is not repeated here: the loop-rate trace
+        // directly below says it, and both are drawn the same way.
+        let mut caption = vec![Span::raw(format!(
+            " {} reports · gap ≤{} ms ",
+            self.pad.reports, GAP_FULL_SCALE_MS
+        ))];
+        // Never silently short: a grid that stops at the last cell that happened to fit is a pad
+        // presented as having fewer axes than it has. The same rule the joints table follows.
+        let room = columns * AXIS_ROWS;
+        if axes > room {
+            caption.push(Span::raw(format!("· {room} of {axes} axes ")));
+        }
+        caption
+    }
+
+    /// The counters that only ever mean something went wrong, on the block's bottom border.
+    ///
+    /// Kept out of the rows above because they are almost always zero and each one invalidates a
+    /// different part of what is above it — a caption is where a qualification belongs.
+    fn pad_alarms(&self) -> Vec<Span<'static>> {
+        let pad = &self.pad;
+        let mut alarms = Vec::new();
+        if pad.after_drops > 0 {
+            alarms.push(Span::styled(
+                format!(
+                    " syn_dropped {} — padd fell behind, not the radio ",
+                    pad.after_drops
+                ),
+                Style::new().fg(Color::Magenta),
+            ));
+        }
+        if pad.socket_dropped > 0 {
+            alarms.push(Span::styled(
+                format!(
+                    " {} reports dropped reaching this view ",
+                    pad.socket_dropped
+                ),
+                Style::new().fg(Color::Magenta),
+            ));
+        }
+        if pad.clock_steps > 0 {
+            alarms.push(Span::styled(
+                format!(" the robot's clock stepped {}× ", pad.clock_steps),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        if alarms.is_empty() {
+            // Not blank: "nothing has invalidated any of this" is a thing the reader needs told,
+            // and an empty border is indistinguishable from a view that does not check.
+            alarms.push(Span::raw(" reports intact ").dim());
+        }
+        alarms
+    }
+
+    /// Why there is nothing to show. Always says what to do next.
+    fn pad_absence(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![match self.pad.trouble.as_deref() {
+            Some(trouble) => Line::from(vec![
+                Span::raw(" no raw pad stream · "),
+                Span::styled(trouble.to_owned(), Style::new().fg(Color::Yellow)),
+            ]),
+            None => Line::from(" waiting for padd to open a pad…").dim(),
+        }];
+        lines.push(
+            Line::from(
+                " `robotctl pad status` says whether a pad is connected and whether padd is running.",
+            )
+            .dim(),
+        );
+        // The counters outlive the device on purpose, so a pad that has just dropped still has its
+        // measurement on screen — that is the moment someone looks.
+        if self.pad.reports > 0 {
+            lines.push(Line::from(vec![
+                Span::raw(format!(
+                    " last link · {} reports · worst gap {} ms · over {} ms {} · over {} ms ",
+                    self.pad.reports,
+                    self.pad.worst_ms,
+                    proto::pad_link::NOTABLE_MS,
+                    self.pad.over_notable,
+                    proto::pad_link::DEADMAN_MS,
+                )),
+                Span::styled(
+                    self.pad.over_deadman.to_string(),
+                    if self.pad.over_deadman > 0 {
+                        Style::new().fg(Color::Red)
+                    } else {
+                        Style::new().dim()
+                    },
+                ),
+            ]));
+        }
+        lines
+    }
+
+    /// Is it arriving, and how fast.
+    fn pad_cadence(&self) -> Paragraph<'static> {
+        let pad = &self.pad;
+        // Before any report there is no rate, no age and no worst gap, and a row of dashes and
+        // zeroes would read as a link delivering nothing rather than as a pad nobody has touched.
+        // An evdev device is silent until something moves, so this is the ordinary opening state.
+        if pad.reports == 0 {
+            return Paragraph::new(
+                Line::from(" cadence  nothing yet — an evdev pad sends nothing until it moves")
+                    .dim(),
+            );
+        }
+
+        let mut line = vec![Span::raw(" cadence  ")];
+        match pad.cadence() {
+            Some(rate) => line.push(Span::styled(
+                format!("{rate:.0}/s"),
+                Style::new().fg(Color::Cyan),
+            )),
+            // Not "0/s": reports have arrived but no gap has been measurable yet — one report, or
+            // nothing but quiet spells — and a zero rate reads as a dead link.
+            None => line.push(Span::raw("—").dim()),
+        }
+        line.push(Span::raw(" while driving · last ").dim());
+
+        match pad.silence() {
+            Some((age, verdict)) => {
+                let (word, style) = match verdict {
+                    Silence::Arriving => (String::new(), Style::new().fg(Color::Green)),
+                    Silence::Notable => (" — sticky".to_owned(), Style::new().fg(Color::Yellow)),
+                    Silence::PastTheDeadman => (
+                        format!(" — past the {} ms deadman", proto::pad_link::DEADMAN_MS),
+                        Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    // The distinction that matters: this is a pad on a table, not a dead radio.
+                    Silence::Idle => (
+                        " — the sticks are still".to_owned(),
+                        Style::new().add_modifier(Modifier::DIM),
+                    ),
+                };
+                line.push(Span::styled(format!("{} ms ago", age.as_millis()), style));
+                if !word.is_empty() {
+                    line.push(Span::styled(word, style));
+                }
+            }
+            None => line.push(Span::raw("nothing yet").dim()),
+        }
+
+        line.push(Span::raw(format!(
+            " · worst {} ms · over {} ms {} · over {} ms ",
+            self.pad.worst_ms,
+            proto::pad_link::NOTABLE_MS,
+            self.pad.over_notable,
+            proto::pad_link::DEADMAN_MS,
+        )));
+        line.push(Span::styled(
+            self.pad.over_deadman.to_string(),
+            if self.pad.over_deadman > 0 {
+                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().dim()
+            },
+        ));
+        if self.pad.quiet > 0 {
+            line.push(Span::raw(format!(" · {} quiet spells", self.pad.quiet)).dim());
+        }
+
+        Paragraph::new(Line::from(line))
+    }
+
+    /// Every gap between reports while driving, newest right.
+    ///
+    /// Drawn to a fixed [`GAP_FULL_SCALE_MS`] rather than to the tallest gap on screen: an
+    /// auto-scaled trace moves its own baseline as the window slides, so a link stalling every
+    /// second draws exactly like a healthy one. Quiet spells are left out entirely — they are the
+    /// operator's hand, and a full-height bar for every pause would bury the stalls this is
+    /// looking for.
+    fn pad_gaps(&self) -> Sparkline<'static> {
+        // Floored at one level, which is the smallest mark a sparkline can make. An 8 ms gap is 8%
+        // of the scale and rounds to a blank cell, so a link behaving perfectly drew an empty row —
+        // indistinguishable from a trace nobody is feeding, which is the one thing it must not be.
+        // A bar at the floor claims only "a report arrived here, below the first step the row can
+        // resolve"; the cadence line carries the precision.
+        // `div_ceil`, not `/`: a sparkline row is eight ticks and the widget scales with integer
+        // arithmetic, so `max / 8` lands a tick *below* the first one that draws anything.
+        let floor = GAP_FULL_SCALE_MS.div_ceil(8);
+        let gaps: Vec<u64> = self.pad.gaps.iter().map(|ms| (*ms).max(floor)).collect();
+        Sparkline::default()
+            .data(gaps)
+            .direction(RenderDirection::RightToLeft)
+            .max(GAP_FULL_SCALE_MS)
+            .style(Style::new().fg(Color::Cyan))
+    }
+
+    /// Where every axis is, against the range the device declares for it.
+    fn pad_axes(&self, device: &proto::PadInputDevice, columns: usize) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let mut axes = device.axes.iter();
+        for _ in 0..AXIS_ROWS {
+            let row: Vec<&proto::PadAxis> = axes.by_ref().take(columns).collect();
+            if row.is_empty() {
+                break;
+            }
+            let mut spans = Vec::new();
+            for axis in row {
+                spans.extend(axis_cell(axis, self.pad.axes.get(&axis.code).copied()));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines
+    }
+
+    /// Which buttons are down, by the name the kernel gives them.
+    ///
+    /// Raw names rather than `padd`'s vocabulary — `BTN_START`, not "Start". The mapping from one to
+    /// the other is gilrs's SDL database, and a pad whose Start does nothing is a pad someone needs
+    /// the raw code of.
+    fn pad_held(&self, device: &proto::PadInputDevice) -> Line<'static> {
+        let mut names: Vec<String> = device
+            .buttons
+            .iter()
+            .filter(|button| self.pad.held.contains(&button.code))
+            .map(|button| button.name.clone())
+            .collect();
+        // A code the device never declared but is sending anyway. Worth showing rather than
+        // dropping: it is either a pad this build has not seen or a stream nobody understands yet.
+        names.extend(
+            self.pad
+                .held
+                .iter()
+                .filter(|code| !device.buttons.iter().any(|b| b.code == **code))
+                .map(|code| format!("{}:{code}", proto::PadEvent::KEY)),
+        );
+        names.sort();
+
+        if names.is_empty() {
+            return Line::from(" held     none").dim();
+        }
+        Line::from(vec![
+            Span::raw(" held     "),
+            Span::styled(names.join(" "), Style::new().fg(Color::Green)),
+        ])
+    }
+
     /// Achieved loop rate over time.
     ///
     /// The instantaneous number in the header cannot show a *dropout*: a loop that fell to
@@ -868,6 +1549,70 @@ impl View {
             .max(self.peak.max(1))
             .style(Style::new().fg(Color::Cyan))
             .block(Block::bordered().title(Line::from(title).alignment(Alignment::Left)))
+    }
+}
+
+/// One axis: its name, where it is in its own range, and the raw value.
+///
+/// The name is the kernel's with `ABS_` taken off: `ABS_HAT0X` does not fit a cell that also has to
+/// hold a bar and a five-digit value, and every axis here carries the same prefix, so dropping it
+/// costs nothing a reader needs. Everything else is the raw code's own — no remapping, no gilrs
+/// vocabulary.
+///
+/// The bar is centred for an axis whose range crosses zero and left-anchored for one that starts
+/// there, because those are two different controls. A stick rests at the middle of −32768..32767 and
+/// a trigger rests at the bottom of 0..1023 — drawing the trigger centred would show it half pulled
+/// at rest, which is exactly the kind of quiet lie this view exists to avoid.
+fn axis_cell(axis: &proto::PadAxis, value: Option<i32>) -> Vec<Span<'static>> {
+    /// Cells of bar, leaving room in [`AXIS_CELL`] for the name and the value.
+    const WIDTH: usize = 9;
+
+    let name = axis.name.trim_start_matches("ABS_").to_owned();
+    let Some(value) = value else {
+        return vec![Span::raw(format!(" {name:<6}{:WIDTH$}{:>8}", "", "-")).dim()];
+    };
+
+    let span = f64::from(axis.max) - f64::from(axis.min);
+    let fraction = if span > 0.0 {
+        ((f64::from(value) - f64::from(axis.min)) / span).clamp(0.0, 1.0)
+    } else {
+        // A degenerate range the driver reported: draw nothing rather than divide by it.
+        0.0
+    };
+
+    let bar = if axis.min < 0 {
+        centred_bar(fraction, WIDTH)
+    } else {
+        let filled = (fraction * WIDTH as f64).round() as usize;
+        format!("{}{}", "█".repeat(filled), "·".repeat(WIDTH - filled))
+    };
+
+    vec![
+        Span::raw(format!(" {name:<6}")),
+        Span::styled(bar, Style::new().fg(Color::Cyan)),
+        Span::raw(format!("{value:>8}")),
+    ]
+}
+
+/// A bar growing from the middle of `width` cells, for an axis that rests at centre.
+fn centred_bar(fraction: f64, width: usize) -> String {
+    let half = width / 2;
+    let offset = ((fraction - 0.5) * 2.0 * half as f64).round();
+    let cells = (offset.abs() as usize).min(half);
+    if offset < 0.0 {
+        format!(
+            "{}{}│{}",
+            "·".repeat(half - cells),
+            "█".repeat(cells),
+            "·".repeat(width - half - 1)
+        )
+    } else {
+        format!(
+            "{}│{}{}",
+            "·".repeat(half),
+            "█".repeat(cells),
+            "·".repeat(width - half - 1 - cells)
+        )
     }
 }
 
@@ -1387,6 +2132,550 @@ mod tests {
         state.movement.requested[2] = 1.0;
         state.movement.applied[2] = 1.0;
         state
+    }
+
+    /// Feed the view one update.
+    ///
+    /// [`Failure`] carries no `Debug`, so `expect` is not available on an absorb — every test here
+    /// asserts on `is_ok` for the same reason the older ones do.
+    fn feed(view: &mut View, update: Update) {
+        assert!(view.absorb(update).is_ok(), "an update is not a failure");
+    }
+
+    /// A stick axis: signed, resting at centre, with the driver's own dead zone.
+    fn stick(code: u16, name: &str) -> proto::PadAxis {
+        proto::PadAxis {
+            code,
+            name: name.to_owned(),
+            min: -32768,
+            max: 32767,
+            flat: 128,
+            fuzz: 16,
+            value: 0,
+        }
+    }
+
+    /// A trigger: it rests at the bottom of its range, not the middle.
+    fn trigger(code: u16, name: &str) -> proto::PadAxis {
+        proto::PadAxis {
+            code,
+            name: name.to_owned(),
+            min: 0,
+            max: 1023,
+            flat: 0,
+            fuzz: 0,
+            value: 0,
+        }
+    }
+
+    fn hat(code: u16, name: &str) -> proto::PadAxis {
+        proto::PadAxis {
+            code,
+            name: name.to_owned(),
+            min: -1,
+            max: 1,
+            flat: 0,
+            fuzz: 0,
+            value: 0,
+        }
+    }
+
+    fn a_device() -> proto::PadInputDevice {
+        proto::PadInputDevice {
+            name: "Xbox Wireless Controller".to_owned(),
+            node: "/dev/input/event5".to_owned(),
+            unique: Some("78:86:2e:bb:13:28".to_owned()),
+            bus: proto::PadInputDevice::BUS_BLUETOOTH,
+            vendor: 0x045e,
+            product: 0x0b13,
+            // The eight an Xbox pad declares: two sticks, two triggers, and the hat. Sticks rest
+            // centred, triggers and the hat do not, which is the distinction the cells have to draw.
+            axes: vec![
+                stick(0, "ABS_X"),
+                stick(1, "ABS_Y"),
+                trigger(2, "ABS_Z"),
+                stick(3, "ABS_RX"),
+                stick(4, "ABS_RY"),
+                trigger(5, "ABS_RZ"),
+                hat(16, "ABS_HAT0X"),
+                hat(17, "ABS_HAT0Y"),
+            ],
+            buttons: vec![proto::PadKey {
+                code: 0x13b,
+                name: "BTN_START".to_owned(),
+                pressed: false,
+            }],
+        }
+    }
+
+    /// A report `since_us` microseconds after the one before it, moving `ABS_X`.
+    fn a_frame(seq: u64, since_us: Option<i64>) -> proto::PadReport {
+        proto::PadReport::Frame(proto::PadFrame {
+            seq,
+            at_us: 1_000_000 + seq * 8_000,
+            since_us,
+            events: vec![
+                proto::PadEvent {
+                    kind: proto::PadEvent::ABSOLUTE,
+                    code: 0,
+                    value: -1583,
+                    name: "ABS_X".to_owned(),
+                },
+                proto::PadEvent {
+                    kind: proto::PadEvent::SYNCHRONIZATION,
+                    code: 0,
+                    value: 0,
+                    name: "SYN_REPORT".to_owned(),
+                },
+            ],
+            after_drop: false,
+            socket_dropped: 0,
+        })
+    }
+
+    /// A view with a pad attached and the block open.
+    fn watching_a_pad() -> View {
+        let mut view = View::new(20);
+        assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Attached {
+                device: Box::new(a_device()),
+            })),
+        );
+        view.toggle_pad();
+        view
+    }
+
+    /// The block costs eight rows on a terminal that is already short of them, so it stays shut
+    /// until someone asks — and the key that opens it is named on screen, since a reader who does
+    /// not know it exists has no way to discover the pad stream is there at all.
+    #[test]
+    fn the_pad_block_is_closed_until_it_is_asked_for() {
+        let mut view = View::new(20);
+        feed(&mut view, Update::State(Box::new(a_state())));
+
+        let shut = render_to(&mut view, 100, 32);
+        assert!(shut.contains("p the raw pad"), "{shut}");
+        assert!(
+            !shut.contains(" pad · "),
+            "nothing of the pad block:\n{shut}"
+        );
+
+        view.toggle_pad();
+        let open = render_to(&mut view, 100, 32);
+        assert!(open.contains("pad · raw input"), "{open}");
+        assert!(open.contains("p hides the pad"), "{open}");
+
+        // With a pad on the other end it is the measurement, not an explanation of its absence.
+        let mut watching = watching_a_pad();
+        let live = render_to(&mut watching, 100, 32);
+        assert!(live.contains("cadence"), "{live}");
+        assert!(live.contains("Xbox Wireless Controller"), "{live}");
+        assert!(
+            live.contains("78:86:2e:bb:13:28"),
+            "the join key for a btmon capture:\n{live}"
+        );
+    }
+
+    /// **A pad on a table is not a stalled link.** An evdev device sends nothing while nothing
+    /// moves, so silence is only evidence while someone is driving — and counting quiet as a stall
+    /// is how the first measurement on this robot reported a 75-second breach of the deadman on a
+    /// link that never faltered.
+    #[test]
+    fn a_pad_at_rest_is_not_a_stalled_link() {
+        let mut view = watching_a_pad();
+        let quiet_us = (proto::pad_link::IDLE_MS as i64 + 1_000) * 1_000;
+        feed(&mut view, Update::Pad(Box::new(a_frame(2, Some(quiet_us)))));
+
+        assert_eq!(view.pad.quiet, 1, "a quiet spell");
+        assert_eq!(view.pad.over_deadman, 0, "and not a stall");
+        assert_eq!(view.pad.worst_ms, 0, "which is not the worst gap either");
+        assert!(
+            view.pad.gaps.is_empty(),
+            "nor a bar on the trace, where it would dwarf every real stall"
+        );
+    }
+
+    /// A gap the sticks *were* moving through is the fault this exists to find, and it is named
+    /// with what it does rather than as a number: past the deadman, `robotd` has already zeroed the
+    /// velocity, and the robot stopped.
+    #[test]
+    fn a_stall_past_the_deadman_is_counted_and_named() {
+        let mut view = watching_a_pad();
+        for (seq, ms) in [(2u64, 8i64), (3, 150), (4, 620)] {
+            feed(
+                &mut view,
+                Update::Pad(Box::new(a_frame(seq, Some(ms * 1_000)))),
+            );
+        }
+
+        assert_eq!(
+            view.pad.over_notable, 2,
+            "150 ms and 620 ms both feel sticky"
+        );
+        assert_eq!(view.pad.over_deadman, 1, "only 620 ms stops the robot");
+        assert_eq!(view.pad.worst_ms, 620);
+        assert_eq!(view.pad.gaps.len(), 3);
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("worst 620 ms"), "{screen}");
+        assert!(screen.contains("over 500 ms 1"), "{screen}");
+    }
+
+    /// `SYN_DROPPED` is this reader falling behind, not the radio. Blaming the link for it would
+    /// invent a fault, and the gap around it measures nothing at all.
+    #[test]
+    fn a_dropped_report_is_blamed_on_the_reader_not_the_radio() {
+        let mut view = watching_a_pad();
+        feed(&mut view, Update::Pad(Box::new(a_frame(2, Some(8_000)))));
+        let proto::PadReport::Frame(mut frame) = a_frame(3, Some(900_000)) else {
+            unreachable!("a_frame builds a frame")
+        };
+        frame.after_drop = true;
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Frame(frame))),
+        );
+
+        assert_eq!(view.pad.after_drops, 1);
+        assert_eq!(
+            view.pad.over_deadman, 0,
+            "the 900 ms spans discarded events"
+        );
+        assert_eq!(view.pad.gaps.len(), 1, "and is not on the trace");
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("syn_dropped 1"), "{screen}");
+        assert!(screen.contains("not the radio"), "{screen}");
+    }
+
+    /// Reports dropped between `padd` and this view are this view's own slowness. They look exactly
+    /// like a stalled radio in the cadence, so they are counted apart and said out loud.
+    #[test]
+    fn reports_lost_reaching_the_view_are_not_the_links_fault() {
+        let mut view = watching_a_pad();
+        let proto::PadReport::Frame(mut frame) = a_frame(9, Some(8_000)) else {
+            unreachable!("a_frame builds a frame")
+        };
+        frame.socket_dropped = 4;
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Frame(frame))),
+        );
+
+        assert_eq!(view.pad.socket_dropped, 4);
+        assert_eq!(view.pad.over_deadman, 0);
+        let screen = render_to(&mut view, 110, 32);
+        assert!(
+            screen.contains("4 reports dropped reaching this view"),
+            "{screen}"
+        );
+    }
+
+    /// The robot's clock stepping is not a report arriving before the one in front of it. A board
+    /// with no RTC does this once, when its first NTP reply lands, and reading it as a 40-year gap
+    /// would put a stall in the record that never happened.
+    #[test]
+    fn a_clock_step_is_not_a_gap() {
+        let mut view = watching_a_pad();
+        feed(
+            &mut view,
+            Update::Pad(Box::new(a_frame(2, Some(-4_000_000)))),
+        );
+
+        assert_eq!(view.pad.clock_steps, 1);
+        assert!(view.pad.gaps.is_empty());
+        assert_eq!(view.pad.worst_ms, 0);
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("clock stepped 1"), "{screen}");
+    }
+
+    /// A stick rests in the middle of its range and a trigger at the bottom of its. Drawing both
+    /// the same way would show every trigger half pulled on an untouched pad.
+    #[test]
+    fn a_trigger_is_not_drawn_like_a_stick() {
+        let device = a_device();
+        let text = |axis: &proto::PadAxis, value: i32| -> String {
+            axis_cell(axis, Some(value))
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+
+        let axis = |name: &str| {
+            device
+                .axes
+                .iter()
+                .find(|a| a.name == name)
+                .expect("a_device declares it")
+                .clone()
+        };
+        let stick = &axis("ABS_X");
+        assert!(text(stick, 0).contains('│'), "a stick has a centre column");
+        assert!(
+            !text(stick, 0).contains('█'),
+            "and nothing filled at rest: {}",
+            text(stick, 0)
+        );
+        assert!(text(stick, -32768).contains('█'), "{}", text(stick, -32768));
+
+        let trigger = &axis("ABS_Z");
+        assert!(
+            !text(trigger, 0).contains('█'),
+            "a trigger at rest is empty: {}",
+            text(trigger, 0)
+        );
+        assert!(text(trigger, 1023).contains('█'), "{}", text(trigger, 1023));
+        assert!(
+            !text(trigger, 0).contains('│'),
+            "and has no centre to speak of: {}",
+            text(trigger, 0)
+        );
+    }
+
+    /// Every cell is the same width whatever the value, or the grid dances from report to report at
+    /// 125 a second. The same rule the deviation bars follow, and for the same reason.
+    #[test]
+    fn axis_cells_are_all_one_width() {
+        let device = a_device();
+        let width = |axis: &proto::PadAxis, value: Option<i32>| {
+            axis_cell(axis, value)
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        };
+        for axis in &device.axes {
+            for value in [None, Some(axis.min), Some(0), Some(axis.max)] {
+                assert_eq!(
+                    width(axis, value),
+                    AXIS_CELL as usize,
+                    "{} at {value:?}",
+                    axis.name
+                );
+            }
+        }
+    }
+
+    /// The measurement outlives the pad. A link that just dropped is exactly when someone looks at
+    /// this block, and clearing the counters on the way out would erase the evidence at that moment.
+    #[test]
+    fn a_pad_that_dropped_keeps_its_measurement_on_screen() {
+        let mut view = watching_a_pad();
+        for (seq, ms) in [(2u64, 8i64), (3, 640)] {
+            feed(
+                &mut view,
+                Update::Pad(Box::new(a_frame(seq, Some(ms * 1_000)))),
+            );
+        }
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Detached {
+                why: "/dev/input/event5 ended: No such device (os error 19)".to_owned(),
+            })),
+        );
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("No such device"), "{screen}");
+        assert!(screen.contains("last link"), "{screen}");
+        assert!(screen.contains("worst gap 640 ms"), "{screen}");
+        assert!(screen.contains("robotctl pad status"), "{screen}");
+    }
+
+    /// No tap at all — an older release, or `padd` stopped — is a sentence and a next step, not an
+    /// empty box and not a dead monitor.
+    #[test]
+    fn no_tap_says_so_and_says_what_to_run() {
+        let mut view = View::new(20);
+        feed(&mut view, Update::State(Box::new(a_state())));
+        view.toggle_pad();
+        // Losing the tap must not end the monitor, which `feed` asserts for every update.
+        feed(
+            &mut view,
+            Update::PadLost(
+                "padd is not running or has no socket at /run/padd/pad.sock".to_owned(),
+            ),
+        );
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("no raw pad stream"), "{screen}");
+        assert!(screen.contains("/run/padd/pad.sock"), "{screen}");
+        assert!(screen.contains("robotctl pad status"), "{screen}");
+    }
+
+    /// The rate is per second of *driving*. Rated against elapsed time it would read as a broken
+    /// pad the moment anyone pauses, which is every real session.
+    #[test]
+    fn the_cadence_is_rated_against_driving_not_the_clock() {
+        let mut view = watching_a_pad();
+        for seq in 2..12 {
+            feed(&mut view, Update::Pad(Box::new(a_frame(seq, Some(8_000)))));
+        }
+        let quiet_us = (proto::pad_link::IDLE_MS as i64 + 30_000) * 1_000;
+        feed(
+            &mut view,
+            Update::Pad(Box::new(a_frame(12, Some(quiet_us)))),
+        );
+
+        let cadence = view.pad.cadence().expect("ten gaps of 8 ms");
+        assert!(
+            (cadence - 125.0).abs() < 1.0,
+            "half a minute of stillness must not slow the pad down: {cadence}"
+        );
+    }
+
+    /// **A link behaving perfectly must still draw something.** An ordinary 8 ms gap is 8% of the
+    /// trace's scale, and the widget's integer arithmetic rounds that to a blank cell — so a healthy
+    /// pad drew an empty row, which cannot be told from a trace nobody is feeding.
+    #[test]
+    fn a_healthy_cadence_still_marks_the_trace() {
+        let mut view = watching_a_pad();
+        for seq in 2..30 {
+            feed(&mut view, Update::Pad(Box::new(a_frame(seq, Some(8_000)))));
+        }
+
+        let screen = render_to(&mut view, 110, 32);
+        let trace = screen
+            .lines()
+            .find(|line| line.contains("gap ms"))
+            .expect("the gap row");
+        assert!(
+            trace.contains('▁'),
+            "every report leaves a mark at the floor:\n{trace}"
+        );
+        assert!(
+            !trace.contains('█'),
+            "and nothing claims a stall on a link with none:\n{trace}"
+        );
+    }
+
+    /// A grid that stops at the last cell that fitted is a pad drawn with fewer axes than it has.
+    /// The joints table has said what it hides since it was written; so does this.
+    #[test]
+    fn a_narrow_terminal_says_which_axes_it_left_out() {
+        let mut view = watching_a_pad();
+        // Two columns of cells, so six of the eight axes fit into three rows.
+        let narrow = render_to(&mut view, 70, 32);
+        assert!(narrow.contains("6 of 8 axes"), "{narrow}");
+
+        let wide = render_to(&mut view, 130, 32);
+        assert!(
+            !wide.contains("of 8 axes"),
+            "nothing is hidden, so nothing is counted:\n{wide}"
+        );
+        for axis in ["HAT0X", "HAT0Y", "RX", "RZ"] {
+            assert!(wide.contains(axis), "{axis} is missing:\n{wide}");
+        }
+    }
+
+    /// Not an assertion — a look at the block with a link under load, printed by
+    /// `cargo test -p robotctl show_the_pad_block -- --nocapture --ignored`.
+    #[test]
+    #[ignore = "prints the pad block for a human to read"]
+    fn show_the_pad_block() {
+        let mut view = watching_a_pad();
+        let gaps = [
+            8i64, 8, 9, 8, 40, 8, 8, 120, 8, 8, 8, 9, 8, 8, 260, 8, 8, 8, 620, 8, 8, 8,
+        ];
+        for (i, ms) in gaps.iter().enumerate() {
+            feed(
+                &mut view,
+                Update::Pad(Box::new(a_frame(i as u64 + 2, Some(ms * 1_000)))),
+            );
+        }
+        let proto::PadReport::Frame(mut frame) = a_frame(99, Some(8_000)) else {
+            unreachable!("a_frame builds a frame")
+        };
+        frame.events.insert(
+            0,
+            proto::PadEvent {
+                kind: proto::PadEvent::KEY,
+                code: 0x13b,
+                value: 1,
+                name: "BTN_START".to_owned(),
+            },
+        );
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Frame(frame))),
+        );
+        println!("{}", render_to(&mut view, 100, 30));
+    }
+
+    /// A pad on a cable has no radio to measure, and a flawless report about one is worse than no
+    /// report — `pad-link-test.sh` refuses to run in that case for the same reason.
+    #[test]
+    fn a_pad_on_usb_is_told_it_has_no_radio() {
+        let mut view = View::new(20);
+        feed(&mut view, Update::State(Box::new(a_state())));
+        view.toggle_pad();
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Attached {
+                device: Box::new(proto::PadInputDevice {
+                    bus: proto::PadInputDevice::BUS_USB,
+                    ..a_device()
+                }),
+            })),
+        );
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("no radio here"), "{screen}");
+    }
+
+    /// The buttons are named as the kernel names them, and an untouched pad says "none" rather than
+    /// leaving the row blank — a blank row cannot be told apart from a row that never updates.
+    #[test]
+    fn held_buttons_are_named_in_the_kernels_words() {
+        let mut view = watching_a_pad();
+        let shut = render_to(&mut view, 110, 32);
+        assert!(shut.contains("held     none"), "{shut}");
+
+        let proto::PadReport::Frame(mut frame) = a_frame(2, Some(8_000)) else {
+            unreachable!("a_frame builds a frame")
+        };
+        frame.events.insert(
+            0,
+            proto::PadEvent {
+                kind: proto::PadEvent::KEY,
+                code: 0x13b,
+                value: 1,
+                name: "BTN_START".to_owned(),
+            },
+        );
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Frame(frame))),
+        );
+
+        let held = render_to(&mut view, 110, 32);
+        assert!(held.contains("BTN_START"), "{held}");
+    }
+
+    /// An autorepeat arrives as 2, not 1. Treating anything but zero as a release would show a
+    /// button letting go while it is being held down.
+    #[test]
+    fn a_repeat_is_not_a_release() {
+        let mut view = watching_a_pad();
+        for value in [1, 2] {
+            let proto::PadReport::Frame(mut frame) = a_frame(2, Some(8_000)) else {
+                unreachable!("a_frame builds a frame")
+            };
+            frame.events.insert(
+                0,
+                proto::PadEvent {
+                    kind: proto::PadEvent::KEY,
+                    code: 0x13b,
+                    value,
+                    name: "BTN_START".to_owned(),
+                },
+            );
+            feed(
+                &mut view,
+                Update::Pad(Box::new(proto::PadReport::Frame(frame))),
+            );
+            assert!(view.pad.held.contains(&0x13b), "value {value}");
+        }
     }
 
     fn a_state() -> proto::RobotState {
