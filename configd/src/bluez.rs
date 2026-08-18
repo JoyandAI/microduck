@@ -189,6 +189,7 @@ trait Device {
 trait AgentManager {
     fn register_agent(&self, agent: &ObjectPath<'_>, capability: &str) -> zbus::Result<()>;
     fn unregister_agent(&self, agent: &ObjectPath<'_>) -> zbus::Result<()>;
+    fn request_default_agent(&self, agent: &ObjectPath<'_>) -> zbus::Result<()>;
 }
 
 /// An agent that says yes to exactly one device.
@@ -789,13 +790,33 @@ impl Pads for BlueZ {
         let manager = AgentManagerProxy::new(&self.bus)
             .await
             .map_err(|e| e.to_string())?;
-        // Not `RequestDefaultAgent`: `btd` holds the default agent for the phone path, and
-        // bluetoothd prefers the agent belonging to whoever called `Pair()` anyway.
         let registered = manager.register_agent(&agent_path, AGENT_CAPABILITY).await;
         if let Err(e) = &registered {
             // Not fatal. A pad is just-works, so bluetoothd may never need to ask anyone — and if
             // it does, `btd`'s default agent is still there to answer.
             tracing::warn!(error = %e, "could not register a pairing agent; relying on the default");
+        }
+
+        // Becoming the *default* agent is what makes `NoInputNoOutput` reach the controller.
+        // bluetoothd pushes an IO capability down to the adapter from the default agent only;
+        // registering an agent without claiming that role leaves the adapter on the kernel's
+        // default, `DisplayYesNo`. That capability puts MITM in the pairing request, which makes
+        // SMP choose numeric comparison over just-works — so bluetoothd raises a
+        // `RequestConfirmation` that arrives at no agent at all, and the pad waits until the link
+        // supervision times out. Observed as `AuthenticationCanceled` after ~17s, with an
+        // unanswered `User Confirmation Request` in `btmon` and nothing in this daemon's log.
+        //
+        // Claiming it for the pairing window is safe even while `btd` serves phones: this agent
+        // answers a phone's bond the same just-works way `btd`'s own does, `unregister_agent`
+        // below hands the role back, and `btd` only holds it when pairing is required at all.
+        if registered.is_ok()
+            && let Err(e) = manager.request_default_agent(&agent_path).await
+        {
+            tracing::warn!(
+                error = %e,
+                "could not become the default pairing agent; a pad that needs confirmation will \
+                 stall"
+            );
         }
 
         let outcome = self.bond(&device).await;
