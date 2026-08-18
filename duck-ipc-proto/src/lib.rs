@@ -72,7 +72,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// v6 `updaterd` would accept `update.apply --from /some/dir` and quietly install from its
 /// *configured* source instead — a mirror of the release the operator meant to sideload, or nothing
 /// at all. Refusing the call outright is what this constant is for.
-pub const API_VERSION: u32 = 7;
+/// # v8 — `pad.input`
+///
+/// A namespace addition of the kind v5 was, and it bumps for the same stated reason: the constant
+/// says "these two peers were not built together", not "nothing you knew has changed".
+///
+/// **What it costs here is smaller than usual, and worth being precise about.** The new method is
+/// served by `padd` on a socket of its own, so no existing client loses anything by not knowing it,
+/// and a `robotctl` that asks an older `padd` for it finds no socket at all rather than a refusal.
+/// The bump still lands on `updaterd`'s exact `!=` check, so every binary on a board must come from
+/// one release — which was already the rule.
+pub const API_VERSION: u32 = 8;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -87,6 +97,13 @@ pub mod socket {
     pub const UPDATER: &str = super::DEFAULT_SOCKET;
     pub const ROBOT: &str = "/run/robotd.sock";
     pub const CONFIG: &str = "/run/configd.sock";
+    /// `padd`'s raw input tap — [`super::method::PAD_INPUT`], and nothing else.
+    ///
+    /// Under `/run/padd/` because that is `padd`'s `RuntimeDirectory=`, which is the only place a
+    /// process running under `ProtectSystem=strict` may create a file. systemd removes the
+    /// directory when the unit stops, so a socket left behind cannot outlive the daemon that
+    /// would have answered on it.
+    pub const PAD: &str = "/run/padd/pad.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -281,6 +298,23 @@ pub mod method {
     pub const PAD_PAIR: &str = "pad.pair";
     /// Forget a pad, so it stops reconnecting.
     pub const PAD_FORGET: &str = "pad.forget";
+
+    /// Subscribe to the raw input stream of the pad `padd` is driving from.
+    ///
+    /// **The one method in this namespace `padd` answers itself**, on [`super::socket::PAD`]
+    /// rather than `configd`'s socket. That is not a lapse in the split above: the three calls
+    /// before it are Bluetooth *configuration*, and this is the input device — which only the
+    /// process already reading it can name, since it is the node gilrs picked.
+    ///
+    /// It exists for one question the rest of the system cannot answer. `padd` polls the last
+    /// known stick value and keeps sending it at 50 Hz, so a radio that stops delivering reports
+    /// still produces fresh intents: `robotd` sees a live driver, the deadman never fires, and the
+    /// robot walks on a stale command. Nothing in `robot.state` can show that. The raw event
+    /// stream can, because a report that never arrived leaves a measurable hole in the cadence.
+    pub const PAD_INPUT: &str = "pad.input";
+
+    /// One report from the pad, pushed after [`PAD_INPUT`].
+    pub const PAD_REPORT: &str = "pad.report";
 }
 
 /// JSON-RPC error codes.
@@ -402,6 +436,8 @@ pub enum Call {
     PadStatus,
     PadPair(PadPairParams),
     PadForget(PadForgetParams),
+    /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
+    PadInput,
 }
 
 impl Call {
@@ -444,6 +480,7 @@ impl Call {
             Call::PadStatus => method::PAD_STATUS,
             Call::PadPair(_) => method::PAD_PAIR,
             Call::PadForget(_) => method::PAD_FORGET,
+            Call::PadInput => method::PAD_INPUT,
         }
     }
 
@@ -531,7 +568,8 @@ impl Call {
             | Call::SystemServices
             | Call::SystemReboot
             | Call::SystemPairingPin
-            | Call::PadStatus => Value::Object(serde_json::Map::new()),
+            | Call::PadStatus
+            | Call::PadInput => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -591,6 +629,7 @@ impl Call {
                 Call::PadPair(decode(params.or(Some(&empty)))?)
             }
             method::PAD_FORGET => Call::PadForget(decode(params)?),
+            method::PAD_INPUT => Call::PadInput,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -658,6 +697,24 @@ impl Request {
     /// Read a robot-state notification back.
     pub fn as_state(&self) -> Option<RobotState> {
         if self.method != method::ROBOT_STATE {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A raw-pad notification: no `id`, so no response is expected.
+    pub fn notify_pad_report(report: &PadReport) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::PAD_REPORT.to_owned(),
+            params: Some(serde_json::to_value(report).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a raw-pad notification back.
+    pub fn as_pad_report(&self) -> Option<PadReport> {
+        if self.method != method::PAD_REPORT {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -1759,8 +1816,10 @@ pub enum UnitState {
 /// **This exists to answer "which version is actually running", which nothing else could.**
 /// `updaterd`, `robotd` and `configd` report their build over their own sockets, so a running
 /// daemon that did not restart into a new release is already visible for those three. `btd` and
-/// `padd` serve no socket, and asking them is not an option — the process that needs interrogating
-/// is by definition the *old* one, which cannot have learned a new way to answer.
+/// `padd` cannot be asked, and the reason is not merely that they have no service socket — `padd`
+/// does serve one, for [`method::PAD_INPUT`] and nothing else. It is that the process which needs
+/// interrogating is by definition the *old* one, which cannot have learned a new way to answer,
+/// whatever socket it is holding.
 ///
 /// So it is read from outside the process: systemd knows the PID, and `/proc/<pid>/exe` resolves to
 /// the real path the binary was executed from. Since a release installs to `…/releases/<version>/`
@@ -1825,6 +1884,232 @@ pub struct PadForgetResult {
     /// False when no such pad was bonded — not an error, and a client should not present it as
     /// one. Same contract as [`ForgetResult`].
     pub removed: bool,
+}
+
+// ── pad input, as the kernel delivers it ─────────────────────────────────────
+
+/// How the cadence of raw pad reports is judged.
+///
+/// Shared so the live view in `robotctl monitor` and `scripts/pad-link-test.sh` reach the same
+/// verdict about the same link: two tools that disagree about what counts as a stall are two tools
+/// nobody can compare. The script keeps its own copies of these numbers deliberately — it is a
+/// `/bin/sh` file that has to run on a board with none of this compiled — and names them there.
+pub mod pad_link {
+    /// Under this, a late report is invisible to whoever is driving. Over it, the robot feels
+    /// sticky.
+    pub const NOTABLE_MS: u64 = 100;
+
+    /// Where `robotd` zeroes the velocity: the default of its `safety.deadman_ms`. A gap past this
+    /// is not a latency complaint, it is the robot stopping.
+    pub const DEADMAN_MS: u64 = 500;
+
+    /// Past this, silence is the operator rather than the radio.
+    ///
+    /// An evdev device sends nothing while nothing moves, so a pad at rest is indistinguishable
+    /// from a link that has stopped delivering — except by duration. A link silent this long would
+    /// have hit its supervision timeout and dropped, and a drop is visible on its own. Counting
+    /// quiet as a stall is how the first real measurement of this robot reported a 75-second
+    /// breach of the deadman on a link that never faltered.
+    pub const IDLE_MS: u64 = 5000;
+}
+
+/// The pad's input device, as the kernel describes it.
+///
+/// Sent when a subscriber attaches and again whenever the device changes, because every number in
+/// a [`PadFrame`] is meaningless without it: `ABS_X = 1583` is a stick position only once you know
+/// the axis runs −32768..32767 on this pad and 0..65535 on the next one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadInputDevice {
+    /// As the pad calls itself: "Xbox Wireless Controller".
+    pub name: String,
+    /// The event node being read, `/dev/input/event5`.
+    ///
+    /// Worth reporting because it *changes*: a pad that drops and comes back is often a different
+    /// number, and one stale path in a log is how two sessions get read as one.
+    pub node: String,
+    /// The pad's address, as the kernel has it. This is what ties a report stream to a `btmon`
+    /// capture of the same link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique: Option<String>,
+    /// `0x0005` for Bluetooth, `0x0003` for USB — [`Self::over_bluetooth`].
+    pub bus: u16,
+    pub vendor: u16,
+    pub product: u16,
+    /// Every absolute axis the device declares, with the range its values live in.
+    pub axes: Vec<PadAxis>,
+    /// Every button it declares. The whole list, not the ones this build has a use for: a pad
+    /// whose Start does nothing is a pad someone needs to see the raw code of.
+    pub buttons: Vec<PadKey>,
+}
+
+impl PadInputDevice {
+    /// Bus id of a Bluetooth device, from `linux/input.h`.
+    pub const BUS_BLUETOOTH: u16 = 0x0005;
+    /// Bus id of a USB device.
+    pub const BUS_USB: u16 = 0x0003;
+
+    /// Is this pad on the radio at all?
+    ///
+    /// A pad on a cable has no link to measure, and saying so beats reporting a flawless one —
+    /// `pad-link-test.sh` refuses to run in that case for the same reason.
+    pub fn over_bluetooth(&self) -> bool {
+        self.bus == Self::BUS_BLUETOOTH
+    }
+}
+
+/// One absolute axis, with the range and the noise floor the driver claims for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadAxis {
+    /// The evdev code: `ABS_X` is 0.
+    pub code: u16,
+    /// `ABS_X`, as `linux/input-event-codes.h` spells it.
+    pub name: String,
+    pub min: i32,
+    pub max: i32,
+    /// The driver's own dead zone for this axis, in axis units.
+    ///
+    /// A *hardware* claim about where centre stops being centre, and worth having next to the
+    /// live value: a stick whose rest position sits outside it is a stick that will creep,
+    /// whatever `padd`'s own `--deadzone` then does about it.
+    pub flat: i32,
+    /// Changes smaller than this the driver considers noise.
+    pub fuzz: i32,
+    /// Where the axis was when the device was described, so a subscriber starts with the whole
+    /// picture rather than with whatever moves first.
+    pub value: i32,
+}
+
+/// One button, and whether it was held when the device was described.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadKey {
+    /// The evdev code: `BTN_SOUTH` is 0x130.
+    pub code: u16,
+    pub name: String,
+    pub pressed: bool,
+}
+
+/// What arrives on a [`method::PAD_INPUT`] subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "report", rename_all = "snake_case")]
+pub enum PadReport {
+    /// A pad's event node is open and reports are coming. Sent on subscribing if a pad is already
+    /// connected, and again each time one appears, so a subscriber has one code path for "already
+    /// there" and "turned up later".
+    Attached { device: Box<PadInputDevice> },
+    /// One report, as the kernel framed it.
+    Frame(PadFrame),
+    /// The node closed: the pad dropped, was switched off, or `padd` stopped reading it.
+    Detached {
+        /// Why, in `padd`'s words. Not a code — nothing acts on this, and the honest answer is
+        /// usually an errno the operator wants verbatim.
+        why: String,
+    },
+}
+
+/// One report from the pad: everything the kernel delivered between two `SYN_REPORT`s.
+///
+/// **The report, not the event, is the unit of a radio's cadence.** One flick of a stick is four
+/// events in a single report, and counting events instead turns one late report into four.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadFrame {
+    /// Reports since this device attached, counted by `padd`.
+    ///
+    /// A hole in it means the *socket* fell behind — see [`Self::socket_dropped`]. A report the
+    /// pad never sent leaves no hole at all, which is the whole difficulty of measuring this:
+    /// absence is not an event, and only the clock can find it.
+    pub seq: u64,
+    /// The kernel's timestamp on the report, microseconds since the epoch.
+    ///
+    /// **Not the time `padd` read it.** `input_event.time` is stamped as the kernel takes the
+    /// report off the transport, so a cadence measured from it is the pad's own and survives
+    /// `padd` being scheduled late. It is also what lines this stream up against a `btmon`
+    /// capture of the same seconds.
+    pub at_us: u64,
+    /// Microseconds since the previous report. Absent for the first one after attaching, where
+    /// there is nothing to measure from.
+    ///
+    /// **Signed, because it can genuinely be negative.** `input_event.time` is `CLOCK_REALTIME`,
+    /// which is the price of [`Self::at_us`] lining up with a `btmon` capture: a board with no RTC
+    /// gets its clock stepped once its first NTP reply lands, and that step falls between two
+    /// reports of a link that never faltered. A negative gap is that step, and reading it as a
+    /// 40-year stall — or clamping it to zero and calling it the fastest report ever seen — are
+    /// both worse than saying so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_us: Option<i64>,
+    /// Every event in the report, in the order the kernel delivered them.
+    pub events: Vec<PadEvent>,
+    /// `SYN_DROPPED` preceded this report: the kernel discarded events because **this reader**
+    /// fell behind.
+    ///
+    /// It says nothing about the radio, and it makes [`Self::since_us`] here meaningless — the
+    /// events that would have filled the gap were thrown away before anyone saw them.
+    #[serde(default, skip_serializing_if = "not")]
+    pub after_drop: bool,
+    /// Reports this subscriber missed because its own socket was behind, since the last frame it
+    /// did receive.
+    ///
+    /// A slow client and a stalled radio produce the same silence, and a debug view that cannot
+    /// tell them apart is one that invents faults. `padd` never blocks its reader on a subscriber:
+    /// it drops, counts, and says so here.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub socket_dropped: u64,
+}
+
+/// One evdev event, as it came off the device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadEvent {
+    /// The evdev type, numerically: `EV_SYN` 0, `EV_KEY` 1, `EV_ABS` 3.
+    pub kind: u16,
+    pub code: u16,
+    pub value: i32,
+    /// `ABS_X`, `BTN_SOUTH`, `SYN_REPORT` — the name `linux/input-event-codes.h` gives this
+    /// type/code pair, so a captured line reads without a lookup table beside it. Numeric for a
+    /// code the kernel headers this was built against do not name.
+    pub name: String,
+}
+
+impl PadEvent {
+    /// `EV_SYN` — bookkeeping: the report boundary, and the dropped marker.
+    pub const SYNCHRONIZATION: u16 = 0x00;
+    /// `EV_KEY` — a button changed state.
+    pub const KEY: u16 = 0x01;
+    /// `EV_ABS` — an absolute axis moved.
+    pub const ABSOLUTE: u16 = 0x03;
+
+    /// Did an axis move? The value is then a position in that axis's own range — see
+    /// [`PadAxis::min`] and [`PadAxis::max`], which is why it cannot be read without them.
+    pub fn is_axis(&self) -> bool {
+        self.kind == Self::ABSOLUTE
+    }
+
+    /// Did a button change? `value` is 0 for released and non-zero for held: 1 on a press and 2 on
+    /// an autorepeat, which a pad does not send but a reader must not mistake for a release.
+    pub fn is_button(&self) -> bool {
+        self.kind == Self::KEY
+    }
+}
+
+/// Answer to [`Call::PadInput`].
+///
+/// `accepted` is not "a pad is connected". A subscription with no pad is normal and is half the
+/// point: `padd` runs from boot waiting for one, and watching for it to appear is exactly what
+/// this stream is for. The pad, when there is one, arrives as [`PadReport::Attached`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadInputResult {
+    pub accepted: bool,
+    /// Why not, when it was refused — a platform with no evdev to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `skip_serializing_if` for a `bool` that is false by default.
+fn not(b: &bool) -> bool {
+    !*b
+}
+
+/// `skip_serializing_if` for a counter that is zero on every healthy frame.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Re-exported so consumers spell version types with the *same* `semver` this crate
@@ -2444,6 +2729,124 @@ mod tests {
         };
         let line = serde_json::to_string(&sick).unwrap();
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), sick);
+    }
+
+    /// The three shapes a pad subscriber has to tell apart travel under one tag, and a frame
+    /// keeps every field a cadence is measured from. A `Frame` that deserialised as `Attached`
+    /// would present a dropped link as a fresh device.
+    #[test]
+    fn pad_reports_round_trip_under_their_tag() {
+        let attached = PadReport::Attached {
+            device: Box::new(PadInputDevice {
+                name: "Xbox Wireless Controller".into(),
+                node: "/dev/input/event5".into(),
+                unique: Some("78:86:2e:bb:13:28".into()),
+                bus: PadInputDevice::BUS_BLUETOOTH,
+                vendor: 0x045e,
+                product: 0x0b13,
+                axes: vec![PadAxis {
+                    code: 0,
+                    name: "ABS_X".into(),
+                    min: -32768,
+                    max: 32767,
+                    flat: 128,
+                    fuzz: 16,
+                    value: -3,
+                }],
+                buttons: vec![PadKey {
+                    code: 0x130,
+                    name: "BTN_SOUTH".into(),
+                    pressed: false,
+                }],
+            }),
+        };
+        let frame = PadReport::Frame(PadFrame {
+            seq: 412,
+            at_us: 1_755_500_000_123_456,
+            since_us: Some(7_920),
+            events: vec![
+                PadEvent {
+                    kind: 3,
+                    code: 0,
+                    value: -1583,
+                    name: "ABS_X".into(),
+                },
+                PadEvent {
+                    kind: 0,
+                    code: 0,
+                    value: 0,
+                    name: "SYN_REPORT".into(),
+                },
+            ],
+            after_drop: false,
+            socket_dropped: 0,
+        });
+        let detached = PadReport::Detached {
+            why: "read failed: No such device (os error 19)".into(),
+        };
+
+        for report in [attached, frame, detached] {
+            let line = serde_json::to_string(&Request::notify_pad_report(&report)).unwrap();
+            assert!(line.contains(r#""method":"pad.report""#), "{line}");
+            let back: Request = serde_json::from_str(&line).unwrap();
+            assert!(back.is_notification(), "a report answers nothing");
+            assert_eq!(back.as_pad_report().unwrap(), report, "{line}");
+        }
+    }
+
+    /// The two counters that only ever mean bad news stay off a healthy frame, which is most of
+    /// them at 125 reports a second — and a reader must still see `false` and `0` rather than a
+    /// missing field it has to interpret.
+    #[test]
+    fn a_clean_frame_carries_neither_alarm() {
+        let clean = PadFrame {
+            seq: 1,
+            at_us: 10,
+            since_us: None,
+            events: vec![],
+            after_drop: false,
+            socket_dropped: 0,
+        };
+        let line = serde_json::to_string(&clean).unwrap();
+        assert!(!line.contains("after_drop"), "{line}");
+        assert!(!line.contains("socket_dropped"), "{line}");
+        assert!(!line.contains("since_us"), "{line}");
+        assert_eq!(serde_json::from_str::<PadFrame>(&line).unwrap(), clean);
+
+        let troubled = PadFrame {
+            after_drop: true,
+            socket_dropped: 3,
+            since_us: Some(640_000),
+            ..clean
+        };
+        let line = serde_json::to_string(&troubled).unwrap();
+        assert!(line.contains(r#""after_drop":true"#), "{line}");
+        assert!(line.contains(r#""socket_dropped":3"#), "{line}");
+        assert_eq!(serde_json::from_str::<PadFrame>(&line).unwrap(), troubled);
+    }
+
+    /// A pad on a cable is not a link with nothing wrong with it — it is a link that is not
+    /// there. `pad-link-test.sh` refuses to measure one, and the live view has to say the same.
+    #[test]
+    fn a_usb_pad_is_not_on_the_radio() {
+        let usb = PadInputDevice {
+            name: "Xbox Wireless Controller".into(),
+            node: "/dev/input/event5".into(),
+            unique: None,
+            bus: PadInputDevice::BUS_USB,
+            vendor: 0,
+            product: 0,
+            axes: vec![],
+            buttons: vec![],
+        };
+        assert!(!usb.over_bluetooth());
+        assert!(
+            PadInputDevice {
+                bus: PadInputDevice::BUS_BLUETOOTH,
+                ..usb
+            }
+            .over_bluetooth()
+        );
     }
 
     /// `move` and `loop` are Rust keywords, so the fields are renamed on the wire. A typo

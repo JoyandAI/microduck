@@ -639,6 +639,18 @@ impl Server {
                 ),
             ),
 
+            // `pad.input` is the one call in that namespace `configd` does *not* answer, so it
+            // cannot share the arm above: sending someone to `configd` for it would cost them the
+            // same wrong-socket round trip this arm exists to save.
+            Call::PadInput => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "pad.input is served by padd itself, on /run/padd/pad.sock — unlike the rest \
+                     of pad.*, which configd answers",
+                ),
+            ),
+
             // Answered by the transport that received it — `btd` checks the PIN itself and never
             // forwards this. Reaching updaterd means a client sent it to the wrong socket, or over
             // a transport that has no PIN gate: on a unix socket, `SO_PEERCRED` already decided who
