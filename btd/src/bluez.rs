@@ -456,14 +456,41 @@ async fn serve_on_an_adapter(
     Ok(())
 }
 
-/// Advertise the service under `name`.
+/// Advertise the service under `name`, and make that the adapter's name too.
 ///
 /// The handle deregisters on drop, so the caller holds it for as long as the robot should be
 /// visible.
+///
+/// **Both names, because a robot has two and only one of them used to be set.** The advertisement
+/// carries a Local Name; the adapter separately serves a GAP Device Name (`0x2A00`), which BlueZ
+/// takes from `Adapter.Alias` and which defaults to the hostname. So a renamed robot advertised
+/// `duck-5b21` while answering `radxa-zero3` to anyone who read the characteristic — and a client
+/// that read it kept the answer:
+///
+/// - **BlueZ caches it over the advertised name.** `Device1.Name` is what `btleplug` reports, so
+///   on Linux a robot is `duck-5b21` until the first connection and `radxa-zero3` after it, and
+///   `duck-btctl --name duck-5b21` then finds nothing. Two scans a minute apart disagreed;
+/// - **CoreBluetooth keeps both**, and `btleplug` joins them as `radxa-zero3 [duck-5b21]`;
+/// - **a phone's Bluetooth settings shows the GAP name**, which is the case that matters most and
+///   the one nothing in this repo could see.
+///
+/// Setting the alias is therefore part of naming the robot rather than a nicety, and it belongs
+/// here so that no path can publish a name without it: [`reconcile_name`] re-advertises on every
+/// rename and comes through this function to do it. The alias persists in BlueZ's own state, so
+/// the write is skipped when it already says the right thing.
+///
+/// A failure to set it is logged and not propagated. The alias is worth less than being visible at
+/// all, and returning an error here would take the advertisement down with it.
 async fn advertise(
     adapter: &bluer::Adapter,
     name: &str,
 ) -> bluer::Result<bluer::adv::AdvertisementHandle> {
+    if adapter.alias().await.ok().as_deref() != Some(name)
+        && let Err(e) = adapter.set_alias(name.to_owned()).await
+    {
+        tracing::warn!(error = %e, name, "cannot set the adapter alias; the GAP name stays stale");
+    }
+
     adapter
         .advertise(Advertisement {
             service_uuids: [SERVICE_UUID].into_iter().collect(),

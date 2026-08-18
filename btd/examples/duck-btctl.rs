@@ -112,12 +112,18 @@ fn identity(peripheral: &Peripheral, address: btleplug::api::BDAddr) -> String {
 /// from the local name in the advertisement, and btleplug reports them joined when they differ:
 /// `radxa-zero3 [duck-c51b]` (`corebluetooth/internal.rs`, `on_discovered_peripheral`).
 ///
-/// They differ on every robot, because the two names come from different places. The GAP name is
-/// BlueZ's adapter alias, which is hostname-derived and therefore `radxa-zero3` on every board
-/// flashed from one image; the advertisement carries the name `configd` owns, `duck-c51b` or
-/// whatever `system.setName` last stored. Matching the joined string exactly meant **both**
-/// spellings a person would type were rejected — and the failure then listed the robot as evidence
-/// it was not in range.
+/// They used to differ on every robot, because the two names came from different places: the GAP
+/// name is BlueZ's adapter alias, hostname-derived and therefore `radxa-zero3` on every board
+/// flashed from one image, while the advertisement carried the name `configd` owns. `btd` now sets
+/// the alias to the advertised name (`btd/src/bluez.rs`, `advertise`), so a robot on a current
+/// release reports one name however it is asked.
+///
+/// **This still has to accept both**, and will for as long as a bench has robots on it. A board on
+/// an older release has the old alias; so does a client that cached the old GAP name before the
+/// robot was updated, until `bluetoothctl remove <mac>` or forgetting it in macOS Bluetooth
+/// settings clears that. Matching the joined string exactly meant **both** spellings a person
+/// would type were rejected — and the failure then listed the robot as evidence it was not in
+/// range.
 ///
 /// So either half is accepted. The advertised half is the robot's real name, and the one the phone
 /// app has to match on; the GAP half is accepted because it is what macOS Bluetooth settings shows.
