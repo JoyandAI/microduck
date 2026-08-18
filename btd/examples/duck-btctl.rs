@@ -784,8 +784,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // on macOS sees neither a prompt nor an error. A read is acknowledged, so an unpaired link
     // fails here instead, which is what makes CoreBluetooth start pairing.
     //
-    // The value is the robot's API version. Worth checking before sending anything: a client one
-    // version ahead can say so rather than have every call refused.
+    // The value is the robot's API version, and it is reported rather than enforced. See the
+    // mismatch warning below for why this tool refuses nothing on it.
     let read = step(
         "reading the API version",
         "This read requires an encrypted link, so it is what triggers pairing. A hang here usually \
@@ -803,12 +803,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("robot speaks API v{theirs}");
             }
             if u32::from(theirs) != duck_ipc_proto::API_VERSION {
-                return Err(format!(
-                    "the robot speaks API v{theirs} and this client speaks v{}; \
-                     install matching versions",
-                    duck_ipc_proto::API_VERSION
-                )
-                .into());
+                warn_about_skew(theirs);
             }
         }
         Err(e) => return Err(e),
@@ -989,6 +984,35 @@ fn characteristics(
 }
 
 /// One command becomes one JSON-RPC line, plus how long to wait for it.
+/// Say that the two ends were not built together, and carry on.
+///
+/// **This used to be a refusal, and the refusal was wrong twice over.**
+///
+/// It was wrong about what it was reading. `API_VERSION` is an agreement between the binaries on
+/// one board — `robotctl` and `updaterd` come from one release, and `updaterd`'s exact `!=` on
+/// `Hello` is what enforces it. A laptop is not a binary on the board, and will routinely be a
+/// release ahead of a robot it is talking to precisely because it is the machine that builds
+/// releases. Nothing on the far side of this link agrees with the refusal either: this tool never
+/// sends `Hello`, `configd` checks no version on `net.*` or `system.*`, and `updaterd` requires no
+/// handshake before `update.status`. So every call the refusal blocked would have been answered.
+///
+/// And it was wrong about when to be strict. BLE is the transport for a robot that has no network,
+/// and `wifi connect` is how that robot gets one — so refusing on version skew took away the
+/// command that fixes the skew, at the one moment it was needed. A robot with a stale release and
+/// no wifi could not be given wifi by the tool whose reason for existing is that case.
+///
+/// What a genuine mismatch costs without the gate is a method whose params changed shape, which
+/// comes back as a JSON-RPC error naming the method — printed, and reported through the exit
+/// status. That is a worse message than this one and a much better outcome than a locked door.
+fn warn_about_skew(theirs: u8) {
+    eprintln!(
+        "warning: the robot speaks API v{theirs} and this client speaks v{}, so they were not \
+         built together. Carrying on: most calls do not care, and a call that does will say so. \
+         Install matching versions before believing anything surprising.",
+        duck_ipc_proto::API_VERSION
+    );
+}
+
 fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::error::Error>> {
     let (method, params, timeout) = match command {
         // `scan` returns from `run` as soon as the discovery loop ends, so it never reaches a
