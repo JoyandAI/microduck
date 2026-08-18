@@ -159,6 +159,22 @@ input reports — the failure `padd` cannot see, where the link stays up and the
 stale command. [`pair-a-gamepad.md`](pair-a-gamepad.md#when-it-drops-while-you-are-driving) reads
 the numbers.
 
+When two boards behave differently with the same pad, the difference is in the stack under it:
+
+```
+scp scripts/pad-stack-report.sh radxa@<board>:/tmp/
+```
+
+```
+sudo sh /tmp/pad-stack-report.sh
+```
+
+Kernel, BlueZ, controller firmware, LE or BR/EDR, and the pad's own firmware revision — printed and
+saved to `/tmp/pad-stack-<host>-<when>.log`. `--fingerprint` prints only the values that must match
+between two boards, for `diff`.
+[`pair-a-gamepad.md`](pair-a-gamepad.md#is-this-board-running-the-same-stack-as-that-one) has the
+comparison.
+
 ### Wifi (`configd`)
 
 ```
