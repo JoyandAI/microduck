@@ -130,6 +130,51 @@ judge a link it barely saw.
 
 Walking away from the robot while it watches is how you find the range.
 
+## Is this board running the same stack as that one
+
+A pad that stalls on one robot and not on its twin is usually not the pad. Two boards built weeks
+apart run different kernels, different BlueZ, different controller firmware, and pads on different
+pad firmware — and none of that is visible in `pad status`.
+
+Copy the report onto each board, from a clone of this repo:
+
+```bash
+scp scripts/pad-stack-report.sh radxa@<board>:/tmp/
+```
+
+```bash
+sudo sh /tmp/pad-stack-report.sh
+```
+
+It prints the whole stack and saves the same text to `/tmp/pad-stack-<host>-<when>.log`: kernel,
+BlueZ, the adapter's HCI version, the controller firmware the kernel loaded at boot, which BlueZ
+modules are carrying HID, whether the bond was made over LE or BR/EDR, the transport in use right
+now, and the pad's own firmware revision. It runs without root, and says `unreadable` for the three
+things that need it.
+
+To compare two boards, ask each for only the values that have to match:
+
+```bash
+ssh radxa@<board-a> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/a.fp
+```
+
+```bash
+ssh radxa@<board-b> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/b.fp
+```
+
+```bash
+diff /tmp/a.fp /tmp/b.fp
+```
+
+No output means the same stack. The fingerprint carries no timestamps and no addresses, so anything
+`diff` prints is a real difference.
+
+Two lines to read before the rest. `transport` is `LE` on every pad tried so far, and a board that
+says `BR/EDR` is putting the pad through the kernel's classic HID path instead of BlueZ's — a
+different driver, different button numbering. `input` is the `Bus`/`Vendor`/`Product`/`Version`
+quadruple that SDL and `gilrs` hash into a mapping GUID: two boards differing there have different
+axis and button mappings, whatever else matches.
+
 ---
 
 Driving — the controls, the speed limits, and running `padd` from a laptop over a forwarded socket —
