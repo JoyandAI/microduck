@@ -48,8 +48,8 @@ A robot that has never been renamed calls itself `duck-` plus four characters de
 serial, so `duck-c51b`. macOS often reports one robot under two names at once, as
 `radxa-zero3 [duck-c51b]` — either half works as `--name`.
 
-Without `--name`, the first robot found wins. With it, two robots answering to the same name is an
-error rather than a choice:
+With no name at all — no `--name`, no `DUCK_ROBOT` — the first robot found wins. With a name, two
+robots answering to it is an error rather than a choice:
 
 ```
 2 robots answer to "radxa-zero3": radxa-zero3, radxa-zero3
@@ -62,6 +62,42 @@ itself and use the new name:
 ```bash
 robotctl system set-name ducky
 ```
+
+## Always the same robot
+
+Put the name in the environment instead of on every command line:
+
+```bash
+export DUCK_ROBOT=duck-c51b
+```
+
+Put that line in `~/.zshrc` to keep it. Every command below then works without `--name`:
+
+```bash
+duck-btctl info
+```
+
+`DUCK_PIN` does the same for `--pin`, which a robot with a PIN of its own needs on every command:
+
+```bash
+export DUCK_PIN=418299
+```
+
+For one command against a different robot, `--name` still wins:
+
+```bash
+duck-btctl --name duck-ffff info
+```
+
+To ignore the default for one command — a bench with somebody else's robot on it — set it to
+nothing:
+
+```bash
+DUCK_ROBOT= duck-btctl scan
+```
+
+`scan` marks the robot `DUCK_ROBOT` names and lists it first, and every command that goes looking
+for it says so before it starts scanning.
 
 ## Identity
 
@@ -78,6 +114,9 @@ duck-btctl --name <robot-name> name <new-name>
 Up to 24 characters. It takes effect within a few seconds and needs no restart, but the Mac keeps
 serving the name it learned earlier, so `scan` and macOS Bluetooth settings both lag behind. Every
 later command uses the new name.
+
+A rename does not follow `DUCK_ROBOT`. The tool says so afterwards; the variable has to be changed
+by hand, or every later command looks for a name that no longer answers.
 
 ```bash
 duck-btctl --name <robot-name> reboot
@@ -154,11 +193,11 @@ until it is done.
 
 ## Global options
 
-- `--name <robot-name>` — which robot. Without it, the first one found wins. Worth giving always:
-  it skips a slow fallback tier that tries every already-connected peripheral on the Mac, earbuds
-  included.
-- `--pin <six-digits>` — defaults to `000000`. `robotctl system pin` on the robot shows the real
-  one.
+- `--name <robot-name>` — which robot. Without it, `DUCK_ROBOT`; without that, the first one found
+  wins. Worth giving always: it skips a slow fallback tier that tries every already-connected
+  peripheral on the Mac, earbuds included.
+- `--pin <six-digits>` — defaults to `DUCK_PIN`, then to `000000`. `robotctl system pin` on the
+  robot shows the real one.
 - `--verbose` — print every line sent and received, and have `scan` list every device rather than
   only the robots. The first thing to add when something hangs.
 
