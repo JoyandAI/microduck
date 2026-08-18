@@ -333,8 +333,25 @@ section_adapter() {
             | sed -E 's/^[[:space:]]*//' || true)"
         [ -n "$f_ctrl_fw" ] || f_ctrl_fw="$(printf '%s\n' "$fw" | tail -1)"
     else
-        # The three places tried are named, because "unknown" here reads as a script that did not
-        # look. The chip line above still identifies the radio.
+        # Last tier, and deliberately unfiltered: a radio driven by an out-of-tree driver does not
+        # prefix its lines `Bluetooth: hci0:` at all, and every pattern above assumes it does. Six
+        # lines of whatever mentions Bluetooth beats a section that says nothing on such a board.
+        if have journalctl; then
+            fw="$(journalctl -k -b --no-pager 2>/dev/null | grep -iE 'bluetooth|btusb|hci[0-9]' \
+                | tail -6 | sed -E 's/^.*kernel: //' || true)"
+        fi
+        if [ -z "$fw" ] && have dmesg; then
+            fw="$(dmesg 2>/dev/null | grep -iE 'bluetooth|btusb|hci[0-9]' | tail -6 || true)"
+        fi
+    fi
+
+    if [ -n "$fw" ] && [ "$f_ctrl_fw" = unreadable ]; then
+        echo "  firmware       (nothing matched a firmware pattern; the last Bluetooth lines)"
+        dump "$fw"
+        f_ctrl_fw="unnamed by the log; see chip"
+    elif [ -z "$fw" ]; then
+        # The places tried are named, because "unknown" here reads as a script that did not look.
+        # The chip line above still identifies the radio.
         f_ctrl_fw="not in journalctl -k -b, dmesg or journalctl -k (ring buffer wrapped, or"
         f_ctrl_fw="${f_ctrl_fw} journald keeps no kmsg)"
         field firmware "$f_ctrl_fw"
