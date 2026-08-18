@@ -45,8 +45,13 @@ Robots only, with everything else in radio range counted rather than listed. `--
 that list, and it is worth reading when the robot you want is not in the first one.
 
 A robot that has never been renamed calls itself `duck-` plus four characters derived from its
-serial, so `duck-c51b`. macOS often reports one robot under two names at once, as
-`radxa-zero3 [duck-c51b]` — either half works as `--name`.
+serial, so `duck-c51b`. Either half of a robot reported under two names at once — macOS shows
+`radxa-zero3 [duck-c51b]` — works as `--name`.
+
+A robot that scanned as `duck-c51b` and then, after one connection, only as `radxa-zero3` is on a
+release that gave its name to the advertisement but not to the adapter, and the client cached the
+adapter's. Update the robot. That does not clear what the client already cached, so clear it too:
+`bluetoothctl remove <mac>` on Linux, or forget the robot in macOS Bluetooth settings.
 
 With no name at all — no `--name`, no `DUCK_ROBOT` — the first robot found wins. With a name, two
 robots answering to it is an error rather than a choice:

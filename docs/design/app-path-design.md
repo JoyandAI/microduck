@@ -603,6 +603,18 @@ three comments in the tree described the intended behaviour as though it existed
 The reconcile runs alongside the adapter watch inside one bring-up, so losing the radio ends both —
 and the next bring-up asks again, which is what picks up a rename made while Bluetooth was down.
 
+**A robot has two names, and both are set.** The advertisement carries a Local Name; the adapter
+separately serves a GAP Device Name (`0x2A00`) that BlueZ takes from `Adapter.Alias` and defaults to
+the hostname. Setting only the first meant a renamed robot advertised `duck-c51b` and answered
+`radxa-zero3` to anyone who read the characteristic — and reading it is what a central does on
+connecting. BlueZ then caches the answer over the advertised name, so on Linux a robot was
+`duck-c51b` until first contact and `radxa-zero3` after it, and `--name duck-c51b` stopped finding
+it; CoreBluetooth keeps both and reports `radxa-zero3 [duck-c51b]`. A phone's own Bluetooth settings
+shows the GAP name, which is the case that matters most here and the one no tool in this tree could
+see. `advertise` sets the alias alongside the advertisement, so every path that publishes a name
+publishes both. A client that cached the old name keeps it until it is forgotten, which is a client
+problem with a client fix.
+
 Reconciled rather than event-driven, deliberately. `btd` forwards `system.setName` without reading
 the reply — interpreting replies is what this daemon avoids — and re-asking the moment it forwards
 one races the write it just forwarded. Polling is fewer moving parts and covers renames made through
