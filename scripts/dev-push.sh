@@ -2,7 +2,8 @@
 # Build the daemon on this laptop and install it on a board, without CI.
 #
 # Usage:  scripts/dev-push.sh [--docker] [--dry-run] [--bootstrap] [user@host]
-#         DUCK_BOARD=radxa@duck.local scripts/dev-push.sh
+#         scripts/dev-push.sh --name duck-c51b       # find the board over Bluetooth
+#         DUCK_ROBOT=duck-c51b scripts/dev-push.sh
 #
 # Requires the team dev secret key, and one of two build toolchains — `cargo-zigbuild` plus
 # `zig`, or `--docker`. The board must be a dev board (`allow_dev_keys = true` and
@@ -49,15 +50,22 @@ KEY="${DUCK_DEV_SECRET_KEY:-$HOME/.duck-keys/team.dev.key}"
 BOOTSTRAP=no
 DRY_RUN=no
 DOCKER=no
-BOARD="${DUCK_BOARD:-}"
+# Both empty here and filled from the environment below, after the arguments have had their say.
+BOARD=""
+ROBOT=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --bootstrap) BOOTSTRAP=yes ;;
         --dry-run) DRY_RUN=yes ;;
         --docker) DOCKER=yes ;;
+        --name)
+            shift
+            [ $# -gt 0 ] || { echo "--name needs a robot name" >&2; exit 2; }
+            ROBOT="$1"
+            ;;
         -h|--help)
-            sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         -*) echo "unknown option: $1" >&2; exit 2 ;;
@@ -66,9 +74,127 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# ── which board, and why a name beats an address ───────────────────────────────────────
+#
+# An address moves. A reflash, a router reboot or a different network hands the board a new
+# lease, and mDNS on this image is unreliable enough that a `.local` name is not the answer
+# either (`provision-board.sh` says the same). So the address is the one thing about a board
+# nobody can keep in a shell profile: `DUCK_BOARD=radxa@192.168.1.42` goes stale, and the way
+# that reads is a push that hangs until ssh times out.
+#
+# A robot's *name* does not move. `duck-btctl` finds it over BLE by that name and `net.status`
+# answers with the address it currently has — which makes the radio the way out of exactly the
+# situation the network cannot help with, and needs nothing on the LAN to be known or guessed.
+#
+# Cached, and re-resolved only when ssh cannot reach the cached address, because BLE discovery
+# costs ten to twenty seconds and this script exists to be quick. The steady state is one ssh
+# probe; the reflashed-board case pays one scan and is quick again after it.
+BOARD_USER="${DUCK_BOARD_USER:-radxa}"
+CACHE_DIR="${DUCK_BOARD_CACHE:-$HOME/.cache/duck/boards}"
+
+# The installed client if there is one, the example in this clone otherwise. `duck-btctl` is an
+# example rather than a binary, so it reaches a PATH only via `cargo install --path btd --example
+# duck-btctl`, and plenty of clones have never run that.
+btctl() {
+    if command -v duck-btctl >/dev/null 2>&1; then
+        duck-btctl "$@"
+    else
+        cargo run -q -p btd --example duck-btctl -- "$@"
+    fi
+}
+
+# `net.status` for one robot, JSON on stdout.
+#
+# Only `--name` is passed. A robot with a PIN of its own needs `DUCK_PIN`, which `duck-btctl`
+# reads for itself (`docs/robot/duck-btctl.md`) — repeating it here would be a second place to
+# keep in step, and passing its factory default unconditionally would override the real one.
+ble_status() {
+    btctl --name "$1" wifi status
+}
+
+# A robot name in, `user@address` out. Everything else goes to stderr, so the substitution that
+# calls this captures the address and nothing else.
+resolve_board() {
+    robot_name="$1"
+    # One file per robot, named after it, so two boards do not fight over one cache. Anything a
+    # filesystem would rather not see becomes `_`: a robot can be called `Ducky the Second`.
+    cache="$CACHE_DIR/$(printf '%s' "$robot_name" | tr -c 'A-Za-z0-9._-' '_')"
+    cached=""
+    if [ -f "$cache" ]; then
+        cached="$(cat "$cache")"
+        # `BatchMode=yes` so an unreachable board fails instead of prompting for a password, and
+        # a short timeout because this runs on the happy path of every push.
+        if [ -n "$cached" ] && ssh -o ConnectTimeout=4 -o BatchMode=yes \
+            "$BOARD_USER@$cached" true >/dev/null 2>&1; then
+            echo "$BOARD_USER@$cached"
+            return 0
+        fi
+    fi
+
+    echo "==> asking $robot_name over Bluetooth where it is" >&2
+    reply="$(ble_status "$robot_name")" || {
+        echo "could not reach $robot_name over Bluetooth" >&2
+        echo "  duck-btctl scan                                  # is it advertising?" >&2
+        echo "  scripts/dev-push.sh $BOARD_USER@<address>        # or say where it is" >&2
+        return 1
+    }
+    # An `error` reply is a robot that answered and refused — a wrong PIN, most often — which is a
+    # different problem from a robot with no address, and says so rather than being reported as one.
+    address="$(printf '%s' "$reply" | python3 -c 'import json, sys
+r = json.load(sys.stdin)
+e = r.get("error")
+if e: sys.exit("the robot refused net.status: %s" % (e.get("message") if isinstance(e, dict) else e))
+print((r.get("result") or {}).get("ip4") or "")')" || return 1
+
+    if [ -z "$address" ]; then
+        echo "$robot_name answered over Bluetooth but has no wifi address" >&2
+        echo "Join it to a network first — over the same radio, so this needs no ssh:" >&2
+        echo "  duck-btctl --name '$robot_name' wifi connect <ssid> --psk <passphrase>" >&2
+        return 1
+    fi
+
+    mkdir -p "$CACHE_DIR"
+    # The bare address, without the user: `DUCK_BOARD_USER` is this laptop's setting and may
+    # change between pushes, and a cache holding it would answer with yesterday's.
+    printf '%s\n' "$address" > "$cache"
+
+    if [ "$address" = "$cached" ]; then
+        # Worth saying rather than resolving silently: the address never moved, so whatever ssh
+        # is unhappy about is not the address. A reflashed board is the usual one — new host keys,
+        # same lease — and it looks identical to an unreachable board until someone says this.
+        echo "    still $address, which ssh could not reach — so the address is not the problem" >&2
+        echo "    a reflashed board has new host keys:" >&2
+        echo "      ./scripts/provision-board.sh $BOARD_USER@$address --forget-host-key" >&2
+    else
+        echo "    $robot_name is at $address" >&2
+    fi
+    echo "$BOARD_USER@$address"
+}
+
+# The command line beats the environment, and an address beats a name: an address needs no radio.
+# `DUCK_ROBOT` is the same variable `duck-btctl` defaults `--name` to, so one exported name serves
+# both tools — and empty means unset in both, so `DUCK_ROBOT= scripts/dev-push.sh radxa@…` works.
+# Not `DUCK_NAME`, which `provision.sh` reads and means the opposite way round: the name to *give*
+# a board, not which board to talk to.
+if [ -z "$BOARD" ] && [ -z "$ROBOT" ]; then
+    BOARD="${DUCK_BOARD:-}"
+    [ -n "$BOARD" ] || ROBOT="${DUCK_ROBOT:-}"
+fi
+
+if [ -n "$BOARD" ] && [ -n "$ROBOT" ]; then
+    echo "pass an address or --name, not both: they name the board two different ways" >&2
+    exit 2
+fi
+
+if [ -n "$ROBOT" ]; then
+    BOARD="$(resolve_board "$ROBOT")" || exit 1
+fi
+
 if [ -z "$BOARD" ]; then
-    echo "no board: pass one as an argument or set DUCK_BOARD" >&2
-    echo "  scripts/dev-push.sh radxa@duck.local" >&2
+    echo "no board: name one, or give its address" >&2
+    echo "  scripts/dev-push.sh --name duck-c51b        # found over Bluetooth" >&2
+    echo "  scripts/dev-push.sh radxa@192.168.1.42" >&2
+    echo "or set DUCK_ROBOT or DUCK_BOARD once per shell" >&2
     exit 2
 fi
 

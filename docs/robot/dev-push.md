@@ -33,18 +33,42 @@ see [build in a container](#build-in-a-container-instead).
 
 ## The loop
 
+Name the robot, and let the push find it:
+
 ```bash
-scripts/dev-push.sh radxa@192.168.1.42
+scripts/dev-push.sh --name duck-c51b
 ```
 
-Or name the board once per shell:
+Or once per shell:
 
 ```bash
-export DUCK_BOARD=radxa@192.168.1.42
+export DUCK_ROBOT=duck-c51b
 ```
 
 ```bash
 scripts/dev-push.sh
+```
+
+The name is the one `duck-btctl scan` lists and `robotctl system set-name` sets — the same
+`DUCK_ROBOT` that tool reads ([`duck-btctl.md`](duck-btctl.md)). Its address is
+asked for over Bluetooth — the robot's own `net.status` answers with it — and then cached, so only
+a push that cannot reach the cached address goes back to the radio. That is what makes a new DHCP
+lease, a reflash or a different network cost nothing to follow.
+
+The ssh user is `radxa`. If yours is not:
+
+```bash
+export DUCK_BOARD_USER=pierre
+```
+
+An address still works, and skips the radio entirely:
+
+```bash
+scripts/dev-push.sh radxa@192.168.1.42
+```
+
+```bash
+export DUCK_BOARD=radxa@192.168.1.42
 ```
 
 It cross-compiles the workspace, packages the same artifact a release does, signs it with the dev
@@ -244,6 +268,30 @@ grep -c 'DEV BOARD' /var/lib/robot/provision.log
 
 `0` means the key is missing; [`install-dev.md`](install-dev.md) has both halves of the fix.
 
+**`could not reach <name> over Bluetooth`** — the robot has to be advertising and in range for
+the name path to resolve an address.
+
+```bash
+duck-btctl scan
+```
+
+Nothing listed is a robot that is off, out of range, or already connected to a phone. Give the
+address instead and the radio is not involved:
+
+```bash
+scripts/dev-push.sh radxa@192.168.1.42
+```
+
+**`<name> answered over Bluetooth but has no wifi address`** — it is up but not on a network, so
+there is nothing to ssh to. Join one over the same radio:
+
+```bash
+duck-btctl --name duck-c51b wifi connect <ssid> --psk <passphrase>
+```
+
+**`still <address>, which ssh could not reach`** — the address never moved, so whatever ssh is
+unhappy about is something else. A reflashed board is the usual one; see the host keys below.
+
 **ssh refuses to connect after a reflash** — the board regenerated its host keys.
 
 ```bash
@@ -278,7 +326,11 @@ This should not have been necessary, so it is worth reading the journal for why 
 
 | | |
 |---|---|
-| `DUCK_BOARD` | The board, instead of an argument. `radxa@192.168.1.42`. |
+| `DUCK_ROBOT` | The robot, by name. Its address is found over Bluetooth and cached. |
+| `DUCK_BOARD_USER` | The ssh user on the board, for the name path. Default `radxa`. |
+| `DUCK_PIN` | The robot's pairing PIN, if it is not the factory `000000`. Read by `duck-btctl`. |
+| `DUCK_BOARD_CACHE` | Where resolved addresses are cached. Default `~/.cache/duck/boards`. |
+| `DUCK_BOARD` | The board, by address, instead of an argument. `radxa@192.168.1.42`. |
 | `DUCK_DEV_SECRET_KEY` | The dev signing key. Default `~/.duck-keys/team.dev.key`. |
 | `DUCK_SIDELOAD_DIR` | Where the artifact lands on the board. Default `~/duck-sideload` there. Never under `/tmp` or `/var/tmp`: `updaterd` has private copies of both and would read those. |
 | `DUCK_CROSS_SYSROOT` | The cached libudev copy. Default `~/.cache/duck-cross/aarch64`. |
