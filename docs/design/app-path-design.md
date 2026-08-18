@@ -138,6 +138,16 @@ One service, **one characteristic**. A client reads it once for the robot's API 
 NDJSON request bytes to it, and subscribes to it for answers — the same JSON-RPC lines every other
 transport carries. The read is not optional; see §5 for why it exists.
 
+**The version it returns is for saying so, not for refusing.** `API_VERSION` is an agreement between
+the binaries on one board, enforced by `updaterd`'s exact `!=` on `hello`; a client on a laptop or a
+phone is not one of those binaries and will routinely be a release either side of a robot. Nothing
+across this link checks it: `configd` gates no `net.*` or `system.*` call on a version, and
+`updaterd` requires no handshake before `update.status`. So a client that refuses on skew refuses
+calls the robot would have answered — and it refuses them on the transport that exists for a robot
+with no network, where `net.connect` is the way out of the skew. `duck-btctl` warns and proceeds,
+and an app should do the same: surface the mismatch, let the call go, and report the JSON-RPC error
+if a method whose shape changed is actually reached.
+
 **No framing header.** The newline that already separates NDJSON messages is the frame delimiter in
 both directions. That is safe rather than lucky: `serde_json` escapes a newline inside a string as
 `\n`, so a raw `0x0A` never appears inside a serialised object — the same property that makes NDJSON
