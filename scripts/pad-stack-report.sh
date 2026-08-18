@@ -42,6 +42,7 @@ INPUT_DEVICES="${PAD_INPUT_DEVICES:-/proc/bus/input/devices}"
 
 BT_CONF="${PAD_BT_CONF:-/etc/bluetooth/main.conf}"
 BT_LIB="${PAD_BT_LIB:-/var/lib/bluetooth}"
+SYS_BT="${PAD_SYS_BT:-/sys/class/bluetooth}"
 OS_RELEASE="${PAD_OS_RELEASE:-/etc/os-release}"
 MODULES="${PAD_PROC_MODULES:-/proc/modules}"
 
@@ -91,8 +92,12 @@ die() {
 
 # One value per line, aligned. Width fits `address type`, which is the longest label here; a label
 # that outgrows it costs alignment, not correctness.
+#
+# Trimmed here rather than at each call site, which is where it was and where the first real run
+# caught it out: `btmgmt` ends its settings line with a space, and a trailing space is invisible in
+# a diff of two fingerprints — the one thing this must never be.
 field() {
-    printf '  %-14s %s\n' "$1" "$2"
+    printf '  %-14s %s\n' "$1" "$(trim "$2")"
 }
 
 # A captured multi-line output, indented under its section. Blank input prints nothing at all rather
@@ -140,11 +145,34 @@ f_modules=
 f_hci=unreadable
 f_settings=unreadable
 f_ctrl_fw=unreadable
+f_chip=unreadable
 f_pad_id=none
 f_pad_transport=none
 f_pad_bond=none
 f_pad_input=none
 f_daemon=absent
+
+# The radio as the kernel has it wired up: the driver bound to it, and for a UART-attached part the
+# device-tree compatible that names the chip. No Bluetooth tool reports either, and both outlive the
+# boot log — which is why this exists next to the firmware lines rather than instead of them.
+chip_identity() {
+    found=
+    for hci in "$SYS_BT"/hci*; do
+        [ -d "$hci" ] || continue
+        one="$(basename "$hci")"
+        if [ -L "${hci}/device/driver" ]; then
+            one="${one} $(basename "$(readlink "${hci}/device/driver")")"
+        fi
+        # NUL-separated, most specific compatible first, so this names the part and not just the bus.
+        if [ -r "${hci}/device/of_node/compatible" ]; then
+            one="${one} $(tr '\0' ' ' < "${hci}/device/of_node/compatible")"
+        elif [ -r "${hci}/device/modalias" ]; then
+            one="${one} $(cat "${hci}/device/modalias")"
+        fi
+        found="${found}${found:+, }$(trim "$one")"
+    done
+    printf '%s' "${found:-no hci device in ${SYS_BT}}"
+}
 
 os_pretty() {
     [ -r "$OS_RELEASE" ] || { printf 'unknown'; return 0; }
@@ -268,9 +296,16 @@ section_adapter() {
     field hci "$f_hci"
     field settings "$f_settings"
 
+    # Which radio this is, from sysfs rather than from the log. The first run on a board came back
+    # with no kernel Bluetooth lines at all — ring buffer wrapped, or journald keeping no kmsg — and
+    # left the only section that names the hardware empty. sysfs is still there an hour into a boot,
+    # and needs no root.
+    f_chip="$(chip_identity)"
+    field chip "$f_chip"
+
     # The controller's own firmware, which on a UART-attached radio is a blob the kernel loads at
-    # boot and names in the log. It is not reported by any Bluetooth command, and it is exactly the
-    # thing that differs between two boards flashed from different images.
+    # boot and names only in the log. No Bluetooth command reports it, and it is exactly the thing
+    # that differs between two boards flashed from different images.
     fw=
     if have journalctl; then
         fw="$(journalctl -k -b --no-pager 2>/dev/null \
@@ -282,6 +317,13 @@ section_adapter() {
         fw="$(dmesg 2>/dev/null | grep -E 'Bluetooth: hci[0-9]' \
             | grep -iE 'firmware|patch|version|chip|RTL|BCM' | tail -6 || true)"
     fi
+    # Boot lines age out of both of those. Every boot the journal still holds is better than none,
+    # and each line says plainly that it is not from this one.
+    if [ -z "$fw" ] && have journalctl; then
+        fw="$(journalctl -k --no-pager 2>/dev/null | grep -E 'Bluetooth: hci[0-9]' \
+            | grep -iE 'firmware|patch|version|chip|RTL|BCM' | tail -4 \
+            | sed -E 's/^.*kernel: /(an earlier boot) /' || true)"
+    fi
     if [ -n "$fw" ]; then
         echo "  firmware"
         dump "$fw"
@@ -291,7 +333,10 @@ section_adapter() {
             | sed -E 's/^[[:space:]]*//' || true)"
         [ -n "$f_ctrl_fw" ] || f_ctrl_fw="$(printf '%s\n' "$fw" | tail -1)"
     else
-        f_ctrl_fw="no kernel Bluetooth lines this boot (root reads more of the log)"
+        # The three places tried are named, because "unknown" here reads as a script that did not
+        # look. The chip line above still identifies the radio.
+        f_ctrl_fw="not in journalctl -k -b, dmesg or journalctl -k (ring buffer wrapped, or"
+        f_ctrl_fw="${f_ctrl_fw} journald keeps no kmsg)"
         field firmware "$f_ctrl_fw"
     fi
     echo
@@ -411,11 +456,14 @@ section_pads() {
         bond="unreadable — root reads /var/lib/bluetooth"
         bond_file="$(bond_dir "$mac" || true)"
         if [ -n "$bond_file" ] && [ -r "$bond_file" ]; then
-            keys=
-            grep -q '^\[LongTermKey\]' "$bond_file" 2>/dev/null && keys="${keys}long-term key (LE) "
-            grep -q '^\[LinkKey\]' "$bond_file" 2>/dev/null && keys="${keys}link key (BR/EDR) "
-            grep -q '^\[IdentityResolvingKey\]' "$bond_file" 2>/dev/null && keys="${keys}IRK "
-            bond="$(trim "${keys:-no keys stored}")"
+            # Every section name in the file, verbatim, rather than a lookup of the three this
+            # script expected. The first run on real hardware reported `IRK` and nothing else for a
+            # pad demonstrably connected over LE — so either BlueZ 5.82 stores the LE key under a
+            # name not guessed here, or there is none in the file, and a curated list cannot tell
+            # those two apart. Printing what is actually in the file can.
+            bond="$(grep -oE '^\[[A-Za-z]+\]' "$bond_file" 2>/dev/null | tr -d '[]' \
+                | grep -v '^General$' | tr '\n' ' ' || true)"
+            bond="$(trim "${bond:-no sections}")"
             # `[DeviceID]` carries the same vendor/product/version BlueZ turns into Modalias, and it
             # is there when the pad has not been queried this boot and Modalias is not.
             if [ -z "$modalias" ]; then
@@ -445,9 +493,18 @@ section_pads() {
         # The verdict, with its evidence named. Every part of it is an inference except the bond,
         # which is why the inputs are printed above rather than replaced by this line.
         transport=unknown
-        case "$bond" in *'long-term key'*) transport="LE" ;; esac
-        case "$bond" in *'link key'*) transport="BR/EDR" ;; esac
-        case "$bond" in *'long-term key'*'link key'*) transport="LE and BR/EDR (dual)" ;; esac
+        # A long-term key is an LE bond, a link key a BR/EDR one. Three spellings of the former:
+        # BlueZ stores the peripheral's own key under its own name, and renamed that once.
+        ltk=
+        case " $bond " in
+            *' LongTermKey '*|*' PeripheralLongTermKey '*|*' SlaveLongTermKey '*) ltk=1 ;;
+        esac
+        [ -n "$ltk" ] && transport="LE"
+        case " $bond " in
+            *' LinkKey '*)
+                if [ -n "$ltk" ]; then transport="LE and BR/EDR (dual)"; else transport="BR/EDR"; fi
+                ;;
+        esac
         case "$link" in *' LE '*|*'< LE'*) transport="LE" ;; esac
         case "$link" in *'ACL'*) transport="BR/EDR" ;; esac
         if [ "$transport" = unknown ] \
@@ -466,8 +523,12 @@ section_pads() {
         # media keys. Both are shown: a board that registered only the second one is a board where
         # nothing can be driven, and that is only visible if both are there. gilrs reads the one with
         # a joystick handler, so that one is named.
+        # Device nodes only. On this board's vendor kernel the handler list also carries `kbd` and
+        # `dmcfreq` — the Rockchip memory-frequency governor, which listens to input events and
+        # drives nothing — and neither is the node gilrs opens.
         js_line="$(input_on_bus "$BUS_BLUETOOTH" "$mac" js | grep -E '^H:' | head -1 \
-            | sed -E 's/^H: Handlers=//' || true)"
+            | sed -E 's/^H: Handlers=//' | tr ' ' '\n' \
+            | grep -E '^(js|event)[0-9]+$' | tr '\n' ' ' || true)"
         if [ -n "$input" ]; then
             echo "  input"
             dump "$input"
@@ -514,7 +575,10 @@ input_on_bus() {
                     b = substr($i, RSTART + 4, RLENGTH - 4)
                 else if ($i ~ /^U: Uniq=/) { uniq = $i; sub(/^U: Uniq=/, "", uniq) }
                 else if ($i ~ /^H: Handlers=/ && $i ~ /js[0-9]/) js = 1
-                if ($i ~ /^[INUH]:/) keep = keep $i "\n"
+                # `S:` kept: an LE pad reaches userspace through `uhid` and a classic one through
+                # `hidp`, and the sysfs path says which — the answer the loaded-module list cannot
+                # give when either is built into the kernel rather than loaded as a module.
+                if ($i ~ /^[INUHS]:/) keep = keep $i "\n"
             }
             if (b != bus) next
             # A joystick handler, not merely an event node: every board has a USB keyboard record,
@@ -561,6 +625,7 @@ section_fingerprint() {
     field modules "$f_modules"
     field hci "$f_hci"
     field settings "$f_settings"
+    field chip "$f_chip"
     field controller "$f_ctrl_fw"
     field pad "$f_pad_id"
     field transport "$f_pad_transport"

@@ -147,10 +147,10 @@ sudo sh /tmp/pad-stack-report.sh
 ```
 
 It prints the whole stack and saves the same text to `/tmp/pad-stack-<host>-<when>.log`: kernel,
-BlueZ, the adapter's HCI version, the controller firmware the kernel loaded at boot, which BlueZ
-modules are carrying HID, whether the bond was made over LE or BR/EDR, the transport in use right
-now, and the pad's own firmware revision. It runs without root, and says `unreadable` for the three
-things that need it.
+BlueZ, the adapter's HCI version, which radio it is and the firmware the kernel loaded for it at
+boot, what is carrying HID, which keys the bond holds, the transport in use right now, and the pad's
+own firmware revision. It runs without root, and says `unreadable` for the three things that need
+it.
 
 To compare two boards, ask each for only the values that have to match:
 
