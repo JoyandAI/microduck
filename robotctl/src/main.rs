@@ -423,6 +423,11 @@ enum UpdateCommand {
         /// robot's trusted set and `allow_dev_keys` is on, so a customer robot refuses it
         /// exactly as it refuses `--ref`.
         ///
+        /// **Not under /tmp or /var/tmp.** `updaterd.service` sets `PrivateTmp=yes`, so the
+        /// daemon that reads this directory has its own pair of those and neither is the one
+        /// a shell copied into. Preflight names that case rather than letting it surface as a
+        /// missing manifest in a directory the caller can plainly see.
+        ///
         /// `conflicts_with = "staging"` because a directory has no channels — the source
         /// layer says so too, and being told at parse time is better than after a connection.
         #[arg(long, value_name = "DIR", conflicts_with = "staging")]

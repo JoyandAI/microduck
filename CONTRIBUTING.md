@@ -45,8 +45,8 @@ another.
 To run a change on a real robot without publishing it, `scripts/dev-push.sh <user@board>` builds
 here and installs there as an ordinary gated update. It cross-compiles with `cargo zigbuild` by
 default, or with `--docker` builds inside the board's userland instead, which needs no toolchain
-set up at all. Setup and the one-time first push:
-[`docs/robot/cheatsheet-dev.md`](docs/robot/cheatsheet-dev.md).
+set up at all. Setup, the flags and the failure modes:
+[`docs/robot/dev-push.md`](docs/robot/dev-push.md).
 
 ## The layout
 

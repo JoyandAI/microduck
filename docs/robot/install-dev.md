@@ -198,8 +198,8 @@ daemon, with the health gate and auto-rollback:
 sudo robotctl update apply daemon --from /media/usb/release
 ```
 
-That is also what `scripts/dev-push.sh` ends with; the
-[dev board cheat sheet](cheatsheet-dev.md) has the laptop-to-board path.
+That is also what `scripts/dev-push.sh` ends with; [`dev-push.md`](dev-push.md) is the
+laptop-to-board path.
 
 The rest of this section is the **bare-board** case: a factory or offline install, before there is
 a daemon to ask. It is `updaterd` rather than `robotctl` for that reason, and `updaterd` is

@@ -1733,6 +1733,7 @@ impl Engine {
             available_bytes: available,
             interrupt_sessions: options.interrupt_sessions,
             robot_query_timeout: ROBOT_QUERY_TIMEOUT,
+            from_dir: options.from_dir.as_deref(),
         }
         .run()
         .await?;
