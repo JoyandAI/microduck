@@ -35,6 +35,11 @@ MAC=
 MODE=watch
 SINCE=-7d
 
+# The three thresholds below have a compiled twin in `duck_ipc_proto::pad_link`, which
+# `robotctl monitor`'s live pad block reads them from. Deliberately two copies: this file has to run
+# on a board with none of that compiled, and it is `scp`-ed there on its own. They must agree — two
+# tools that disagree about what counts as a stall are two tools nobody can compare — so change both.
+#
 # Where the deadman zeroes the velocity, from robotd's default `safety.deadman_ms`. A stall longer
 # than this is not a latency complaint, it is the robot stopping.
 DEADMAN_MS=500

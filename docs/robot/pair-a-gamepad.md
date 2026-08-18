@@ -100,7 +100,39 @@ the one instrument that distinguishes a board setting from a pad that is not lis
 
 ## When it drops while you are driving
 
-Copy the measurement onto the board, from a clone of this repo:
+Watch the pad's own input stream, which is already on the board:
+
+```bash
+robotctl monitor
+```
+
+Press `p`. The block that opens is the raw evdev stream from the pad `padd` is driving from — every
+report, timestamped by the kernel:
+
+```
+┌ pad Xbox Wireless Controller · /dev/input/event5 · 78:86:2e:bb:13:28 ─────────────┐
+│ cadence  124/s while driving · last 8 ms ago · worst 84 ms · over 100 ms 0 · …    │
+│ gap ms                                       ▁▁▁▁▂▁▁▁▁▃▁▁▁▁▁▁▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁ │
+│ X     ····│██··   -8734 Y     ····│····       0 Z     ·········       0 …         │
+│ held     BTN_START                                                                │
+└ 4213 reports · gap ≤100 ms ───────────────────────────────── reports intact ──────┘
+```
+
+Move the sticks and the bars follow them. What the trace is for is the row above: a bar per report,
+so a stall is a spike, and one that has already recovered is still on screen. Full height is 100 ms
+— the point a driver starts to feel it — and past 500 ms `robotd` has zeroed the velocity.
+
+**Nothing else on the robot can show this.** `padd` resends the last stick value at 50 Hz, so a
+radio that has stopped delivering still looks like a live driver everywhere downstream: `robot.state`
+carries fresh intents, the deadman never fires, and the robot keeps walking on a command nobody is
+giving. The `asked` column in the block above it will look perfect while this one flatlines.
+
+A pad at rest sends nothing, so silence is only evidence while you are driving. The block says
+`the sticks are still` past five seconds rather than accusing the link, and counts those spells
+separately.
+
+Then, for a verdict over a window rather than a live picture, copy the measurement onto the board
+from a clone of this repo:
 
 ```bash
 scp scripts/pad-link-test.sh radxa@<board>:/tmp/

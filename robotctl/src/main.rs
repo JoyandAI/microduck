@@ -82,6 +82,13 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::CONFIG)]
     config_socket: PathBuf,
 
+    /// Path to `padd`'s raw input tap, which `monitor` reads the pad's own event stream from.
+    ///
+    /// Optional in the only sense that matters: nothing fails when it is absent. `monitor` says the
+    /// tap is not there and carries on showing the robot.
+    #[arg(long, global = true, default_value = proto::socket::PAD)]
+    pad_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -2105,7 +2112,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return run_version(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }
         Namespace::Monitor { hz, json } => {
-            return monitor::run(&cli.robot_socket, hz, json);
+            return monitor::run(&cli.robot_socket, &cli.pad_socket, hz, json);
         }
         // Pure codegen: no socket, no daemon, no root. It must keep working on a robot
         // where nothing is running, since that is where an operator most wants to type

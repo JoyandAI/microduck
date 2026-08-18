@@ -85,13 +85,20 @@ Environment=RUST_LOG=info
 StandardOutput=journal
 StandardError=journal
 
-# Where this daemon publishes what it is running: /run/padd/identity.json, read by
-# `robotctl health` and by updaterd's startup check.
+# /run/padd/, which holds two things: identity.json — what this daemon is running, read by
+# `robotctl health` and by updaterd's startup check — and pad.sock, the read-only raw input tap
+# `robotctl monitor` shows the pad's own event stream from (`src/tap.rs`).
 #
 # `RuntimeDirectory=` rather than a path this unit is granted: it is the only mechanism that both
 # creates the directory owned by this unit's User= *and* survives ProtectSystem=strict, which
 # otherwise leaves the whole filesystem read-only. systemd also removes it when the unit stops, so a
-# stopped daemon cannot leave behind an identity claiming to be running.
+# stopped daemon cannot leave behind an identity claiming to be running — nor a socket nothing is
+# listening on, which is the difference between "padd is not running" and a client hanging.
+#
+# The tap's socket is 0660 and handed to the `robot` group by `padd` itself, so it reaches exactly
+# who may already drive the robot. That is done in code rather than with `Group=robot` here, the way
+# robotd does it: this process keeps its own primary group, and reaches the robot group as a
+# supplementary one.
 RuntimeDirectory=padd
 
 [Install]
