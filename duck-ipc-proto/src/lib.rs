@@ -1145,9 +1145,10 @@ pub struct EnableParams {
     /// restarting), and a stale belief turns Start into a button that does nothing every
     /// other press. The robot owns the toggle, so a press always means "the other one".
     ///
-    /// Toggling ON also re-homes first: the robot ramps to its home pose and the policy
-    /// takes over from there — never from whatever crouch the last stop froze. The reply's
-    /// `reason` names the state the robot ended in.
+    /// Toggling OFF returns the robot to its home pose — commanded directly, the
+    /// prototype's "returning to default pose" — so the next toggle ON hands the policy a
+    /// robot already standing at home. The reply's `reason` names the state the robot
+    /// ended in.
     #[serde(default)]
     pub toggle: bool,
 }

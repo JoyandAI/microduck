@@ -345,8 +345,8 @@ fn main() -> std::process::ExitCode {
             // robot's the moment anything else moves it — robot.relax, the shutdown
             // sequence, either side restarting — and a stale belief turns Start into a
             // button that does nothing every other press. `toggle` flips the robot's own
-            // state; turning on also re-homes first (Start means "stand at home, then
-            // drive", as the prototype's Start runs init_position before the policy).
+            // state; turning OFF returns it to the home pose (the prototype's "returning
+            // to default pose"), so turning on always starts the policy from home.
             let call = proto::Call::RobotEnable(proto::EnableParams {
                 on: false,
                 toggle: true,

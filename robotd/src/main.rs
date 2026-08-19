@@ -1424,9 +1424,16 @@ async fn control_loop<T: RobotIo>(
             }
         }
         if was_driving && !driving {
-            // Freeze where it is rather than snapping back to the startup pose. Captured
-            // once, not re-read each tick, or the hold target would sag under gravity.
-            if let Some(sensors) = sensors.as_ref() {
+            if !snapshot.enabled {
+                // A deliberate stop returns to the home pose — the prototype's Start-off
+                // ("policy DISABLED - returning to default pose"). Commanded directly, no
+                // ramp: the servos do the travel at their own speed, and the robot is
+                // standing at home when Start next hands it to the policy.
+                hold = DEFAULT_POSITION;
+            } else if let Some(sensors) = sensors.as_ref() {
+                // Any other stop — IMU cooling, a read failure, the armed fall gate —
+                // freezes where it is rather than snapping anywhere. Captured once, not
+                // re-read each tick, or the hold target would sag under gravity.
                 hold = sensors.positions;
             }
         }
@@ -1942,16 +1949,21 @@ fn dispatch(
             let result = if on && state.fall_gate && state.fallen.load(Ordering::Relaxed) {
                 proto::IntentResult::refused("the robot is down; stand it up first")
             } else {
-                if p.toggle && on {
-                    // Start means "stand at home, then drive". Queued before the enable
-                    // and handled earlier in the same tick, so the policy never sees the
-                    // pose the last stop froze — it takes over when the ramp completes.
-                    intents.request_init();
-                }
                 intents.set_enabled(on);
+                // No init here: stopping is what returns the robot to its home pose (the
+                // loop commands it directly on the disable — the prototype's "returning
+                // to default pose"), so the next start already begins from home. From
+                // limp, the enable-triggered bring-up still ramps torque on as ever.
                 proto::IntentResult {
                     accepted: true,
-                    reason: Some(if on { "enabled — homing first" } else { "disabled" }.to_owned()),
+                    reason: Some(
+                        if on {
+                            "enabled — driving"
+                        } else {
+                            "disabled — returning to the home pose"
+                        }
+                        .to_owned(),
+                    ),
                 }
             };
             proto::Response::ok(Some(id), &result)
