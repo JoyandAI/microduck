@@ -1305,13 +1305,6 @@ impl Engine {
                 continue;
             }
 
-            tracing::warn!(
-                component = %pending.component,
-                version = %pending.version,
-                boots = pending.boots,
-                "pending update never confirmed healthy; reverting"
-            );
-
             // A trial for a component that has since been removed from config must
             // not wedge startup; clear it and move on.
             let Ok(cfg) = self.config.component(&pending.component).cloned() else {
@@ -1322,6 +1315,65 @@ impl Engine {
                 self.boot_counter.confirm(&pending.component)?;
                 continue;
             };
+
+            // **The budget decides when to ask; the robot decides whether to revert.**
+            //
+            // A trial reaching this point means no apply ever confirmed it — the usual cause being
+            // an apply that was killed before its gate ran, which is what happens when the
+            // release's own `hooks/postinstall` restarts `updaterd` mid-apply. It does *not* mean
+            // the release is bad, and reverting one that is working replaces the code under
+            // whoever is looking at the robot, having told them nothing.
+            //
+            // So the same three-way question `health_gate` asks, in the same words, because the
+            // reasoning is identical:
+            //
+            //   - healthy: the release works. Confirm it. The budget was spent counting boots on a
+            //     release that was fine all along.
+            //   - degraded: the robot is not working *for a reason a rollback cannot fix* — no
+            //     servo power, a loose bus, absent hardware. Reverting hides a hardware fault
+            //     behind a software change, and the next release will be reverted too.
+            //   - anything else: revert, as before. `robotd` not answering, or answering
+            //     unhealthy, is the case this budget exists for.
+            //
+            // Only for a socket gate. `HealthCheck::None` has nothing to ask, and `Command` answers
+            // a two-way question — there is no "degraded" in an exit status.
+            if let HealthCheck::Socket { .. } = cfg.health {
+                match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
+                    crate::robot::Health::Healthy => {
+                        tracing::warn!(
+                            component = %pending.component,
+                            version = %pending.version,
+                            boots = pending.boots,
+                            "trial was never confirmed, but the robot is healthy on it; \
+                             committing instead of reverting"
+                        );
+                        self.boot_counter.confirm(&pending.component)?;
+                        continue;
+                    }
+                    crate::robot::Health::Degraded(reason) => {
+                        tracing::warn!(
+                            component = %pending.component,
+                            version = %pending.version,
+                            boots = pending.boots,
+                            reason = %reason,
+                            "trial was never confirmed and the robot is degraded for a reason this \
+                             release cannot have caused and a rollback cannot fix; committing"
+                        );
+                        self.boot_counter.confirm(&pending.component)?;
+                        continue;
+                    }
+                    // Fall through to the revert below, which logs why.
+                    _ => {}
+                }
+            }
+
+            tracing::warn!(
+                component = %pending.component,
+                version = %pending.version,
+                boots = pending.boots,
+                "pending update never confirmed healthy; reverting"
+            );
+
             let store = self.store(&pending.component)?;
 
             // §8.2's chain: previous → golden. Escalate past `previous` when it is

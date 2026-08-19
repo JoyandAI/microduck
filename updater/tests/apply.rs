@@ -892,11 +892,15 @@ async fn a_revert_whose_restart_fails_is_still_a_revert() {
 
 // ── crash recovery ───────────────────────────────────────────────────────────
 
-/// Simulates `kill -9` right after the symlink swap: the new release is live and
-/// the boot counter is still armed. The in-process health gate cannot help here —
-/// it died with the process — so the boot counter must catch it.
+/// Simulates `kill -9` right after the symlink swap: the new release is live and the boot counter is
+/// still armed. The in-process health gate cannot help — it died with the process — so the boot
+/// counter must catch it **when the robot is not working on the new release**.
+///
+/// The robot is unhealthy here on purpose. A crash after the swap is not by itself evidence against
+/// a release, and what happens when the robot *is* fine is
+/// [`an_unconfirmed_trial_on_a_healthy_robot_is_committed`].
 #[tokio::test]
-async fn crash_after_swap_is_reverted_by_boot_counter() {
+async fn crash_after_swap_is_reverted_when_the_robot_is_unhealthy() {
     let fx = Fixture::new();
     fx.publish("1.0.0", None);
     let mut engine = fx.engine_healthy();
@@ -916,14 +920,86 @@ async fn crash_after_swap_is_reverted_by_boot_counter() {
     // Post-crash state: 1.1.0 is live but never confirmed healthy.
     assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
 
-    // Restarts: the first is still "on trial", the second exhausts the budget.
-    let mut engine = fx.engine_healthy();
+    // Restarts: the first is still "on trial", the second exhausts the budget. The robot does not
+    // work on 1.1.0, which is what makes reverting the right answer.
+    let mut engine = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), "");
     assert!(engine.recover_on_start().await.unwrap().is_empty());
     let recovered = engine.recover_on_start().await.unwrap();
 
     assert_eq!(recovered.len(), 1, "should have reverted");
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
     assert_eq!(fx.live_marker().as_deref(), Some("version=1.0.0\n"));
+}
+
+/// **A release the robot is healthy on must not be reverted for want of a confirmation.**
+///
+/// The trial exists to catch a release that does not work. An apply killed before its gate ran —
+/// which is what happens when the release's own `hooks/postinstall` restarts `updaterd` — arms a
+/// trial nothing will ever confirm, and reverting on the budget alone then swaps working code out
+/// from under whoever is using the robot, silently. Observed on a board that had installed a branch
+/// build, paired a gamepad on it, and came back two boots later running the stable release.
+#[tokio::test]
+async fn an_unconfirmed_trial_on_a_healthy_robot_is_committed() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish("1.1.0", None);
+    let mut crashing = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults {
+            abort_after_swap: true,
+            ..Faults::none()
+        },
+        "",
+    );
+    let _ = apply_latest(&mut crashing).await;
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    // Three restarts: more than the budget, so nothing here is the budget merely not having run out.
+    let mut engine = fx.engine_healthy();
+    for _ in 0..3 {
+        assert!(
+            engine.recover_on_start().await.unwrap().is_empty(),
+            "a healthy robot on the new release is not a rollback"
+        );
+    }
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+}
+
+/// And the case that prompted all of this: a bench board with no servo power.
+///
+/// `robotd` comes up and answers, and reports `degraded` because it can see no motor bus. That is a
+/// hardware fault. Reverting hides it behind a software change — and reverts the next release too,
+/// forever, on a board whose only problem is a switch nobody turned on.
+#[tokio::test]
+async fn an_unconfirmed_trial_on_a_degraded_robot_is_committed() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish("1.1.0", None);
+    let mut crashing = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults {
+            abort_after_swap: true,
+            ..Faults::none()
+        },
+        "",
+    );
+    let _ = apply_latest(&mut crashing).await;
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    let mut engine = fx.engine(Box::new(DegradedRobot), Faults::none(), "");
+    for _ in 0..3 {
+        assert!(
+            engine.recover_on_start().await.unwrap().is_empty(),
+            "no motor bus is a hardware fault, not a failed release"
+        );
+    }
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
 }
 
 #[tokio::test]
@@ -1352,7 +1428,10 @@ async fn unrecoverable_first_install_reports_stuck_once() {
     );
     let _ = apply_latest(&mut crashing).await;
 
-    let mut engine = fx.engine_healthy();
+    // Unhealthy, because the subject is what happens when a revert is warranted and there is
+    // nowhere to revert *to*. On a robot that works, the trial is committed and there is nothing to
+    // report — see `an_unconfirmed_trial_on_a_healthy_robot_is_committed`.
+    let mut engine = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), "");
     assert!(
         engine.recover_on_start().await.unwrap().is_empty(),
         "on trial"
@@ -1427,7 +1506,12 @@ health = {{ probe = "none" }}
         .await
         .unwrap();
 
-    // The daemon trial must have survived, and still revert.
+    // The daemon trial must have survived, and still revert. A fresh engine with an *unhealthy*
+    // robot, because what is being asserted here is that the trial still exists and is still acted
+    // on — and a robot that works on the new release is committed rather than reverted, which would
+    // pass this assertion for the wrong reason. See
+    // `an_unconfirmed_trial_on_a_healthy_robot_is_committed`.
+    let mut engine = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), &extra);
     assert!(
         engine.recover_on_start().await.unwrap().is_empty(),
         "on trial"
@@ -1900,7 +1984,10 @@ async fn recovery_escalates_to_golden_when_previous_is_gone() {
     // Now 1.1.0 disappears (pruned, or a corrupted directory removed by hand).
     std::fs::remove_dir_all(fx.install.join("releases/1.1.0")).unwrap();
 
-    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), golden);
+    // Unhealthy on purpose: the subject here is *where* a revert lands, so there has to be one.
+    // A robot that works on the new release is committed instead — see
+    // `an_unconfirmed_trial_on_a_healthy_robot_is_committed`.
+    let mut engine = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), golden);
     engine.recover_on_start().await.unwrap();
     engine.recover_on_start().await.unwrap();
 

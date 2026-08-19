@@ -51,17 +51,35 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// # The rule, since a bump has consequences and nothing else states them
 ///
 /// **A bump promises nothing in either direction.** It is not "additive unless stated": v5 was
-/// additive and v4 was not, and the constant does not distinguish them. So `updaterd` refuses on an
-/// exact `!=`, and that stays deliberate rather than pending — accepting an older client would
-/// promise backward compatibility on every past and future bump, with no mechanism to keep it and
-/// no way to make a non-additive change afterwards. There is one user and one robot; a promise is
-/// worth less here than the freedom to change the wire shape.
+/// additive and v4 was not, and the constant does not distinguish them. Every binary on a board is
+/// expected to come from one release, and the install path is what delivers that.
 ///
-/// **What a bump therefore costs.** Every client on a board must come from the same release as
-/// `updaterd`, and for a few seconds after an update they do not: `robotctl` is a symlink into
+/// **No daemon refuses a call because this number differs.** `updaterd` used to refuse `hello` on
+/// an exact `!=`. The premise was sound — a bump promises nothing — and the conclusion did not
+/// follow from it: what actually breaks a mismatched peer is a *route it cannot reach* or a
+/// *parameter shape that moved*, and each of those refuses itself, by name, on the one call that
+/// cannot be served. A gate on the handshake fired on all of them instead, including the calls that
+/// were perfectly serveable and including `update apply`, which is how a skew ends. The difference
+/// is now *reported* — in `updaterd`'s journal, and in [`HelloResult::api_version`] for a client to
+/// compare against its own — and refused nowhere. See `updater/src/ipc.rs`.
+///
+/// **What refuses instead, and it is narrower on purpose.** A method this release does not have is
+/// [`code::METHOD_NOT_FOUND`] naming the method ([`Request::as_call`]). A member of `params` this
+/// release does not know is [`code::INVALID_PARAMS`] naming the member, because every params type
+/// denies unknown fields — which is the strictness the handshake was reaching for, moved to where it
+/// can tell a changed call from an unchanged one. Both were wanted regardless of the gate: v7 added
+/// `ApplyOptions::from_dir`, and an older `updaterd` that merely *ignored* it would have installed
+/// from its configured source while the operator believed they were sideloading a directory. Silence
+/// was the danger there, not disagreement. It reaches only forward — a daemon built before this
+/// cannot refuse what it was already ignoring — which is one more reason the bump is still worth
+/// making.
+///
+/// **What a bump therefore costs.** Two peers from different releases are still not interchangeable:
+/// a method whose shape moved will fail. It fails on that method now rather than on the handshake,
+/// and for the few seconds after an update it costs nothing at all — `robotctl` is a symlink into
 /// `current`, so it follows the new release immediately, while `updaterd` is mid-restart of itself.
-/// Retrying is the fix. A client that is *persistently* older is a copy taken from somewhere other
-/// than `/usr/local/bin/robotctl`. Both directions are named in the refusal — `updater/src/ipc.rs`.
+/// A client that is *persistently* older is a copy taken from somewhere other than
+/// `/usr/local/bin/robotctl`.
 /// # v7 — `ApplyOptions::from_dir`
 ///
 /// First ships in 0.5.0, which is therefore the version a board has to be on before
@@ -71,7 +89,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// That is the reason to bump rather than a reason not to: serde ignores what it does not know, so a
 /// v6 `updaterd` would accept `update.apply --from /some/dir` and quietly install from its
 /// *configured* source instead — a mirror of the release the operator meant to sideload, or nothing
-/// at all. Refusing the call outright is what this constant is for.
+/// at all.
+///
+/// Refusing the call outright is what the handshake used to be for, and it is now the params
+/// decoder's job: an unknown member of `params` is an [`code::INVALID_PARAMS`] naming the member. A
+/// v6 daemon predates that and still ignores the field, which is exactly why the bump stays — it is
+/// the honest label for two peers that do not share a release.
 /// # v8 — `pad.input`
 ///
 /// A namespace addition of the kind v5 was, and it bumps for the same stated reason: the constant
@@ -80,8 +103,8 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// **What it costs here is smaller than usual, and worth being precise about.** The new method is
 /// served by `padd` on a socket of its own, so no existing client loses anything by not knowing it,
 /// and a `robotctl` that asks an older `padd` for it finds no socket at all rather than a refusal.
-/// The bump still lands on `updaterd`'s exact `!=` check, so every binary on a board must come from
-/// one release — which was already the rule.
+/// The bump lands on nothing that refuses: it records that two peers differ, and the rule that every
+/// binary on a board comes from one release is kept by the install path rather than by a handshake.
 pub const API_VERSION: u32 = 8;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
@@ -333,6 +356,12 @@ pub mod code {
     // Application-specific.
     pub const BUSY: i32 = 1;
     pub const UNKNOWN_COMPONENT: i32 = 2;
+    /// Retired: nothing emits this any more. A version *difference* is logged and served, and
+    /// what refuses is the route that is genuinely missing — see [`super::API_VERSION`].
+    ///
+    /// The constant stays, and the number is not reused, because a board running an `updaterd`
+    /// from 0.5.1 or earlier still answers `hello` with it and `robotctl` still maps it to an
+    /// exit status. Deleting it would make that board's refusal read as a generic failure.
     pub const PROTOCOL_MISMATCH: i32 = 3;
     pub const PREFLIGHT_FAILED: i32 = 4;
     pub const NETWORK: i32 = 5;
@@ -853,12 +882,26 @@ impl From<&str> for ComponentId {
     }
 }
 
+/// Every params type below denies unknown fields, and this is the one place that is worth saying
+/// why rather than repeating it fourteen times.
+///
+/// `serde` ignores what it does not know, so without this a client from another release can send a
+/// member that changes what a call *means* and be told nothing: v7's `ApplyOptions::from_dir` is the
+/// worked example — a daemon that ignores it installs from its configured source while the operator
+/// believes they are sideloading a directory. Refusing it names the member, on the one call that
+/// cannot be served, which is what [`API_VERSION`]'s handshake gate was standing in for until it was
+/// removed for firing on every other call too.
+///
+/// The robot-intent types (`MoveParams`, `HeadParams`, …) had it from the start; the updater and
+/// config ones did not, because the gate was covering for them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HelloParams {
     pub api_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentParams {
     pub component: ComponentId,
 }
@@ -989,6 +1032,7 @@ pub enum Target {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApplyOptions {
     /// Run every check (fetch, verify, compatibility, space) and stop before the symlink
     /// swap.
@@ -1017,6 +1061,7 @@ pub struct ApplyOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApplyParams {
     pub component: ComponentId,
     pub target: Target,
@@ -1025,12 +1070,14 @@ pub struct ApplyParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectParams {
     pub component: ComponentId,
     pub version: semver::Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PinParams {
     pub component: ComponentId,
     /// `None` unpins.
@@ -1038,6 +1085,7 @@ pub struct PinParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogParams {
     pub limit: usize,
 }
@@ -1050,6 +1098,7 @@ pub struct LogParams {
 /// `btd` and `robotctl` all log calls, and the credential-carrying one must not be readable
 /// afterwards by anyone who can run `journalctl`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetConnectParams {
     pub ssid: String,
     /// `None` for an open network. Either a passphrase or a 64-hex pre-shared key;
@@ -1078,11 +1127,13 @@ impl std::fmt::Debug for NetConnectParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetForgetParams {
     pub ssid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetNameParams {
     pub name: String,
 }
@@ -1093,6 +1144,7 @@ pub struct SetNameParams {
 /// is the only thing standing between a paired-but-unauthenticated peer and the robot, and a
 /// journal is the wrong place for it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticateParams {
     pub pin: String,
 }
@@ -1122,6 +1174,7 @@ pub struct AuthenticateResult {
 /// and a `u32` would store that as 0 and display it as "0". The robot and the phone must agree
 /// on six characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetPairingPinParams {
     pub pin: String,
 }
@@ -1130,6 +1183,7 @@ pub struct SetPairingPinParams {
 
 /// Pair the gamepad that is in pairing mode now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PadPairParams {
     /// Which pad, when the address is already known. **Omit it in the normal case**: the point of
     /// this call is not having to find a MAC address first, so the robot looks for a pad that
@@ -1153,6 +1207,7 @@ pub struct PadPairParams {
 /// room any more — a colleague's controller that still steals the bond on boot — so identifying it
 /// by its current connection state would name the wrong thing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PadForgetParams {
     pub mac: String,
 }
@@ -2580,6 +2635,41 @@ mod tests {
             params: Some(serde_json::json!({ "wrong": "shape" })),
         };
         assert_eq!(malformed.as_call().unwrap_err().code, code::INVALID_PARAMS);
+    }
+
+    /// A `params` member this release does not know is refused, and named, for every method that
+    /// takes parameters.
+    ///
+    /// Pinned across all of them rather than left to fourteen `deny_unknown_fields` attributes being
+    /// remembered, because this is where the strictness the `hello` handshake used to supply now
+    /// lives — see [`API_VERSION`]. A params type added without the attribute fails here.
+    ///
+    /// Methods taking *no* parameters are exempt by design: `parse` ignores whatever arrived for
+    /// them, so that `{}`, `null` and an absent member all mean the same call.
+    #[test]
+    fn an_unknown_params_member_is_refused_by_name() {
+        for call in every_call() {
+            let Value::Object(mut params) = call.params() else {
+                panic!(
+                    "{} serialised its params as something other than an object",
+                    call.method()
+                );
+            };
+            if params.is_empty() {
+                continue;
+            }
+            params.insert("from_a_later_release".to_owned(), Value::Bool(true));
+
+            let error = Call::parse(call.method(), Some(&Value::Object(params)))
+                .expect_err(&format!("{} accepted an unknown member", call.method()));
+            assert_eq!(error.code, code::INVALID_PARAMS, "{}", call.method());
+            assert!(
+                error.message.contains("from_a_later_release"),
+                "{}: {}",
+                call.method(),
+                error.message
+            );
+        }
     }
 
     /// A no-parameter method must accept whatever a client sent for `params` — `{}`, `null`

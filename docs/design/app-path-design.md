@@ -138,15 +138,17 @@ One service, **one characteristic**. A client reads it once for the robot's API 
 NDJSON request bytes to it, and subscribes to it for answers — the same JSON-RPC lines every other
 transport carries. The read is not optional; see §5 for why it exists.
 
-**The version it returns is for saying so, not for refusing.** `API_VERSION` is an agreement between
-the binaries on one board, enforced by `updaterd`'s exact `!=` on `hello`; a client on a laptop or a
-phone is not one of those binaries and will routinely be a release either side of a robot. Nothing
-across this link checks it: `configd` gates no `net.*` or `system.*` call on a version, and
-`updaterd` requires no handshake before `update.status`. So a client that refuses on skew refuses
-calls the robot would have answered — and it refuses them on the transport that exists for a robot
-with no network, where `net.connect` is the way out of the skew. `duck-btctl` warns and proceeds,
-and an app should do the same: surface the mismatch, let the call go, and report the JSON-RPC error
-if a method whose shape changed is actually reached.
+**The version it returns is for saying so, not for refusing.** `API_VERSION` says the two peers were
+not built together; it does not say which calls stop working, and on this link it is usually none of
+them. Nothing across it checks the number — `configd` gates no `net.*` or `system.*` call on a
+version, `updaterd` requires no handshake before `update.status`, and `updaterd`'s `hello` no longer
+refuses on it either. So a client that refuses on skew refuses calls the robot would have answered —
+and it refuses them on the transport that exists for a robot with no network, where `net.connect` is
+the way out of the skew. `duck-btctl` warns and proceeds, and an app should do the same: surface the
+mismatch, let the call go, and report the JSON-RPC error if a method whose shape changed is actually
+reached. Those errors name themselves — `METHOD_NOT_FOUND` for a route this release does not have,
+`INVALID_PARAMS` for a parameter it does not know — which is what makes proceeding safe rather than
+merely optimistic.
 
 **No framing header.** The newline that already separates NDJSON messages is the frame delimiter in
 both directions. That is safe rather than lucky: `serde_json` escapes a newline inside a string as
@@ -677,11 +679,6 @@ The identity and the derived name are ordinary unit tests. The scenario this exi
 robots advertising at once and a client choosing correctly — is not testable off a board, and wants
 either three of them or a fake peripheral. Worth saying plainly rather than leaving the green suite
 to imply otherwise.
-
-### 8.3 `API_VERSION` skew
-
-`hello` should refuse only when the client is *newer* than the daemon —
-`install-path-gap.md` covers it. Small, self-contained, and it has already cost an hour twice.
 
 ### 8.4 PIN attempts across reconnects
 
