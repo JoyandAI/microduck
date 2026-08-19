@@ -1712,6 +1712,83 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The unit paused while a pad bonds. See [`BtdPaused`].
+const BTD_UNIT: &str = "btd.service";
+
+/// Run `systemctl` and say whether it succeeded, with its output discarded.
+///
+/// Discarded because every call here has something better to say than systemd does: a stop that
+/// fails is reported as what it means for the pairing, not as an exit status.
+fn systemctl(args: &[&str]) -> bool {
+    std::process::Command::new("systemctl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `btd` stopped for the length of a pad pairing, and started again afterwards.
+///
+/// **A temporary workaround for a board that is going away, and deliberately in the CLI rather than
+/// in a daemon.** Measured on a Radxa Zero 3W on 2026-08-19: with `btd` running, a pad cannot form a
+/// *new* bond — the bisect in `docs/project/pad-minimal-pairing.md` narrows it to `btd` and nothing
+/// else, one variable, reproducible both ways. An existing bond is unaffected: a bonded pad connects
+/// and drives with the whole stack up, which is what makes stopping `btd` for one pairing a complete
+/// answer rather than a degradation.
+///
+/// Why not in `btd` or `configd`. The fault is the aic8800 radio behaving badly with an adapter that
+/// both advertises as a peripheral and acts as central at once; the chip and the board are not what
+/// ships. Teaching `btd` to drop its advertisement would be real work against hardware with no
+/// future, and having `configd` drive `btd.service` would put a dependency between them that
+/// `docs/design/architecture.md` §1.1 keeps out on purpose — `btd` is in the recovery path.
+///
+/// So it lives at the edge, in one place, in the command a human runs. **Delete this whole type when
+/// the radio changes**; nothing else has to be unpicked.
+///
+/// A guard rather than a stop and a start around the call, so `btd` comes back on every path out —
+/// including the error ones, which is where a pairing is most likely to end.
+struct BtdPaused {
+    /// Was it running when we arrived? Only then is starting it again correct: a board with `btd`
+    /// deliberately disabled must not have it switched on by pairing a gamepad.
+    restart: bool,
+}
+
+impl BtdPaused {
+    fn for_pairing() -> Self {
+        if !systemctl(&["is-active", "--quiet", BTD_UNIT]) {
+            return Self { restart: false };
+        }
+        if systemctl(&["stop", BTD_UNIT]) {
+            eprintln!(
+                "paused btd while the pad bonds — on this board it cannot bond while btd \
+                 advertises; it comes back on its own"
+            );
+            Self { restart: true }
+        } else {
+            // Not fatal: the pairing may still work, and refusing to try would be worse than
+            // trying and saying why it might fail. This is also what an unprivileged run looks
+            // like, where the call below is about to be refused anyway.
+            eprintln!(
+                "warning: could not stop btd, so this pairing may fail on this board. Try:\n    \
+                 sudo systemctl stop btd"
+            );
+            Self { restart: false }
+        }
+    }
+}
+
+impl Drop for BtdPaused {
+    fn drop(&mut self) {
+        if self.restart && !systemctl(&["start", BTD_UNIT]) {
+            eprintln!(
+                "warning: could not start btd again, so the phone path is down until:\n    \
+                 sudo systemctl start btd"
+            );
+        }
+    }
+}
+
 /// The gamepad, through `configd`.
 ///
 /// `pair` is the only command here that takes a while — discovery is held open while someone holds
@@ -1744,6 +1821,11 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
              button on the top edge (not the Xbox button, which switches it off)"
         );
     }
+
+    // Held until this function returns, so `btd` is restored on every path out including the
+    // failures. See `BtdPaused` — temporary, and only for `pair`: `status` and `forget` neither
+    // need the radio quiet nor should disturb it.
+    let _btd = matches!(command, PadCommand::Pair { .. }).then(BtdPaused::for_pairing);
 
     let result = result_of(client.call(&call)?)?;
     if json {

@@ -71,6 +71,32 @@ This removes **the robot's half** of the bond, which is all a robot can remove. 
 half, so pairing it again needs it back in pairing mode — otherwise it arrives with a key this robot
 no longer has and the bond is refused.
 
+An Xbox pad holds **one** host bond, and a half-completed attempt leaves it holding a key this board
+no longer has — which fails in exactly the way a broken board does. If pairing keeps failing, pair
+the pad to a laptop once and remove it there; that consumes and releases its bond slot, and putting
+it in pairing mode alone does not reliably do so.
+
+## `btd` and pairing, on the Radxa boards
+
+`sudo robotctl pad pair` stops `btd` for the length of the pairing and starts it again afterwards.
+It says so when it does. On these boards a pad cannot form a **new** bond while `btd` advertises; an
+existing bond is unaffected, so a paired pad connects and drives with everything running.
+
+Pairing by hand needs the same thing:
+
+```bash
+sudo systemctl stop btd
+```
+
+Pair, then:
+
+```bash
+sudo systemctl start btd
+```
+
+This is a workaround for the aic8800 radio on the Zero 3W, not a property of the design. It lives in
+`robotctl` alone and goes away with the board.
+
 ## When pairing fails every time
 
 Check `/etc/bluetooth/main.conf` for the `Privacy` setting. It should read `Privacy = device`.
