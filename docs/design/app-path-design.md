@@ -169,9 +169,10 @@ The cost of one characteristic is that it reads oddly in nRF Connect, where the 
 
 ### 3.1 The routed subset is the security boundary
 
-BLE exposes a subset (§4.1). One table in `btd/src/route.rs` decides both *whether* a call is
-permitted and *which socket* answers it, because those are the same question: a call is allowed
-exactly when the table names a service for it.
+BLE exposes a subset (§4.1). One table in `btd/src/route.rs` decides *whether* a call is
+permitted, *which socket* answers it and *which connection to that socket* carries it. The first
+two are the same question — a call is allowed exactly when the table names a service for it — and
+the third is in the same table so that a new method cannot be added without answering it (§3.5).
 
 **The match over `Call` is exhaustive on purpose.** Adding a protocol method fails `btd`'s build
 until someone decides about it. A `_ => None` wildcard would be the safe default in the moment and
@@ -335,6 +336,46 @@ it: arrivals per device with signal strength, then the robot's silences.
 Nine times as often, and — the part that matters — nothing left within a factor of two of `duck-btctl`'s
 eight-second window, so the failure it was diagnosed from cannot occur. The robot went from 34th of
 106 devices heard to 7th of 74.
+
+### 3.5 One connection per lane, because a daemon serves one request at a time
+
+`btd` opens sockets to `updaterd`, `robotd` and `configd` on demand and keeps them for the session
+(`btd/src/upstream.rs`). It held **one per service**, and both daemons behind it serve a connection
+one request at a time: read a line, await the whole call, then read the next
+(`updater/src/ipc.rs::handle_connection`, `configd/src/main.rs::handle`). So every call on a session
+queued behind the slowest thing on that queue, and the two orderings an app reaches for first were
+broken by it:
+
+| the client does | what happened |
+|---|---|
+| `update.apply`, then `update.status` while it runs | the status line waited in a socket `updaterd` would not read for minutes. The client timed out having heard nothing, while the robot was fine and updating |
+| `update.subscribe`, then `update.apply` | worse. `stream_progress` owns its connection until the peer goes away and never reads another request, so the apply was written into a socket nobody read: it never ran, never replied and never errored |
+
+The second is the one to remember. An owner taps "update", the robot does nothing at all, and there
+is no error anywhere to find — the request is sitting in a socket buffer.
+
+So calls are grouped by **how long they hold a connection**, and each group gets its own connection.
+The lane is decided in `route.rs` next to the permission and the service (§3.1), which is what makes
+the exhaustive match cover it too: a new long-running method cannot be added without someone
+choosing.
+
+| lane | holds its connection for | calls |
+|---|---|---|
+| `Prompt` | as long as a lookup | `hello`, `update.status`, `update.log`, `update.listInstalled`, `robot.health`, `net.status`, `net.forget`, `system.*`, `pad.status`, `pad.forget` |
+| `Slow` | seconds — the network, or a radio sweep | `update.check`, `net.scan` |
+| `Operation` | as long as it takes, and changes the robot | `update.apply`, `net.connect`, `pad.pair` |
+| `Stream` | forever, and answers nothing | `update.subscribe` |
+
+Sharing a lane is queueing, and each grouping is one where that is the right answer: `updaterd`
+single-flights mutations behind a file lock and answers `BUSY` for a second one, and two radio
+operations at once on `configd` is not a thing to want. `update.check` is deliberately *not* on the
+`Operation` lane — asked during an update it has an immediate answer, and queueing it would turn
+`BUSY` into a spinner that resolves minutes later.
+
+At most four sockets per service per session, and in practice two. A connection per call would be
+the tidier model and needs `btd` to know when a call ended, which needs it to parse replies — it
+never does (§3), and that property is what keeps the routed subset a transport rather than a second
+implementation of the API.
 
 ## 5. Pairing: just-works, and a PIN the transport checks
 

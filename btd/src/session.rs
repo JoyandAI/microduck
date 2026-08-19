@@ -184,8 +184,8 @@ async fn dispatch(
         };
     }
 
-    let upstream = match route::route_for(&call) {
-        Route::To(upstream) => upstream,
+    let (upstream, lane) = match route::route_for(&call) {
+        Route::To(upstream, lane) => (upstream, lane),
         Route::Local => {
             let proto::Call::SystemAuthenticate(params) = &call else {
                 // `route_for` returns `Local` for exactly one variant; anything else here is a
@@ -212,7 +212,7 @@ async fn dispatch(
         }
     };
 
-    if let Err(e) = pool.send(upstream, line).await {
+    if let Err(e) = pool.send(upstream, lane, line).await {
         tracing::warn!(method = call.method(), upstream = ?upstream, error = %e, "upstream unreachable");
         // Naming the service is what makes this diagnosable from a phone screenshot: "robotd
         // is not answering" is a different problem from "the robot refused".
@@ -796,6 +796,134 @@ mod tests {
                 .await
                 .contains(r#""authenticated":false"#),
             "a PIN missing its leading zero must not authenticate"
+        );
+    }
+
+    /// A stand-in with `updaterd`'s connection model, which is the whole reason lanes exist:
+    /// **one request at a time per connection**, and a connection handed to `update.subscribe`
+    /// never reads another line (`Server::stream_progress` owns it until the peer goes away).
+    ///
+    /// Every line it receives is reported as `<connection number> <line>`, so a test can assert
+    /// which calls travelled together rather than only that they arrived.
+    fn spawn_serial_updaterd(dir: &std::path::Path) -> (PathBuf, Receiver<String>) {
+        let path = dir.join("updaterd.sock");
+        let (seen, seen_rx) = mpsc::channel(16);
+        let listener = UnixListener::bind(&path).expect("bind");
+
+        tokio::spawn(async move {
+            let mut connection = 0u32;
+            while let Ok((stream, _)) = listener.accept().await {
+                connection += 1;
+                let seen = seen.clone();
+                let n = connection;
+                tokio::spawn(async move {
+                    // Held for the task's life: dropping the stream would close the socket, and a
+                    // client that learns of a swallowed request by disconnection has not
+                    // reproduced the bug — it would reconnect and recover.
+                    let (read, _write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let subscribe = line.contains(proto::method::SUBSCRIBE);
+                        let _ = seen.send(format!("{n} {line}")).await;
+                        if subscribe {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                });
+            }
+        });
+        (path, seen_rx)
+    }
+
+    async fn next_line(seen: &mut Receiver<String>, what: &str) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(2), seen.recv())
+            .await
+            .unwrap_or_else(|_| panic!("updaterd never saw the {what}"))
+            .expect("daemon gone")
+    }
+
+    /// Subscribing must not swallow the update that follows it.
+    ///
+    /// This is the failure the lanes were added for, and it is the worst one in the transport:
+    /// with a single connection per service, the apply was written into a socket that
+    /// `stream_progress` had stopped reading. No reply, no error, no update — an owner tapping
+    /// "update" and a robot doing nothing at all. Nothing else in this file would have caught it,
+    /// because every other test makes one call.
+    #[tokio::test]
+    async fn an_apply_still_reaches_updaterd_while_a_progress_stream_is_open() {
+        let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
+        let (_, mut seen) = spawn_serial_updaterd(dir.path());
+        let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
+
+        let (link, to_robot, mut from_robot) = Link::pair(23, "AA:BB");
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
+        authenticate(&to_robot, &mut from_robot).await;
+
+        let subscribe = r#"{"jsonrpc":"2.0","id":1,"method":"update.subscribe","params":{}}"#;
+        to_robot
+            .send(format!("{subscribe}\n").into_bytes())
+            .await
+            .unwrap();
+        let streaming = next_line(&mut seen, "subscribe").await;
+
+        let apply = r#"{"jsonrpc":"2.0","id":2,"method":"update.apply","params":{"component":"daemon","target":"latest"}}"#;
+        to_robot
+            .send(format!("{apply}\n").into_bytes())
+            .await
+            .unwrap();
+        let applying = next_line(&mut seen, "apply").await;
+
+        assert!(
+            applying.contains(apply),
+            "not forwarded verbatim: {applying}"
+        );
+        // And on its own connection, which is *why* it arrived.
+        let connection = |line: &str| line.split(' ').next().unwrap().to_owned();
+        assert_ne!(connection(&streaming), connection(&applying));
+    }
+
+    /// A status poll during an update must not queue behind it.
+    ///
+    /// `updaterd` goes to some trouble to answer `update.status` while the engine is busy — a
+    /// cached snapshot with the live phase patched in — and all of it is wasted if the request
+    /// sits unread in a socket for the minutes an update takes. The assertion is that the two
+    /// calls travel on different connections, because that is the property the daemon's effort
+    /// depends on.
+    #[tokio::test]
+    async fn a_status_poll_does_not_travel_behind_an_apply() {
+        let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
+        let (_, mut seen) = spawn_serial_updaterd(dir.path());
+        let (_, _) = FakeDaemon::spawn(dir.path(), "robotd.sock", vec![]);
+
+        let (link, to_robot, mut from_robot) = Link::pair(23, "AA:BB");
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
+        authenticate(&to_robot, &mut from_robot).await;
+
+        for request in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"update.apply","params":{"component":"daemon","target":"latest"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"update.status","params":{}}"#,
+        ] {
+            to_robot
+                .send(format!("{request}\n").into_bytes())
+                .await
+                .unwrap();
+        }
+
+        let applying = next_line(&mut seen, "apply").await;
+        let polling = next_line(&mut seen, "status poll").await;
+        let connection = |line: &str| line.split(' ').next().unwrap().to_owned();
+        assert_ne!(
+            connection(&applying),
+            connection(&polling),
+            "the status poll shares the apply's queue"
         );
     }
 

@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use crate::route::Upstream;
+use crate::route::{Lane, Upstream};
 
 /// Long enough for a loaded board, short enough that a phone gets an answer rather than a
 /// spinner. A unix socket connect either succeeds immediately or the daemon is not there.
@@ -128,9 +128,15 @@ struct Conn {
 /// version has no reason to make `robotd` accept a connection it will never use. And because
 /// connecting eagerly would mean a dead `robotd` delayed or failed a session that did not need
 /// it.
+///
+/// **Keyed on the lane as well as the service**, which is what keeps a minutes-long update from
+/// silencing everything else the client asks. Every daemon here serves one connection one request
+/// at a time, so calls that share a connection share a queue — see [`Lane`] for the two orderings
+/// a single connection per service broke. At most four sockets per service per session, and in
+/// practice two.
 pub struct Pool {
     sockets: Sockets,
-    conns: HashMap<Upstream, Conn>,
+    conns: HashMap<(Upstream, Lane), Conn>,
     /// Every reply and notification from every upstream, merged. Merging is safe because
     /// JSON-RPC correlates by `id`, which is the client's business — `btd` forwards lines
     /// without reading them.
@@ -146,15 +152,16 @@ impl Pool {
         }
     }
 
-    /// Send one line to `upstream`, connecting first if needed.
-    pub async fn send(&mut self, upstream: Upstream, line: &str) -> io::Result<()> {
-        if !self.conns.contains_key(&upstream) {
+    /// Send one line to `upstream` on `lane`'s connection, connecting first if needed.
+    pub async fn send(&mut self, upstream: Upstream, lane: Lane, line: &str) -> io::Result<()> {
+        let key = (upstream, lane);
+        if !self.conns.contains_key(&key) {
             let conn = self.open(upstream).await?;
-            self.conns.insert(upstream, conn);
+            self.conns.insert(key, conn);
         }
 
         // Unwrap is sound: just inserted, or the contains_key above held.
-        let conn = self.conns.get_mut(&upstream).expect("connection present");
+        let conn = self.conns.get_mut(&key).expect("connection present");
 
         let mut bytes = line.as_bytes().to_vec();
         bytes.push(b'\n');
@@ -168,11 +175,13 @@ impl Pool {
             Ok(Err(e)) => {
                 // A broken pipe here is ordinary — the daemon restarted. Drop the connection
                 // so the next call reconnects rather than writing into a dead socket forever.
-                self.conns.remove(&upstream);
+                // This lane's connection only: the others may be perfectly alive, and a restart
+                // that broke one breaks the next write to each of them anyway.
+                self.conns.remove(&key);
                 Err(e)
             }
             Err(_) => {
-                self.conns.remove(&upstream);
+                self.conns.remove(&key);
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "upstream write timed out",
