@@ -722,6 +722,7 @@ install_units() {
     done
 
     install_completions
+    install_login_banner
 
     systemctl daemon-reload
     enable_unit updaterd.service
@@ -799,6 +800,54 @@ install_units() {
 #
 # Written by hand rather than shipped in the artifact for the same reason: the artifact
 # would then have to carry a file whose only content is this indirection.
+# What the robot is running, and whether it is working, printed at every ssh login.
+#
+# This exists because of a specific failure that cost an afternoon: a dev board silently reverted a
+# branch build to the stable release — `updaterd`'s cross-boot health gate, correctly, since a bench
+# board with no servo power can never report healthy — and nothing said so. Every command afterwards
+# ran against code nobody had asked for, and the symptom was a feature that "did not work".
+#
+# So the two facts worth having before typing anything are on screen at login: the release actually
+# live, and whether the last update stuck.
+#
+# An motd drop-in rather than /etc/profile.d: it runs once per ssh login rather than per shell, it is
+# the mechanism the image already uses for this kind of thing, and a slow or broken robotctl there
+# cannot wedge an interactive shell.
+#
+# Exits 0 on every path, always. A banner that fails must never be the reason a login is noisy or
+# slow — that is how people start disabling motd.
+install_login_banner() {
+    if [ ! -d /etc/update-motd.d ]; then
+        # No motd machinery on this image. Not worth building one for a banner.
+        return 0
+    fi
+
+    cat > /etc/update-motd.d/40-robot <<'BANNER'
+#!/bin/sh
+# What this robot is running, and whether it is working. Installed by scripts/install.sh.
+command -v robotctl >/dev/null 2>&1 || exit 0
+
+live="$(readlink /opt/robot/daemon/current 2>/dev/null | sed 's|releases/||')"
+[ -n "$live" ] || exit 0
+
+# First line only: `robotctl health` leads with the whole-robot verdict, and the detail below it
+# belongs to someone who has decided to look.
+verdict="$(robotctl health 2>/dev/null | head -1 | sed 's/^robot *//')"
+[ -n "$verdict" ] || verdict="not answering"
+
+printf '\nrobot   %s — %s\n' "$live" "$verdict"
+
+# The rollback that prompted this banner. Grepped rather than parsed: there is no jq on this image,
+# and the only question is whether the last attempt ended that way.
+if robotctl update status 2>/dev/null | grep -q rolled_back; then
+    printf '        the last update was ROLLED BACK — robotctl update status\n'
+fi
+exit 0
+BANNER
+    chmod 755 /etc/update-motd.d/40-robot
+    say "wrote /etc/update-motd.d/40-robot, so a login says what is running"
+}
+
 install_completions() {
     if [ ! -d /etc/bash_completion.d ]; then
         # No bash-completion on this image. Not worth installing a directory nothing reads.

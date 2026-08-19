@@ -491,6 +491,11 @@ chmod +x /stub/curl /stub/find /stub/systemctl
 touch /usr/local/lib/libonnxruntime.so.9.9.9
 ln -sf libonnxruntime.so.9.9.9 /usr/local/lib/libonnxruntime.so
 
+# The motd directory the login banner installs into. Present on the image, so the fixture has to
+# have it too or install_login_banner correctly does nothing and the assertion below would be
+# testing the fixture rather than the installer.
+mkdir -p /etc/update-motd.d
+
 # A BlueZ config with [General] but no Privacy key — the insert-after-[General] branch, which
 # is the one a stock Armbian image takes.
 mkdir -p /etc/bluetooth
@@ -788,6 +793,14 @@ getent group robot >/dev/null \
 getent passwd btd >/dev/null \
     || { echo "    [FAIL] the btd user was not created"; exit 1; }
 echo "    [ok] robot group and btd user exist, sysusers drop-ins installed"
+
+# The login banner, which exists because a board silently reverted a branch build and nothing said
+# so. Asserted executable: motd drop-ins that are not are skipped without a word.
+test -x /etc/update-motd.d/40-robot \
+    || { echo "    [FAIL] the login banner was not installed executable"; exit 1; }
+grep -q "robotctl update status" /etc/update-motd.d/40-robot \
+    || { echo "    [FAIL] the banner does not report a rolled-back update"; exit 1; }
+echo "    [ok] the login banner is installed and reports a rolled-back update"
 
 # Through `current`, not at a versioned directory: the symlink has to follow the active
 # release, or robotctl on PATH silently pins to whichever release installed it.
