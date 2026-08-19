@@ -47,7 +47,7 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-./scripts/provision-board.sh --weird-ble radxa@192.168.1.42
+./scripts/provision-board.sh --weird-ble --name <MY_COOL_ROBOT_NAME> radxa@192.168.1.42
 ```
 
 That sends your dev key, starts provisioning, waits out the reboot, streams the log, and ends on
