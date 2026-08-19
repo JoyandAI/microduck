@@ -599,11 +599,12 @@ bump would rename every robot in the field, and nobody would ever connect the tw
 Four hex characters is 65 536 possibilities, so three robots in a room collide about once in 22 000
 times. This is a default meant to be *distinguishable*, not a unique key.
 
-A name of more than **8 characters** does not fit the 31 bytes of a legacy advertisement once flags
-and the 128-bit service UUID are counted, so it travels in the scan response — a second exchange a
-central can miss. `duck-c51b` is 9, one over. Dropping to three hex characters would fit, at 4 096
-possibilities; whether that trade is worth taking is unmeasured, because it depends on how BlueZ
-packs the two payloads.
+The name travels in the **scan response**, not the advertisement, and now always will: flags (3),
+the 128-bit service UUID (18) and the address field (8, see below) spend 29 of the 31 bytes a legacy
+advertisement holds. Before the address it was 21, and a name of 8 characters or fewer could have
+fitted alongside — `duck-c51b` is 9, one over, so in practice it never did. A scan response is a
+second exchange a central can miss on its own, which is why a device reported with no name and no
+services is a plausible robot rather than something to filter out.
 
 #### The advertised name is the one the robot was given
 
@@ -630,9 +631,39 @@ problem with a client fix.
 Reconciled rather than event-driven, deliberately. `btd` forwards `system.setName` without reading
 the reply — interpreting replies is what this daemon avoids — and re-asking the moment it forwards
 one races the write it just forwarded. Polling is fewer moving parts and covers renames made through
-`robotctl`, which never cross `btd` at all. `--name` pins the advertisement for bench work. An
-unreachable `configd` falls back to the hostname: `btd` is on the recovery path and has to come up
-when the rest of the robot has not.
+`robotctl`, which never cross `btd` at all. `--name` pins the *name* for bench work — the reconcile
+loop still runs, because the address below moves whether or not the name does. An unreachable
+`configd` falls back to the hostname: `btd` is on the recovery path and has to come up when the rest
+of the robot has not.
+
+#### The advertisement carries the robot's IPv4 address
+
+`duck-btctl scan` connects to nothing, which is what makes it the command to reach for when a robot
+is unreachable — and it is why a listing can only report what an advertisement carries. So the
+question a listing is most often read to answer, *where do I ssh?*, had no answer in it: the address
+is in `net.status`, and reading that costs a connection, a bond and the PIN, per robot.
+
+Four bytes of IPv4 go in a manufacturer-data field under company id `0xFFFF` — the id the Bluetooth
+SIG reserves for internal and interoperability testing, which is the right one for a project that
+has not been assigned one. Anyone may use that id, so **the field is not an identity check**: it is
+read only from a device that also advertised the service UUID, which is the discriminator.
+
+**The SSID is not in it and cannot be.** An SSID is up to 32 bytes on its own, against the 6 bytes
+of payload the budget above leaves. It stays a `wifi status` question, and that is the one to ask
+when the address in a listing says something surprising.
+
+A robot with no address advertises `0.0.0.0` rather than dropping the field, so a listing can tell
+three states apart: an address, a robot with no network, and a robot on a release from before this
+existed, which broadcasts no field at all. Collapsing the last two would send the reader to check
+wifi on a robot that needs an update.
+
+The address is reconciled on the same tick as the name, every few seconds — far faster than a DHCP
+lease moves, and the point is the other case: whoever just ran `wifi connect` is waiting to read the
+address it produced. `configd` failing to answer keeps the last known address rather than clearing
+it, or a `configd` restart would deregister and re-register the advertisement every tick with a
+client watching the address blink. And if BlueZ ever refuses an advertisement carrying the field,
+`btd` retries without it: an advertisement with no address is a robot someone can still reach, and a
+refused one is a robot gone dark.
 
 #### Provisioning can name a board, and does not have to
 
