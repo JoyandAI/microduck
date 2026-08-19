@@ -556,16 +556,38 @@ apply_asked_ref() {
     [ -n "$ASKED_REF" ] || return 0
 
     say "installing the daemon that ${ASKED_REF} last built"
+
+    # **The exit status is not the verdict, and cannot be.** The release`s `hooks/postinstall`
+    # restarts `updaterd`, which is the process streaming progress back — so a *successful* apply
+    # ends with `updaterd closed the connection` and a non-zero exit, every time. Treating that as
+    # failure is why this refused a board that had just installed correctly.
     if ! robotctl update apply daemon --ref "$ASKED_REF"; then
-        die "could not install the ${ASKED_REF} build of the daemon.
-  This board is running the stable release, which is not what was asked for. Common causes:
-    - CI has not published it yet. A push builds for a minute or two; check:
-        gh run list --branch ${ASKED_REF}
-    - this is not a dev board, so a dev-signed build is refused. Provisioning installs the key
-      unless --no-dev-key was passed:  grep -c 'DEV BOARD' ${LOG}
-    - the branch has no build at all, which is normal for a docs-only branch.
-  Then:  sudo robotctl update apply daemon --ref ${ASKED_REF}"
+        say "the apply did not answer cleanly. Expected: the post-install hook restarts updaterd and
+  drops the connection carrying the reply. What is actually running is the verdict, below."
     fi
+
+    # Wait for the restarted daemons before reading anything, or this samples mid-swap. `update
+    # status` answering means `updaterd` is back and serving, which is the earliest point at which
+    # the question can be asked at all.
+    waited=0
+    while [ "$waited" -lt 90 ]; do
+        if robotctl update status >/dev/null 2>&1; then
+            break
+        fi
+        waited=$((waited + 2))
+        sleep 2
+    done
+    if [ "$waited" -ge 90 ]; then
+        die "updaterd did not come back within 90s of installing the ${ASKED_REF} build.
+  The board may be mid-rollback. Look at:
+    journalctl -u updaterd -b --no-pager
+    robotctl health"
+    fi
+
+    # And then a moment more: the health gate runs *after* the swap, so a build that fails it is
+    # rolled back seconds later. Reading `current` the instant updaterd answers can catch the new
+    # release still in place on a board that is about to revert.
+    sleep 5
 
     live="$(readlink /opt/robot/daemon/current 2>/dev/null | sed 's|releases/||')"
     case "$live" in
@@ -574,10 +596,13 @@ apply_asked_ref() {
             ;;
         *)
             die "asked for ${ASKED_REF} and this board is running ${live}.
-  The apply was accepted and then rolled back, which means the branch build failed its health
-  gate. The board is on the stable release and working; the branch is what needs looking at:
+  Either the build could not be installed, or it was installed and rolled back by the health gate.
+  The board is on the stable release and working; the branch is what needs looking at:
     journalctl -u updaterd -b --no-pager
-    journalctl -u robotd -b --no-pager"
+    journalctl -u robotd -b --no-pager
+  Common causes: CI has not published the build yet (gh run list --branch ${ASKED_REF}), the
+  branch has no build at all, or this is not a dev board so a dev-signed build is refused
+  (grep -c 'DEV BOARD' ${LOG})."
             ;;
     esac
 }
