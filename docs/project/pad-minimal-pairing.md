@@ -184,12 +184,23 @@ check is computed over both devices' addresses, so this is the shape that produc
 first place, at a time when `btd` was running. A `btmon` capture of a failing pair, read for own
 address type and the SMP failure reason, settles it.
 
-### And the `Privacy` conclusion needs re-testing
+### Two faults, and they were being read as one
 
-The `Privacy = off` run recorded above failed with `le-connection-abort-by-local` after several
-half-completed bonds, so it may have been a poisoned pad rather than the setting. Re-run it with
-`btd` disabled and the pad freshly reset. If a pad bonds under `off` too, `btd` is the whole fault
-and `setup-board.sh` should be left alone.
+Re-tested with a reset pad, so neither result rests on a poisoned bond slot:
+
+1. **The board split.** On a fresh Armbian with nothing installed, some Zero 3W units bond a pad
+   under BlueZ's default `Privacy = off`. Others do not bond at all under `off`, and only `device`
+   works. Roughly half of ten in each group, with nothing measurable separating them.
+2. **`device` versus `btd`.** Under `device`, a pad cannot form a new bond while `btd` advertises.
+
+Together they explain the `DHKey check failed (0x0b)` that made this tree set `Privacy = off` in the
+first place: that was fault 2, measured on a board that needed `device` for fault 1, and it was read
+as proof that `device` broke pairing. The result was a setting that could not bond a pad on half the
+boards, for a fortnight.
+
+`setup-board.sh` sets `device` everywhere — there is no test that would pick the boards needing it —
+and `robotctl pad pair` stops `btd` for the pairing window. Both are workarounds for the aic8800
+radio, which is not what ships.
 
 Reboot after each step, and clear **both** halves of the bond before each attempt: `pad forget`
 or `bluetoothctl remove` on the board, and the pad held in pairing mode. An Xbox pad keeps one

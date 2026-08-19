@@ -399,37 +399,33 @@ free_motor_port() {
 
 # The one Bluetooth setting a gamepad needs from this script.
 #
-# `Privacy = device`, which is what `microduck_runtime`'s installer has always set and what this
-# script sets again after a spell setting the opposite. The reversal is worth recording, because
-# both observations behind it are real and they disagree.
+# `Privacy = device`. BlueZ defaults to `off`, and `off` is fine on some Radxa Zero 3W units. On the
+# others a pad will not bond under `off` at all — on a freshly flashed Armbian with nothing else
+# installed — and only `device` works. Roughly half of ten units are in each population, and nothing
+# measurable separates them: same kernel version, same BlueZ, byte-identical aic8800 firmware, and
+# the driver build does not track it either (a pad bonds fine on the build that was once blamed).
 #
-#   An earlier round saw `Privacy = device` fail every pairing, with `btmon` showing LE Secure
-#   Connections reaching the last step and the pad rejecting it:
+# Set unconditionally, because there is no test that would pick out the boards needing it, and
+# because `device` is what microduck_runtime has always shipped — on the Pi too, where pads work. A
+# board that would have been happy with `off` is not known to lose anything.
 #
-#       SMP: Pairing Public Key x2 - Confirm - Random x2 - DHKey Check
-#       > ACL Data RX: SMP: Pairing Failed - Reason: DHKey check failed (0x0b)
+# What `device` costs. With `btd` advertising, a pad cannot form a *new* bond under `device`.
+# Measured 2026-08-19 on 50:37:CD:16:2A:39: one variable, reproducible both ways, with the whole
+# release installed and every other daemon stopped. An existing bond is unaffected — a paired pad
+# connects and drives with everything running — so `robotctl pad pair` stops `btd` for the pairing
+# window and starts it again afterwards. See `BtdPaused` in robotctl/src/main.rs, which exists to be
+# deleted when the radio changes.
 #
-#   That reading — the DHKey check is computed over both addresses, and privacy pairs from a
-#   resolvable private one — is why this script was changed to `off`.
+# That also accounts for the observation that made an earlier version of this script set `off`:
+# pairing reaching the last SMP step and the pad answering `DHKey check failed (0x0b)`. That was
+# `device` with `btd` running, which is the interaction above rather than evidence against the
+# setting. Reading it as evidence against `device` cost a fortnight and a broken pad on every board
+# provisioned since.
 #
-#   Measured again on 2026-08-18 on 50:37:CD:16:2A:39, on a freshly flashed Armbian carrying the
-#   stock aic8800 driver with none of this tree installed, the polarity is the other way round —
-#   and the same card was then confirmed on a second Zero 3W.
-#   With `Privacy = device` a `bluetoothctl connect` bonds first try, /dev/input/js0 appears, the
-#   pad survives a power cycle and streams axis events. With `Privacy = off` written into the same
-#   file on the same card, the identical flow leaves `Paired: no` and the connect gives up with
-#   `le-connection-abort-by-local` — no SMP exchange at all, so not the failure above.
-#
-# So `device` is what has been seen to work on hardware, and it is what the runtime that drives
-# these robots ships. If a board turns up failing with `DHKey check failed (0x0b)`, that is the
-# earlier observation recurring and `off` is the value to try on that board — but do not make it
-# the default again without a capture, because that is what cost this board its pad.
-#
-# The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon here
-# leaves the kernel holding hci0 while bluetoothd reports "No default controller available",
-# which needs a reboot to clear. Confirmed again on 2026-08-18, and it is the one thing
-# `microduck_runtime`'s installer gets wrong at this step: it restarts the service, which leaves
-# the board with no adapter until someone reboots it anyway.
+# The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon here leaves
+# the kernel holding hci0 while bluetoothd reports "No default controller available", which needs a
+# reboot to clear — confirmed again on 2026-08-19, and it is the one thing microduck_runtime's
+# installer gets wrong at this step: it restarts the service, leaving the board with no adapter.
 configure_bluetooth() {
     if [ ! -f "$BT_CONF" ]; then
         warn "no ${BT_CONF}; skipping the gamepad Bluetooth settings"
