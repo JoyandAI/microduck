@@ -239,6 +239,12 @@ impl Intents {
         self.enabled.store(on, Ordering::Relaxed);
     }
 
+    /// The current enable state — what `robot.enable`'s `toggle` flips. The loop reads its
+    /// copy through [`Self::snapshot`]; this is for the IPC side, which owns the toggle.
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
     /// Ask the loop to power the joints and stand up.
     pub fn request_init(&self) {
         self.power.store(POWER_INIT, Ordering::Relaxed);

@@ -110,7 +110,8 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// `robot.do` (ground pick, kicks, sit↔stand, roulade), `robot.pose` (standing body pose),
 /// `robot.mouth`, `robot.shutdown` (sit, then power off) and `robot.mode` (walk vs roller),
-/// ported from `microduck_runtime`. Additive, and bumps anyway, per the rule above.
+/// ported from `microduck_runtime`; `robot.enable` gains `toggle`, the pad's Start
+/// evaluated robot-side. Additive, and bumps anyway, per the rule above.
 pub const API_VERSION: u32 = 9;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
@@ -1136,6 +1137,19 @@ pub struct SubscribeResult {
 #[serde(deny_unknown_fields)]
 pub struct EnableParams {
     pub on: bool,
+    /// Flip the robot's current state instead of setting `on` (which is then ignored).
+    ///
+    /// This is the gamepad's Start button, and it exists because the alternative was the
+    /// client keeping its own on/off belief — which drifts from the robot's the moment
+    /// anything else moves the state (`robot.relax`, the shutdown sequence, either side
+    /// restarting), and a stale belief turns Start into a button that does nothing every
+    /// other press. The robot owns the toggle, so a press always means "the other one".
+    ///
+    /// Toggling ON also re-homes first: the robot ramps to its home pose and the policy
+    /// takes over from there — never from whatever crouch the last stop froze. The reply's
+    /// `reason` names the state the robot ended in.
+    #[serde(default)]
+    pub toggle: bool,
 }
 
 /// What an apply should move to.
@@ -2633,7 +2647,10 @@ mod tests {
                 head_roll: 0.0,
             }),
             Call::RobotStop,
-            Call::RobotEnable(EnableParams { on: true }),
+            Call::RobotEnable(EnableParams {
+                on: true,
+                toggle: false,
+            }),
             Call::RobotInit,
             Call::RobotRelax,
             Call::RobotDo(DoParams {

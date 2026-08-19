@@ -462,7 +462,10 @@ mod tests {
                 head_roll: 0.0,
             }),
             proto::Call::RobotStop,
-            proto::Call::RobotEnable(proto::EnableParams { on: true }),
+            proto::Call::RobotEnable(proto::EnableParams {
+                on: true,
+                toggle: false,
+            }),
             proto::Call::RobotInit,
             proto::Call::RobotRelax,
             proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),

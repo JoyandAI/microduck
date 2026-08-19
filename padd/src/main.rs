@@ -244,7 +244,6 @@ fn main() -> std::process::ExitCode {
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
     let mut mode = Mode::Drive;
-    let mut enabled = false;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
     let mut select_held_since: Option<Instant> = None;
@@ -342,23 +341,31 @@ fn main() -> std::process::ExitCode {
         }
 
         if toggle_enable {
-            enabled = !enabled;
-            if enabled {
-                // Start means "stand at home, then drive", as the prototype's Start runs
-                // init_position before the policy — not "drive from whatever pose the last
-                // stop left the legs in". robotd ramps (~2 s) and the policy holds off
-                // until the ramp completes, so the order here is all the sequencing needed.
-                if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotInit) {
-                    tracing::error!(error = %e, "init failed");
+            // The robot owns the toggle. A local on/off belief here drifts from the
+            // robot's the moment anything else moves it — robot.relax, the shutdown
+            // sequence, either side restarting — and a stale belief turns Start into a
+            // button that does nothing every other press. `toggle` flips the robot's own
+            // state; turning on also re-homes first (Start means "stand at home, then
+            // drive", as the prototype's Start runs init_position before the policy).
+            let call = proto::Call::RobotEnable(proto::EnableParams {
+                on: false,
+                toggle: true,
+            });
+            match request(&mut stream, &mut next_id, &call) {
+                Err(e) => {
+                    tracing::error!(error = %e, "enable failed");
                     return std::process::ExitCode::FAILURE;
                 }
+                Ok(response) => {
+                    // The robot names the state it ended in; that is the log, since padd
+                    // no longer has a belief of its own to report.
+                    let outcome = response
+                        .and_then(|r| r.result_as::<proto::IntentResult>().ok())
+                        .and_then(|r| r.reason)
+                        .unwrap_or_else(|| "toggled".to_owned());
+                    tracing::warn!(%outcome, "policy");
+                }
             }
-            let call = proto::Call::RobotEnable(proto::EnableParams { on: enabled });
-            if let Err(e) = request(&mut stream, &mut next_id, &call) {
-                tracing::error!(error = %e, "enable failed");
-                return std::process::ExitCode::FAILURE;
-            }
-            tracing::warn!(enabled, "policy");
         }
 
         // One-shot skills. Answered, because "refused, and here is why" is a real outcome —

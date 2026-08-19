@@ -1931,11 +1931,24 @@ fn dispatch(
         // Refusing to enable a fallen robot is a normal answer with a reason, not an
         // error: the client asked something reasonable and safety declined.
         proto::Call::RobotEnable(p) => {
-            let result = if p.on && state.fall_gate && state.fallen.load(Ordering::Relaxed) {
+            // `toggle` flips the robot's own state — the pad's Start. Evaluated here, not
+            // in the client, because a client-side belief drifts (relax, shutdown, either
+            // side restarting) and a stale one turns Start into a no-op every other press.
+            let on = if p.toggle { !intents.enabled() } else { p.on };
+            let result = if on && state.fall_gate && state.fallen.load(Ordering::Relaxed) {
                 proto::IntentResult::refused("the robot is down; stand it up first")
             } else {
-                intents.set_enabled(p.on);
-                proto::IntentResult::accepted()
+                if p.toggle && on {
+                    // Start means "stand at home, then drive". Queued before the enable
+                    // and handled earlier in the same tick, so the policy never sees the
+                    // pose the last stop froze — it takes over when the ramp completes.
+                    intents.request_init();
+                }
+                intents.set_enabled(on);
+                proto::IntentResult {
+                    accepted: true,
+                    reason: Some(if on { "enabled — homing first" } else { "disabled" }.to_owned()),
+                }
             };
             proto::Response::ok(Some(id), &result)
         }
