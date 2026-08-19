@@ -542,22 +542,54 @@ echo "    [ok] setup-board is idempotent on a second run"
 # No apostrophes and no single quotes anywhere in this string. It is passed to the container
 # single-quoted, so one would end it early and run the rest on the host — which is exactly what
 # happened once, and it presented as a grep failing on a file the fixture had just written.
-grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
-echo "    [ok] setup-board sets Privacy = device, which is what lets a pad bond"
+# Without --weird-ble it must touch nothing: most boards bond a pad under the BlueZ default, and
+# imposing `device` on them would make robotctl pause btd for every pairing for no reason.
+if grep -qE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf; then
+    echo "    [FAIL] setup-board set Privacy without --weird-ble"
+    exit 1
+fi
+if [ -e /var/lib/robot/weird-ble ]; then
+    echo "    [FAIL] setup-board wrote the weird-ble marker without the flag"
+    exit 1
+fi
+echo "    [ok] without --weird-ble, setup-board leaves Privacy and the marker alone"
 
-# Idempotent too: the second run above must not have added a duplicate key, which BlueZ
-# would read as a conflicting setting.
+# And with it: the setting, and the marker robotctl reads to decide whether to pause btd.
+DUCK_WEIRD_BLE=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
+    > /tmp/weird.log 2>&1
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
+echo "    [ok] --weird-ble sets Privacy = device, which is what lets such a board bond a pad"
+test -f /var/lib/robot/weird-ble \
+    || { echo "    [FAIL] the weird-ble marker was not written"; exit 1; }
+test "$(stat -c %a /var/lib/robot/weird-ble)" = "644" \
+    || { echo "    [FAIL] the marker is not readable by robotctl"; exit 1; }
+echo "    [ok] --weird-ble leaves the marker robotctl reads, mode 644"
+
+# Idempotent: a second flagged run must not add a duplicate key, which BlueZ would read as a
+# conflicting setting.
+DUCK_WEIRD_BLE=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
+    > /tmp/weird2.log 2>&1
 test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
 echo "    [ok] Privacy is set exactly once"
 
-# The upgrade case, which is every board provisioned while this script set the other value: the
-# wrong value is already in the file and has to be corrected rather than left alone. An absent
-# setting and a wrong one need different work, and only the first was ever tested.
+# The upgrade case: a board carrying the other value already, which has to be corrected rather than
+# left alone. An absent setting and a wrong one need different work, and only the first was tested
+# when this was written.
 sed -i "s|^Privacy = device|Privacy = off|" /etc/bluetooth/main.conf
-ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board3.log 2>&1
+DUCK_WEIRD_BLE=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
+    >/tmp/board3.log 2>&1
 grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
 test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
-echo "    [ok] a board carrying Privacy = off is corrected to device"
+echo "    [ok] with --weird-ble, a board carrying Privacy = off is corrected to device"
+
+# And a board that already has the workaround must not lose it because someone re-provisioned
+# without the flag — that would leave Privacy = device with nothing pausing btd, which is the
+# silent version of the bug the flag exists for.
+ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board4.log 2>&1
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
+test -f /var/lib/robot/weird-ble \
+    || { echo "    [FAIL] a re-run without the flag removed the marker"; exit 1; }
+echo "    [ok] a re-run without --weird-ble leaves an already-configured board alone"
 
 # ── the generated preinstall hook ──
 #

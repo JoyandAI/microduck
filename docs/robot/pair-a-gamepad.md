@@ -76,13 +76,23 @@ no longer has — which fails in exactly the way a broken board does. If pairing
 the pad to a laptop once and remove it there; that consumes and releases its bond slot, and putting
 it in pairing mode alone does not reliably do so.
 
-## `btd` and pairing, on the Radxa boards
+## When a pad will not bond at all
 
-`sudo robotctl pad pair` stops `btd` for the length of the pairing and starts it again afterwards.
-It says so when it does. On these boards a pad cannot form a **new** bond while `btd` advertises; an
-existing bond is unaffected, so a paired pad connects and drives with everything running.
+Some Radxa Zero 3W units cannot bond a gamepad under BlueZ's default settings — roughly half of ten,
+with nothing measurable to tell them apart from the ones that can. Re-provision such a board with
+`--weird-ble`:
 
-Pairing by hand needs the same thing:
+```bash
+./scripts/provision-board.sh --weird-ble pierre@192.168.1.42
+```
+
+That sets `Privacy = device`, which those boards need, and leaves a marker at
+`/var/lib/robot/weird-ble`. On a board with that marker, `sudo robotctl pad pair` stops `btd` for the
+length of the pairing and starts it again afterwards — it says so when it does — because under
+`Privacy = device` a pad cannot form a **new** bond while `btd` advertises. An existing bond is
+unaffected, so a paired pad connects and drives with everything running.
+
+Pairing by hand on such a board needs the same thing:
 
 ```bash
 sudo systemctl stop btd
@@ -94,8 +104,8 @@ Pair, then:
 sudo systemctl start btd
 ```
 
-This is a workaround for the aic8800 radio on the Zero 3W, not a property of the design. It lives in
-`robotctl` alone and goes away with the board.
+Try a board *without* the flag first. Both of these are workarounds for the aic8800 radio, not
+properties of the design, and a board that does not need them should not carry them.
 
 ## When pairing fails every time
 

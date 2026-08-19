@@ -83,6 +83,9 @@ sudo -E sh ~/install.sh
 Drop `DUCK_DEV_KEY` for a board that should only take releases. Set `DUCK_REF` to a branch to
 install what that branch last built.
 
+`DUCK_WEIRD_BLE=1` on the `setup-board.sh` runs above is `--weird-ble`: for a board whose Bluetooth
+cannot bond a gamepad at all. See [`pair-a-gamepad.md`](pair-a-gamepad.md).
+
 `DUCK_NO_START=1` installs the release, the units, the users and the groups and enables **nothing**
 — not even for the next boot. It also stops and disables any of the five a previous install left
 running, so the state is the same whether the card is fresh or not. For separating a board-level

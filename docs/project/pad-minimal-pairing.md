@@ -198,9 +198,10 @@ first place: that was fault 2, measured on a board that needed `device` for faul
 as proof that `device` broke pairing. The result was a setting that could not bond a pad on half the
 boards, for a fortnight.
 
-`setup-board.sh` sets `device` everywhere — there is no test that would pick the boards needing it —
-and `robotctl pad pair` stops `btd` for the pairing window. Both are workarounds for the aic8800
-radio, which is not what ships.
+Both workarounds are behind `provision-board.sh --weird-ble`, so a board that does not need them
+does not carry them: the flag sets `Privacy = device` and leaves `/var/lib/robot/weird-ble`, and
+`robotctl pad pair` pauses `btd` only on a board with that marker. Try a board without the flag
+first. Both go when the aic8800 does.
 
 Reboot after each step, and clear **both** halves of the bond before each attempt: `pad forget`
 or `bluetoothctl remove` on the board, and the pad held in pairing mode. An Xbox pad keeps one

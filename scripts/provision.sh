@@ -66,6 +66,7 @@ ENV_TOKEN="${DUCK_TOKEN:-}"
 ENV_DEV_KEY="${DUCK_DEV_KEY:-}"
 ENV_FORCE="${DUCK_FORCE_REINSTALL:-}"
 ENV_NAME="${DUCK_NAME:-}"
+ENV_WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
 
 REPO="${ENV_REPO:-pollen-robotics/microduck_daemon}"
 REF="${ENV_REF:-main}"
@@ -95,6 +96,15 @@ DEV_KEY="$ENV_DEV_KEY"
 
 # Passed straight through to install.sh.
 FORCE_REINSTALL="$ENV_FORCE"
+
+# Does this board need the Bluetooth workarounds? Passed to `setup-board.sh`, which is where the
+# one setting they need lives.
+#
+# Off by default because most Radxa Zero 3W units do not need it and the workarounds have a cost:
+# `Privacy = device` stops a pad forming a new bond while `btd` advertises, which is why
+# `robotctl pad pair` has to pause `btd` on a board that has it. See `configure_bluetooth` in
+# `setup-board.sh` for the split this exists for.
+WEIRD_BLE="$ENV_WEIRD_BLE"
 
 # ── paths ────────────────────────────────────────────────────────────────────
 
@@ -209,6 +219,7 @@ save_state() {
         printf 'DUCK_DEV_KEY=%s\n' "$1"
         printf 'DUCK_FORCE_REINSTALL=%s\n' "$FORCE_REINSTALL"
         printf 'DUCK_NAME=%s\n' "$NAME"
+        printf 'DUCK_WEIRD_BLE=%s\n' "$WEIRD_BLE"
         printf 'PROVISION_BOOT_ID=%s\n' "$(boot_id)"
     } > "$STATE"
 }
@@ -228,6 +239,7 @@ load_state() {
     DEV_KEY="${ENV_DEV_KEY:-${DUCK_DEV_KEY:-}}"
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
     NAME="${ENV_NAME:-${DUCK_NAME:-}}"
+    WEIRD_BLE="${ENV_WEIRD_BLE:-${DUCK_WEIRD_BLE:-}}"
     RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
     return 0
 }
@@ -420,7 +432,7 @@ phase_one() {
 
     tmp=/tmp/setup-board.sh
     fetch setup-board.sh "$tmp"
-    sh "$tmp"
+    DUCK_WEIRD_BLE="$WEIRD_BLE" sh "$tmp"
 
     tmp=/tmp/migrate-network.sh
     fetch migrate-network.sh "$tmp"
@@ -457,11 +469,11 @@ phase_two() {
     # The persisted copies, which is what those scripts leave behind for exactly this moment.
     # Re-fetching would work and would also be a second chance for the network to fail.
     if [ -x "$SETUP_SELF" ]; then
-        "$SETUP_SELF"
+        DUCK_WEIRD_BLE="$WEIRD_BLE" "$SETUP_SELF"
     else
         tmp=/tmp/setup-board.sh
         fetch setup-board.sh "$tmp"
-        sh "$tmp"
+        DUCK_WEIRD_BLE="$WEIRD_BLE" sh "$tmp"
     fi
 
     # This run is what retires the wifi backstop. Left armed, any later boot where wifi is

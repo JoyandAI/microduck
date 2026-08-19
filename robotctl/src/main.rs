@@ -1715,6 +1715,23 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
 /// The unit paused while a pad bonds. See [`BtdPaused`].
 const BTD_UNIT: &str = "btd.service";
 
+/// Where a board provisioned with `--weird-ble` says so. Written by `scripts/setup-board.sh`.
+///
+/// Under /var/lib rather than in a release directory: it is a fact about the board, and it has to
+/// survive an update and a rollback.
+const WEIRD_BLE_MARKER: &str = "/var/lib/robot/weird-ble";
+
+/// Was this board provisioned with `--weird-ble`?
+///
+/// A marker rather than re-deriving the answer from `Privacy = device` in `main.conf`: an explicit
+/// record of the decision someone made cannot be confused with a setting that arrived some other
+/// way, and there is no parsing to get subtly wrong.
+///
+/// Absent answers `false`, which is the right default — most boards need nothing.
+fn needs_the_ble_workaround() -> bool {
+    std::path::Path::new(WEIRD_BLE_MARKER).exists()
+}
+
 /// Run `systemctl` and say whether it succeeded, with its output discarded.
 ///
 /// Discarded because every call here has something better to say than systemd does: a stop that
@@ -1746,6 +1763,9 @@ fn systemctl(args: &[&str]) -> bool {
 /// So it lives at the edge, in one place, in the command a human runs. **Delete this whole type when
 /// the radio changes**; nothing else has to be unpicked.
 ///
+/// Applied only on a board provisioned with `--weird-ble`, which is what sets `Privacy = device` and
+/// leaves the marker this looks for.
+///
 /// A guard rather than a stop and a start around the call, so `btd` comes back on every path out —
 /// including the error ones, which is where a pairing is most likely to end.
 struct BtdPaused {
@@ -1756,7 +1776,9 @@ struct BtdPaused {
 
 impl BtdPaused {
     fn for_pairing() -> Self {
-        if !systemctl(&["is-active", "--quiet", BTD_UNIT]) {
+        // Only where the workaround is needed. A board at BlueZ's default bonds a pad with `btd`
+        // running, and stopping it there would take the phone path down for no reason.
+        if !needs_the_ble_workaround() || !systemctl(&["is-active", "--quiet", BTD_UNIT]) {
             return Self { restart: false };
         }
         if systemctl(&["stop", BTD_UNIT]) {

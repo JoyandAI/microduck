@@ -28,6 +28,11 @@
 #                     deploy/dev-key/team.dev.pub.
 #   --dev-key PATH    somewhere else to find it.
 #   --no-ble          do not use Bluetooth to re-find the board. See below for what that costs.
+#   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all. Sets
+#                     `Privacy = device`, which such boards need and the rest do not — and which
+#                     makes `robotctl pad pair` pause `btd` for the pairing window. Try a board
+#                     without it first; reach for it when a pad refuses to bond on a board that
+#                     is otherwise fine. See `configure_bluetooth` in scripts/setup-board.sh.
 #
 # Needs `ssh` and `scp`, an account on the board that can `sudo`, and nothing else. It expects
 # to be able to prompt for the sudo password, so it allocates a terminal for that one command.
@@ -79,6 +84,7 @@ DEV_KEY="$DEV_KEY_DEFAULT"
 NO_DEV_KEY=""
 USE_LOCAL=""
 NO_BLE=""
+WEIRD_BLE=""
 
 # ── the Bluetooth fallback ───────────────────────────────────────────────────
 #
@@ -143,6 +149,7 @@ while [ $# -gt 0 ]; do
         --dev-key)    DEV_KEY="${2:?--dev-key needs a path}"; shift 2 ;;
         --no-dev-key) NO_DEV_KEY=1; shift ;;
         --no-ble)     NO_BLE=1; shift ;;
+        --weird-ble)  WEIRD_BLE=1; shift ;;
         --local)      USE_LOCAL=1; shift ;;
         -h|--help)    usage 0 ;;
         -*)           die "unknown option: $1" ;;
@@ -635,6 +642,7 @@ echo
 _env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
 [ -z "$REF" ]     || _env="${_env} DUCK_REF='${REF}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
+[ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
 
 # `-t` so sudo can prompt for a password, and the exit status deliberately ignored: this
 # command ends by rebooting the machine it is running on, so ssh reporting a dropped connection
