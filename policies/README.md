@@ -17,12 +17,15 @@ walking one.
 
 Removing this directory later is the whole migration: point the `[policy]` paths in
 `deploy/robotd.toml` at wherever the model component installs, and drop the `--include`
-lines from `.github/workflows/_build-release.yml` and `scripts/dev-push.sh`.
+lines from `.github/workflows/dev.yml`, `.github/workflows/_build-release.yml` and
+`scripts/dev-push.sh` — all three, and `xtask`'s `every_policy_in_the_repo_is_packaged`
+test is what keeps the three lists honest until then.
 
 ## Provenance
 
-Copied from `apirrone/microduck_runtime` at commit `5f3b314`, dereferencing the symlinks that
-repository uses to give stable names to specific training runs:
+Copied from `apirrone/microduck_runtime` at commit `5f3b314` (`roulade.onnx` at `7e4ab6d`,
+where it first appeared), dereferencing the symlinks that repository uses to give stable
+names to specific training runs:
 
 | here | there | role |
 | --- | --- | --- |
@@ -34,6 +37,7 @@ repository uses to give stable names to specific training runs:
 | `ball_kick_right.onnx` | `ball_kick_right.onnx` | right-leg kick |
 | `roller.onnx` | `BEST_roller.onnx` | roller-mode locomotion |
 | `roller_crouch.onnx` | `BEST_roller_crounch.onnx` | roller-mode crouch (ground-pick slot) |
+| `roulade.onnx` | `roulade.onnx` | forward roll (Mjlab-Roulade-MicroDuck) |
 
 (`roller_crouch` also fixes the upstream file name's typo.)
 

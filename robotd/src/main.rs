@@ -256,6 +256,7 @@ struct RobotState {
     policy_ground_pick: Option<String>,
     policy_kick_left: Option<String>,
     policy_kick_right: Option<String>,
+    policy_roulade: Option<String>,
     /// `walk` or `roller` — constant for the life of the process; `robot.mode` reports it.
     mode: &'static str,
     /// Published by the loop so the IPC side can answer without consulting it.
@@ -307,6 +308,7 @@ impl RobotState {
             policy_ground_pick: named_policy(params, |p| p.ground_pick.clone()),
             policy_kick_left: named_policy(params, |p| p.kick_left.clone()),
             policy_kick_right: named_policy(params, |p| p.kick_right.clone()),
+            policy_roulade: named_policy(params, |p| p.roulade.clone()),
             mode: params.policy.mode.as_str(),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
@@ -953,6 +955,9 @@ async fn control_loop<T: RobotIo>(
             ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
             ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
             kick_duration: policy_cfg.kick_duration,
+            roulade_duration: policy_cfg.roulade_duration,
+            roulade_action_scale: policy_cfg.roulade_action_scale,
+            roulade_gain_ratio: policy_cfg.roulade_gain_ratio,
         };
         let paths = PolicyPaths {
             walk: policy_cfg.walk.clone(),
@@ -961,6 +966,7 @@ async fn control_loop<T: RobotIo>(
             ground_pick: policy_cfg.ground_pick.clone(),
             kick_left: policy_cfg.kick_left.clone(),
             kick_right: policy_cfg.kick_right.clone(),
+            roulade: policy_cfg.roulade.clone(),
         };
         match Policy::load(&paths, DEFAULT_STANDING_THRESHOLD) {
             Ok(mut policy) => {
@@ -977,6 +983,7 @@ async fn control_loop<T: RobotIo>(
                     sitstand = ?policy_cfg.sitstand.as_ref().map(|p| p.display().to_string()),
                     ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
                     kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
+                    roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
                     fall_recover = params.safety.fall_recover,
                     "policy loaded"
                 );
@@ -1144,6 +1151,17 @@ async fn control_loop<T: RobotIo>(
                         match controller.sit_toggle() {
                             Ok(direction) => tracing::warn!(direction, "sit toggle"),
                             Err(reason) => tracing::warn!(reason, "sit toggle refused"),
+                        }
+                    }
+                    if requests.roulade {
+                        // A held button lands here every tick; only the start of a roll is
+                        // journal-worthy. `Ok(false)` is a chain refresh, and stays quiet.
+                        match controller.request_roulade() {
+                            Ok(true) => tracing::warn!(skill = "roulade", "skill started"),
+                            Ok(false) => {}
+                            Err(reason) => {
+                                tracing::debug!(skill = "roulade", reason, "skill refused");
+                            }
                         }
                     }
                 }
@@ -1791,6 +1809,14 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
             intents.set_mouth(p.open);
             true
         }
+        // A skill as a notification: how a client spells "the button is held" — `padd`
+        // resends `roulade` every tick to keep a chain alive, and an answer per resend
+        // would be pure overhead. The one-shot press stays a request (`dispatch` refuses
+        // it with a reason); the loop arbitrates either way.
+        proto::Call::RobotDo(p) => {
+            intents.request_skill(p.skill);
+            true
+        }
         _ => false,
     }
 }
@@ -1820,6 +1846,7 @@ fn dispatch(
                 proto::Skill::KickLeft => state.policy_kick_left.is_some(),
                 proto::Skill::KickRight => state.policy_kick_right.is_some(),
                 proto::Skill::SitToggle => state.policy_sitstand.is_some(),
+                proto::Skill::Roulade => state.policy_roulade.is_some(),
             };
             let result = if !configured {
                 proto::IntentResult::refused("no policy configured for that skill")
@@ -1862,6 +1889,7 @@ fn dispatch(
                 ground_pick: state.policy_ground_pick.clone(),
                 kick_left: state.policy_kick_left.clone(),
                 kick_right: state.policy_kick_right.clone(),
+                roulade: state.policy_roulade.clone(),
                 unavailable: state.policy_error.load_full().map_or_else(
                     || {
                         state
@@ -2203,12 +2231,14 @@ mod tests {
             "the request must be queued"
         );
 
-        // A roller robot has no kick networks; asking must refuse, not queue.
+        // A slot disabled with the `"none"` sentinel is a robot without that skill; asking
+        // must refuse, not queue. (The roller preset no longer serves as the example — its
+        // rebased line carries the kicks and the sit like walking does.)
         let mut params = Params::default();
-        params.policy.mode = params::Mode::Roller;
-        let roller = RobotState::new(&params, false, false);
+        params.policy.kick_left = Some("none".into());
+        let unconfigured = RobotState::new(&params, false, false);
         let refused: proto::IntentResult = dispatch(
-            &roller,
+            &unconfigured,
             &intents,
             id(),
             &proto::Call::RobotDo(proto::DoParams {

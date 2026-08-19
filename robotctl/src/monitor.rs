@@ -1008,6 +1008,36 @@ impl View {
             }
             None => caption.push(Span::raw("none loaded").dim()),
         }
+        // The skill networks, compactly: which one-shots this robot can actually do. A
+        // robot with no kick refuses the button with a reason, but the reason arrives in
+        // padd's journal — this is where someone at the screen finds out first.
+        let mut skills: Vec<&str> = Vec::new();
+        if policy.sitstand.is_some() {
+            skills.push("sit");
+        }
+        if policy.ground_pick.is_some() {
+            skills.push("pick");
+        }
+        match (policy.kick_left.is_some(), policy.kick_right.is_some()) {
+            (true, true) => skills.push("kicks"),
+            (true, false) => skills.push("kick-left"),
+            (false, true) => skills.push("kick-right"),
+            (false, false) => {}
+        }
+        if policy.roulade.is_some() {
+            skills.push("roulade");
+        }
+        if policy.walk.is_some() {
+            if skills.is_empty() {
+                caption.push(Span::raw(" · no skills").dim());
+            } else {
+                caption.push(Span::raw(" · skills ").dim());
+                caption.push(Span::styled(
+                    skills.join("+"),
+                    Style::new().fg(Color::Cyan),
+                ));
+            }
+        }
         if let Some(why) = policy.unavailable.as_deref() {
             caption.push(Span::styled(
                 format!(" — {why}"),

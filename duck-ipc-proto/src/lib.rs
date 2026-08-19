@@ -108,7 +108,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// # v9 — the skill intents
 ///
-/// `robot.do` (ground pick, kicks, sit↔stand), `robot.pose` (standing body pose),
+/// `robot.do` (ground pick, kicks, sit↔stand, roulade), `robot.pose` (standing body pose),
 /// `robot.mouth`, `robot.shutdown` (sit, then power off) and `robot.mode` (walk vs roller),
 /// ported from `microduck_runtime`. Additive, and bumps anyway, per the rule above.
 pub const API_VERSION: u32 = 9;
@@ -1019,6 +1019,10 @@ pub enum Skill {
     KickRight,
     /// Sit if standing, stand if sitting. The daemon knows which; the client need not.
     SitToggle,
+    /// Forward roll, ~1 s. One request is one roll; a request that arrives while a roll
+    /// runs chains another when the current one completes — which is how a client maps
+    /// "button held" onto it: keep sending while the button is down.
+    Roulade,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1123,6 +1127,8 @@ pub struct SubscribeResult {
     pub kick_left: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kick_right: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roulade: Option<String>,
 }
 
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].

@@ -311,7 +311,8 @@ enum RobotCommand {
         json: bool,
     },
 
-    /// Run a one-shot skill: `ground-pick`, `kick-left`, `kick-right`, or `sit` (toggle).
+    /// Run a one-shot skill: `ground-pick`, `kick-left`, `kick-right`, `roulade`, or
+    /// `sit` (toggle).
     ///
     /// The same requests the gamepad's buttons send, for a bench without a pad. The policy
     /// must be enabled and driving; a skill whose network is not on this robot is refused
@@ -337,6 +338,8 @@ enum SkillArg {
     KickRight,
     /// Sit if standing, stand if sitting.
     Sit,
+    /// One forward roll. The gamepad chains rolls by holding X; one invocation is one roll.
+    Roulade,
 }
 
 impl SkillArg {
@@ -346,6 +349,7 @@ impl SkillArg {
             SkillArg::KickLeft => proto::Skill::KickLeft,
             SkillArg::KickRight => proto::Skill::KickRight,
             SkillArg::Sit => proto::Skill::SitToggle,
+            SkillArg::Roulade => proto::Skill::Roulade,
         }
     }
 }

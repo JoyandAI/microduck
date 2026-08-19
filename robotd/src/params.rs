@@ -75,6 +75,8 @@ pub struct PolicyParams {
     pub ground_pick: Option<PathBuf>,
     pub kick_left: Option<PathBuf>,
     pub kick_right: Option<PathBuf>,
+    /// Episodic forward roll. Ships by default in both modes, as the prototype now does.
+    pub roulade: Option<PathBuf>,
     /// Scales raw policy output into a joint offset. Absent resolves per mode: 0.9 walking
     /// (the prototype's alpha default), 0.8 roller.
     pub action_scale: Option<f64>,
@@ -83,9 +85,10 @@ pub struct PolicyParams {
     pub standing_gain_ratio: f64,
     /// Position P gain while running.
     pub gain: u16,
-    /// First-order low-pass on the head joint targets, `1.0` = pass-through. Absent
-    /// resolves per mode: 0.5 walking — the value the alpha policies are *trained* with,
-    /// so it must match or transfer degrades — and off for roller.
+    /// First-order low-pass on the head joint targets, `1.0` = pass-through. Default 0.5
+    /// in both modes — the value the alpha policies are *trained* with, so it must match
+    /// or transfer degrades. (The roller preset used to ship it off; the prototype rebased
+    /// its roller line on the alpha defaults, and this follows.)
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Walking default 0.7.
     pub legs_lowpass: Option<f64>,
@@ -98,6 +101,13 @@ pub struct PolicyParams {
     pub ground_pick_gain_ratio: f64,
     /// How long a kick window stays on the kick network, seconds.
     pub kick_duration: f64,
+    /// One roulade — one forward roll, seconds. Holding the button chains rolls; this is
+    /// the length of each. The prototype's measured single-roll time.
+    pub roulade_duration: f64,
+    /// Action scale while a roulade runs.
+    pub roulade_action_scale: f64,
+    /// Gain multiplier while a roulade runs.
+    pub roulade_gain_ratio: f64,
     /// Scale actions with battery voltage: effective scale × (nominal / measured). The
     /// servos' effective kP tracks their supply, so this holds the robot's response steady
     /// as the pack sags. Off by default, as in the prototype.
@@ -125,6 +135,7 @@ pub struct ResolvedPolicy {
     pub ground_pick: Option<PathBuf>,
     pub kick_left: Option<PathBuf>,
     pub kick_right: Option<PathBuf>,
+    pub roulade: Option<PathBuf>,
     pub action_scale: f64,
     pub standing_action_scale: f64,
     pub standing_gain_ratio: f64,
@@ -135,6 +146,9 @@ pub struct ResolvedPolicy {
     pub ground_pick_action_scale: f64,
     pub ground_pick_gain_ratio: f64,
     pub kick_duration: f64,
+    pub roulade_duration: f64,
+    pub roulade_action_scale: f64,
+    pub roulade_gain_ratio: f64,
     pub voltage_adapt: bool,
     pub nominal_voltage: f64,
 }
@@ -158,9 +172,19 @@ impl PolicyParams {
                 Some("alpha_ground_pick.onnx"),
                 true,
             ),
-            // The prototype's roller preset: roller policy, crouch on the ground-pick
-            // trigger, no standing policy, no sit, no kicks, low-pass off.
-            Mode::Roller => ("roller.onnx", None, None, Some("roller_crouch.onnx"), false),
+            // The prototype's roller preset, since rebased on the alpha defaults: roller
+            // policy, crouch on the ground-pick trigger, and everything else — sit/stand,
+            // kicks, the trained low-pass — as the walking mode has it. `stand` stays
+            // unloaded, deliberately: the prototype loads the standing network in roller
+            // mode and then skips every standing transition while `roller_mode` is set, so
+            // it never runs — not loading it is the same robot without the dead session.
+            Mode::Roller => (
+                "roller.onnx",
+                None,
+                Some("alpha_sitstand.onnx"),
+                Some("roller_crouch.onnx"),
+                true,
+            ),
         };
 
         ResolvedPolicy {
@@ -172,6 +196,7 @@ impl PolicyParams {
             ground_pick: path(&self.ground_pick, ground_pick),
             kick_left: path(&self.kick_left, kick.then_some("ball_kick_left.onnx")),
             kick_right: path(&self.kick_right, kick.then_some("ball_kick_right.onnx")),
+            roulade: path(&self.roulade, Some("roulade.onnx")),
             action_scale: self.action_scale.unwrap_or(match self.mode {
                 Mode::Walk => 0.9,
                 Mode::Roller => 0.8,
@@ -179,16 +204,8 @@ impl PolicyParams {
             standing_action_scale: self.standing_action_scale,
             standing_gain_ratio: self.standing_gain_ratio,
             gain: self.gain,
-            head_lowpass: match self.mode {
-                Mode::Walk => Some(self.head_lowpass.unwrap_or(0.5)),
-                Mode::Roller => self.head_lowpass,
-            }
-            .filter(|a| *a < 1.0),
-            legs_lowpass: match self.mode {
-                Mode::Walk => Some(self.legs_lowpass.unwrap_or(0.7)),
-                Mode::Roller => self.legs_lowpass,
-            }
-            .filter(|a| *a < 1.0),
+            head_lowpass: Some(self.head_lowpass.unwrap_or(0.5)).filter(|a| *a < 1.0),
+            legs_lowpass: Some(self.legs_lowpass.unwrap_or(0.7)).filter(|a| *a < 1.0),
             ground_pick_period: self.ground_pick_period.unwrap_or(match self.mode {
                 Mode::Walk => 4.0,
                 Mode::Roller => 3.0,
@@ -199,6 +216,9 @@ impl PolicyParams {
             }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
             kick_duration: self.kick_duration,
+            roulade_duration: self.roulade_duration,
+            roulade_action_scale: self.roulade_action_scale,
+            roulade_gain_ratio: self.roulade_gain_ratio,
             voltage_adapt: self.voltage_adapt,
             nominal_voltage: self.nominal_voltage,
         }
@@ -239,6 +259,7 @@ impl Default for PolicyParams {
             ground_pick: None,
             kick_left: None,
             kick_right: None,
+            roulade: None,
             action_scale: None,
             standing_action_scale: 1.0,
             // The prototype's `--standing-kp-ratio`.
@@ -250,6 +271,9 @@ impl Default for PolicyParams {
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
             kick_duration: 0.5,
+            roulade_duration: 1.0,
+            roulade_action_scale: 1.0,
+            roulade_gain_ratio: 1.0,
             voltage_adapt: false,
             nominal_voltage: 7.4,
         }
@@ -520,6 +544,9 @@ mod tests {
         assert_eq!(p.ground_pick_action_scale, 1.0);
         assert_eq!(p.ground_pick_gain_ratio, 1.0);
         assert_eq!(p.kick_duration, 0.5);
+        assert_eq!(p.roulade_duration, 1.0, "one roll, the measured time");
+        assert_eq!(p.roulade_action_scale, 1.0);
+        assert_eq!(p.roulade_gain_ratio, 1.0);
         assert!(!p.voltage_adapt, "off by default in the prototype");
         assert_eq!(p.nominal_voltage, 7.4);
 
@@ -537,6 +564,7 @@ mod tests {
         );
         assert_eq!(name(&p.kick_left).as_deref(), Some("ball_kick_left.onnx"));
         assert_eq!(name(&p.kick_right).as_deref(), Some("ball_kick_right.onnx"));
+        assert_eq!(name(&p.roulade).as_deref(), Some("roulade.onnx"));
     }
 
     /// Command smoothing matches the prototype's `--cmd-alpha` / `--head-alpha`.
@@ -547,9 +575,12 @@ mod tests {
         assert_eq!(c.head_alpha, 0.2);
     }
 
-    /// One line — `mode = "roller"` — must reproduce the prototype's whole roller preset:
-    /// the roller policy, the crouch on the ground-pick trigger, no standing/sit/kicks,
-    /// softer action scale, faster crouch cycle, low-pass off.
+    /// One line — `mode = "roller"` — must reproduce the prototype's whole roller preset,
+    /// which its installer rebased on the alpha defaults: the roller policy and its tuning
+    /// (kp 200, scale 0.8, the crouch on the ground-pick trigger at 3 s / 0.8), and
+    /// everything else exactly as walking mode has it — sit/stand, kicks, roulade, the
+    /// trained low-pass. Only the standing network stays out (the prototype loads it and
+    /// then skips every standing transition in roller mode, so it never runs).
     #[test]
     fn roller_mode_resolves_to_the_prototype_roller_preset() {
         let dir = tempfile::tempdir().unwrap();
@@ -558,10 +589,25 @@ mod tests {
 
         assert_eq!(p.mode, Mode::Roller);
         assert!(p.walk.ends_with("policies/roller.onnx"));
-        assert_eq!(p.stand, None, "roller runs without a standing policy");
-        assert_eq!(p.sitstand, None);
-        assert_eq!(p.kick_left, None);
-        assert_eq!(p.kick_right, None);
+        assert_eq!(
+            p.stand, None,
+            "the prototype never runs standing in roller mode"
+        );
+        assert!(
+            p.sitstand
+                .as_ref()
+                .unwrap()
+                .ends_with("alpha_sitstand.onnx"),
+            "the rebased roller line keeps the sit"
+        );
+        assert!(p.kick_left.as_ref().unwrap().ends_with("ball_kick_left.onnx"));
+        assert!(
+            p.kick_right
+                .as_ref()
+                .unwrap()
+                .ends_with("ball_kick_right.onnx")
+        );
+        assert!(p.roulade.as_ref().unwrap().ends_with("roulade.onnx"));
         assert!(
             p.ground_pick
                 .as_ref()
@@ -571,8 +617,12 @@ mod tests {
         assert_eq!(p.action_scale, 0.8);
         assert_eq!(p.ground_pick_period, 3.0);
         assert_eq!(p.ground_pick_action_scale, 0.8);
-        assert_eq!(p.head_lowpass, None, "the roller preset ships low-pass off");
-        assert_eq!(p.legs_lowpass, None);
+        assert_eq!(
+            p.head_lowpass,
+            Some(0.5),
+            "the rebased roller line keeps the trained filters"
+        );
+        assert_eq!(p.legs_lowpass, Some(0.7));
         assert_eq!(p.gain, 200);
     }
 

@@ -184,6 +184,9 @@ pub enum Net {
     GroundPick,
     KickLeft,
     KickRight,
+    /// Episodic forward roll; trained with every command slot at zero, and it starts
+    /// rolling the moment it is switched in.
+    Roulade,
 }
 
 /// Which policy files to load. `walk` is mandatory; every other slot is a capability the
@@ -196,6 +199,7 @@ pub struct PolicyPaths {
     pub ground_pick: Option<PathBuf>,
     pub kick_left: Option<PathBuf>,
     pub kick_right: Option<PathBuf>,
+    pub roulade: Option<PathBuf>,
 }
 
 /// The loaded networks.
@@ -210,6 +214,7 @@ pub struct Policy {
     ground_pick: Option<Session>,
     kick_left: Option<Session>,
     kick_right: Option<Session>,
+    roulade: Option<Session>,
     standing_threshold: f64,
     /// Roller mode and fall-recovery mode reserve the standing network (roller has none;
     /// fall recovery keeps it for getting up), so command magnitude must never select it.
@@ -252,6 +257,7 @@ impl Policy {
                 ground_pick: open_opt(&paths.ground_pick, &zero)?,
                 kick_left: open_opt(&paths.kick_left, &zero)?,
                 kick_right: open_opt(&paths.kick_right, &zero)?,
+                roulade: open_opt(&paths.roulade, &zero)?,
                 standing_threshold,
                 standing_disabled: false,
             })
@@ -286,6 +292,10 @@ impl Policy {
         self.ground_pick.is_some()
     }
 
+    pub fn has_roulade(&self) -> bool {
+        self.roulade.is_some()
+    }
+
     pub fn has_kick(&self, left: bool) -> bool {
         if left {
             self.kick_left.is_some()
@@ -309,6 +319,7 @@ impl Policy {
             Net::GroundPick => self.ground_pick.as_mut(),
             Net::KickLeft => self.kick_left.as_mut(),
             Net::KickRight => self.kick_right.as_mut(),
+            Net::Roulade => self.roulade.as_mut(),
         };
         let session = match session {
             Some(session) => session,

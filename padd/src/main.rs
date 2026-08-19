@@ -262,6 +262,7 @@ fn main() -> std::process::ExitCode {
         let mut kick_left = false;
         let mut kick_right = false;
         let mut sit_toggle = false;
+        let mut roulade = false;
         while let Some(event) = gilrs.next_event() {
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
@@ -269,6 +270,9 @@ fn main() -> std::process::ExitCode {
                     Button::North => toggle_head = true,
                     Button::East => toggle_body = true,
                     Button::South => ground_pick = true,
+                    // X on an Xbox pad. Press = one roulade; holding it chains rolls,
+                    // which the resend below carries.
+                    Button::West => roulade = true,
                     // gilrs names the bumpers `LeftTrigger`/`RightTrigger`; the analog
                     // triggers are `LeftTrigger2`/`RightTrigger2`.
                     Button::LeftTrigger => kick_left = true,
@@ -354,6 +358,7 @@ fn main() -> std::process::ExitCode {
             (kick_left, proto::Skill::KickLeft),
             (kick_right, proto::Skill::KickRight),
             (sit_toggle, proto::Skill::SitToggle),
+            (roulade, proto::Skill::Roulade),
         ] {
             if fired {
                 let call = proto::Call::RobotDo(proto::DoParams { skill });
@@ -361,6 +366,22 @@ fn main() -> std::process::ExitCode {
                     tracing::error!(error = %e, "skill request failed");
                     return std::process::ExitCode::FAILURE;
                 }
+            }
+        }
+
+        // X held: keep the roulade chain alive. The robot chains another roll when a
+        // request lands near the end of the current one, so "held" is spelled "resent every
+        // tick" — as a notification, because fifty answered requests a second would spend
+        // their time waiting on replies, and the press above already got the real answer.
+        if pad.is_pressed(Button::West) && !roulade {
+            if let Err(e) = notify(
+                &mut stream,
+                &proto::Call::RobotDo(proto::DoParams {
+                    skill: proto::Skill::Roulade,
+                }),
+            ) {
+                tracing::error!(error = %e, "send failed");
+                return std::process::ExitCode::FAILURE;
             }
         }
 

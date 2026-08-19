@@ -63,11 +63,18 @@ pub struct SkillRequests {
     pub kick_left: bool,
     pub kick_right: bool,
     pub sit_toggle: bool,
+    /// Start a roll — or, arriving while one runs, chain another. Clients hold a button
+    /// down by sending this every tick, so unlike the others it is a *level* in practice.
+    pub roulade: bool,
 }
 
 impl SkillRequests {
     pub fn any(&self) -> bool {
-        self.ground_pick || self.kick_left || self.kick_right || self.sit_toggle
+        self.ground_pick
+            || self.kick_left
+            || self.kick_right
+            || self.sit_toggle
+            || self.roulade
     }
 }
 
@@ -76,6 +83,7 @@ const SKILL_GROUND_PICK: u32 = 1 << 0;
 const SKILL_KICK_LEFT: u32 = 1 << 1;
 const SKILL_KICK_RIGHT: u32 = 1 << 2;
 const SKILL_SIT_TOGGLE: u32 = 1 << 3;
+const SKILL_ROULADE: u32 = 1 << 4;
 
 pub struct Intents {
     /// Epoch for every stamp. `Instant` so the clock cannot run backwards under us.
@@ -199,6 +207,7 @@ impl Intents {
             duck_ipc_proto::Skill::KickLeft => SKILL_KICK_LEFT,
             duck_ipc_proto::Skill::KickRight => SKILL_KICK_RIGHT,
             duck_ipc_proto::Skill::SitToggle => SKILL_SIT_TOGGLE,
+            duck_ipc_proto::Skill::Roulade => SKILL_ROULADE,
         };
         self.skills
             .fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
@@ -212,6 +221,7 @@ impl Intents {
             kick_left: bits & SKILL_KICK_LEFT != 0,
             kick_right: bits & SKILL_KICK_RIGHT != 0,
             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
+            roulade: bits & SKILL_ROULADE != 0,
         }
     }
 

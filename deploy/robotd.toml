@@ -83,8 +83,11 @@ enabled = true
 # Drive mode: "walk" (legs, the default) or "roller". The mode changes which policies load
 # AND the tuning defaults below — every value left unset resolves per mode, so switching a
 # robot to the roller is this one line plus `systemctl restart robotd`. The roller preset
-# is the prototype launcher's: roller.onnx as the locomotion policy, the crouch on the
-# ground-pick trigger, no standing/sit/kick policies, action_scale 0.8, low-pass off.
+# is the prototype launcher's, rebased on the alpha defaults as its installer now is:
+# roller.onnx as the locomotion policy, the crouch on the ground-pick trigger (3.0 s, 0.8),
+# action_scale 0.8 — and everything else as walking has it: sit/stand, kicks, roulade, the
+# trained low-pass. Only the standing network stays out: the prototype loads it in roller
+# mode and then never runs it, standing transitions being skipped on wheels.
 mode = "walk"
 
 # Policy files. Unset means the mode's default inside the release directory, so an ordinary
@@ -104,6 +107,7 @@ mode = "walk"
 # ground_pick = ".../current/policies/alpha_ground_pick.onnx" A-button pick
 # kick_left   = ".../current/policies/ball_kick_left.onnx"
 # kick_right  = ".../current/policies/ball_kick_right.onnx"
+# roulade     = ".../current/policies/roulade.onnx"          X-button forward roll
 
 # Requires ONNX Runtime on the board. It is dlopened, not linked, so a missing library is
 # a startup failure rather than a build one — robotd reports it through robot.health and
@@ -123,7 +127,7 @@ gain = 200
 # First-order low-pass on the head and leg joint targets, as a blend factor in (0, 1].
 # 1.0 is pass-through (off). Unset resolves per mode: 0.5 / 0.7 walking — the values the
 # alpha policies are TRAINED with (mjlab ACTION_LOW_PASS_{HEAD,LEG}_ALPHA); they must match
-# training or transfer degrades — and off for roller, matching its preset.
+# training or transfer degrades. Both modes: the rebased roller preset keeps them too.
 # head_lowpass = 0.5
 # legs_lowpass = 0.7
 
@@ -136,6 +140,14 @@ ground_pick_gain_ratio = 1.0
 
 # How long a kick window stays on the kick network, seconds.
 kick_duration = 0.5
+
+# One roulade — one forward roll, seconds (the prototype's measured single-roll time).
+# Holding X chains rolls of this length; the roll in flight always completes. The scale
+# and gain multiplier apply while a roll runs — 1.0 means full walking values, which is
+# what the roll is trained against.
+roulade_duration = 1.0
+roulade_action_scale = 1.0
+roulade_gain_ratio = 1.0
 
 # Scale actions with battery voltage: effective scale = action_scale * (nominal / measured
 # EMA, clamped 6.0..9.5 V). The servos' effective kP tracks their supply, so this holds the

@@ -125,6 +125,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **Y** / triangle | head mode: sticks pose the head (body holds still) |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
+| **X** / square | roulade — one forward roll; hold to chain rolls |
 | **LB / RB** | left / right kick |
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) |
@@ -132,7 +133,8 @@ mapping is the prototype's, so muscle memory carries over:
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
 if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
-shaping automatically — asymmetric push/brake, no strafe — and A triggers the crouch.
+shaping automatically — asymmetric push/brake, no strafe — and A triggers the crouch. The
+other skills ride along: sit, kicks and the roulade work on wheels too, as the prototype has it.
 
 `pad status` answers two questions separately, because a connected pad and a dead driver look
 identical from the outside:
