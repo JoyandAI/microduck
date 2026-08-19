@@ -38,10 +38,14 @@
 #   --dev-key PATH    somewhere else to find it.
 #   --no-ble          do not use Bluetooth to re-find the board. See below for what that costs.
 #   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all. Sets
-#                     `Privacy = device`, which such boards need and the rest do not — and which
-#                     makes `robotctl pad pair` pause `btd` for the pairing window. Try a board
-#                     without it first; reach for it when a pad refuses to bond on a board that
-#                     is otherwise fine. See `configure_bluetooth` in scripts/setup-board.sh.
+#                     `Privacy = device` and leaves /var/lib/robot/weird-ble, which makes
+#                     `robotctl pad pair` stop `btd` and power-cycle the adapter for a pairing.
+#                     **The default in docs/robot/install-dev.md**, because about half these
+#                     boards need it and nothing measurable says which — and a board that needed
+#                     it and did not get it presents as a pad that will not pair, for no visible
+#                     reason. Drop it on a board proven to bond a pad without it; see that page
+#                     for how to check, and `configure_bluetooth` in scripts/setup-board.sh for
+#                     the measurement behind it.
 #
 # Needs `ssh` and `scp`, an account on the board that can `sudo`, and nothing else. It expects
 # to be able to prompt for the sudo password, so it allocates a terminal for that one command.

@@ -47,11 +47,43 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-./scripts/provision-board.sh radxa@192.168.1.42
+./scripts/provision-board.sh --weird-ble radxa@192.168.1.42
 ```
 
 That sends your dev key, starts provisioning, waits out the reboot, streams the log, and ends on
 `robotctl health`.
+
+### Why `--weird-ble` is in that command
+
+Roughly half the Radxa Zero 3W units here cannot bond a gamepad under BlueZ's default settings, and
+nothing measurable tells them apart from the ones that can — same kernel, same BlueZ, same firmware
+bytes. So the flag is the default here: a board that needed it and was provisioned without it
+presents as a gamepad that will not pair, for no visible reason — and every plausible cause you
+chase first is somewhere else entirely. A board that did not need it pays a smaller price, described
+below.
+
+**Drop it once you know the board is fine.** On a board that bonds a pad under the defaults, the flag
+buys nothing and costs something real: `Privacy = device` means a pad cannot form a *new* bond while
+`btd` advertises, so `robotctl pad pair` has to stop `btd` and power-cycle the adapter for every
+pairing. To find out, and to undo it:
+
+```bash
+sudo rm /var/lib/robot/weird-ble
+```
+
+```bash
+sudo sed -i '/^Privacy = device/d' /etc/bluetooth/main.conf && sudo reboot
+```
+
+Then pair a pad. If it bonds, that board never needed the flag — provision it without one next time.
+If it does not, put both back with the copy of the script provisioning leaves on the board:
+
+```bash
+sudo DUCK_WEIRD_BLE=1 /usr/local/sbin/robot-setup-board && sudo reboot
+```
+
+Both are workarounds for the aic8800 radio, not properties of the design; they go when the radio
+does. [`pair-a-gamepad.md`](pair-a-gamepad.md) has the detail.
 
 It is a **viewer**, not the thing doing the work — provisioning installs a systemd unit that
 resumes at boot, so the board finishes whether or not you are still watching. Ctrl-C costs you

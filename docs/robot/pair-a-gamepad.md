@@ -113,8 +113,13 @@ pairing agent gave the controller behind, and a pad still refuses to bond — a 
 effect, which is how this was found. Never `systemctl restart bluetooth` instead: on this board that
 leaves no adapter at all until a reboot.
 
-Try a board *without* the flag first. Both of these are workarounds for the aic8800 radio, not
-properties of the design, and a board that does not need them should not carry them.
+`--weird-ble` is the default in [`install-dev.md`](install-dev.md), because about half these boards
+need it and nothing measurable says which. But a board that does not need it should not carry it —
+the flag costs a `btd` stop and an adapter power cycle on every pairing — so that page also says how
+to check and how to drop it.
+
+Both are workarounds for the aic8800 radio, not properties of the design. They go when the radio
+does.
 
 ## When pairing fails every time
 
