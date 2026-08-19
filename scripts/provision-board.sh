@@ -131,6 +131,11 @@ BOOT_TIMEOUT=300
 STATE=/var/lib/robot/provision.env
 LOG=/var/lib/robot/provision.log
 
+# The unit that runs phase 2 on the board, asked whether it failed. Must match `UNIT_NAME` in
+# provision.sh; a mismatch would make a failed phase 2 look like one still working, which is the
+# hang this exists to end.
+UNIT_NAME=robot-provision.service
+
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -254,6 +259,15 @@ alive() (
 # go looking, so it cannot be collapsed.
 still_provisioning() {
     if rsh "test -f ${STATE}" >/dev/null 2>&1; then
+        # The state file outlives a phase 2 that *failed*: `provision.sh` removes it only on the way
+        # out cleanly, so its presence alone cannot tell a board still working from one that stopped
+        # with an error. Ask systemd, which knows.
+        #
+        # Returned as its own verdict rather than folded into "finished", because the two need
+        # different words: one is a robot ready to use, the other is a board that needs looking at.
+        if rsh "systemctl is-failed --quiet ${UNIT_NAME}" >/dev/null 2>&1; then
+            return 3
+        fi
         return 0
     fi
     # The file is gone, or the board is. One more question tells them apart, and it is only ever
@@ -771,6 +785,18 @@ while :; do
         # out a dev board. Which is the part worth reading.
         drain_log || true
         break
+    fi
+
+    # Phase 2 stopped with an error. The log already says why — it is streamed above — so this
+    # ends rather than adding a diagnosis of its own, and names the two commands worth running.
+    if [ "$_left" = 3 ]; then
+        drain_log || true
+        echo
+        die "provisioning failed on ${HOST_ONLY}; the reason is the last thing in the log above.
+  The board is reachable and whatever ran before the failure is in place, so this is a step to
+  fix rather than a board to reflash:
+    ssh ${HOST} 'systemctl status ${UNIT_NAME}'
+    ssh -t ${HOST} 'sudo cat ${LOG}'"
     fi
 
     # The board went away mid-install. Not the end of provisioning — it carries on without this
