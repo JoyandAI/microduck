@@ -289,8 +289,8 @@ enum RobotCommand {
     /// robot with no walking network can still stand — and it is what the gamepad's Start does on
     /// its way to driving, so running this by hand is for the bench rather than the everyday path.
     ///
-    /// Refused on a robot that has fallen: the fall gate holds a fallen robot limp on purpose. Stand
-    /// it up by hand first.
+    /// Refused on a fallen robot only when `[safety] fall_limp` or `fall_recover` arms the
+    /// fall gate — by default it works whatever gravity says, as the prototype does.
     Init {
         #[arg(long)]
         json: bool,

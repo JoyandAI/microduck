@@ -259,6 +259,10 @@ struct RobotState {
     policy_roulade: Option<String>,
     /// `walk` or `roller` — constant for the life of the process; `robot.mode` reports it.
     mode: &'static str,
+    /// Whether a fall preempts anything (`fall_limp` or `fall_recover`). When false —
+    /// the default, the prototype's behaviour — `fallen` is a report, not a wall, and
+    /// none of the `robot.*` calls refuse for it.
+    fall_gate: bool,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
     /// The policy is driving and has been asked for a non-zero velocity.
@@ -310,6 +314,7 @@ impl RobotState {
             policy_kick_right: named_policy(params, |p| p.kick_right.clone()),
             policy_roulade: named_policy(params, |p| p.roulade.clone()),
             mode: params.policy.mode.as_str(),
+            fall_gate: params.safety.fall_limp || params.safety.fall_recover,
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
@@ -902,6 +907,9 @@ async fn control_loop<T: RobotIo>(
     poweroff: PowerOff,
 ) {
     let policy_cfg = params.policy.resolved();
+    // Whether a fall preempts anything. Mirrors `RobotState::fall_gate` for the loop's own
+    // gates — with it off, `fallen` is a report in the state stream and nothing more.
+    let fall_gate = params.safety.fall_limp || params.safety.fall_recover;
     let mut safety = Safety::new(
         io,
         SafetyConfig {
@@ -910,6 +918,8 @@ async fn control_loop<T: RobotIo>(
             deadman: Duration::from_millis(params.safety.deadman_ms),
             gain_running: policy_cfg.gain,
             gain_limp: params.safety.gain_limp,
+            // Recovery cannot work without the limp settle, so it implies the gate.
+            fall_limp: params.safety.fall_limp || params.safety.fall_recover,
         },
     );
 
@@ -1105,8 +1115,20 @@ async fn control_loop<T: RobotIo>(
                     }
                     Err(e) => tracing::warn!(error = %e, "cannot enable torque"),
                 },
-                // Already up, or up and driving: nothing to do, and saying so beats a silent no-op.
-                (state, _) => tracing::info!(?state, "robot.init: already brought up"),
+                // Already up: ramp back to home from wherever the joints are, as the
+                // prototype's init_position always does — Start on a robot stopped
+                // mid-crouch must not hand the policy that crouch as its starting pose.
+                // The policy holds off while Homing runs and resumes at Ready.
+                (Bringup::Ready, Some(sensors)) => {
+                    tracing::warn!(?HOME_RAMP, "robot.init: re-homing from the current pose");
+                    bringup = Bringup::Homing {
+                        from: sensors.positions,
+                        since: tick_start,
+                    };
+                }
+                // Mid-ramp, or no sample to ramp from: nothing to do, and saying so beats
+                // a silent no-op.
+                (state, _) => tracing::info!(?state, "robot.init: nothing to bring up"),
             },
             Some(intents::PowerRequest::Relax) => match safety.set_torque(false) {
                 Ok(()) => {
@@ -1131,7 +1153,7 @@ async fn control_loop<T: RobotIo>(
                 Some(controller)
                     if snapshot.enabled
                         && bringup == Bringup::Ready
-                        && !safety.fallen()
+                        && !(fall_gate && safety.fallen())
                         && shutdown_sit.is_none() =>
                 {
                     let outcome = |what: &str, result: Result<(), &'static str>| match result {
@@ -1306,11 +1328,10 @@ async fn control_loop<T: RobotIo>(
 
         // Bring the robot up when someone asks it to drive and it has no torque yet.
         //
-        // Gated on `!safety.fallen()` as well as on the request, and that is not belt-and-braces: a
-        // robot the IMU calls fallen is one `apply` will command at limp gain anyway, so ramping it
-        // would be writing a stand-up that cannot happen. `robot.enable` refuses in that state and
-        // says to stand the robot up first; `robotd init`, with the daemon stopped, is still the way
-        // to do that.
+        // Gated on the fall only when the fall gate is armed, and there it is not
+        // belt-and-braces: a robot `apply` holds at limp gain is one a ramp cannot stand
+        // up. With the gate off (the default) a fallen robot ramps like any other, which
+        // is the prototype's behaviour.
         //
         // Needs a sample: `from` is where the joints actually are, and starting a ramp from a
         // position nobody read would be the lurch this exists to avoid.
@@ -1322,7 +1343,7 @@ async fn control_loop<T: RobotIo>(
             bringup,
             snapshot.enabled,
             controller.is_some(),
-            safety.fallen(),
+            fall_gate && safety.fallen(),
             sensors.as_ref(),
         ) {
             match safety.set_torque(true) {
@@ -1850,7 +1871,7 @@ fn dispatch(
             };
             let result = if !configured {
                 proto::IntentResult::refused("no policy configured for that skill")
-            } else if state.fallen.load(Ordering::Relaxed) {
+            } else if state.fall_gate && state.fallen.load(Ordering::Relaxed) {
                 proto::IntentResult::refused("the robot is down; stand it up first")
             } else {
                 intents.request_skill(p.skill);
@@ -1910,7 +1931,7 @@ fn dispatch(
         // Refusing to enable a fallen robot is a normal answer with a reason, not an
         // error: the client asked something reasonable and safety declined.
         proto::Call::RobotEnable(p) => {
-            let result = if p.on && state.fallen.load(Ordering::Relaxed) {
+            let result = if p.on && state.fall_gate && state.fallen.load(Ordering::Relaxed) {
                 proto::IntentResult::refused("the robot is down; stand it up first")
             } else {
                 intents.set_enabled(p.on);
@@ -1925,13 +1946,14 @@ fn dispatch(
         // Both only *ask*. The control loop owns the only `RobotIo` handle, so nothing here touches
         // the bus — which is also why `robotd init` needs the daemon stopped and these do not.
         proto::Call::RobotInit => {
-            let result = if state.fallen.load(Ordering::Relaxed) {
-                // The same wall `robot.enable` hits, and for the same reason: `Safety::apply`
-                // commands a fallen robot at limp gain and holds it, so a ramp would be writing a
-                // stand-up that cannot happen. Named in the refusal, with the escape hatch, because
-                // "it refused exactly when I needed it" is otherwise the whole experience.
+            // Refused only when the fall gate is armed (`fall_limp`/`fall_recover`): there,
+            // `Safety::apply` commands a fallen robot at limp gain and holds it, so a ramp
+            // would be writing a stand-up that cannot happen. With the gate off — the
+            // default — init works whatever gravity says, which is the prototype's
+            // behaviour and what a bench actually needs.
+            let result = if state.fall_gate && state.fallen.load(Ordering::Relaxed) {
                 proto::IntentResult::refused(
-                    "the robot is down. Stand it up by hand, or stop robotd and run                      `robotd init` — the fall gate holds a fallen robot limp on purpose",
+                    "the robot is down and the fall gate is armed. Stand it up first, or drop `fall_limp`/`fall_recover` from robotd.toml",
                 )
             } else {
                 intents.request_init();
@@ -2250,7 +2272,8 @@ mod tests {
         assert!(!refused.accepted);
         assert!(!intents.take_skills().kick_left, "a refusal must not queue");
 
-        // A fallen robot is refused whatever is configured — same wall as robot.enable.
+        // A fall refuses a skill only when the fall gate is armed. By default it is not —
+        // the prototype never limps on a fall — so `fallen` is a report, not a wall.
         s.fallen.store(true, Ordering::Relaxed);
         let down: proto::IntentResult = dispatch(
             &s,
@@ -2262,7 +2285,26 @@ mod tests {
         )
         .result_as()
         .unwrap();
+        assert!(down.accepted, "with the gate off, fallen must not refuse");
+        assert!(intents.take_skills().sit_toggle);
+
+        // With `fall_limp` armed, the same call hits the wall — same as robot.enable.
+        let mut params = Params::default();
+        params.safety.fall_limp = true;
+        let gated = RobotState::new(&params, false, false);
+        gated.fallen.store(true, Ordering::Relaxed);
+        let down: proto::IntentResult = dispatch(
+            &gated,
+            &intents,
+            id(),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: proto::Skill::SitToggle,
+            }),
+        )
+        .result_as()
+        .unwrap();
         assert!(!down.accepted);
+        assert!(!intents.take_skills().sit_toggle, "a refusal must not queue");
     }
 
     /// The pose and mouth intents land in their slots like move and head do — including via

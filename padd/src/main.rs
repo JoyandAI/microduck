@@ -343,6 +343,16 @@ fn main() -> std::process::ExitCode {
 
         if toggle_enable {
             enabled = !enabled;
+            if enabled {
+                // Start means "stand at home, then drive", as the prototype's Start runs
+                // init_position before the policy — not "drive from whatever pose the last
+                // stop left the legs in". robotd ramps (~2 s) and the policy holds off
+                // until the ramp completes, so the order here is all the sequencing needed.
+                if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotInit) {
+                    tracing::error!(error = %e, "init failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
             let call = proto::Call::RobotEnable(proto::EnableParams { on: enabled });
             if let Err(e) = request(&mut stream, &mut next_id, &call) {
                 tracing::error!(error = %e, "enable failed");

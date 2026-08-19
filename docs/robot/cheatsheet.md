@@ -91,7 +91,10 @@ corrupt each other's replies:
 sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
 ```
 
-A fallen robot refuses `init`: the fall gate holds it limp on purpose. Stand it up by hand first.
+`init` works whether or not the robot has fallen — by default a fall is a *report* (visible in
+`robotctl monitor`), not a gate, matching the prototype. A board that sets `[safety] fall_limp`
+or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp and refuses
+`init`/`enable`/skills until it is stood up.
 
 ### Gamepad (`configd`)
 

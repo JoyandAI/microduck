@@ -237,6 +237,13 @@ pub struct SafetyParams {
     pub deadman_ms: u64,
     /// Gain once fallen — low enough to yield rather than fight the floor.
     pub gain_limp: u16,
+    /// Whether a detected fall preempts the policy: hold at `gain_limp`, refuse
+    /// `robot.init`/`robot.enable`/skills until the robot is upright again. Off by
+    /// default, as the prototype is — its `--fall-detect` ships off, so a fallen robot
+    /// keeps being driven and the humans stay in charge. The fall verdict is reported in
+    /// the state stream either way. `fall_recover = true` implies this: recovery starts
+    /// with the limp settle.
+    pub fall_limp: bool,
     /// Stand back up after a fall, on its own: limp 0.3 s, then the standing network drives
     /// until the robot has been solidly upright for a second. Reserves the standing network
     /// for recovery, so command magnitude stops selecting it. Off by default, as the
@@ -287,6 +294,7 @@ impl Default for SafetyParams {
             fall_debounce_ms: 200,
             deadman_ms: 500,
             gain_limp: 50,
+            fall_limp: false,
             fall_recover: false,
             battery_empty_shutdown: true,
         }

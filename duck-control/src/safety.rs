@@ -9,19 +9,22 @@
 //! once something has already gone wrong is the code most likely to be quietly broken, so
 //! make the broken state unrepresentable instead.
 //!
-//! Three rules, all unconditional:
+//! Two rules, unconditional:
 //!
 //!  - **Non-finite rejection.** A `NaN` target is not clamped, it is refused outright.
 //!  - **Range clamp.** Targets are held inside the actuator's travel.
-//!  - **Fall → limp.** Debounced, and it preempts whatever the policy wanted.
 //!
 //! Plus a deadman on the command itself: if intents stop arriving, the velocity goes to
 //! zero. **Stop is not limp** — losing comms makes the robot *stand still*, because standing
 //! is the safe state for a biped; losing balance makes it yield. Two events, two responses.
 //!
-//! In the prototype fall detection is `--fall-detect`, a flag, evaluated inline among the
-//! gamepad handling and skipped while a scripted move is running. Safety that the
-//! interesting cases opt out of is the anti-pattern `architecture.md` §6 names.
+//! **Fall → limp is a mode, not a rule** ([`SafetyConfig::fall_limp`]), and it ships OFF.
+//! The prototype never limps on a fall — its `--fall-detect` defaults off and doubles as
+//! auto-recovery when on — and a robot that yields the moment gravity misreads a lean is a
+//! robot that keeps sitting down while someone handles it. The fall *verdict* is always
+//! tracked and reported; what changes with the flag is only whether it preempts the
+//! policy. Fall recovery requires the limp (its settle phase), so `robotd` turns this on
+//! whenever `fall_recover` is on.
 
 use std::time::Duration;
 
@@ -53,6 +56,9 @@ pub struct SafetyConfig {
     pub gain_running: u16,
     /// Gain once fallen. Low enough to yield rather than fight the floor.
     pub gain_limp: u16,
+    /// Whether a fall preempts the policy: hold at `gain_limp` until upright. Off matches
+    /// the prototype, whose `--fall-detect` ships off; the fall verdict reports either way.
+    pub fall_limp: bool,
 }
 
 impl Default for SafetyConfig {
@@ -64,6 +70,7 @@ impl Default for SafetyConfig {
             deadman: Duration::from_millis(500),
             gain_running: 200,
             gain_limp: 50,
+            fall_limp: false,
         }
     }
 }
@@ -254,12 +261,13 @@ impl<T: RobotIo> Safety<T> {
     ) -> Result<Applied, IoError> {
         let mut applied = Applied::default();
 
-        // A fallen robot yields. This precedes everything else: whatever the policy
-        // computed for a robot it believes is upright is not something to send to one that
-        // is on its side. The one exception is an active recovery ([`Self::set_recovery`]),
-        // where the stand-up network is deliberately driving a robot gravity still calls
-        // fallen — its targets flow through the ordinary checks below.
-        if self.fallen && !self.recovering {
+        // A fallen robot yields — when the fall gate is on. It precedes everything else:
+        // whatever the policy computed for a robot it believes is upright is not something
+        // to send to one that is on its side. Two exceptions: the gate itself off (the
+        // prototype's default — the policy keeps driving and the humans stay in charge),
+        // and an active recovery ([`Self::set_recovery`]), where the stand-up network is
+        // deliberately driving a robot gravity still calls fallen.
+        if self.fallen && self.config.fall_limp && !self.recovering {
             applied.limits.push(Limit::Fallen);
             self.set_gain(self.config.gain_limp)?;
             self.io.write(&JointTargets::new(hold))?;
@@ -331,6 +339,18 @@ mod tests {
 
     fn safety() -> Safety<FakeIo> {
         Safety::new(FakeIo::at(DEFAULT_POSITION), SafetyConfig::default())
+    }
+
+    /// A safety with the fall gate ON — what `robotd` builds when `fall_limp` or
+    /// `fall_recover` is configured.
+    fn gated() -> Safety<FakeIo> {
+        Safety::new(
+            FakeIo::at(DEFAULT_POSITION),
+            SafetyConfig {
+                fall_limp: true,
+                ..SafetyConfig::default()
+            },
+        )
     }
 
     /// A hard footfall spikes gravity briefly. Treating that as a fall would drop the robot
@@ -405,9 +425,39 @@ mod tests {
         );
     }
 
+    /// With the gate OFF — the default, the prototype's behaviour — a fall changes
+    /// nothing about what gets written: the verdict is reported, the policy keeps
+    /// driving, the gain stays the caller's. Going limp under someone adjusting the
+    /// robot's lean is exactly the annoyance this default removes.
+    #[test]
+    fn by_default_a_fall_reports_but_does_not_preempt() {
+        let mut s = safety();
+        for _ in 0..11 {
+            s.observe(&on_its_side(), Duration::from_millis(20));
+        }
+        assert!(s.fallen(), "the verdict is still tracked");
+
+        let mut wanted = DEFAULT_POSITION;
+        wanted[0] = 0.9;
+        let applied = s
+            .apply(
+                wanted,
+                DEFAULT_POSITION,
+                SafetyConfig::default().gain_running,
+            )
+            .unwrap();
+        assert!(applied.limits.is_empty(), "{:?}", applied.limits);
+        assert_eq!(
+            s.io().last_written.unwrap().positions,
+            wanted,
+            "the policy keeps driving"
+        );
+        assert_eq!(s.io().last_gain, Some(SafetyConfig::default().gain_running));
+    }
+
     #[test]
     fn falling_goes_limp_rather_than_freezing() {
-        let mut s = safety();
+        let mut s = gated();
         for _ in 0..11 {
             s.observe(&on_its_side(), Duration::from_millis(20));
         }
@@ -522,7 +572,7 @@ mod tests {
     /// cleared, or fall → limp would be silently dead after the first recovery.
     #[test]
     fn recovery_lets_the_caller_drive_a_fallen_robot() {
-        let mut s = safety();
+        let mut s = gated();
         for _ in 0..11 {
             s.observe(&on_its_side(), Duration::from_millis(20));
         }
