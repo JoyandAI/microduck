@@ -1403,12 +1403,14 @@ async fn control_loop<T: RobotIo>(
         // observation to build, and inventing one would feed the policy a stale robot.
         //
         // And only once the ramp is done, or the policy's first step would come from wherever the
-        // robot was slumped. A fallen robot is not driven — except by its own recovery,
-        // which is the one sanctioned exception and is marked inside safety itself.
+        // robot was slumped. A fall stops the driving only when the fall gate is armed
+        // (`fall_limp`/`fall_recover`) — by default it does not, as the prototype does not:
+        // the policy keeps driving and the humans stay in charge. Recovery is the armed
+        // gate's one sanctioned exception, marked inside safety itself.
         let driving = snapshot.enabled
             && bringup == Bringup::Ready
             && controller.is_some()
-            && (!safety.fallen() || safety.recovering())
+            && (!(fall_gate && safety.fallen()) || safety.recovering())
             && !matches!(recovery, Recovery::Limp { .. })
             && sensors.is_some()
             && imu_warm
@@ -1501,7 +1503,9 @@ async fn control_loop<T: RobotIo>(
                 policy: policy_label.to_owned(),
                 safety: proto::SafetyState {
                     fallen: safety.fallen(),
-                    limp: safety.fallen(),
+                    // Limp means "safety is actually holding it at limp gain", which needs
+                    // the fall gate armed — a bare fall verdict is a report, not a state.
+                    limp: fall_gate && safety.fallen() && !safety.recovering(),
                     gravity: sensors.imu.gravity,
                     gain: safety.gain(),
                 },
