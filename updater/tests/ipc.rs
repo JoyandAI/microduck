@@ -316,46 +316,31 @@ async fn socket_is_group_restricted() {
     assert_eq!(mode, 0o660, "socket mode is {mode:o}, want 660");
 }
 
+/// `hello` serves a client built against another `API_VERSION`, in both directions.
+///
+/// It used to refuse on an exact `!=`, and `hello` precedes every `robotctl` command — so one
+/// differing digit took away `update apply`, which is how a skew ends, and `version`, which is how
+/// it gets diagnosed. A client newer than the daemon is the ordinary few seconds after an update;
+/// a client older than it is a copy from somewhere other than `/usr/local/bin/robotctl`. Neither is
+/// a reason to refuse a call this release can serve, and both learn the daemon's version from the
+/// reply and can say so themselves.
+///
+/// What refuses is in `unknown_method_and_bad_params_are_reported_distinctly`: a route that is
+/// genuinely missing, and a parameter this release does not know.
 #[tokio::test]
-async fn hello_accepts_matching_version_and_refuses_a_mismatch() {
+async fn hello_serves_a_client_from_another_release() {
     let fx = Harness::new();
     let _server = fx.serve(fx.engine(true, Faults::none())).await;
     let mut client = Client::connect(&fx.socket).await;
 
-    let response = client.hello().await;
-    assert!(response.error.is_none(), "{:?}", response.error);
-    let result: proto::HelloResult = response.result_as().unwrap();
-    assert_eq!(result.api_version, proto::API_VERSION);
-
-    // A stale robotctl in someone's shell must get a clear refusal, not a
-    // misinterpreted request.
-    let response = client
-        .call(method::HELLO, serde_json::json!({ "api_version": 999 }))
-        .await;
-    let error = response.error.unwrap();
-    assert_eq!(error.code, proto::code::PROTOCOL_MISMATCH);
-    // Client newer than the daemon is what the seconds after an update look like, so the refusal
-    // has to say "retry" rather than leave an operator reinstalling a board that is already fine.
-    assert!(error.message.contains("newer release"), "{}", error.message);
-    assert!(
-        error.message.contains("systemctl restart updaterd"),
-        "{}",
-        error.message
-    );
-
-    // The other direction is a different situation with a different remedy, and a refusal naming
-    // only the two numbers made them look like one problem.
-    let response = client
-        .call(method::HELLO, serde_json::json!({ "api_version": 1 }))
-        .await;
-    let error = response.error.unwrap();
-    assert_eq!(error.code, proto::code::PROTOCOL_MISMATCH);
-    assert!(error.message.contains("older release"), "{}", error.message);
-    assert!(
-        error.message.contains("/usr/local/bin/robotctl"),
-        "{}",
-        error.message
-    );
+    for theirs in [proto::API_VERSION, 999, 1] {
+        let response = client
+            .call(method::HELLO, serde_json::json!({ "api_version": theirs }))
+            .await;
+        assert!(response.error.is_none(), "v{theirs}: {:?}", response.error);
+        let result: proto::HelloResult = response.result_as().unwrap();
+        assert_eq!(result.api_version, proto::API_VERSION, "v{theirs}");
+    }
 }
 
 #[tokio::test]
@@ -462,6 +447,7 @@ async fn refusals_carry_their_code_over_the_wire() {
     assert_eq!(fx.live_version(), None, "nothing may be installed");
 }
 
+/// The three ways a mismatched client actually fails, now that the handshake is not one of them.
 #[tokio::test]
 async fn unknown_method_and_bad_params_are_reported_distinctly() {
     let fx = Harness::new();
@@ -475,6 +461,27 @@ async fn unknown_method_and_bad_params_are_reported_distinctly() {
         .call(method::APPLY, serde_json::json!({ "wrong": "shape" }))
         .await;
     assert_eq!(response.error.unwrap().code, proto::code::INVALID_PARAMS);
+
+    // A member from a later release, on a method that exists. This is the case the handshake gate
+    // was standing in for: without it, serde would ignore the member and the apply would run
+    // against the *configured* source while the caller believed it was sideloading a directory.
+    let response = client
+        .call(
+            method::APPLY,
+            serde_json::json!({
+                "component": "daemon",
+                "target": "latest",
+                "from_a_later_release": true,
+            }),
+        )
+        .await;
+    let error = response.error.expect("an unknown member must be refused");
+    assert_eq!(error.code, proto::code::INVALID_PARAMS);
+    assert!(
+        error.message.contains("from_a_later_release"),
+        "{}",
+        error.message
+    );
 }
 
 #[tokio::test]
