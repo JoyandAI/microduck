@@ -302,10 +302,24 @@ impl RobotIo for DynamixelIo {
     }
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {
+        // I and D are written too, at zero — the prototype's `--ki`/`--kd` defaults, which
+        // its startup writes to every motor. These are RAM registers, so every power-up
+        // restores the servo's factory values, and the factory D gain is not zero: left in
+        // place it damps the servo's internal PID, and the robot runs measurably softer
+        // than the prototype at the *same* kP. That is not a tuning choice anyone made, so
+        // it is pinned here rather than exposed as a knob.
+        const KI: u16 = 0;
+        const KD: u16 = 0;
         for &id in &JOINT_IDS {
             self.controller
                 .write_position_p_gain(id, kp)
                 .map_err(|e| IoError::Bus(format!("position_p_gain {kp} on {id}: {e}")))?;
+            self.controller
+                .write_position_i_gain(id, KI)
+                .map_err(|e| IoError::Bus(format!("position_i_gain {KI} on {id}: {e}")))?;
+            self.controller
+                .write_position_d_gain(id, KD)
+                .map_err(|e| IoError::Bus(format!("position_d_gain {KD} on {id}: {e}")))?;
         }
         Ok(())
     }
