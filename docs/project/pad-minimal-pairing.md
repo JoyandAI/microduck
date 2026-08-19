@@ -154,7 +154,42 @@ every test, and `systemctl disable --now` afterwards does not undo what they pus
 `btd` leaves `Pairable` set, an advertising instance, and the IO capability its default pairing
 agent gave the adapter. **Reboot before measuring.**
 
-`btd` is the one to enable first — it is the only one that touches BlueZ.
+## It is `btd`
+
+2026-08-19, one variable, reproducible both ways on `2A:39`:
+
+| | |
+|---|---|
+| `btd` enabled, reboot, pad reset, fresh pair | **fails** |
+| `btd` disabled, reboot, pad reset, fresh pair | **works** |
+
+`/var/lib/bluetooth` was **not** wiped for the working run, so the two files `btd` causes BlueZ to
+write — `attributes`, the persisted local GATT database, and `identity`, the adapter's local IRK —
+are both exonerated. So is anything else persisted.
+
+An earlier round where disabling `btd` did *not* restore pairing was the pad's own bond slot: an
+Xbox pad holds one host bond, and a half-completed attempt leaves it holding a key the board no
+longer has. **Reset the pad on a laptop between attempts**, or the fault is indistinguishable from
+a poisoned pad — this cost most of two days.
+
+Nothing running keeps an existing bond from working: a bonded pad connects and drives with the
+whole stack up. Only *making* a bond fails.
+
+### The mechanism, not yet measured
+
+`btd` advertises continuously as a peripheral. With `Privacy = device` that advertising uses a
+resolvable private address, while the same adapter acts as central to bond the pad. The SMP DHKey
+check is computed over both devices' addresses, so this is the shape that produces
+`DHKey check failed (0x0b)` — the failure that made this tree abandon `Privacy = device` in the
+first place, at a time when `btd` was running. A `btmon` capture of a failing pair, read for own
+address type and the SMP failure reason, settles it.
+
+### And the `Privacy` conclusion needs re-testing
+
+The `Privacy = off` run recorded above failed with `le-connection-abort-by-local` after several
+half-completed bonds, so it may have been a poisoned pad rather than the setting. Re-run it with
+`btd` disabled and the pad freshly reset. If a pad bonds under `off` too, `btd` is the whole fault
+and `setup-board.sh` should be left alone.
 
 Reboot after each step, and clear **both** halves of the bond before each attempt: `pad forget`
 or `bluetoothctl remove` on the board, and the pad held in pairing mode. An Xbox pad keeps one
