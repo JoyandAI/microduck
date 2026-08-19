@@ -61,7 +61,14 @@ nothing, and you can pick the log back up:
 ssh -t radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
 ```
 
-Useful flags: `--ref BRANCH` provisions from a branch, `--local` sends this clone's
+`--ref BRANCH` takes the provisioning **scripts** from a branch — `provision.sh`,
+`setup-board.sh`, `migrate-network.sh`, `install.sh`. It does **not** install that branch's daemon:
+`install.sh` resolves the release through GitHub's `/releases/latest`, which excludes pre-releases,
+and every branch build is one. So a board provisioned with `--ref BRANCH` comes up running the
+stable release with that branch's scripts, which is a genuinely useful thing and not the whole test.
+Put the branch's daemon on afterwards, as below.
+
+Other useful flags: `--local` sends this clone's
 `provision.sh` instead of fetching it (which is how to test a change to the provisioning scripts
 without merging first), and `--no-dev-key` makes a board that only takes releases.
 
