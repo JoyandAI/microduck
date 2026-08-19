@@ -1401,11 +1401,21 @@ fn progress_line(params: &serde_json::Value) -> String {
 /// about five seconds *after* the reply goes out (`docs/design/restart-order.md` §1). Every client
 /// has to expect that, and a phone app should show it as a step rather than an error.
 fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
-    let Command::Update(Update::Apply { .. } | Update::Rollback { .. } | Update::Select { .. }) =
-        command
-    else {
-        return None;
+    let component = match command {
+        Command::Update(
+            Update::Apply { component, .. }
+            | Update::Rollback { component }
+            | Update::Select { component, .. },
+        ) => component,
+        _ => return None,
     };
+    // `btd` ships in the daemon release and in nothing else, so only that component's transition
+    // takes the connection down. A model bundle restarts `robotd` and leaves this link alone —
+    // there are no model components configured today, and a note that is wrong the first time one
+    // appears is worse than no note.
+    if component != "daemon" {
+        return None;
+    }
     // Only when something actually moved. `already_current` and `dry_run_passed` restart nothing.
     match reply["result"]["outcome"].as_str()? {
         "applied" | "rolled_back" => Some(
@@ -1930,5 +1940,11 @@ mod tests {
             .expect("parses")
             .command;
         assert!(restart_note(&status, &applied).is_none());
+
+        // Nor a component whose release does not ship `btd`.
+        let model = Cli::try_parse_from(["duck-btctl", "update", "apply", "--component", "model"])
+            .expect("parses")
+            .command;
+        assert!(restart_note(&model, &applied).is_none());
     }
 }
