@@ -406,25 +406,6 @@ free_motor_port() {
         sed -i 's/^console=serial$/console=display/' "$ENV_TXT"
         needs_reboot=1
     fi
-
-    # Written after the setting, so the marker never claims a board is configured that is not.
-    if [ -f "$WEIRD_BLE_MARKER" ]; then
-        say "weird-ble marker already at ${WEIRD_BLE_MARKER}"
-    else
-        mkdir -p "$(dirname "$WEIRD_BLE_MARKER")"
-        cat > "$WEIRD_BLE_MARKER" <<'MARKER'
-# This board was provisioned with --weird-ble.
-#
-# Its Bluetooth cannot bond a gamepad under BlueZ's default Privacy = off, so
-# /etc/bluetooth/main.conf sets Privacy = device. Under that setting a pad cannot form a new bond
-# while btd advertises, so `robotctl pad pair` stops btd for the pairing window and starts it again.
-#
-# Both are workarounds for the aic8800 radio. Delete this file, unset Privacy, and drop BtdPaused
-# from robotctl when the radio changes.
-MARKER
-        chmod 644 "$WEIRD_BLE_MARKER"
-        say "wrote ${WEIRD_BLE_MARKER} so robotctl pauses btd while a pad bonds"
-    fi
 }
 
 # The one Bluetooth setting a gamepad needs from this script, on the boards that need it.
@@ -484,6 +465,25 @@ configure_bluetooth() {
             printf '\n[General]\nPrivacy = device\n' >> "$BT_CONF"
         fi
         needs_reboot=1
+    fi
+
+    # Written after the setting, so the marker never claims a board is configured that is not.
+    if [ -f "$WEIRD_BLE_MARKER" ]; then
+        say "weird-ble marker already at ${WEIRD_BLE_MARKER}"
+    else
+        mkdir -p "$(dirname "$WEIRD_BLE_MARKER")"
+        cat > "$WEIRD_BLE_MARKER" <<'MARKER'
+# This board was provisioned with --weird-ble.
+#
+# Its Bluetooth cannot bond a gamepad under BlueZ's default Privacy = off, so
+# /etc/bluetooth/main.conf sets Privacy = device. Under that setting a pad cannot form a new bond
+# while btd advertises, so `robotctl pad pair` stops btd for the pairing window and starts it again.
+#
+# Both are workarounds for the aic8800 radio. Delete this file, unset Privacy, and drop BtdPaused
+# from robotctl when the radio changes.
+MARKER
+        chmod 644 "$WEIRD_BLE_MARKER"
+        say "wrote ${WEIRD_BLE_MARKER} so robotctl pauses btd while a pad bonds"
     fi
 }
 
