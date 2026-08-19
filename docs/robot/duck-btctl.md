@@ -233,10 +233,10 @@ disconnects.
 ## What is refused
 
 Motor control (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`,
-`robot.relax`), high-rate telemetry (`robot.subscribe`), the operator decisions (`update.select`,
-`update.pin`, `update.rollback`, `update.resetToGolden`) and the pairing PIN
-(`system.pairingPin`, `system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
-They come back as error code 14, "not available over Bluetooth".
+`robot.relax`), high-rate telemetry (`robot.subscribe`), the two update commands a person has to
+mean (`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
+`system.setPairingPin`) are refused by `btd` itself and never reach a daemon. They come back as
+error code 14, "not available over Bluetooth".
 
 That is a security boundary rather than a missing feature, and each refusal has its reason next
 to it in `btd/src/route.rs` — [`app-path-design.md`](../design/app-path-design.md) §3.1 is the

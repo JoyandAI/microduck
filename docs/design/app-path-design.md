@@ -184,11 +184,20 @@ Refused, each for a reason:
 
 | refused | why |
 |---|---|
-| `update.select`, `update.pin` | Operator surgery, made with `robotctl` and a record of who did it — not a mistap in a phone UI |
-| `update.rollback` | The engine reverts a bad release itself, so the phone needs no button for the ordinary case. Recovery mode (§8.2) should reopen this deliberately |
+| `update.pin` | A robot pinned by a mistap refuses every later update and reports itself as up to date — the one failure here that looks like correct behaviour. `robotctl`, and a person who meant it |
 | `update.resetToGolden` | Factory reset in all but name. Never over a radio |
 | `robot.safeToRestart`, `robot.modelApi`, `robot.remoteSessionActive` | `updaterd`'s private questions to `robotd`; a phone reading them learns nothing it can act on |
 | `system.pairingPin`, `system.setPairingPin` | **The load-bearing one.** A passkey an unpaired peer could read — or overwrite — would make pairing theatre. `btd` reads it over the unix socket instead |
+
+**`update.rollback` and `update.select` were on that list and are not now.** They were refused on
+the reasoning that the engine reverts a bad release itself, which it does — the one that fails its
+health gate. That is not the case an owner reaches for a phone about, which is a release that
+installs, passes its gate and then behaves *worse*: a policy that walks unsteadily rather than not
+at all, a pad that stops reconnecting. Nothing reverts that but a person, and the person is holding
+a phone and has no ssh. Both move to a release that has already run on this board, download
+nothing, and are gated and auto-reverted like any other transition. `update.apply` was already
+routed and is the more consequential of the three, so this widens what a peer in radio range can do
+by close to nothing. `docs/project/update-over-ble.md` §2.4 is the decision and its trade-offs.
 
 ## 4. Authorisation: two layers, kept apart
 
@@ -363,7 +372,7 @@ choosing.
 |---|---|---|
 | `Prompt` | as long as a lookup | `hello`, `update.status`, `update.log`, `update.listInstalled`, `robot.health`, `net.status`, `net.forget`, `system.*`, `pad.status`, `pad.forget` |
 | `Slow` | seconds — the network, or a radio sweep | `update.check`, `net.scan` |
-| `Operation` | as long as it takes, and changes the robot | `update.apply`, `net.connect`, `pad.pair` |
+| `Operation` | as long as it takes, and changes the robot | `update.apply`, `update.rollback`, `update.select`, `net.connect`, `pad.pair` |
 | `Stream` | forever, and answers nothing | `update.subscribe` |
 
 Sharing a lane is queueing, and each grouping is one where that is the right answer: `updaterd`

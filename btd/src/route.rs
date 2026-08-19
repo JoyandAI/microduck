@@ -128,6 +128,25 @@ pub fn destination_for(call: &proto::Call) -> Option<(Upstream, Lane)> {
         Log(_) => Some((Updater, Prompt)),
         ListInstalled(_) => Some((Updater, Prompt)),
 
+        // Going back. Both are permitted, and both are less consequential than the `Apply`
+        // above them: they move the robot to a release that has already run on this board,
+        // download nothing, and are gated and auto-reverted like any other transition
+        // (`Engine::rollback` and `Engine::select` both go through `transition_to`).
+        //
+        // They were refused until the update path was driven from a phone, on the reasoning that
+        // the engine reverts a bad release on its own. It does — the one that fails its health
+        // gate. That is not the case an owner reaches for a phone about, which is a release that
+        // installs, passes its gate, and then behaves *worse*: a policy that walks unsteadily
+        // rather than not at all, a pad that stops reconnecting. Nothing reverts that but a
+        // person, and the person is holding a phone and has no ssh.
+        //
+        // `Rollback` is the undo — the previous release, no arguments, one tap. `Select` is the
+        // same authority plus a version number, and it is what a list of installed releases is
+        // *for*: `ListInstalled` is already routed above, so an app can show them, and being able
+        // to show them without being able to choose one would be the odd half.
+        Rollback(_) => Some((Updater, Operation)),
+        Select(_) => Some((Updater, Operation)),
+
         // Is the robot alright? The one `robot.*` call an app has any use for.
         RobotHealth => Some((Robot, Prompt)),
 
@@ -189,19 +208,17 @@ pub fn destination_for(call: &proto::Call) -> Option<(Upstream, Lane)> {
 
         // ── refused ─────────────────────────────────────────────────────────
 
-        // Operator surgery. Choosing which installed release runs, or pinning one, is a
-        // considered decision made with `robotctl` and a record of who did it — not a
-        // mistap in a phone UI.
-        Select(_) | Pin(_) => None,
-
-        // Recovery, and deliberately not here *yet*. The engine reverts a bad release on its
-        // own (health gate plus boot counter), so the phone needs no button for the ordinary
-        // case. Recovery mode (§8.2) is what should reopen this, with its own thinking about
-        // what a stranger holding a broken robot is allowed to trigger.
-        Rollback(_) => None,
+        // Pinning, and it stays refused while `Select` above it does not. The difference is what
+        // the mistake looks like afterwards: a wrong `select` is one release away from being
+        // undone and the robot says which release it is on, whereas a robot pinned by a mistap
+        // refuses every later update and reports itself as up to date. That is the one failure
+        // here that looks exactly like correct behaviour, and it needs `robotctl` and a person
+        // who meant it.
+        Pin(_) => None,
 
         // Factory reset in all but name: back to the golden image, discarding every release
-        // since. Never over a radio.
+        // since. Never over a radio — and note that `Rollback` and `Select` being routed does
+        // not weaken this, because neither discards anything.
         ResetToGolden(_) => None,
 
         // `updaterd`'s private questions to `robotd` — may I restart the control loop, which
@@ -313,6 +330,11 @@ mod tests {
             mutating_and_allowed,
             vec![
                 proto::method::APPLY,
+                // Going back, both of them. Routed when the update path was driven from a phone:
+                // an owner whose robot got worse after an update has no other way to undo it, and
+                // neither call discards anything or downloads anything.
+                proto::method::ROLLBACK,
+                proto::method::SELECT,
                 proto::method::NET_CONNECT,
                 proto::method::NET_FORGET,
                 proto::method::SYSTEM_SET_NAME,
@@ -395,18 +417,16 @@ mod tests {
 
     /// The refusals, named individually. If a future change makes one of these reachable it
     /// should have to delete a line here and say why in the commit.
+    ///
+    /// Two lines were deleted from it when the update path was driven from a phone —
+    /// `update.rollback` and `update.select` — and the reasoning is on their arms in
+    /// `destination_for`. What is left is a factory reset, a pin whose mistake looks like correct
+    /// behaviour, and `updaterd`'s private questions to `robotd`.
     #[test]
     fn the_refused_calls_stay_refused() {
         for call in [
-            proto::Call::Rollback(proto::ComponentParams {
-                component: component(),
-            }),
             proto::Call::ResetToGolden(proto::ComponentParams {
                 component: component(),
-            }),
-            proto::Call::Select(proto::SelectParams {
-                component: component(),
-                version: semver::Version::new(1, 0, 0),
             }),
             proto::Call::Pin(proto::PinParams {
                 component: component(),
@@ -520,6 +540,13 @@ mod tests {
                 target: proto::Target::Latest,
                 options: proto::ApplyOptions::default(),
             }),
+            proto::Call::Rollback(proto::ComponentParams {
+                component: component(),
+            }),
+            proto::Call::Select(proto::SelectParams {
+                component: component(),
+                version: semver::Version::new(1, 0, 0),
+            }),
             proto::Call::Check(proto::ComponentParams {
                 component: component(),
             }),
@@ -532,6 +559,28 @@ mod tests {
         ] {
             let (_, lane) = destination_for(&call).expect("routed");
             assert_ne!(lane, Lane::Prompt, "{}", call.method());
+        }
+    }
+
+    /// Going back is reachable, and reaches `updaterd`. The pair of them is what §2.4 of
+    /// `docs/project/update-over-ble.md` decided.
+    #[test]
+    fn going_back_is_reachable_from_the_phone() {
+        for call in [
+            proto::Call::Rollback(proto::ComponentParams {
+                component: component(),
+            }),
+            proto::Call::Select(proto::SelectParams {
+                component: component(),
+                version: semver::Version::new(0, 5, 1),
+            }),
+        ] {
+            assert_eq!(
+                destination_for(&call),
+                Some((Upstream::Updater, Lane::Operation)),
+                "{}",
+                call.method()
+            );
         }
     }
 
