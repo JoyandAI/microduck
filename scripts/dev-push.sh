@@ -397,7 +397,9 @@ cargo run -p xtask -- package \
     --include "policies/ball_kick_left.onnx=policies/ball_kick_left.onnx" \
     --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
     --include "policies/roller.onnx=policies/roller.onnx" \
-    --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx"
+    --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx" \
+    --include "policies/roulade.onnx=policies/roulade.onnx"
+
 
 echo "==> signing with $KEY"
 cargo run -p xtask -- sign --dir dist --key "$KEY"
