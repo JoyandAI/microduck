@@ -636,9 +636,25 @@ and the next update that ships the unit reinstalls it.
   per-component timeout (motors ack, model loads, media pipeline inits).
 - Belt-and-suspenders for hard hangs (not just clean failures):
   - `systemd` `WatchdogSec` on `robotd` so a hang trips recovery.
-  - A **boot-counter** file `updaterd` inspects on start: if the last update
-    never reached "healthy" across 2 boots, revert unconditionally. Covers both
-    "started but sick" and "won't start at all."
+  - A **boot-counter** file `updaterd` inspects on start: if the last update never reached
+    "healthy" across 2 boots, ask the robot and then decide. Covers both "started but sick" and
+    "won't start at all."
+
+    **The budget decides when to ask; the robot decides whether to revert.** Reaching the end of
+    the budget means no apply ever confirmed the trial — and the usual cause is not a bad release
+    but an apply killed before its gate ran, which is what happens when the release's own
+    `hooks/postinstall` restarts `updaterd`. So the same three-way question the health gate asks:
+    *healthy* commits, *degraded* commits, anything else reverts.
+
+    Degraded commits for the reason §4's boot net gives for not being able to fix hardware: a
+    `robotd` with no servo power fails identically on golden. Reverting there hides a hardware
+    fault behind a software change, reverts the next release too, and — worst — replaces the code
+    under whoever is holding the robot without saying so. That is not hypothetical: a board that
+    had installed a branch build and paired a gamepad on it came back two boots later running the
+    stable release, and every command afterwards ran against code nobody had asked for.
+
+    What still reverts is what this net is for: `robotd` unhealthy, unreachable, or answering in a
+    shape this `updaterd` cannot read.
 - `keep_previous` (default 1) retained release dirs bound disk usage while
   always leaving a known-good target to roll back to.
 
