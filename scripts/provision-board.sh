@@ -22,6 +22,11 @@
 #                     if that build cannot be installed or is rolled back — a dev board quietly
 #                     running stable when a branch was asked for is worse than a clear stop.
 #                     Needs the branch build to exist, so give CI its minute or two first.
+#   --name NAME       name the robot, at the end of provisioning: `--name Ducky`. Optional —
+#                     without it the board names itself `duck-<four hex>` from its SoC serial,
+#                     which is already unique per board. Changeable later at any time with
+#                     `robotctl system set-name`, so this saves a command rather than deciding
+#                     anything permanent.
 #   --forget-host-key drop this host's key from known_hosts first. Reflashing the card
 #                     regenerates the board's host keys, so the same address then presents a
 #                     different one and ssh refuses outright — see `probe`.
@@ -89,6 +94,9 @@ NO_DEV_KEY=""
 USE_LOCAL=""
 NO_BLE=""
 WEIRD_BLE=""
+# The name to give the robot. Not `BLE_NAME` below, which points the other way: the name this board
+# already answers to, used to find it again after the reboot.
+ROBOT_NAME=""
 
 # ── the Bluetooth fallback ───────────────────────────────────────────────────
 #
@@ -154,6 +162,7 @@ usage() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --ref)        REF="${2:?--ref needs a branch}"; shift 2 ;;
+        --name)       ROBOT_NAME="${2:?--name needs a name}"; shift 2 ;;
         --forget-host-key) FORGET_KEY=1; shift ;;
         --dev-key)    DEV_KEY="${2:?--dev-key needs a path}"; shift 2 ;;
         --no-dev-key) NO_DEV_KEY=1; shift ;;
@@ -662,11 +671,20 @@ _env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
 [ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
 
+# The name is a flag rather than one more `DUCK_*`, because on the board it goes no further than
+# `robotctl system set-name`. Single-quoted with any quote of its own escaped: a name is free text,
+# and this whole string is handed to a shell on the board — `Pierre's duck` would otherwise arrive
+# as a syntax error rather than as a name.
+_args=""
+if [ -n "$ROBOT_NAME" ]; then
+    _args=" --name '$(printf '%s' "$ROBOT_NAME" | sed "s/'/'\\\\''/g")'"
+fi
+
 # `-t` so sudo can prompt for a password, and the exit status deliberately ignored: this
 # command ends by rebooting the machine it is running on, so ssh reporting a dropped connection
 # is the *expected* outcome. Whether it worked is decided below, by looking at the board.
 ssh -t -o StrictHostKeyChecking=accept-new "$HOST" \
-    "sudo env ${_env} sh /tmp/provision.sh" || true
+    "sudo env ${_env} sh /tmp/provision.sh${_args}" || true
 
 echo
 say "waiting for ${HOST} to come back (up to ${BOOT_TIMEOUT}s)"

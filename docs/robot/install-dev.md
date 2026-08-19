@@ -71,9 +71,11 @@ by the health gate. A dev board quietly running the stable release when a branch
 worst failure to debug: everything looks installed and the code under test is not there. Give CI its
 minute or two before provisioning, and check with `gh run list --branch BRANCH` if it stops.
 
-Other useful flags: `--local` sends this clone's
-`provision.sh` instead of fetching it (which is how to test a change to the provisioning scripts
-without merging first), and `--no-dev-key` makes a board that only takes releases.
+Other useful flags: `--name Ducky` names the robot instead of leaving it the `duck-7f3a` it derives
+from its own serial (`robotctl system set-name` changes it later, so this only saves a command),
+`--local` sends this clone's `provision.sh` instead of fetching it (which is how to test a change to
+the provisioning scripts without merging first), and `--no-dev-key` makes a board that only takes
+releases.
 
 ## Check it worked
 

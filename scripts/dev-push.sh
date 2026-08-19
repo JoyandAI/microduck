@@ -174,8 +174,9 @@ print((r.get("result") or {}).get("ip4") or "")')" || return 1
 # The command line beats the environment, and an address beats a name: an address needs no radio.
 # `DUCK_ROBOT` is the same variable `duck-btctl` defaults `--name` to, so one exported name serves
 # both tools — and empty means unset in both, so `DUCK_ROBOT= scripts/dev-push.sh radxa@…` works.
-# Not `DUCK_NAME`, which `provision.sh` reads and means the opposite way round: the name to *give*
-# a board, not which board to talk to.
+# `--name` here is `duck-btctl`'s sense of it: which robot to talk to. `provision-board.sh --name`
+# means the opposite way round — the name to *give* a board — because provisioning is the one place
+# a name is assigned rather than used to find something.
 if [ -z "$BOARD" ] && [ -z "$ROBOT" ]; then
     BOARD="${DUCK_BOARD:-}"
     [ -n "$BOARD" ] || ROBOT="${DUCK_ROBOT:-}"
