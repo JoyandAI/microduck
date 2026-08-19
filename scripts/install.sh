@@ -620,6 +620,24 @@ stop_instead() {
     systemctl disable --now "$1" 2>/dev/null || true
 }
 
+# Undo what the release's own postinstall hook did, when this install is meant to start nothing.
+#
+# `hooks/postinstall`, inside the release `bootstrap_first_release` installs, does
+# `systemctl enable --now` on every unit the release ships — and that runs *before* `install_units`
+# here. So skipping the enables below is not enough on a fresh board either: all five are already
+# up by the time this script gets a say.
+#
+# They do still run for a few seconds, which no knob in this script can prevent, so `report` tells
+# you to reboot. A daemon does not undo what it pushed to a subsystem when it dies.
+quiet_the_release_units() {
+    [ -n "$NO_START" ] || return 0
+    say "DUCK_NO_START: undoing the enables hooks/postinstall just did"
+    for unit in padd.service btd.service configd.service robotd.service updaterd.service; do
+        [ -f "${UNIT_DIR}/${unit}" ] || continue
+        stop_instead "$unit"
+    done
+}
+
 # `systemctl enable --now`, unless this install is meant to start nothing.
 #
 # Returns success in that case, so a caller's `|| warn` does not fire about a unit that was never
@@ -865,8 +883,14 @@ report() {
 
     if [ -n "$NO_START" ]; then
         warn "DUCK_NO_START was set: the release and its units are installed and NOTHING is
-  enabled or running, including after a reboot. This board is not a working robot until:
-    sudo systemctl enable --now updaterd robotd configd btd padd"
+  enabled, now or at the next boot. This board is not a working robot until:
+    sudo systemctl enable --now updaterd robotd configd btd padd
+
+  REBOOT BEFORE MEASURING ANYTHING. The release's own hooks/postinstall enabled and started
+  every daemon before this script could stop them, so they have run on this boot. A daemon does
+  not undo what it pushed to a subsystem when it dies — btd leaves Pairable set, an advertising
+  instance, and the IO capability its default pairing agent gave the adapter:
+    sudo reboot"
     fi
 
     # Before the command list, not after: every command below fails with "Permission denied"
@@ -993,6 +1017,9 @@ main() {
     install_config
     install_dev_key
     bootstrap_first_release
+    # Straight after, not at install_units: the release's postinstall hook has already enabled and
+    # started everything by this point.
+    quiet_the_release_units
     create_group
     install_units
     install_token_dropin

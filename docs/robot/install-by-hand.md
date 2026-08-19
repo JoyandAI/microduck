@@ -94,6 +94,18 @@ sudo -E DUCK_NO_START=1 sh ~/install.sh
 ```
 
 ```bash
+sudo reboot
+```
+
+The reboot is part of it, not tidiness. The release's own `hooks/postinstall` enables and starts
+every daemon before `install.sh` can stop them, so they have run on that boot whatever the knob
+says — and a daemon does not undo what it pushed to a subsystem when it dies. `btd` leaves
+`Pairable` set, an advertising instance, and the IO capability its default pairing agent gave the
+adapter.
+
+To make it a working robot again:
+
+```bash
 sudo systemctl enable --now updaterd robotd configd btd padd
 ```
 
