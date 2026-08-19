@@ -607,13 +607,26 @@ install_dev_key() {
 # symlink would change under systemd's feet on every update, and after a rollback
 # systemd's view of the world would depend on which release happened to be live at the
 # last daemon-reload.
+# What `DUCK_NO_START` does instead of enabling a unit.
+#
+# `disable --now`, not merely "skip the enable". A board being re-installed is already running
+# these from last time, and skipping the enable would leave every one of them up while this script
+# printed that nothing was enabled or running — which is worse than not having the knob, because
+# the measurement it exists for would be taken against a board that looks quiet and is not.
+#
+# Failure is ignored: a unit that was never enabled is exactly the state being asked for.
+stop_instead() {
+    say "not enabling ${1}, and stopping it if it was running (DUCK_NO_START)"
+    systemctl disable --now "$1" 2>/dev/null || true
+}
+
 # `systemctl enable --now`, unless this install is meant to start nothing.
 #
 # Returns success in that case, so a caller's `|| warn` does not fire about a unit that was never
 # meant to run.
 enable_unit() {
     if [ -n "$NO_START" ]; then
-        say "not enabling ${1} (DUCK_NO_START)"
+        stop_instead "$1"
         return 0
     fi
     systemctl enable --now "$1"
@@ -622,7 +635,7 @@ enable_unit() {
 # The same, for a unit enabled without being started — see `robot-boot-check.timer`.
 enable_at_boot() {
     if [ -n "$NO_START" ]; then
-        say "not enabling ${1} (DUCK_NO_START)"
+        stop_instead "$1"
         return 0
     fi
     systemctl enable "$1"

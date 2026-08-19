@@ -822,6 +822,13 @@ if grep -q "^start" /stub/systemctl.log; then
     echo "    [FAIL] DUCK_NO_START started a unit"
     exit 1
 fi
+# And it takes down what a previous install left running, rather than only declining to enable.
+# Skipping the enable on a board that already runs these leaves all five up while the script
+# reports that nothing is — which is how the first attempt at this measurement was wasted.
+for unit in updaterd robotd configd btd padd; do
+    grep -q "^disable --now ${unit}.service$" /stub/systemctl.log \
+        || { echo "    [FAIL] DUCK_NO_START did not disable ${unit}.service"; exit 1; }
+done
 # Still an install: the units belong on disk whether or not anything runs them.
 test -f /etc/systemd/system/robotd.service \
     || { echo "    [FAIL] DUCK_NO_START skipped installing the units"; exit 1; }
