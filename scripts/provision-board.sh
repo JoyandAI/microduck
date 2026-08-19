@@ -17,7 +17,16 @@
 # come back, streams the log the unattended half writes, and ends on `robotctl health` — so
 # provisioning is one command with continuous output instead of three with a gap.
 #
-#   --ref BRANCH      provision from a branch instead of main
+#   --ref BRANCH      provision from a branch: its scripts run the bring-up, and its build of
+#                     the daemon is installed on top of the stable release. Provisioning FAILS
+#                     if that build cannot be installed or is rolled back — a dev board quietly
+#                     running stable when a branch was asked for is worse than a clear stop.
+#                     Needs the branch build to exist, so give CI its minute or two first.
+#   --name NAME       name the robot, at the end of provisioning: `--name Ducky`. Optional —
+#                     without it the board names itself `duck-<four hex>` from its SoC serial,
+#                     which is already unique per board. Changeable later at any time with
+#                     `robotctl system set-name`, so this saves a command rather than deciding
+#                     anything permanent.
 #   --forget-host-key drop this host's key from known_hosts first. Reflashing the card
 #                     regenerates the board's host keys, so the same address then presents a
 #                     different one and ssh refuses outright — see `probe`.
@@ -28,6 +37,15 @@
 #                     deploy/dev-key/team.dev.pub.
 #   --dev-key PATH    somewhere else to find it.
 #   --no-ble          do not use Bluetooth to re-find the board. See below for what that costs.
+#   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all. Sets
+#                     `Privacy = device` and leaves /var/lib/robot/weird-ble, which makes
+#                     `robotctl pad pair` stop `btd` and power-cycle the adapter for a pairing.
+#                     **The default in docs/robot/install-dev.md**, because about half these
+#                     boards need it and nothing measurable says which — and a board that needed
+#                     it and did not get it presents as a pad that will not pair, for no visible
+#                     reason. Drop it on a board proven to bond a pad without it; see that page
+#                     for how to check, and `configure_bluetooth` in scripts/setup-board.sh for
+#                     the measurement behind it.
 #
 # Needs `ssh` and `scp`, an account on the board that can `sudo`, and nothing else. It expects
 # to be able to prompt for the sudo password, so it allocates a terminal for that one command.
@@ -79,6 +97,10 @@ DEV_KEY="$DEV_KEY_DEFAULT"
 NO_DEV_KEY=""
 USE_LOCAL=""
 NO_BLE=""
+WEIRD_BLE=""
+# The name to give the robot. Not `BLE_NAME` below, which points the other way: the name this board
+# already answers to, used to find it again after the reboot.
+ROBOT_NAME=""
 
 # ── the Bluetooth fallback ───────────────────────────────────────────────────
 #
@@ -121,6 +143,11 @@ BOOT_TIMEOUT=300
 STATE=/var/lib/robot/provision.env
 LOG=/var/lib/robot/provision.log
 
+# The unit that runs phase 2 on the board, asked whether it failed. Must match `UNIT_NAME` in
+# provision.sh; a mismatch would make a failed phase 2 look like one still working, which is the
+# hang this exists to end.
+UNIT_NAME=robot-provision.service
+
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -139,10 +166,12 @@ usage() {
 while [ $# -gt 0 ]; do
     case "$1" in
         --ref)        REF="${2:?--ref needs a branch}"; shift 2 ;;
+        --name)       ROBOT_NAME="${2:?--name needs a name}"; shift 2 ;;
         --forget-host-key) FORGET_KEY=1; shift ;;
         --dev-key)    DEV_KEY="${2:?--dev-key needs a path}"; shift 2 ;;
         --no-dev-key) NO_DEV_KEY=1; shift ;;
         --no-ble)     NO_BLE=1; shift ;;
+        --weird-ble)  WEIRD_BLE=1; shift ;;
         --local)      USE_LOCAL=1; shift ;;
         -h|--help)    usage 0 ;;
         -*)           die "unknown option: $1" ;;
@@ -243,6 +272,15 @@ alive() (
 # go looking, so it cannot be collapsed.
 still_provisioning() {
     if rsh "test -f ${STATE}" >/dev/null 2>&1; then
+        # The state file outlives a phase 2 that *failed*: `provision.sh` removes it only on the way
+        # out cleanly, so its presence alone cannot tell a board still working from one that stopped
+        # with an error. Ask systemd, which knows.
+        #
+        # Returned as its own verdict rather than folded into "finished", because the two need
+        # different words: one is a robot ready to use, the other is a board that needs looking at.
+        if rsh "systemctl is-failed --quiet ${UNIT_NAME}" >/dev/null 2>&1; then
+            return 3
+        fi
         return 0
     fi
     # The file is gone, or the board is. One more question tells them apart, and it is only ever
@@ -635,12 +673,22 @@ echo
 _env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
 [ -z "$REF" ]     || _env="${_env} DUCK_REF='${REF}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
+[ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
+
+# The name is a flag rather than one more `DUCK_*`, because on the board it goes no further than
+# `robotctl system set-name`. Single-quoted with any quote of its own escaped: a name is free text,
+# and this whole string is handed to a shell on the board — `Pierre's duck` would otherwise arrive
+# as a syntax error rather than as a name.
+_args=""
+if [ -n "$ROBOT_NAME" ]; then
+    _args=" --name '$(printf '%s' "$ROBOT_NAME" | sed "s/'/'\\\\''/g")'"
+fi
 
 # `-t` so sudo can prompt for a password, and the exit status deliberately ignored: this
 # command ends by rebooting the machine it is running on, so ssh reporting a dropped connection
 # is the *expected* outcome. Whether it worked is decided below, by looking at the board.
 ssh -t -o StrictHostKeyChecking=accept-new "$HOST" \
-    "sudo env ${_env} sh /tmp/provision.sh" || true
+    "sudo env ${_env} sh /tmp/provision.sh${_args}" || true
 
 echo
 say "waiting for ${HOST} to come back (up to ${BOOT_TIMEOUT}s)"
@@ -759,6 +807,18 @@ while :; do
         # out a dev board. Which is the part worth reading.
         drain_log || true
         break
+    fi
+
+    # Phase 2 stopped with an error. The log already says why — it is streamed above — so this
+    # ends rather than adding a diagnosis of its own, and names the two commands worth running.
+    if [ "$_left" = 3 ]; then
+        drain_log || true
+        echo
+        die "provisioning failed on ${HOST_ONLY}; the reason is the last thing in the log above.
+  The board is reachable and whatever ran before the failure is in place, so this is a step to
+  fix rather than a board to reflash:
+    ssh ${HOST} 'systemctl status ${UNIT_NAME}'
+    ssh -t ${HOST} 'sudo cat ${LOG}'"
     fi
 
     # The board went away mid-install. Not the end of provisioning — it carries on without this

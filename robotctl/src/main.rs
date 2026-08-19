@@ -1744,6 +1744,155 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The unit paused while a pad bonds. See [`BtdPaused`].
+const BTD_UNIT: &str = "btd.service";
+
+/// Where a board provisioned with `--weird-ble` says so. Written by `scripts/setup-board.sh`.
+///
+/// Under /var/lib rather than in a release directory: it is a fact about the board, and it has to
+/// survive an update and a rollback.
+const WEIRD_BLE_MARKER: &str = "/var/lib/robot/weird-ble";
+
+/// Was this board provisioned with `--weird-ble`?
+///
+/// A marker rather than re-deriving the answer from `Privacy = device` in `main.conf`: an explicit
+/// record of the decision someone made cannot be confused with a setting that arrived some other
+/// way, and there is no parsing to get subtly wrong.
+///
+/// Absent answers `false`, which is the right default — most boards need nothing.
+fn needs_the_ble_workaround() -> bool {
+    std::path::Path::new(WEIRD_BLE_MARKER).exists()
+}
+
+/// Run `systemctl` and say whether it succeeded, with its output discarded.
+///
+/// Discarded because every call here has something better to say than systemd does: a stop that
+/// fails is reported as what it means for the pairing, not as an exit status.
+fn systemctl(args: &[&str]) -> bool {
+    std::process::Command::new("systemctl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `btd` stopped for the length of a pad pairing, and started again afterwards.
+///
+/// **A temporary workaround for a board that is going away, and deliberately in the CLI rather than
+/// in a daemon.** Measured on a Radxa Zero 3W on 2026-08-19: with `btd` running, a pad cannot form a
+/// *new* bond — the bisect in `docs/project/pad-minimal-pairing.md` narrows it to `btd` and nothing
+/// else, one variable, reproducible both ways. An existing bond is unaffected: a bonded pad connects
+/// and drives with the whole stack up, which is what makes stopping `btd` for one pairing a complete
+/// answer rather than a degradation.
+///
+/// Why not in `btd` or `configd`. The fault is the aic8800 radio behaving badly with an adapter that
+/// both advertises as a peripheral and acts as central at once; the chip and the board are not what
+/// ships. Teaching `btd` to drop its advertisement would be real work against hardware with no
+/// future, and having `configd` drive `btd.service` would put a dependency between them that
+/// `docs/design/architecture.md` §1.1 keeps out on purpose — `btd` is in the recovery path.
+///
+/// So it lives at the edge, in one place, in the command a human runs. **Delete this whole type when
+/// the radio changes**; nothing else has to be unpicked.
+///
+/// Applied only on a board provisioned with `--weird-ble`, which is what sets `Privacy = device` and
+/// leaves the marker this looks for.
+///
+/// Stopping `btd` is only half of it: what it already pushed to the controller outlives the process,
+/// so the adapter is power-cycled too. See [`reset_the_adapter`].
+///
+/// A guard rather than a stop and a start around the call, so `btd` comes back on every path out —
+/// including the error ones, which is where a pairing is most likely to end.
+struct BtdPaused {
+    /// Was it running when we arrived? Only then is starting it again correct: a board with `btd`
+    /// deliberately disabled must not have it switched on by pairing a gamepad.
+    restart: bool,
+}
+
+impl BtdPaused {
+    fn for_pairing() -> Self {
+        // Only where the workaround is needed. A board at BlueZ's default bonds a pad with `btd`
+        // running, and stopping it there would take the phone path down for no reason.
+        if !needs_the_ble_workaround() {
+            return Self { restart: false };
+        }
+
+        // Only restarted if it was running: a board with `btd` deliberately disabled must not have
+        // it switched on by pairing a gamepad.
+        let restart = if systemctl(&["is-active", "--quiet", BTD_UNIT]) {
+            if systemctl(&["stop", BTD_UNIT]) {
+                eprintln!("paused btd while the pad bonds; it comes back on its own");
+                true
+            } else {
+                // Not fatal: the pairing may still work, and refusing to try would be worse than
+                // trying and saying why it might fail. This is also what an unprivileged run looks
+                // like, where the call below is about to be refused anyway.
+                eprintln!(
+                    "warning: could not stop btd, so this pairing may fail on this board. Try:\n \
+                     sudo systemctl stop btd"
+                );
+                false
+            }
+        } else {
+            false
+        };
+
+        reset_the_adapter();
+        Self { restart }
+    }
+}
+
+/// Power the adapter down and up, which is what actually makes a pad bond here.
+///
+/// Stopping `btd` is not enough on its own. Its advertisement and the IO capability its default
+/// pairing agent gave the controller outlive the process — a daemon does not undo what it pushed to
+/// a subsystem when it dies — and a pad still refuses to bond. Every manual pairing that worked had
+/// a **reboot** after stopping `btd`; measured 2026-08-19, a power cycle substitutes for it, which is
+/// what keeps `pad pair` one command instead of two with a reboot between.
+///
+/// Done unconditionally on a marker board, even when `btd` was already stopped: it may have run
+/// earlier this boot and left the same residue, and a board someone stopped `btd` on by hand should
+/// not pair differently from one where this did it.
+///
+/// `bluetoothctl power off/on` and **not** `systemctl restart bluetooth`, which on this board leaves
+/// the kernel holding hci0 while bluetoothd reports "No default controller available" until a reboot.
+/// This is an adapter power toggle through mgmt; the daemon stays up.
+fn reset_the_adapter() {
+    let cycled = bluetoothctl(&["power", "off"]) && bluetoothctl(&["power", "on"]);
+    if !cycled {
+        eprintln!(
+            "warning: could not power-cycle the Bluetooth adapter, so this pairing may fail. \
+             A reboot has the same effect."
+        );
+        return;
+    }
+    // The controller comes back through `off-enabling` before it is usable, and the discovery below
+    // starts immediately. Short enough not to be felt against a discovery window measured in tens
+    // of seconds.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+/// Run `bluetoothctl` and say whether it succeeded, with its output discarded.
+fn bluetoothctl(args: &[&str]) -> bool {
+    std::process::Command::new("bluetoothctl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+impl Drop for BtdPaused {
+    fn drop(&mut self) {
+        if self.restart && !systemctl(&["start", BTD_UNIT]) {
+            eprintln!(
+                "warning: could not start btd again, so the phone path is down until:\n    \
+                 sudo systemctl start btd"
+            );
+        }
+    }
+}
+
 /// The gamepad, through `configd`.
 ///
 /// `pair` is the only command here that takes a while — discovery is held open while someone holds
@@ -1776,6 +1925,11 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
              button on the top edge (not the Xbox button, which switches it off)"
         );
     }
+
+    // Held until this function returns, so `btd` is restored on every path out including the
+    // failures. See `BtdPaused` — temporary, and only for `pair`: `status` and `forget` neither
+    // need the radio quiet nor should disturb it.
+    let _btd = matches!(command, PadCommand::Pair { .. }).then(BtdPaused::for_pairing);
 
     let result = result_of(client.call(&call)?)?;
     if json {
@@ -1877,11 +2031,11 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
                 }
                 proto::PadPairFailure::Rejected => {
                     "Bluetooth refused the pairing. If this fails every time, check \
-                     /etc/bluetooth/main.conf: `Privacy = device` stops a pad bonding at all — it \
-                     rejects the pairing with `DHKey check failed` — and `Privacy = off` is what \
-                     works. Fix it with scripts/setup-board.sh and reboot, since it does not apply \
-                     until then. Otherwise the pad had probably left pairing mode: press Sync \
-                     again and re-run this while its light is flashing quickly"
+                     /etc/bluetooth/main.conf: the `Privacy` setting decides whether a pad can \
+                     bond at all, and it should read `Privacy = device`. Fix it with \
+                     scripts/setup-board.sh and reboot, since it does not apply until then. \
+                     Otherwise the pad had probably left pairing mode: press Sync again and \
+                     re-run this while its light is flashing quickly"
                 }
                 proto::PadPairFailure::Other => "pairing failed",
             };

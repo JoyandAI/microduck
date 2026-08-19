@@ -636,7 +636,8 @@ when the rest of the robot has not.
 
 #### Provisioning can name a board, and does not have to
 
-`DUCK_NAME` makes `provision.sh` call `robotctl system set-name` at the end. Optional on purpose:
+`provision.sh --name`, which `provision-board.sh --name` passes through, calls
+`robotctl system set-name` at the end. Optional on purpose:
 the derived default already distinguishes a board, so provisioning *improves* on a working name
 rather than being what supplies one. That is what makes this survive a board flashed by hand, which
 was the objection that ruled out assigning identity at provisioning time.

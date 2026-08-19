@@ -71,12 +71,65 @@ This removes **the robot's half** of the bond, which is all a robot can remove. 
 half, so pairing it again needs it back in pairing mode — otherwise it arrives with a key this robot
 no longer has and the bond is refused.
 
+An Xbox pad holds **one** host bond, and a half-completed attempt leaves it holding a key this board
+no longer has — which fails in exactly the way a broken board does. If pairing keeps failing, pair
+the pad to a laptop once and remove it there; that consumes and releases its bond slot, and putting
+it in pairing mode alone does not reliably do so.
+
+## When a pad will not bond at all
+
+Some Radxa Zero 3W units cannot bond a gamepad under BlueZ's default settings — roughly half of ten,
+with nothing measurable to tell them apart from the ones that can. Re-provision such a board with
+`--weird-ble`:
+
+```bash
+./scripts/provision-board.sh --weird-ble pierre@192.168.1.42
+```
+
+That sets `Privacy = device`, which those boards need, and leaves a marker at
+`/var/lib/robot/weird-ble`. On a board with that marker, `sudo robotctl pad pair` handles the rest by
+itself — it stops `btd`, power-cycles the adapter, pairs, and starts `btd` again. It says so as it
+goes. An existing bond is unaffected by any of this, so a paired pad connects and drives with
+everything running.
+
+Pairing by hand on such a board needs the same two steps:
+
+```bash
+sudo systemctl stop btd
+```
+
+```bash
+sudo bluetoothctl power off && sudo bluetoothctl power on
+```
+
+Pair, then:
+
+```bash
+sudo systemctl start btd
+```
+
+The power cycle is not optional. Stopping `btd` leaves its advertisement and the IO capability its
+pairing agent gave the controller behind, and a pad still refuses to bond — a reboot has the same
+effect, which is how this was found. Never `systemctl restart bluetooth` instead: on this board that
+leaves no adapter at all until a reboot.
+
+`--weird-ble` is the default in [`install-dev.md`](install-dev.md), because about half these boards
+need it and nothing measurable says which. But a board that does not need it should not carry it —
+the flag costs a `btd` stop and an adapter power cycle on every pairing — so that page also says how
+to check and how to drop it.
+
+Both are workarounds for the aic8800 radio, not properties of the design. They go when the radio
+does.
+
 ## When pairing fails every time
 
-Check `/etc/bluetooth/main.conf` for `Privacy = device`. Boards provisioned before this was
-understood have it, and with it **a pad cannot bond at all**: it rejects the pairing with `DHKey
-check failed (0x0b)`, because that check is computed over both devices' addresses and privacy pairs
-from a resolvable private one. `Privacy = off` is what works.
+Check `/etc/bluetooth/main.conf` for the `Privacy` setting. It should read `Privacy = device`.
+A board that carries `Privacy = off` may refuse to bond a pad at all — the connect gives up with
+`le-connection-abort-by-local` and the pad never reaches `Paired: yes`.
+
+If instead a capture shows the pairing reaching `DHKey check failed (0x0b)`, that is the opposite
+fault and `Privacy = off` is the value to try on that board. Take a `btmon` capture before changing
+the value, because both have been seen and they need different answers.
 
 ```bash
 sudo sh scripts/setup-board.sh

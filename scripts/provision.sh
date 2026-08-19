@@ -12,8 +12,9 @@
 #
 # `DUCK_NO_REBOOT=1` keeps the old four-command shape: it stops and tells you what to run.
 #
-# `DUCK_NAME="Ducky"` names the robot at the end. Optional: without it the board names itself
-# `duck-<four hex>` from its SoC serial, which is already unique per board.
+# `--name Ducky` names the robot at the end — `sudo sh /tmp/provision.sh --name Ducky`. Optional:
+# without it the board names itself `duck-<four hex>` from its SoC serial, which is already unique
+# per board.
 #
 # This orchestrates `setup-board.sh`, `migrate-network.sh` and `install.sh`; it does not
 # duplicate them. They stay separately runnable, and they stay separate for the reasons each
@@ -65,7 +66,7 @@ ENV_REF="${DUCK_REF:-}"
 ENV_TOKEN="${DUCK_TOKEN:-}"
 ENV_DEV_KEY="${DUCK_DEV_KEY:-}"
 ENV_FORCE="${DUCK_FORCE_REINSTALL:-}"
-ENV_NAME="${DUCK_NAME:-}"
+ENV_WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
 
 REPO="${ENV_REPO:-pollen-robotics/microduck_daemon}"
 REF="${ENV_REF:-main}"
@@ -81,13 +82,19 @@ RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
 # during it. `finish` says where it ended up.
 TOKEN="$ENV_TOKEN"
 
-# A name for this robot, or empty to let it name itself.
+# A name for this robot, or empty to let it name itself. Set by `--name`; see `main`.
 #
 # Optional on purpose. Without one the robot derives `duck-7f3a` from its SoC serial, which is
 # already distinguishable from every other board flashed from the same image — so this improves on
 # a working default rather than supplying the only one. That is what keeps a hand-flashed board
 # usable, and it is why the default is derived rather than assigned here.
-NAME="$ENV_NAME"
+#
+# A flag rather than a `DUCK_*` knob, unlike everything above it. Those are environment variables
+# because they are passed on — `install.sh` reads the same names, so a fork or a pinned tag is one
+# decision for the whole bring-up. A name goes no further than `robotctl system set-name` at the
+# end of phase 2. It is also the only thing here that is per-board rather than per-session, and an
+# exported name is exactly the kind of thing that is still set when the next board is provisioned.
+NAME=""
 
 # Path to `team.dev.pub`, to make this a dev board. Usually somewhere under /tmp because it
 # arrived by `scp`, which is why phase 1 copies it somewhere that survives the reboot.
@@ -95,6 +102,21 @@ DEV_KEY="$ENV_DEV_KEY"
 
 # Passed straight through to install.sh.
 FORCE_REINSTALL="$ENV_FORCE"
+
+# Does this board need the Bluetooth workarounds? Passed to `setup-board.sh`, which is where the
+# one setting they need lives.
+#
+# Off by default because most Radxa Zero 3W units do not need it and the workarounds have a cost:
+# `Privacy = device` stops a pad forming a new bond while `btd` advertises, which is why
+# `robotctl pad pair` has to pause `btd` on a board that has it. See `configure_bluetooth` in
+# `setup-board.sh` for the split this exists for.
+WEIRD_BLE="$ENV_WEIRD_BLE"
+
+# The branch the operator asked for, or empty. Kept apart from `REF` because they answer different
+# questions: `REF` is always set — it defaults to `main` — and says where the *scripts* come from,
+# while this says whether a *branch build of the daemon* was asked for. Provisioning plainly with no
+# `--ref` must install the stable release, not `main`'s dev build.
+ASKED_REF="$ENV_REF"
 
 # ── paths ────────────────────────────────────────────────────────────────────
 
@@ -190,6 +212,17 @@ persist_self() {
   reboot would then have nothing to resume — finish by hand if that happens."
 }
 
+# One `KEY='value'` line for the state file, with any single quote in the value escaped.
+#
+# Quoted because `load_state` reads that file by sourcing it, and one of the values is free text:
+# `PROVISION_NAME=Ducky Two` sources as an assignment plus an attempt to run `Two`, which under
+# `set -eu` ends phase 2 on its first line. Naming a robot after two words would then have broken
+# provisioning rather than just the name. Applied to every value rather than to the name alone — a
+# rule that holds for all of them cannot be got wrong by the next one added.
+kv() {
+    printf "%s='%s'\n" "$1" "$(printf '%s' "$2" | sed "s/'/'\\\\''/g")"
+}
+
 # Write what phase 2 needs to know, 0600, root-only.
 #
 # This is where the token lives between the two phases. Not `~/.profile`, which was the
@@ -203,13 +236,17 @@ save_state() {
     : > "$STATE"
     chmod 600 "$STATE"
     {
-        printf 'DUCK_REPO=%s\n' "$REPO"
-        printf 'DUCK_REF=%s\n' "$REF"
-        printf 'DUCK_TOKEN=%s\n' "$TOKEN"
-        printf 'DUCK_DEV_KEY=%s\n' "$1"
-        printf 'DUCK_FORCE_REINSTALL=%s\n' "$FORCE_REINSTALL"
-        printf 'DUCK_NAME=%s\n' "$NAME"
-        printf 'PROVISION_BOOT_ID=%s\n' "$(boot_id)"
+        kv DUCK_REPO "$REPO"
+        kv DUCK_REF "$REF"
+        kv DUCK_TOKEN "$TOKEN"
+        kv DUCK_DEV_KEY "$1"
+        kv DUCK_FORCE_REINSTALL "$FORCE_REINSTALL"
+        kv DUCK_WEIRD_BLE "$WEIRD_BLE"
+        kv DUCK_ASKED_REF "$ASKED_REF"
+        # `PROVISION_*` for the two that are not environment knobs, so sourcing this file cannot
+        # set something an operator could also have exported.
+        kv PROVISION_NAME "$NAME"
+        kv PROVISION_BOOT_ID "$(boot_id)"
     } > "$STATE"
 }
 
@@ -227,7 +264,13 @@ load_state() {
     TOKEN="${ENV_TOKEN:-${DUCK_TOKEN:-}}"
     DEV_KEY="${ENV_DEV_KEY:-${DUCK_DEV_KEY:-}}"
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
-    NAME="${ENV_NAME:-${DUCK_NAME:-}}"
+    WEIRD_BLE="${ENV_WEIRD_BLE:-${DUCK_WEIRD_BLE:-}}"
+    ASKED_REF="${ENV_REF:-${DUCK_ASKED_REF:-}}"
+    # No `ENV_` mirror for the name, unlike its neighbours. Theirs exist because sourcing this file
+    # sets the very `DUCK_*` variables the operator's environment did, so the typed value has to be
+    # kept somewhere else to still win. Nothing else writes `PROVISION_NAME`, so a `--name` on the
+    # phase 2 command line survives the sourcing and can simply be preferred.
+    NAME="${NAME:-${PROVISION_NAME:-}}"
     RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
     return 0
 }
@@ -420,7 +463,7 @@ phase_one() {
 
     tmp=/tmp/setup-board.sh
     fetch setup-board.sh "$tmp"
-    sh "$tmp"
+    DUCK_WEIRD_BLE="$WEIRD_BLE" sh "$tmp"
 
     tmp=/tmp/migrate-network.sh
     fetch migrate-network.sh "$tmp"
@@ -457,11 +500,11 @@ phase_two() {
     # The persisted copies, which is what those scripts leave behind for exactly this moment.
     # Re-fetching would work and would also be a second chance for the network to fail.
     if [ -x "$SETUP_SELF" ]; then
-        "$SETUP_SELF"
+        DUCK_WEIRD_BLE="$WEIRD_BLE" "$SETUP_SELF"
     else
         tmp=/tmp/setup-board.sh
         fetch setup-board.sh "$tmp"
-        sh "$tmp"
+        DUCK_WEIRD_BLE="$WEIRD_BLE" sh "$tmp"
     fi
 
     # This run is what retires the wifi backstop. Left armed, any later boot where wifi is
@@ -510,9 +553,81 @@ phase_two() {
     fi
     sh "$tmp"
 
+    apply_asked_ref
     name_the_robot
 
     finish
+}
+
+# Install the daemon that `--ref BRANCH` last built, when a branch was asked for.
+#
+# `install.sh` cannot do this itself: it resolves the release through GitHub`s `/releases/latest`,
+# which excludes pre-releases, and every branch build is one. So provisioning brings the board up on
+# the stable release and this puts the branch build on top — which is also the right arrangement
+# rather than a workaround. The first release installed becomes **golden**, the boot recovery net`s
+# fallback, and a branch build as golden would give a broken branch a broken fallback. This way
+# `golden` stays stable and `current` is the branch.
+#
+# **Fatal, not a warning.** A dev board asked to run a branch and quietly running the stable release
+# instead is the failure that is worst to debug: everything looks installed and the code under test
+# is not there. Better to stop with the reason.
+#
+# The check is on what is *running*, not on the exit status, because `apply` has a health gate: a
+# branch build that fails it is rolled back to stable and the apply reports that honestly — leaving
+# exactly the silent board this exists to prevent.
+apply_asked_ref() {
+    [ -n "$ASKED_REF" ] || return 0
+
+    say "installing the daemon that ${ASKED_REF} last built"
+
+    # **The exit status is not the verdict, and cannot be.** The release`s `hooks/postinstall`
+    # restarts `updaterd`, which is the process streaming progress back — so a *successful* apply
+    # ends with `updaterd closed the connection` and a non-zero exit, every time. Treating that as
+    # failure is why this refused a board that had just installed correctly.
+    if ! robotctl update apply daemon --ref "$ASKED_REF"; then
+        say "the apply did not answer cleanly. Expected: the post-install hook restarts updaterd and
+  drops the connection carrying the reply. What is actually running is the verdict, below."
+    fi
+
+    # Wait for the restarted daemons before reading anything, or this samples mid-swap. `update
+    # status` answering means `updaterd` is back and serving, which is the earliest point at which
+    # the question can be asked at all.
+    waited=0
+    while [ "$waited" -lt 90 ]; do
+        if robotctl update status >/dev/null 2>&1; then
+            break
+        fi
+        waited=$((waited + 2))
+        sleep 2
+    done
+    if [ "$waited" -ge 90 ]; then
+        die "updaterd did not come back within 90s of installing the ${ASKED_REF} build.
+  The board may be mid-rollback. Look at:
+    journalctl -u updaterd -b --no-pager
+    robotctl health"
+    fi
+
+    # And then a moment more: the health gate runs *after* the swap, so a build that fails it is
+    # rolled back seconds later. Reading `current` the instant updaterd answers can catch the new
+    # release still in place on a board that is about to revert.
+    sleep 5
+
+    live="$(readlink /opt/robot/daemon/current 2>/dev/null | sed 's|releases/||')"
+    case "$live" in
+        *-dev.*)
+            say "running ${live}"
+            ;;
+        *)
+            die "asked for ${ASKED_REF} and this board is running ${live}.
+  Either the build could not be installed, or it was installed and rolled back by the health gate.
+  The board is on the stable release and working; the branch is what needs looking at:
+    journalctl -u updaterd -b --no-pager
+    journalctl -u robotd -b --no-pager
+  Common causes: CI has not published the build yet (gh run list --branch ${ASKED_REF}), the
+  branch has no build at all, or this is not a dev board so a dev-signed build is refused
+  (grep -c 'DEV BOARD' ${LOG})."
+            ;;
+    esac
 }
 
 # Give this board the name the operator asked for, if they asked for one.
@@ -592,11 +707,13 @@ main() {
     [ "$(id -u)" = 0 ] || die "run as root — re-run that same command with sudo"
     command -v curl >/dev/null 2>&1 || die "curl is required"
 
-    case "${1:-}" in
-        --resumed) RESUMED=1 ;;
-        '') ;;
-        *) die "unknown argument: $1 (only --resumed, which systemd passes)" ;;
-    esac
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)    NAME="${2:?--name needs a name}"; shift 2 ;;
+            --resumed) RESUMED=1; shift ;;
+            *) die "unknown argument: $1 (--name NAME, or --resumed, which systemd passes)" ;;
+        esac
+    done
 
     if [ "$RESUMED" = 1 ]; then
         # Before the work, not after: one automatic attempt, whatever happens next.

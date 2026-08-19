@@ -113,8 +113,8 @@ sudo robotctl pad forget 78:86:2E:BB:13:28
 
 Pairing is once per pad and has a page of its own —
 [`pair-a-gamepad.md`](pair-a-gamepad.md): which button puts a pad in pairing mode, adding a second
-pad without forgetting the first, and what to do when it will not bond (`Privacy = device` is the
-answer more often than anything else).
+pad without forgetting the first, and what to do when it will not bond (the `Privacy` setting in
+`/etc/bluetooth/main.conf` is the answer more often than anything else).
 
 `padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. On the
 pad: **Start** toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks
@@ -138,8 +138,10 @@ sudo systemctl stop padd
 sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
 ```
 
-When the link itself is the suspect, watch it live — `robotctl monitor`, then `p`. For a verdict
-over a window instead, copy the measurement over from a clone of this repo:
+When the link itself is the suspect, watch it live — `robotctl monitor`, then `p`. That works with
+no robot too: on a board whose servos are unpowered or whose `robotd` is stopped, the monitor opens
+on the pad block instead of refusing. For a verdict over a window instead, copy the measurement
+over from a clone of this repo:
 
 ```
 scp scripts/pad-link-test.sh radxa@<board>:/tmp/
