@@ -110,6 +110,21 @@ FORCE_REINSTALL="${DUCK_FORCE_REINSTALL:-}"
 # property that must not be automatic.
 DEV_KEY="${DUCK_DEV_KEY:-}"
 
+# Install everything and start nothing.
+#
+#   sudo DUCK_NO_START=1 DUCK_TOKEN=... sh install.sh
+#
+# For separating a board-level fault from the daemons. It puts the release, the units, the users
+# and the groups in place and leaves every unit neither enabled nor started, so the board — and
+# the boot after it — comes back with nothing of ours running. `verify_install` then skips the
+# checks that need a live daemon rather than failing them.
+#
+# Deliberately not `enable` without `--now`: the point is that the *next* boot is clean too, and
+# an enabled unit would start on it. That reboot is what makes the measurement honest, because
+# stopping a daemon does not undo what it pushed to a subsystem — a `btd` that has set `Pairable`
+# and registered a default pairing agent leaves both behind when it dies.
+NO_START="${DUCK_NO_START:-}"
+
 RAW="https://raw.githubusercontent.com/${REPO}/${REF}"
 BOOTSTRAP_ASSET="updaterd-bootstrap-aarch64"
 
@@ -592,6 +607,27 @@ install_dev_key() {
 # symlink would change under systemd's feet on every update, and after a rollback
 # systemd's view of the world would depend on which release happened to be live at the
 # last daemon-reload.
+# `systemctl enable --now`, unless this install is meant to start nothing.
+#
+# Returns success in that case, so a caller's `|| warn` does not fire about a unit that was never
+# meant to run.
+enable_unit() {
+    if [ -n "$NO_START" ]; then
+        say "not enabling ${1} (DUCK_NO_START)"
+        return 0
+    fi
+    systemctl enable --now "$1"
+}
+
+# The same, for a unit enabled without being started — see `robot-boot-check.timer`.
+enable_at_boot() {
+    if [ -n "$NO_START" ]; then
+        say "not enabling ${1} (DUCK_NO_START)"
+        return 0
+    fi
+    systemctl enable "$1"
+}
+
 install_units() {
     say "installing systemd units"
     unit_src="${INSTALL_DIR}/current/systemd"
@@ -657,8 +693,8 @@ install_units() {
     install_completions
 
     systemctl daemon-reload
-    systemctl enable --now updaterd.service
-    systemctl enable --now robotd.service
+    enable_unit updaterd.service
+    enable_unit robotd.service
 
     # configd before btd: btd asks configd for the pairing PIN, and a btd that starts first
     # simply refuses to pair until configd answers. Ordering here saves a confusing first boot
@@ -667,13 +703,13 @@ install_units() {
     # Both `if`-guarded, because a release older than this script does not carry them and the
     # right response to that is to install what there is, not to refuse.
     if [ -f "${UNIT_DIR}/configd.service" ]; then
-        systemctl enable --now configd.service
+        enable_unit configd.service
     fi
     # btd is allowed to fail without failing the install. It needs a Bluetooth adapter, and on
     # this board hci0 does not exist until ~73s after boot; a robot with no working radio is
     # still a robot that updates and walks.
     if [ -f "${UNIT_DIR}/btd.service" ]; then
-        systemctl enable --now btd.service || warn "btd did not start; check:
+        enable_unit btd.service || warn "btd did not start; check:
     journalctl -u btd -b
   The robot works without it — only the phone path is unavailable."
     fi
@@ -685,7 +721,7 @@ install_units() {
     # Allowed to fail like btd. It needs the `padd` user and the `input` group, and a robot that
     # cannot read a gamepad is still a robot that updates and walks.
     if [ -f "${UNIT_DIR}/padd.service" ]; then
-        systemctl enable --now padd.service || warn "padd did not start; check:
+        enable_unit padd.service || warn "padd did not start; check:
     journalctl -u padd -b
   The robot works without it — only the gamepad is unavailable."
     fi
@@ -701,7 +737,7 @@ install_units() {
     # `robot-boot-check.service` is not enabled and must not be: it carries no `[Install]` section
     # precisely so that nothing enables it, and the timer is what starts it.
     if [ -f "${UNIT_DIR}/robot-boot-check.timer" ]; then
-        systemctl enable robot-boot-check.timer || warn "the boot recovery timer did not enable;
+        enable_at_boot robot-boot-check.timer || warn "the boot recovery timer did not enable;
   a release whose daemons cannot start will need robot-rescue by hand."
     fi
 
@@ -763,6 +799,12 @@ verify_install() {
         fi
     done
 
+    # Nothing was started, so every check below would report a failure that was asked for.
+    if [ -n "$NO_START" ]; then
+        say "nothing enabled or started (DUCK_NO_START); skipping the daemon checks"
+        return 0
+    fi
+
     failed=0
     for unit in updaterd robotd; do
         if systemctl is-active --quiet "$unit"; then
@@ -807,6 +849,12 @@ verify_install() {
 report() {
     version="$(readlink "${INSTALL_DIR}/current" | sed 's|releases/||')"
     say "installed daemon ${version}"
+
+    if [ -n "$NO_START" ]; then
+        warn "DUCK_NO_START was set: the release and its units are installed and NOTHING is
+  enabled or running, including after a reboot. This board is not a working robot until:
+    sudo systemctl enable --now updaterd robotd configd btd padd"
+    fi
 
     # Before the command list, not after: every command below fails with "Permission denied"
     # in the shell reading this, and that is what a first-time operator reasonably reads as a

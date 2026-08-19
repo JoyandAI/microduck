@@ -83,6 +83,18 @@ sudo -E sh ~/install.sh
 Drop `DUCK_DEV_KEY` for a board that should only take releases. Set `DUCK_REF` to a branch to
 install what that branch last built.
 
+`DUCK_NO_START=1` installs the release, the units, the users and the groups and enables **nothing**
+— not even for the next boot. For separating a board-level fault from the daemons: reboot into a
+board with nothing of ours ever having run, test, then bring them up one at a time.
+
+```bash
+sudo -E DUCK_NO_START=1 sh ~/install.sh
+```
+
+```bash
+sudo systemctl enable --now updaterd robotd configd btd padd
+```
+
 Name it, if you want a name:
 
 ```bash

@@ -798,6 +798,35 @@ echo "    [ok] daemon-reload precedes every enable, and configd precedes btd"
 # board that has no golden release yet anyway.
 grep -q "^enable robot-boot-check.timer$" /stub/systemctl.log \
     || { echo "    [FAIL] the boot recovery timer was never enabled"; exit 1; }
+
+# DUCK_NO_START, which exists to separate a board-level fault from the daemons: install
+# everything, start nothing, and leave the next boot clean too.
+#
+# `enable` is asserted absent as well as `enable --now`. An enabled-but-not-started unit would come
+# up on the reboot, and the reboot is the whole point — stopping a daemon does not undo what it
+# pushed to a subsystem, so the measurement needs a boot with nothing of ours ever running.
+: > /stub/systemctl.log
+DUCK_NO_START=1 PATH="/stub:$PATH" sh /bin/scripts/install.sh > /tmp/nostart.log 2>&1 || {
+    echo "    [FAIL] install.sh with DUCK_NO_START exited non-zero"
+    cat /tmp/nostart.log
+    exit 1
+}
+# `if`, not `grep && fail`: this script runs under set -e, and a grep that finds nothing — the
+# passing case here — would make the whole list non-zero and abort before reaching the verdict.
+if grep -q "^enable" /stub/systemctl.log; then
+    echo "    [FAIL] DUCK_NO_START enabled a unit:"
+    grep "^enable" /stub/systemctl.log
+    exit 1
+fi
+if grep -q "^start" /stub/systemctl.log; then
+    echo "    [FAIL] DUCK_NO_START started a unit"
+    exit 1
+fi
+# Still an install: the units belong on disk whether or not anything runs them.
+test -f /etc/systemd/system/robotd.service \
+    || { echo "    [FAIL] DUCK_NO_START skipped installing the units"; exit 1; }
+echo "    [ok] DUCK_NO_START installs the units and enables nothing"
+
 grep -q "^enable --now robot-boot-check" /stub/systemctl.log \
     && { echo "    [FAIL] the boot recovery check was started during provisioning"; exit 1; }
 for script in robot-rescue robot-boot-check; do
