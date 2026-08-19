@@ -46,7 +46,7 @@ Dated records rather than reference. They describe a moment, and go stale on pur
 | [`ci-setup.md`](project/ci-setup.md) | One-time setup for the release pipeline: keys, secrets, rotation. |
 | [`install-path-gap.md`](project/install-path-gap.md) | Why four install-path bugs reached a board, and what closed it. Closed. |
 | [`slice-2-bringup.md`](project/slice-2-bringup.md) | What a real Radxa Zero 3W did with slice 2. |
-| [`update-over-ble.md`](project/update-over-ble.md) | Driving the update path from a phone: what works, what blocks it, and two decisions. Open. |
+| [`update-over-ble.md`](project/update-over-ble.md) | Driving the update path from a phone: what it turned up, and what rollback over a radio was decided on. |
 
 ## Elsewhere
 

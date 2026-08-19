@@ -219,6 +219,11 @@ What that leaves for M6 proper: recovery mode, manifest staleness, authority arb
 provisioning step the pairing PIN now depends on (below). It also means the app has something to
 talk to before the app exists, which is the right order for finding out that an API is wrong.
 
+**The update path over Bluetooth is now driven rather than merely routed**, which is what that
+order was for: `update-over-ble.md` records what driving it from `duck-btctl` turned up, including
+one defect that made "start an update and watch it" an update the robot silently never performed.
+`update.rollback` and `update.select` are reachable from a phone as of that work.
+
 **Done when:** a non-developer updates the robot from the phone, and a deliberately
 bricked release recovers without a laptop.
 
