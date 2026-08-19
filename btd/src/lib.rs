@@ -25,10 +25,12 @@
 //! holds the connections to the services that own the answers.
 //!
 //! `net.*` and `system.*` — wifi, name, reboot — go to `configd`, one arm each in [`route`]'s
-//! table. The robot's name is the one thing `btd` reads back rather than only forwarding: it has to
-//! advertise it, so [`bluez`] asks `configd` what the robot is called and keeps the advertisement
-//! in step with it.
+//! table. The robot's name and its IPv4 address are the two things `btd` reads back rather than
+//! only forwarding: both go in the advertisement, so [`bluez`] asks `configd` for them and keeps
+//! the advertisement in step. [`adv`] is the layout of the address field, shared with the client
+//! that decodes it.
 
+pub mod adv;
 #[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod framing;

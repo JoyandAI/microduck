@@ -15,7 +15,7 @@
 //! it a real test of the protocol rather than a reimplementation that could agree with itself.
 //!
 //! ```text
-//! cargo run -p btd --example duck-btctl -- scan
+//! cargo run -p btd --example duck-btctl -- scan          # robots in range, and their addresses
 //! cargo run -p btd --example duck-btctl -- status
 //! cargo run -p btd --example duck-btctl -- wifi scan
 //! cargo run -p btd --example duck-btctl -- wifi connect "Pollen" --psk secret
@@ -26,12 +26,15 @@
 //! `DUCK_ROBOT` and `DUCK_PIN` in the environment are the defaults for `--name` and `--pin`, for
 //! the machine that talks to the same robot every day. See [`Target`].
 
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+use btd::adv;
 use btd::framing::{self, Reassembler};
 use btd::gatt::{RPC_UUID, SERVICE_UUID};
 use btleplug::api::{
-    Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
+    Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, PeripheralProperties,
+    ScanFilter, WriteType,
 };
 use btleplug::platform::{Manager, Peripheral};
 use clap::{Parser, Subcommand};
@@ -85,9 +88,62 @@ struct Seen {
     identity: String,
     local_name: Option<String>,
     services: usize,
-    /// Whether this advertisement carried the duck service UUID, which is the only evidence a
-    /// listing has: everything better needs a connection, and `scan` deliberately makes none.
+    /// Whether this advertisement carried the duck service UUID, which is the strongest evidence a
+    /// listing has: anything better needs a connection, and `scan` deliberately makes none.
     duck: bool,
+    /// What the robot broadcast about its place on the network — see [`Address`], and `btd::adv`
+    /// for why four bytes of IPv4 and not the SSID too.
+    address: Address,
+}
+
+/// What a device said about its IPv4 address, which is three answers rather than two.
+///
+/// `Option<Ipv4Addr>` would collapse the two blanks into one, and they send the reader somewhere
+/// different: a robot that broadcast `0.0.0.0` has no network, and a robot that broadcast nothing is
+/// on a release from before this existed. The first is a wifi problem and the second is an update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Address {
+    At(Ipv4Addr),
+    /// The field was there and said `0.0.0.0`: this robot has no address, because it is on no
+    /// network or because DHCP has not given it one yet.
+    ///
+    /// Not called `None`: it sits next to `Option`'s in [`Address::read`], and one of the two is
+    /// about a robot's network while the other is about a missing field.
+    Unassigned,
+    /// No field at all — an older `btd`, or a device that is not a robot.
+    Unsaid,
+}
+
+impl Address {
+    /// Read from one advertisement, and **only for a robot**.
+    ///
+    /// `btd` files the address under company id `0xFFFF`, which the Bluetooth SIG leaves open to
+    /// anyone, so four bytes from `0xFFFF` on an arbitrary device are four bytes of somebody else's
+    /// business. Reading it only where the duck service UUID was also advertised is what keeps a
+    /// beacon from being listed with an invented address.
+    fn read(properties: &PeripheralProperties, duck: bool) -> Self {
+        if !duck {
+            return Self::Unsaid;
+        }
+        match adv::address_in(&properties.manufacturer_data) {
+            Some(address) => Self::At(address),
+            None if adv::has_address_field(&properties.manufacturer_data) => Self::Unassigned,
+            None => Self::Unsaid,
+        }
+    }
+
+    /// How it reads on the device's line in a listing, or nothing at all.
+    ///
+    /// `Unsaid` renders as nothing rather than as "unknown": every non-robot line is `Unsaid`, and a
+    /// column of "unknown" against a room full of earbuds is noise. The robot on an older release is
+    /// covered by the note under the list instead, which has room to say what to do about it.
+    fn note(self) -> Option<String> {
+        match self {
+            Self::At(address) => Some(address.to_string()),
+            Self::Unassigned => Some("no address".to_owned()),
+            Self::Unsaid => None,
+        }
+    }
 }
 
 /// Whatever names this device on this platform.
@@ -317,7 +373,8 @@ fn choose<T>(found: Vec<(T, String)>, target: &Target) -> Result<(T, String), St
     })
 }
 
-/// Devices as indented lines: what names each one, what it calls itself, what it is doing.
+/// Devices as indented lines: what names each one, what it calls itself, where it is, what it is
+/// doing.
 ///
 /// Shared by `scan` and by the failure message, because identifying a robot in a list of earbuds is
 /// the same problem whether the list is the answer or the diagnosis — and two renderings of it would
@@ -339,6 +396,9 @@ async fn device_list(mut devices: Vec<&Seen>, target: &Target) -> String {
     let mut lines: Vec<String> = Vec::new();
     for device in devices.iter().take(LISTED_DEVICES) {
         let mut notes: Vec<String> = Vec::new();
+        // The leading note, because it is what the line is read for: `scan` is how someone finds the
+        // robot to ssh into or point a browser at, and the service count is diagnosis by comparison.
+        notes.extend(device.address.note());
         if device.services > 0 {
             notes.push(format!("{} service(s)", device.services));
         }
@@ -375,8 +435,8 @@ async fn device_list(mut devices: Vec<&Seen>, target: &Target) -> String {
 
 /// Whether the devices that are not robots are listed, or only counted.
 ///
-/// The duck service UUID in the advertisement is the only evidence available to a listing —
-/// everything stronger needs a connection, and connecting to 43 devices to ask each whether it is a
+/// The duck service UUID in the advertisement is the strongest evidence available to a listing —
+/// anything better needs a connection, and connecting to 43 devices to ask each whether it is a
 /// robot would be minutes of pairing prompts. So that block is not padding: a robot already bonded
 /// with this Mac frequently advertises no services at all, and it is the reason `--name` exists.
 ///
@@ -397,8 +457,12 @@ fn lists_others(verbose: bool, robots: usize) -> bool {
 /// What `scan` prints: the robots, and — per [`lists_others`] — everything else.
 async fn listing(seen: &[Seen], verbose: bool, target: &Target) -> String {
     let (robots, others): (Vec<&Seen>, Vec<&Seen>) = seen.iter().partition(|d| d.duck);
-    // Kept before `device_list` consumes the vector, since it decides the second block below.
+    // Kept before `device_list` consumes the vector, since they decide the blocks below.
     let found = robots.len();
+    let silent = robots
+        .iter()
+        .filter(|d| d.address == Address::Unsaid)
+        .count();
 
     let mut out = if robots.is_empty() {
         "no robot advertised the duck service.".to_owned()
@@ -409,6 +473,18 @@ async fn listing(seen: &[Seen], verbose: bool, target: &Target) -> String {
             device_list(robots, target).await,
         )
     };
+
+    // A robot whose line carries no address at all is on a release from before `btd` broadcast one,
+    // and its line cannot say so: an absent field looks the same as a device that never had one. Said
+    // once, below the list, where there is room for what to do about it — and only when it happened,
+    // because on a bench of current robots this sentence is noise.
+    if silent > 0 {
+        out.push_str(&format!(
+            "\n\n{silent} of them broadcast no address, which is a release from before `btd` \
+             advertised one. `duck-btctl wifi status` still reports it; updating the robot puts it \
+             in this list."
+        ));
+    }
 
     if !others.is_empty() {
         if lists_others(verbose, found) {
@@ -438,12 +514,10 @@ async fn listing(seen: &[Seen], verbose: bool, target: &Target) -> String {
 /// the radio — while a list the robot is missing from points at the robot.
 ///
 /// And the robot can be *in* that list, unrecognisable. `btd` advertises flags (3 bytes), a 128-bit
-/// service UUID (18) and the robot's name (2 + its length), so a name of more than **8 characters**
-/// is past the 31 bytes a legacy advertisement holds — and the name travels in the scan response, a
-/// second exchange that can be missed on its own. `radxa-zero3` was 11, and the derived default
-/// `duck-c51b` is 9, so this is still the normal case rather than the edge one. A device reported
-/// with no name and no services is therefore a plausible robot, which is why the unnamed ones are
-/// listed rather than filtered out.
+/// service UUID (18) and the address field (8, see `btd::adv`), which is 29 of the 31 bytes a legacy
+/// advertisement holds — so the name never travels in it. It goes in the scan response, a second
+/// exchange that can be missed on its own. A device reported with no name and no services is
+/// therefore a plausible robot, which is why the unnamed ones are listed rather than filtered out.
 async fn nothing_found(seen: &[Seen], target: &Target) -> String {
     if seen.is_empty() {
         return format!(
@@ -544,7 +618,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List robots in range, and stop.
+    /// List robots in range with the address each one broadcast, and stop.
     Scan,
     /// Version handshake plus update status.
     Status,
@@ -684,6 +758,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 local_name: properties.local_name.clone(),
                 services: properties.services.len(),
                 duck,
+                address: Address::read(&properties, duck),
             });
 
             if list_only {
@@ -1323,6 +1398,70 @@ mod tests {
             !Target::new(None, None).marks(Some("duck-c51b")),
             "with no default there is nothing to mark"
         );
+    }
+
+    /// One advertisement, as `btleplug` would report it.
+    fn advertised(
+        duck: bool,
+        manufacturer_data: &[(u16, Vec<u8>)],
+    ) -> (PeripheralProperties, bool) {
+        (
+            PeripheralProperties {
+                manufacturer_data: manufacturer_data.iter().cloned().collect(),
+                ..Default::default()
+            },
+            duck,
+        )
+    }
+
+    /// The whole point of the change: a listing says where to reach the robot, with no connection.
+    #[test]
+    fn a_robot_broadcasts_where_it_is() {
+        let (properties, duck) = advertised(
+            true,
+            &[(
+                adv::COMPANY_ID,
+                adv::address_data(Some(Ipv4Addr::new(192, 168, 1, 42))),
+            )],
+        );
+        let address = Address::read(&properties, duck);
+        assert_eq!(address, Address::At(Ipv4Addr::new(192, 168, 1, 42)));
+        assert_eq!(address.note().as_deref(), Some("192.168.1.42"));
+    }
+
+    /// The two blanks are not one blank. A robot with no wifi is a wifi problem; a robot that said
+    /// nothing is an update — and the listing sends the reader somewhere different for each.
+    #[test]
+    fn no_wifi_and_no_field_read_differently() {
+        let (properties, duck) = advertised(true, &[(adv::COMPANY_ID, adv::address_data(None))]);
+        assert_eq!(Address::read(&properties, duck), Address::Unassigned);
+        assert_eq!(
+            Address::read(&properties, duck).note().as_deref(),
+            Some("no address")
+        );
+
+        let (properties, duck) = advertised(true, &[]);
+        assert_eq!(Address::read(&properties, duck), Address::Unsaid);
+        assert_eq!(
+            Address::read(&properties, duck).note(),
+            None,
+            "nothing on the line; the note under the list covers it"
+        );
+    }
+
+    /// `0xFFFF` is the company id the SIG leaves open to anyone, so four bytes of it on a device that
+    /// never advertised the duck service are somebody else's four bytes. Listing an earbud with an
+    /// invented address would be worse than listing it with none.
+    #[test]
+    fn only_a_robot_is_read_for_an_address() {
+        let (properties, duck) = advertised(
+            false,
+            &[(
+                adv::COMPANY_ID,
+                adv::address_data(Some(Ipv4Addr::new(10, 0, 0, 1))),
+            )],
+        );
+        assert_eq!(Address::read(&properties, duck), Address::Unsaid);
     }
 
     /// The PIN matters more than the name does — a robot with a real one needs it on every

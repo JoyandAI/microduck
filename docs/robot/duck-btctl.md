@@ -41,8 +41,23 @@ cargo uninstall btd --bin btctl
 duck-btctl scan
 ```
 
+```
+1 robot(s) advertising the duck service:
+  aa:bb:cc:dd:ee:ff duck-c51b — 192.168.1.42, 1 service(s)  ← DUCK_ROBOT
+
+7 other device(s) in range, not listed. …
+```
+
 Robots only, with everything else in radio range counted rather than listed. `--verbose` expands
 that list, and it is worth reading when the robot you want is not in the first one.
+
+Each robot broadcasts its IPv4 address, so this is also where the address to ssh to comes from. No
+connection is made and no PIN is needed. `no address` on the line means the robot is not on a
+network; a line with no address at all means a release from before robots broadcast one, and
+`duck-btctl wifi status` still reports it.
+
+The SSID is not in the listing — it does not fit in an advertisement. `duck-btctl wifi status` has
+it, along with the signal and both addresses.
 
 A robot that has never been renamed calls itself `duck-` plus four characters derived from its
 serial, so `duck-c51b`. Either half of a robot reported under two names at once — macOS shows
