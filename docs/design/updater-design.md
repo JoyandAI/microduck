@@ -110,7 +110,8 @@ naive "restart everything" would kill the executor mid-swap or mid-health-gate.
 **Excluded from the in-flight restart is not the same as skipped**, and reading it that way was the
 bug. Deferring them to "the next boot or an explicit later restart" left both running the old binary
 indefinitely: a resident `updaterd` rejected a newer `robotctl` with "client speaks API v4, daemon
-speaks v3", and `btd` fixes were tested against binaries that had never been running. So
+speaks v3" (that refusal is gone — the stale binary was the fault, not the disagreement), and `btd`
+fixes were tested against binaries that had never been running. So
 `RESTART_AFTER_REPLYING` schedules each through a systemd transient timer 5 s after the outcome is on
 the wire — long enough for a single write, short enough that nobody is waiting. The reason for each
 exclusion expires at exactly that moment: the update is finished, and the reply `btd` was carrying

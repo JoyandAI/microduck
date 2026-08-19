@@ -481,27 +481,37 @@ or to restart `updaterd` — neither of which is discoverable from the error.
 
 The handshake at least *caught* it and named both versions, which is more than case 1 managed.
 
-The proposed fix was **`hello` should refuse only when the client is *newer* than the daemon** — a v3
-daemon serves a v2 client perfectly when v3 only *added* methods, so refusing that direction costs
-the ability to recover and buys nothing. It would also have made `API_VERSION` mean "the newest
-contract I understand" rather than "the only contract I will speak".
+The first proposed fix was **`hello` should refuse only when the client is *newer* than the daemon**,
+and it was **decided against** (#77): it assumed bumps are additive, and they are not — v5 added
+`pad.*` and was additive, v4 made `system.authenticate` mandatory and was not. Accepting older
+clients on the strength of a pattern the constant does not track would have promised backward
+compatibility with nothing to enforce it.
 
-**Decided against** (#77), because writing the argument out exposed the premise underneath it: that
-bumps are additive. They are not, and the constant does not distinguish them — v5 added `pad.*` and
-was additive, v4 made `system.authenticate` mandatory and was not. Accepting older clients would
-promise backward compatibility on every past and future bump, with nothing to enforce it and no way
-to make a non-additive change afterwards. With one user and one robot, the freedom to change the
-wire shape is worth more than a promise the protocol cannot keep. `API_VERSION`'s doc comment now
-states that outright, which is the part that was genuinely missing: the rule existed only as an
-`!=` in one file.
+**Fixed instead by removing the gate outright.** The premise of that refusal survives — a bump
+promises nothing — but the conclusion does not follow from it. What breaks a mismatched peer is a
+*route it cannot reach* or a *parameter shape that moved*, and both of those already refuse
+themselves, by name, on the one call that cannot be served: `METHOD_NOT_FOUND` from
+`Request::as_call`, `INVALID_PARAMS` from a params decode. A gate on the handshake fired on every
+other call as well — every call, in fact, since `hello` precedes all of them — which is how a
+one-digit difference took away `update apply` and `version` at the same time. So `updaterd` now
+logs the pair of versions and serves the call; the difference reaches the client through
+`HelloResult::api_version`, and `robotctl` prints one warning line per run.
 
-What did change is the message, because the remaining cost was never leniency — it was that
-`client speaks API v2, daemon speaks v3` names no way out, on a board where the two halves are a
-symlink and a running process. The refusal now branches on direction: client newer is the seconds
-after an update, so retry and then `systemctl restart updaterd`; client older cannot happen through
-`/usr/local/bin/robotctl`, which is a symlink into `current`, so the answer is to use that one.
-`robotctl` correspondingly stopped appending "install matching versions", which was true and not
-actionable.
+Two things had to be true before the gate could go, and the second is the useful part:
+
+- **The refusal had to be redundant, not merely annoying.** It is: `robotd`, `configd` and `padd`
+  never checked the number at all, and `updaterd` required no handshake before `update.status`
+  anyway. `duck-btctl` had already reached the same conclusion from the far end of the link (#102).
+- **A silently ignored parameter had to stop being possible.** `serde` ignores what it does not
+  know, which is what made the gate feel load-bearing: v7 added `ApplyOptions::from_dir`, and a v6
+  daemon that ignored it would install from its *configured* source while the operator believed they
+  were sideloading a directory. Every params type now denies unknown fields, so that is an
+  `INVALID_PARAMS` naming the member. It reaches forward only — a daemon built before this still
+  ignores what it does not know — which is why an `API_VERSION` bump is still worth making.
+
+The message was rewritten before this and is now gone with the gate. It said `client speaks API v2,
+daemon speaks v3` and named no way out; the remedy it grew (retry, or use the symlink at
+`/usr/local/bin/robotctl`) now lives in `robotctl`'s warning, where nothing is being refused.
 
 ### Why these are not install-path bugs
 

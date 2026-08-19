@@ -537,6 +537,10 @@ struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
+    /// Which daemon is on the other end. The connect failure names it too, but that happens
+    /// before there is a `Self` to keep it in — this copy is for [`Client::hello_result`]'s skew
+    /// warning, which has to say which of three sockets disagreed.
+    service: &'static str,
 }
 
 impl Client {
@@ -552,7 +556,7 @@ impl Client {
     /// `systemctl status` for it. Hardcoding "updaterd" told anyone diagnosing a stopped
     /// `robotd` to go check the wrong service — a diagnostic that points at the wrong
     /// place is worse than none.
-    fn connect_to(service: &str, path: &std::path::Path) -> Result<Self, Failure> {
+    fn connect_to(service: &'static str, path: &std::path::Path) -> Result<Self, Failure> {
         let stream = UnixStream::connect(path)
             .map_err(|e| Failure::new(exit::UNREACHABLE, unreachable_hint(service, path, &e)))?;
         let writer = stream
@@ -562,6 +566,7 @@ impl Client {
             reader: BufReader::new(stream),
             writer,
             next_id: 1,
+            service,
         })
     }
 
@@ -624,30 +629,29 @@ impl Client {
         }
     }
 
-    /// Refuse a protocol mismatch loudly rather than sending requests the daemon
-    /// might misread. A stale `robotctl` in someone's shell is normal.
+    /// Confirm the daemon is answering JSON-RPC before sending it a command.
+    ///
+    /// **A liveness check, not a gate.** It used to be one: a daemon whose `API_VERSION` differed
+    /// refused the handshake and every command failed here, including the `update apply` that ends
+    /// the skew. No daemon refuses on that number now — see [`proto::API_VERSION`] — so what remains
+    /// is worth keeping for its own sake, because it turns a socket that accepts and then says
+    /// nothing into a failure before the real call goes out.
     fn hello(&mut self) -> Result<(), Failure> {
         self.hello_result().map(|_| ())
     }
 
-    /// As [`Self::hello`], but returns what the daemon said about itself.
-    ///
-    /// `version` needs the payload rather than a pass/fail, and needs it even when the
-    /// daemon speaks a different API version — "these two are out of step" is the single
-    /// most useful thing the command can report, so refusing to print it would defeat the
-    /// purpose. The protocol check still fails for every *other* command.
+    /// As [`Self::hello`], but returns what the daemon said about itself, which is what
+    /// `version` and `health` report.
     fn hello_result(&mut self) -> Result<proto::HelloResult, Failure> {
         let response = self.call(&proto::Call::Hello(proto::HelloParams {
             api_version: proto::API_VERSION,
         }))?;
         if let Some(error) = response.error {
-            // The daemon's message is passed through unadorned. It used to gain
-            // "robotctl and updaterd are out of step; install matching versions" here, which was
-            // true and not actionable — the daemon now says which of the two is behind and what
-            // to do, which this side cannot know, and two remedies would disagree.
+            // Passed through unadorned. This side cannot add a remedy the daemon does not
+            // already know, and two remedies would disagree.
             return Err(Failure::new(exit::FAILED, error.message));
         }
-        response
+        let hello: proto::HelloResult = response
             .result
             .and_then(|r| serde_json::from_value(r).ok())
             .ok_or_else(|| {
@@ -655,8 +659,36 @@ impl Client {
                     exit::FAILED,
                     "daemon answered hello in an unexpected shape".to_owned(),
                 )
-            })
+            })?;
+        warn_once_about_skew(self.service, hello.api_version);
+        Ok(hello)
     }
+}
+
+/// Say that this client and a daemon were not built together, once per run.
+///
+/// The daemon writes the same pair of versions to its journal and serves the call anyway, which is
+/// the right answer for the machine and an incomplete one for the person typing: they see the
+/// eventual `unknown method` or `unknown field` and nothing connecting it to a stale binary. One
+/// line of stderr closes that gap.
+///
+/// **Once**, because `version` and `health` ask three daemons and a real skew involves all three —
+/// this client is either from the installed release or it is not, so three lines would be three
+/// copies of one fact. And on stderr, because stdout is what `--json` pipes into something.
+fn warn_once_about_skew(service: &str, theirs: u32) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+
+    if theirs == proto::API_VERSION || SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "warning: {service} speaks API v{theirs} and this robotctl speaks v{}, so they were not \
+         built together. Carrying on — a call that cannot be served will name itself. \
+         `/usr/local/bin/robotctl` follows the installed release: older than the daemon means this \
+         is a copy from somewhere else, newer means the few seconds after an update.",
+        proto::API_VERSION
+    );
 }
 
 // ── version reporting ────────────────────────────────────────────────────────
