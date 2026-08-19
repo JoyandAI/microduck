@@ -198,6 +198,11 @@ first place: that was fault 2, measured on a board that needed `device` for faul
 as proof that `device` broke pairing. The result was a setting that could not bond a pad on half the
 boards, for a fortnight.
 
+Stopping `btd` is not sufficient on its own: what it pushed to the controller outlives the process,
+so every manual pairing that worked had a **reboot** after the stop. An adapter power cycle
+(`bluetoothctl power off && power on`) substitutes for that reboot — measured 2026-08-19, `pad pair`
+succeeding first try on a fully installed board — which is what keeps pairing one command.
+
 Both workarounds are behind `provision-board.sh --weird-ble`, so a board that does not need them
 does not carry them: the flag sets `Privacy = device` and leaves `/var/lib/robot/weird-ble`, and
 `robotctl pad pair` pauses `btd` only on a board with that marker. Try a board without the flag

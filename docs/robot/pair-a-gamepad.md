@@ -87,15 +87,19 @@ with nothing measurable to tell them apart from the ones that can. Re-provision 
 ```
 
 That sets `Privacy = device`, which those boards need, and leaves a marker at
-`/var/lib/robot/weird-ble`. On a board with that marker, `sudo robotctl pad pair` stops `btd` for the
-length of the pairing and starts it again afterwards — it says so when it does — because under
-`Privacy = device` a pad cannot form a **new** bond while `btd` advertises. An existing bond is
-unaffected, so a paired pad connects and drives with everything running.
+`/var/lib/robot/weird-ble`. On a board with that marker, `sudo robotctl pad pair` handles the rest by
+itself — it stops `btd`, power-cycles the adapter, pairs, and starts `btd` again. It says so as it
+goes. An existing bond is unaffected by any of this, so a paired pad connects and drives with
+everything running.
 
-Pairing by hand on such a board needs the same thing:
+Pairing by hand on such a board needs the same two steps:
 
 ```bash
 sudo systemctl stop btd
+```
+
+```bash
+sudo bluetoothctl power off && sudo bluetoothctl power on
 ```
 
 Pair, then:
@@ -103,6 +107,11 @@ Pair, then:
 ```bash
 sudo systemctl start btd
 ```
+
+The power cycle is not optional. Stopping `btd` leaves its advertisement and the IO capability its
+pairing agent gave the controller behind, and a pad still refuses to bond — a reboot has the same
+effect, which is how this was found. Never `systemctl restart bluetooth` instead: on this board that
+leaves no adapter at all until a reboot.
 
 Try a board *without* the flag first. Both of these are workarounds for the aic8800 radio, not
 properties of the design, and a board that does not need them should not carry them.
