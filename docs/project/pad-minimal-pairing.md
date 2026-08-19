@@ -131,7 +131,8 @@ scp scripts/setup-board.sh scripts/migrate-network.sh pierre@BOARD:~/
 | 0 | nothing — the minimal sequence above | yes | the control |
 | 1 | `sudo sh ~/setup-board.sh` — overlays, `console=display`, getty mask, onnxruntime | **yes** | |
 | 2 | `sudo sh ~/migrate-network.sh` — netplan → NetworkManager | **yes** | |
-| 3 | `sudo -E sh ~/install.sh` | **no** | the bisect point |
+| 3 | `sudo -E sh ~/install.sh` | **no** | first attempts; the daemons were running |
+| 3b | `DUCK_NO_START=1`, then reboot | **yes** | so nothing install.sh writes is at fault |
 | 4 | `systemctl enable --now updaterd` | | |
 | 5 | `... robotd` | | |
 | 6 | `... configd` | | |
@@ -142,10 +143,18 @@ Ran 2026-08-19, pairing manually with `bluetoothctl` at each step and removing t
 afterwards. Steps 1 and 2 bond fine; `install.sh` is where it stops. So the board bring-up, the
 device-tree overlays, the console move and the NetworkManager cutover are all exonerated.
 
-What is left to split inside `install.sh`: the files it writes, versus the five daemons it starts.
-`systemctl disable --now updaterd robotd configd btd padd` and a reboot separates them. `btd` is
-the one to enable first — it is the only one that touches BlueZ, advertising as a peripheral,
-setting `Pairable`, and holding the default pairing agent.
+Split inside `install.sh` on 2026-08-19: with `DUCK_NO_START=1` and a reboot, a pad bonds. So
+nothing `install.sh` writes to disk is at fault — not the units, the users, the groups, the release
+tree or the token drop-in. It is one of the five daemons, running.
+
+Three attempts at that measurement were wasted before it worked, all for the same reason:
+`hooks/postinstall` inside the release does `systemctl enable --now` on every unit it ships, from
+inside `updaterd install`, which happens *before* `install_units` — so the daemons were up during
+every test, and `systemctl disable --now` afterwards does not undo what they pushed to the adapter.
+`btd` leaves `Pairable` set, an advertising instance, and the IO capability its default pairing
+agent gave the adapter. **Reboot before measuring.**
+
+`btd` is the one to enable first — it is the only one that touches BlueZ.
 
 Reboot after each step, and clear **both** halves of the bond before each attempt: `pad forget`
 or `bluetoothctl remove` on the board, and the pad held in pairing mode. An Xbox pad keeps one
