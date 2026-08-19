@@ -200,35 +200,60 @@ enum Update {
 /// the piped one. A closed socket is an error either way — that is what `robotd` restarting
 /// mid-update looks like, and it is worth seeing rather than hanging through.
 pub fn run(robot_socket: &Path, pad_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> {
-    let mut client = Client::connect_to("robotd", robot_socket)?;
-    let call = proto::Call::RobotSubscribe(proto::SubscribeParams {
-        hz: (hz > 0).then_some(hz),
-    });
-    client.send(&proto::Request::call(
-        proto::Id::Number(SUBSCRIBE_ID),
-        &call,
-    ))?;
+    let subscribe = || {
+        proto::Request::call(
+            proto::Id::Number(SUBSCRIBE_ID),
+            &proto::Call::RobotSubscribe(proto::SubscribeParams {
+                hz: (hz > 0).then_some(hz),
+            }),
+        )
+    };
 
+    // A pipe or `--json` is a stream *of robot state*, so there it stays an error: emitting
+    // nothing forever is not a useful answer to `monitor > log`.
     if json || !stdout_is_a_terminal() {
+        let mut client = Client::connect_to("robotd", robot_socket)?;
+        client.send(&subscribe())?;
         return stream_lines(client, json);
     }
 
-    let Client { reader, writer, .. } = client;
-    // Held, not dropped: it is the write half of the subscription. Closing it tells `robotd`
-    // this client has gone away, which would end the stream we are about to render.
-    let _writer = writer;
+    // The live view does **not** require a robot.
+    //
+    // `padd`'s tap is a second daemon on a second socket, and the pad is worth watching on a board
+    // whose servos are unpowered, whose `robotd` is stopped, or which is being bisected — exactly
+    // the boards someone reaches for this on. Refusing to open at all made the pad block reachable
+    // only where it was least needed.
+    //
+    // The reason is carried rather than discarded, so the frame says which of "no robotd" and "no
+    // state yet" it is looking at instead of showing one sentence for both.
+    let (robot, no_robot) = match Client::connect_to("robotd", robot_socket) {
+        Ok(mut client) => match client.send(&subscribe()) {
+            Ok(()) => (Some(client), None),
+            Err(e) => (None, Some(e.message)),
+        },
+        Err(e) => (None, Some(e.message)),
+    };
 
     let (tx, rx) = mpsc::channel();
     let pad_tx = tx.clone();
     let pad_socket = pad_socket.to_path_buf();
-    thread::spawn(move || read_states(reader, &tx));
+
+    // Held for as long as the view lives, not dropped: it is the write half of the subscription,
+    // and closing it tells `robotd` this client has gone away, which would end the stream being
+    // rendered.
+    let _writer = robot.map(|client| {
+        let Client { reader, writer, .. } = client;
+        thread::spawn(move || read_states(reader, &tx));
+        writer
+    });
+
     // Its own thread and its own connection, for the same reason the robot's stream has one: a
     // blocking read on either socket must not be able to hold up the other, and `padd`'s tap goes
     // quiet for minutes at a time whenever nobody is touching the sticks.
     thread::spawn(move || read_pad(&pad_socket, &pad_tx));
 
     let mut terminal = ratatui::init();
-    let outcome = live(&mut terminal, &rx, hz);
+    let outcome = live(&mut terminal, &rx, hz, no_robot);
     ratatui::restore();
     outcome
 }
@@ -425,11 +450,16 @@ fn decode_pad(line: &str) -> Option<Result<proto::PadReport, String>> {
 }
 
 /// The live view's loop: absorb whatever has arrived, honour the keyboard, repaint.
-fn live(terminal: &mut DefaultTerminal, rx: &Receiver<Update>, hz: u32) -> Result<(), Failure> {
+fn live(
+    terminal: &mut DefaultTerminal,
+    rx: &Receiver<Update>,
+    hz: u32,
+    no_robot: Option<String>,
+) -> Result<(), Failure> {
     // A frame every `1/hz`, so waiting a fifth of a period keeps the keyboard responsive
     // without spinning. Clamped: `--hz 1000` must not turn this into a busy loop.
     let poll = Duration::from_secs_f64(1.0 / f64::from(hz.clamp(1, 200)) / 5.0);
-    let mut view = View::new(hz);
+    let mut view = View::new(hz, no_robot);
     let mut painted = Instant::now();
 
     loop {
@@ -733,12 +763,17 @@ struct View {
     /// The pad's raw event stream. Accumulated whether or not it is on screen, so opening the block
     /// shows a link's history rather than starting a measurement from the keypress.
     pad: PadView,
-    /// Is the pad block open? Closed to begin with — see [`PAD_HEIGHT`].
+    /// Is the pad block open? Closed to begin with when there is a robot to look at — see
+    /// [`PAD_HEIGHT`] — and open from the start when there is not, because then it is the only
+    /// thing this view has to show and nobody should have to guess `p`.
     show_pad: bool,
+    /// Why there is no robot stream, when there is none. `None` means one is connected, so an
+    /// absent state is merely one that has not arrived yet.
+    no_robot: Option<String>,
 }
 
 impl View {
-    fn new(hz: u32) -> Self {
+    fn new(hz: u32, no_robot: Option<String>) -> Self {
         Self {
             hz,
             policy: None,
@@ -751,7 +786,8 @@ impl View {
             visible: 0,
             units: Units::Degrees,
             pad: PadView::default(),
-            show_pad: false,
+            show_pad: no_robot.is_some(),
+            no_robot,
         }
     }
 
@@ -824,11 +860,27 @@ impl View {
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         let Some(rows) = self.latest.as_ref().map(joint_rows) else {
+            // No robot state — either `robotd` has not sent one yet, or there is no `robotd` to
+            // connect to. Either way the pad block is still drawn when it is open: it reads a
+            // different daemon over a different socket, and a robot is not a precondition for
+            // watching the sticks.
+            let pad_height = if self.show_pad { PAD_HEIGHT } else { 0 };
+            let [pad, rest] =
+                Layout::vertical([Constraint::Length(pad_height), Constraint::Min(3)]).areas(area);
+            if self.show_pad {
+                self.render_pad(frame, pad);
+            }
+            let waiting = match &self.no_robot {
+                // Named rather than folded into "waiting", because waiting for a robot that is
+                // there and waiting for one that is not need different things done about them.
+                Some(why) => format!("no robotd: {why}\nthe pad block still works — p toggles it"),
+                None => "waiting for robot.state…".to_owned(),
+            };
             frame.render_widget(
-                Paragraph::new("waiting for robot.state…")
+                Paragraph::new(waiting)
                     .block(Block::bordered().title(" monitor "))
                     .dim(),
-                area,
+                rest,
             );
             return;
         };
@@ -1793,7 +1845,7 @@ mod tests {
     /// A stream that has gone quiet is reported as such, and one arriving on time is not.
     #[test]
     fn a_quiet_stream_is_called_stalled() {
-        let mut view = View::new(50);
+        let mut view = View::new(50, None);
         assert_eq!(view.stalled_for(), None, "nothing has arrived yet");
 
         view.arrived = Some(Instant::now());
@@ -1807,7 +1859,7 @@ mod tests {
     /// which is the shape of an unbounded buffer if nothing trims it.
     #[test]
     fn the_trace_does_not_grow_without_end() {
-        let mut view = View::new(50);
+        let mut view = View::new(50, None);
         for _ in 0..TRACE_SAMPLES + 50 {
             assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
         }
@@ -1853,7 +1905,7 @@ mod tests {
     /// Scrolling stops at the last joint rather than running the table off the screen.
     #[test]
     fn scrolling_stops_at_the_end() {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
         view.scroll_by(99);
         render_to(&mut view, 96, 24);
@@ -1918,7 +1970,7 @@ mod tests {
     /// different releases share; the file name is what tells them apart.
     #[test]
     fn the_frame_names_the_policy_it_was_told_about() {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         assert!(
             view.absorb(Update::Policy(Box::new(proto::SubscribeResult {
                 accepted: true,
@@ -1947,7 +1999,7 @@ mod tests {
     /// robot behaves at rest. Said out loud rather than left as an absence.
     #[test]
     fn a_missing_standing_policy_is_stated() {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         assert!(
             view.absorb(Update::Policy(Box::new(proto::SubscribeResult {
                 accepted: true,
@@ -2052,7 +2104,7 @@ mod tests {
     /// to be able to see the wire value rather than convert it back by hand.
     #[test]
     fn pressing_u_puts_the_radians_back() {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         assert!(view.absorb(Update::State(Box::new(a_bent_state()))).is_ok());
         // The key is on screen before it is pressed, or nobody knows it is there.
         assert!(
@@ -2076,7 +2128,7 @@ mod tests {
     /// reading would print `+0.00°`, which is a claim about a joint nothing measured.
     #[test]
     fn a_missing_angle_is_a_dash_in_either_unit() {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         assert_eq!(view.angle(None).content, "-");
         view.toggle_units();
         assert_eq!(view.angle(None).content, "-");
@@ -2084,7 +2136,7 @@ mod tests {
 
     /// Render one frame and return it as text.
     fn draw(width: u16, height: u16, state: &proto::RobotState, scroll: usize) -> String {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         assert!(
             view.absorb(Update::State(Box::new(state.clone()))).is_ok(),
             "a state is not a failure"
@@ -2114,7 +2166,7 @@ mod tests {
     /// The end of the stream becomes the command's exit code, not a blank screen.
     #[test]
     fn the_stream_ending_is_an_unreachable_failure() {
-        let mut view = View::new(50);
+        let mut view = View::new(50, None);
         let failure = view
             .absorb(Update::Ended("robotd closed the connection".to_owned()))
             .expect_err("ending the stream is a failure");
@@ -2233,9 +2285,44 @@ mod tests {
         })
     }
 
+    /// The pad block is the reason to open this view on a board with no robot — a bench board
+    /// whose servos are unpowered, a stopped `robotd`, a board being bisected. Refusing to render
+    /// it there put the feature only where it was least wanted.
+    #[test]
+    fn a_pad_is_watchable_with_no_robot_at_all() {
+        let mut view = View::new(20, Some("connection refused".to_owned()));
+        // No `Update::State` ever arrives, which is the whole point.
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Attached {
+                device: Box::new(a_device()),
+            })),
+        );
+
+        let frame = render_to(&mut view, 80, 24);
+        assert!(
+            frame.contains("Xbox Wireless Controller"),
+            "the pad block should be drawn with no robot state: {frame}"
+        );
+        // And it says which absence this is, rather than one sentence for both.
+        assert!(
+            frame.contains("no robotd") && frame.contains("connection refused"),
+            "the reason there is no robot should be on screen: {frame}"
+        );
+    }
+
+    /// Open from the start when there is no robot: it is the only thing on screen, and a user who
+    /// has to guess `p` to see anything at all has been given a blank window.
+    #[test]
+    fn the_pad_block_opens_itself_when_there_is_no_robot() {
+        assert!(View::new(20, Some("connection refused".to_owned())).show_pad);
+        // With a robot it stays closed — those rows belong to the joints table.
+        assert!(!View::new(20, None).show_pad);
+    }
+
     /// A view with a pad attached and the block open.
     fn watching_a_pad() -> View {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
         feed(
             &mut view,
@@ -2252,7 +2339,7 @@ mod tests {
     /// not know it exists has no way to discover the pad stream is there at all.
     #[test]
     fn the_pad_block_is_closed_until_it_is_asked_for() {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         feed(&mut view, Update::State(Box::new(a_state())));
 
         let shut = render_to(&mut view, 100, 32);
@@ -2486,7 +2573,7 @@ mod tests {
     /// empty box and not a dead monitor.
     #[test]
     fn no_tap_says_so_and_says_what_to_run() {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         feed(&mut view, Update::State(Box::new(a_state())));
         view.toggle_pad();
         // Losing the tap must not end the monitor, which `feed` asserts for every update.
@@ -2606,7 +2693,7 @@ mod tests {
     /// report — `pad-link-test.sh` refuses to run in that case for the same reason.
     #[test]
     fn a_pad_on_usb_is_told_it_has_no_radio() {
-        let mut view = View::new(20);
+        let mut view = View::new(20, None);
         feed(&mut view, Update::State(Box::new(a_state())));
         view.toggle_pad();
         feed(
