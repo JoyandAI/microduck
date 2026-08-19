@@ -2320,6 +2320,21 @@ mod tests {
         assert!(!View::new(20, None).show_pad);
     }
 
+    /// The block has to survive the terminal people actually use.
+    ///
+    /// Every other render test here works at 100x32. A robot has 15 joints, and with the header and
+    /// the trace that is 34 rows of wanted content against the 24 an ssh window gives you — so if
+    /// `p` were ever going to appear to do nothing, this is the geometry it would do it in.
+    #[test]
+    fn the_pad_block_fits_an_eighty_by_twenty_four_terminal() {
+        let mut view = watching_a_pad();
+        let frame = render_to(&mut view, 80, 24);
+        assert!(
+            frame.contains("Xbox Wireless Controller"),
+            "the pad block should survive an 80x24 terminal with a robot on screen: {frame}"
+        );
+    }
+
     /// A view with a pad attached and the block open.
     fn watching_a_pad() -> View {
         let mut view = View::new(20, None);
