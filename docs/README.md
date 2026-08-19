@@ -8,8 +8,11 @@ Start at the [README](../README.md) if you have a robot and want to use it.
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
-| [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, `btctl`. |
+| [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
+| [`dev-push.md`](robot/dev-push.md) | Build on your machine and install on the board over ssh, with no CI run. |
+| [`duck-btctl.md`](robot/duck-btctl.md) | Every `duck-btctl` command — the robot over Bluetooth, from a laptop. |
 | [`install-dev.md`](robot/install-dev.md) | Setting up a board for development, from nothing. |
+| [`install-by-hand.md`](robot/install-by-hand.md) | The same install as separate commands, for testing one step at a time. |
 
 ## `design/` — you are changing the daemon
 

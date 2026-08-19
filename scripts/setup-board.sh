@@ -48,6 +48,17 @@ CMDLINE="${CMDLINE:-/proc/cmdline}"
 
 BT_CONF=/etc/bluetooth/main.conf
 
+# Does this board need the Bluetooth workarounds? `--weird-ble` on provision-board.sh.
+#
+# Off by default: most Zero 3W units bond a pad under BlueZ's own default and want nothing from
+# this script. See `configure_bluetooth`.
+WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
+
+# Where the answer is left for `robotctl`, which has to pause `btd` while a pad bonds on such a
+# board. Under /var/lib rather than in a release directory: it is a fact about this board and must
+# survive an update and a rollback.
+WEIRD_BLE_MARKER=/var/lib/robot/weird-ble
+
 # A gamepad is paired with `sudo robotctl pad pair` on the installed release, with the pad held in
 # pairing mode. This script's part of it is the one BlueZ setting a pad needs, which is here because
 # it takes a reboot to apply — see `configure_bluetooth`.
@@ -397,59 +408,82 @@ free_motor_port() {
     fi
 }
 
-# The one Bluetooth setting a gamepad needs from this script.
+# The one Bluetooth setting a gamepad needs from this script, on the boards that need it.
 #
-# `Privacy = off`, and it is the *opposite* of what this script used to set. The history matters,
-# because the old value is still on every board provisioned so far:
+# **Only with `DUCK_WEIRD_BLE=1`** — `--weird-ble` on `provision-board.sh`. Without it this touches
+# nothing, because most boards want nothing touched.
 #
-#   This script set `Privacy = device`, taken from microduck_runtime's installer, whose notes
-#   credit it with fixing an Xbox controller that pairs and then drops straight back out — an
-#   endless connect/disconnect loop, or `disconnected with reason 3` during pairing.
+# The split. On a fresh Armbian with nothing installed, some Radxa Zero 3W units bond an Xbox pad
+# under BlueZ`s default `Privacy = off`. Others do not bond at all under `off`, and only
+# `Privacy = device` works. Roughly half of ten units in each group, and nothing measurable separates
+# them: same kernel version, same BlueZ, byte-identical aic8800 firmware, and the driver build does
+# not track it either — a pad bonds fine on the build that was once blamed.
 #
-#   With that setting, an Xbox controller cannot bond with this board at all. `btmon` shows LE
-#   Secure Connections pairing reaching the last step and the *pad* rejecting it:
+# Why it is a flag rather than the default. `device` is not free: under it a pad cannot form a *new*
+# bond while `btd` advertises, so `robotctl pad pair` has to stop `btd` for the pairing window on any
+# board that has it. Setting `device` everywhere would impose that on boards that never needed it.
+# `robotctl` needs to know too, since it is what pauses `btd`. It reads a marker this writes rather
+# than re-deriving the answer from `main.conf`: an explicit record of the decision someone made
+# cannot be confused with a `Privacy` value that arrived some other way.
 #
-#       SMP: Pairing Public Key ×2 · Confirm · Random ×2 · DHKey Check
-#       > ACL Data RX: SMP: Pairing Failed — Reason: DHKey check failed (0x0b)
+# It also accounts for the observation that once made this script set `Privacy = off` outright:
+# pairing reaching the last SMP step and the pad answering `DHKey check failed (0x0b)`. That was
+# `device` with `btd` running — the interaction above, not evidence against the setting.
 #
-#   The DHKey check is computed over both devices' addresses, and `Privacy = device` makes the
-#   adapter pair from a resolvable private address rather than its public one. The two sides
-#   compute different values, and the pad refuses — every time, with no key on either side, and
-#   unaffected by retrying, by `JustWorksRepairing`, or by which side starts.
+# Both are workarounds for the aic8800 radio, which is not what ships. When the radio changes, this
+# flag and `BtdPaused` in robotctl/src/main.rs both go.
 #
-#   With `Privacy = off` the same pad pairs first time, is trusted, and reconnects by itself
-#   across a reboot. The drop-on-connect symptom the old value was meant to prevent has not
-#   returned.
-#
-# So this is a measurement replacing an inherited setting. If a pad ever does start dropping on
-# connect, the two are in genuine tension and the answer is to pair with privacy off and then
-# re-enable it — not to set `device` and lose the ability to pair at all.
-#
-# The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon on
-# this board left the kernel holding hci0 while bluetoothd reported "No default controller
-# available", which needs a reboot to clear — so a reboot is the honest instruction, not an
-# extra step.
+# The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon here leaves
+# the kernel holding hci0 while bluetoothd reports "No default controller available", which needs a
+# reboot to clear.
 configure_bluetooth() {
+    if [ -z "$WEIRD_BLE" ]; then
+        # Reported rather than silent, because a board that needs the workaround and was provisioned
+        # without the flag presents as a pad that will not pair for no visible reason.
+        say "leaving bluetooth Privacy alone (no --weird-ble); a pad that will not bond may need it"
+        # The marker is deliberately *not* removed here. Without the flag this function changes
+        # nothing, so a board that has `Privacy = device` still has it — and clearing the marker
+        # would leave `robotctl` no longer pausing `btd` on a board that still needs it, which is
+        # the silent version of the bug this whole flag exists for. Undoing it is a hand edit.
+        return 0
+    fi
+
     if [ ! -f "$BT_CONF" ]; then
         warn "no ${BT_CONF}; skipping the gamepad Bluetooth settings"
         return 0
     fi
 
-    # Written explicitly even though `off` is BlueZ's default: a board provisioned by an older
-    # copy of this script has `Privacy = device` in the file, and that line has to be *corrected*
-    # rather than left alone. An absent setting and a wrong one need different work.
-    if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*off' "$BT_CONF"; then
-        say "bluetooth Privacy already off"
+    if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
+        say "bluetooth Privacy already device"
     else
-        say "setting Privacy = off in ${BT_CONF} (a pad cannot bond otherwise)"
+        say "setting Privacy = device in ${BT_CONF} (--weird-ble)"
         if grep -Eq '^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF"; then
-            sed -i -E 's|^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=.*|Privacy = off|' "$BT_CONF"
+            sed -i -E 's|^[[:space:]]*#?[[:space:]]*Privacy[[:space:]]*=.*|Privacy = device|' "$BT_CONF"
         elif grep -q '^\[General\]' "$BT_CONF"; then
-            sed -i '/^\[General\]/a Privacy = off' "$BT_CONF"
+            sed -i '/^\[General\]/a Privacy = device' "$BT_CONF"
         else
-            printf '\n[General]\nPrivacy = off\n' >> "$BT_CONF"
+            printf '\n[General]\nPrivacy = device\n' >> "$BT_CONF"
         fi
         needs_reboot=1
+    fi
+
+    # Written after the setting, so the marker never claims a board is configured that is not.
+    if [ -f "$WEIRD_BLE_MARKER" ]; then
+        say "weird-ble marker already at ${WEIRD_BLE_MARKER}"
+    else
+        mkdir -p "$(dirname "$WEIRD_BLE_MARKER")"
+        cat > "$WEIRD_BLE_MARKER" <<'MARKER'
+# This board was provisioned with --weird-ble.
+#
+# Its Bluetooth cannot bond a gamepad under BlueZ's default Privacy = off, so
+# /etc/bluetooth/main.conf sets Privacy = device. Under that setting a pad cannot form a new bond
+# while btd advertises, so `robotctl pad pair` stops btd for the pairing window and starts it again.
+#
+# Both are workarounds for the aic8800 radio. Delete this file, unset Privacy, and drop BtdPaused
+# from robotctl when the radio changes.
+MARKER
+        chmod 644 "$WEIRD_BLE_MARKER"
+        say "wrote ${WEIRD_BLE_MARKER} so robotctl pauses btd while a pad bonds"
     fi
 }
 
@@ -472,14 +506,15 @@ report() {
 
     # Gamepad readiness. This board's part of it is one setting; who may read the pad is
     # `padd.service`'s business now, and pairing one is `sudo robotctl pad pair`.
-    if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*off' "$BT_CONF"; then
-        printf '  %-22s %s\n' "bluetooth privacy" "off"
-    elif [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
-        # Named rather than lumped in with "not off": this is what older boards have, and it is
-        # the one value that makes pairing a pad impossible. See `configure_bluetooth`.
-        printf '  %-22s %s\n' "bluetooth privacy" "device — a pad CANNOT bond; re-run this script"
+    if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
+        # Worth naming the consequence every time: this is the board where `robotctl pad pair` stops
+        # btd for the pairing window, and someone reading this should know that is expected.
+        printf '  %-22s %s\n' "bluetooth privacy" "device — pad pair pauses btd"
     else
-        printf '  %-22s %s\n' "bluetooth privacy" "not set (BlueZ defaults to off, which works)"
+        # Covers both `off` and absent, which behave the same. Named as a possible cause rather than
+        # a fault: most boards bond a pad exactly like this.
+        printf '  %-22s %s\n' "bluetooth privacy" \
+            "off — if a pad will not bond, re-provision with --weird-ble"
     fi
 
     # The device node is what gilrs opens, so this is the only claim that matters.

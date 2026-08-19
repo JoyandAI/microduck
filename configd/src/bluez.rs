@@ -37,13 +37,23 @@
 //! active scan and it fails intermittently, which presents as a pad that pairs on the second
 //! attempt and looks like flaky hardware.
 //!
-//! ## The agent, and why it is not the default one
+//! ## The agent, and why it claims the default role
 //!
 //! Pairing needs an agent — something for bluetoothd to ask "is this allowed" — and `btd` already
-//! registers one as the **default** agent for the phone path. This registers a second, *non-default*
-//! agent, which works because bluetoothd picks the agent belonging to the D-Bus connection that
-//! called `Pair()` and only falls back to the default. So `configd` answers for the pairings it
-//! starts and `btd` keeps answering for everything else; neither has to know about the other.
+//! registers one as the **default** agent for the phone path. This registers a second agent scoped
+//! to the pad being paired, and takes the default role for the length of the pairing window.
+//!
+//! Taking the role is not optional, for two reasons that compound. bluetoothd pushes an IO
+//! capability down to the adapter from the default agent only, so a non-default `NoInputNoOutput`
+//! leaves the adapter declaring input and display — which puts MITM in the pairing request and makes
+//! SMP choose numeric comparison over just-works. And bluetoothd prefers the agent belonging to the
+//! connection that called `Pair()`, which on the path that works is nobody: `Connect()` bonds the pad
+//! on its own and the `Pair()` fallback below never runs. So the confirmation is raised against the
+//! default agent, and a `configd` that had not claimed the role would never see it — the pad waits
+//! out the link supervision timeout and BlueZ reports `AuthenticationCanceled`.
+//!
+//! `unregister_agent` hands the role back, and `btd` only holds it when pairing is required at all,
+//! so `configd` answers for the pairings it starts and `btd` keeps answering for everything else.
 //!
 //! It is scoped to one device path and rejects anything else, so a pairing request arriving from an
 //! unrelated device while the window is open is refused rather than auto-accepted. A pad is
@@ -51,10 +61,20 @@
 //! because a human asked" is the entire authorisation, and narrowing it to the device is the only
 //! part of that this code controls.
 //!
-//! ## The board setting that made all of this impossible
+//! ## The board setting that decides whether any of this can work
 //!
-//! `Privacy = device` in `/etc/bluetooth/main.conf` stops a pad bonding at all, and nothing in this
-//! file can work around it. The trace, with no key on either side:
+//! `Privacy` in `/etc/bluetooth/main.conf`, which `scripts/setup-board.sh` sets to `device`.
+//!
+//! BlueZ defaults to `off`, and `off` works on some Radxa Zero 3W units. On the others a pad will
+//! not bond under `off` at all, and only `device` does. Nothing measurable separates the two
+//! populations, so `device` is set on every board.
+//!
+//! Under `device`, a pad cannot form a **new** bond while `btd` advertises. An existing bond is
+//! unaffected, which is why `robotctl pad pair` stops `btd` for the pairing window rather than
+//! anything here changing — see `BtdPaused` in `robotctl/src/main.rs`, and
+//! `docs/project/pad-minimal-pairing.md` for the bisect.
+//!
+//! The failure that looks like this file is at fault, and is not:
 //!
 //! ```text
 //! SMP: Pairing Public Key ×2 · Confirm · Random ×2 · DHKey Check
@@ -62,13 +82,17 @@
 //! ```
 //!
 //! The DHKey check is computed over both devices' addresses, and privacy makes the adapter pair from
-//! a resolvable private address rather than its public one, so the two sides compute different
-//! values and the pad refuses. `bluetoothctl pair` fails identically, which is what places this
-//! below anything here. `Privacy = off` — now what `scripts/setup-board.sh` sets — pairs first time.
+//! a resolvable private one — while `btd` advertises from the same adapter. That is the interaction
+//! above, seen from SMP. It was once read as evidence that `device` itself broke pairing, which is
+//! how this tree came to set `off` and break a pad on every board provisioned after.
 //!
-//! Worth knowing because the symptom is indistinguishable from the ones this file *can* cause, and
-//! it cost most of a day: retrying does not help, `JustWorksRepairing` does not help, and neither
-//! does clearing the bond on either side.
+//! Worth knowing because the symptom is indistinguishable from the ones this file *can* cause:
+//! retrying does not help, `JustWorksRepairing` does not help, and neither does clearing the bond on
+//! either side. `bluetoothctl` fails identically, which is what places it below anything here.
+//!
+//! And one more thing that mimics it exactly: an Xbox pad holds **one** host bond, so a
+//! half-completed attempt leaves it holding a key this adapter no longer has. Reset the pad against
+//! a laptop before concluding anything about a board.
 //!
 //! It is also the first clue about which transport is in play: resolvable private addresses are an LE
 //! mechanism, so a setting that breaks bonding this way can only be breaking an LE bond.
@@ -189,6 +213,7 @@ trait Device {
 trait AgentManager {
     fn register_agent(&self, agent: &ObjectPath<'_>, capability: &str) -> zbus::Result<()>;
     fn unregister_agent(&self, agent: &ObjectPath<'_>) -> zbus::Result<()>;
+    fn request_default_agent(&self, agent: &ObjectPath<'_>) -> zbus::Result<()>;
 }
 
 /// An agent that says yes to exactly one device.
@@ -789,13 +814,33 @@ impl Pads for BlueZ {
         let manager = AgentManagerProxy::new(&self.bus)
             .await
             .map_err(|e| e.to_string())?;
-        // Not `RequestDefaultAgent`: `btd` holds the default agent for the phone path, and
-        // bluetoothd prefers the agent belonging to whoever called `Pair()` anyway.
         let registered = manager.register_agent(&agent_path, AGENT_CAPABILITY).await;
         if let Err(e) = &registered {
             // Not fatal. A pad is just-works, so bluetoothd may never need to ask anyone — and if
             // it does, `btd`'s default agent is still there to answer.
             tracing::warn!(error = %e, "could not register a pairing agent; relying on the default");
+        }
+
+        // Becoming the *default* agent is what makes `NoInputNoOutput` reach the controller.
+        // bluetoothd pushes an IO capability down to the adapter from the default agent only;
+        // registering an agent without claiming that role leaves the adapter on the kernel's
+        // default, `DisplayYesNo`. That capability puts MITM in the pairing request, which makes
+        // SMP choose numeric comparison over just-works — so bluetoothd raises a
+        // `RequestConfirmation` that arrives at no agent at all, and the pad waits until the link
+        // supervision times out. Observed as `AuthenticationCanceled` after ~17s, with an
+        // unanswered `User Confirmation Request` in `btmon` and nothing in this daemon's log.
+        //
+        // Claiming it for the pairing window is safe even while `btd` serves phones: this agent
+        // answers a phone's bond the same just-works way `btd`'s own does, `unregister_agent`
+        // below hands the role back, and `btd` only holds it when pairing is required at all.
+        if registered.is_ok()
+            && let Err(e) = manager.request_default_agent(&agent_path).await
+        {
+            tracing::warn!(
+                error = %e,
+                "could not become the default pairing agent; a pad that needs confirmation will \
+                 stall"
+            );
         }
 
         let outcome = self.bond(&device).await;

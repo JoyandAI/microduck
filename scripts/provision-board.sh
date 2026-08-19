@@ -17,7 +17,16 @@
 # come back, streams the log the unattended half writes, and ends on `robotctl health` — so
 # provisioning is one command with continuous output instead of three with a gap.
 #
-#   --ref BRANCH      provision from a branch instead of main
+#   --ref BRANCH      provision from a branch: its scripts run the bring-up, and its build of
+#                     the daemon is installed on top of the stable release. Provisioning FAILS
+#                     if that build cannot be installed or is rolled back — a dev board quietly
+#                     running stable when a branch was asked for is worse than a clear stop.
+#                     Needs the branch build to exist, so give CI its minute or two first.
+#   --name NAME       name the robot, at the end of provisioning: `--name Ducky`. Optional —
+#                     without it the board names itself `duck-<four hex>` from its SoC serial,
+#                     which is already unique per board. Changeable later at any time with
+#                     `robotctl system set-name`, so this saves a command rather than deciding
+#                     anything permanent.
 #   --forget-host-key drop this host's key from known_hosts first. Reflashing the card
 #                     regenerates the board's host keys, so the same address then presents a
 #                     different one and ssh refuses outright — see `probe`.
@@ -27,9 +36,52 @@
 #                     releases. The default is to send this clone's
 #                     deploy/dev-key/team.dev.pub.
 #   --dev-key PATH    somewhere else to find it.
+#   --no-ble          do not use Bluetooth to re-find the board. See below for what that costs.
+#   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all. Sets
+#                     `Privacy = device` and leaves /var/lib/robot/weird-ble, which makes
+#                     `robotctl pad pair` stop `btd` and power-cycle the adapter for a pairing.
+#                     **The default in docs/robot/install-dev.md**, because about half these
+#                     boards need it and nothing measurable says which — and a board that needed
+#                     it and did not get it presents as a pad that will not pair, for no visible
+#                     reason. Drop it on a board proven to bond a pad without it; see that page
+#                     for how to check, and `configure_bluetooth` in scripts/setup-board.sh for
+#                     the measurement behind it.
 #
 # Needs `ssh` and `scp`, an account on the board that can `sudo`, and nothing else. It expects
 # to be able to prompt for the sudo password, so it allocates a terminal for that one command.
+#
+# ## When the board comes back at a different address
+#
+# A DHCP lease moves, and the cutover in the middle of provisioning is exactly when it does: the
+# board leaves on netplan's lease and comes back on NetworkManager's. From out here that is
+# indistinguishable from a board that never booted at all — the address you were given simply
+# stops answering, and every remaining step is addressed to it.
+#
+# So the wait is a race. ssh keeps polling the address you gave, and in parallel a Bluetooth probe
+# asks the robot itself what address it ended up with — `net.status`, the same call the phone app
+# makes. Whichever answers first wins, and an answer over Bluetooth is adopted for everything
+# after it.
+#
+# On the same address ssh wins essentially always: `hci0` takes about seventy seconds to appear on
+# this board and sshd does not, so the probe is still building when the ordinary case is already
+# over. That is the point. It costs nothing in the normal case and it is the only thing that can
+# answer in the abnormal one.
+#
+# **The probe is only trusted when exactly one robot answers to the name this board advertises**,
+# which is read off the board before the reboot while ssh still works. Adopting an address means
+# ssh'ing somewhere new, and doing that to a robot chosen by scan order is worse than waiting.
+#
+# It needs `cargo` and this clone, because `duck-btctl` is an example rather than an installed
+# binary. Without either, the wait is exactly what it was before and says so. Three more things it
+# cannot do:
+#
+#   - A board being provisioned for the first time has no `btd` until the install reaches it, so
+#     Bluetooth cannot answer for the first few minutes.
+#   - A robot with a per-robot pairing PIN needs it in `DUCK_PIN`; the probe otherwise offers the
+#     factory default.
+#   - `net.status` reports the *wifi* interface, so a board you reach over ethernet is not covered.
+#     Which is the right interface to read — the cutover this exists for is wifi's — but it means an
+#     ethernet lease that moves is still a lease nothing here can find.
 set -eu
 
 # Committed, so a new developer needs nothing from anybody to provision a dev board. `--dev-key`
@@ -44,6 +96,39 @@ REF=""
 DEV_KEY="$DEV_KEY_DEFAULT"
 NO_DEV_KEY=""
 USE_LOCAL=""
+NO_BLE=""
+WEIRD_BLE=""
+# The name to give the robot. Not `BLE_NAME` below, which points the other way: the name this board
+# already answers to, used to find it again after the reboot.
+ROBOT_NAME=""
+
+# ── the Bluetooth fallback ───────────────────────────────────────────────────
+#
+# `duck-btctl` is an example rather than a binary — deliberately, so `btleplug` never reaches a
+# robot — which means the only way to run it is `cargo` against this clone.
+BLE_MANIFEST="$(dirname "$0")/../Cargo.toml"
+
+# The name the robot advertises, read off the board before the reboot.
+#
+# Empty means the fallback is off: a probe with no name talks to whichever robot the scan reported
+# first, and the whole point of the fallback is to hand ssh a new address to trust.
+BLE_NAME=""
+
+# Whether `btd` was already running before the reboot. Does not gate the probe — it is one line in
+# a message, so a first-time board is told why Bluetooth has nothing to say yet rather than left to
+# wonder whether the probe is broken.
+BLE_LIVE=""
+
+# The PIN the probe offers. The factory default, which is what a board being provisioned has;
+# `DUCK_PIN` is for a robot that has been given its own.
+BLE_PIN="${DUCK_PIN:-000000}"
+
+# Scratch for the probe: its verdict, and its output kept for the diagnosis.
+BLE_DIR=""
+# The running probe, empty when none is.
+BLE_PID=""
+# What the probe last said, printed once rather than every three seconds.
+BLE_SAID=""
 
 # How long to wait for the board to come back after its reboot. Generous on purpose, and sized
 # for the worst legitimate case rather than the normal one: a first boot after an overlay change
@@ -58,21 +143,35 @@ BOOT_TIMEOUT=300
 STATE=/var/lib/robot/provision.env
 LOG=/var/lib/robot/provision.log
 
+# The unit that runs phase 2 on the board, asked whether it failed. Must match `UNIT_NAME` in
+# provision.sh; a mismatch would make a failed phase 2 look like one still working, which is the
+# hang this exists to end.
+UNIT_NAME=robot-provision.service
+
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# The header is the help, so print it whole: every comment line from the shebang to the first line
+# that is not one.
+#
+# A line range is what this was, and it had already gone stale — `2,22p` stopped mid-sentence
+# inside `--forget-host-key` and hid the three options after it, because the range does not move
+# when a paragraph is added above it. Nothing to keep in step this way.
 usage() {
-    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
     exit "${1:-0}"
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --ref)        REF="${2:?--ref needs a branch}"; shift 2 ;;
+        --name)       ROBOT_NAME="${2:?--name needs a name}"; shift 2 ;;
         --forget-host-key) FORGET_KEY=1; shift ;;
         --dev-key)    DEV_KEY="${2:?--dev-key needs a path}"; shift 2 ;;
         --no-dev-key) NO_DEV_KEY=1; shift ;;
+        --no-ble)     NO_BLE=1; shift ;;
+        --weird-ble)  WEIRD_BLE=1; shift ;;
         --local)      USE_LOCAL=1; shift ;;
         -h|--help)    usage 0 ;;
         -*)           die "unknown option: $1" ;;
@@ -158,11 +257,271 @@ alive() (
     wait "$_probe_pid"
 ) 2>/dev/null
 
-# True while the board still has provisioning left to do. `provision.sh` removes the state file
-# when it finishes, which makes "are we done" a question with a file for an answer rather than
-# a log line to pattern-match.
+# Does the board still have provisioning left to do? `provision.sh` removes the state file when it
+# finishes, which makes "are we done" a question with a file for an answer rather than a log line
+# to pattern-match.
+#
+#   0  still provisioning
+#   1  finished
+#   2  cannot tell, because the board is not answering
+#
+# Three answers rather than two, and the third is a bug this fixes. `rsh` fails when the *board*
+# went away just as surely as when the file is gone, so one test read `finished` for a board that
+# had merely moved to a new lease mid-install — and the watcher announced provisioning complete and
+# then a health check that could not connect. Which of the two it is decides whether to stop or to
+# go looking, so it cannot be collapsed.
 still_provisioning() {
-    rsh "test -f ${STATE}" >/dev/null 2>&1
+    if rsh "test -f ${STATE}" >/dev/null 2>&1; then
+        # The state file outlives a phase 2 that *failed*: `provision.sh` removes it only on the way
+        # out cleanly, so its presence alone cannot tell a board still working from one that stopped
+        # with an error. Ask systemd, which knows.
+        #
+        # Returned as its own verdict rather than folded into "finished", because the two need
+        # different words: one is a robot ready to use, the other is a board that needs looking at.
+        if rsh "systemctl is-failed --quiet ${UNIT_NAME}" >/dev/null 2>&1; then
+            return 3
+        fi
+        return 0
+    fi
+    # The file is gone, or the board is. One more question tells them apart, and it is only ever
+    # asked once — at the end, or at the failure.
+    if alive 10; then
+        return 1
+    fi
+    return 2
+}
+
+# Point everything at a new address for the same board.
+#
+# The `[user@]` is carried across rather than rebuilt: a board whose account is not the default
+# would otherwise become unreachable at the moment this was trying to save it.
+adopt_address() {
+    case "$HOST" in
+        *@*) HOST="${HOST%@*}@$1" ;;
+        *)   HOST="$1" ;;
+    esac
+    HOST_ONLY="$1"
+
+    # A recycled lease is the one way an adopted address cannot work: another board held it, so
+    # known_hosts has *its* key on record and ssh refuses this one outright. `alive` discards output,
+    # so without this the wait would simply go quiet until the budget ran out and blame the board.
+    _adopted="$(rsh true 2>&1 || true)"
+    case "$_adopted" in
+        *"REMOTE HOST IDENTIFICATION HAS CHANGED"*|*"Host key verification failed"*)
+            die "the robot says it is at ${1}, and ssh refuses that address: known_hosts has a
+  different board's key on record for it. A DHCP lease that has been round the houses is enough
+  to do this. Drop it and re-run:
+    ssh-keygen -R ${1}" ;;
+    esac
+}
+
+# ── the Bluetooth probe ──────────────────────────────────────────────────────
+
+# Print something in the middle of a line of progress dots, once per distinct message.
+#
+# Repeats are dropped rather than rate-limited: a probe that keeps returning the same answer every
+# twenty seconds has nothing new to say, and the alternative is a screen of one repeated line with
+# the useful message scrolled off the top.
+#
+# Closing the dot line is this function's job rather than every caller's, which it can do because
+# POSIX `sh` has no locals and `_dots` is therefore shared with the loop printing them.
+ble_say() {
+    [ "$BLE_SAID" != "$1" ] || return 0
+    BLE_SAID="$1"
+    [ "${_dots:-0}" = 0 ] || echo
+    _dots=0
+    printf '\033[1m  bluetooth:\033[0m %s\n' "$1"
+}
+
+# Learn the name the robot advertises, while ssh still works. Empty when it cannot be known.
+#
+# Two sources, because a board being provisioned is in one of two states and they have different
+# authorities:
+#
+#   - A board that already runs the daemon is asked. That answer includes a rename someone stored
+#     through `system.setName`, which no derivation can know about.
+#   - A board that does not is derived from, exactly as `configd/src/identity.rs` will when it
+#     starts: `duck-` and the first two bytes of the SHA-256 of the SoC serial. Computed on the
+#     board, so nothing is needed on this machine — macOS has `shasum` and not `sha256sum`, and
+#     that is a silly reason for a fallback not to work.
+#
+# A board with no readable serial is deliberately left empty rather than guessed at. `configd` falls
+# back to the hostname there, and every board flashed from one image has the same one — so the name
+# would match all of them, which is the case the probe must not act on.
+learn_ble_name() {
+    if _name="$(rsh "robotctl system info --json 2>/dev/null" 2>/dev/null)"; then
+        _name="$(printf '%s' "$_name" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')"
+        if [ -n "$_name" ]; then
+            printf '%s' "$_name"
+            return 0
+        fi
+    fi
+
+    # Mirrors `serial_at` clause for clause, because a name that disagrees with the robot's is worse
+    # than no name at all:
+    #
+    #   tr '\0' '\n' | head -n1   a devicetree property holds NUL-terminated strings and may hold
+    #                             several, so the first NUL ends the value — `split('\0').next()`,
+    #                             not "delete the NULs", which would hash two values joined.
+    #   sed            the `.trim()`.
+    #   *[![:graph:]]* `is_ascii_graphic`, which excludes the space: a property that exists but is
+    #                  blank or full of control characters is no identity, and printing nothing here
+    #                  is how this agrees.
+    #
+    # Nothing is printed unless the digest came out, so a board without `sha256sum` yields no name
+    # rather than the name `duck-`, which every such board would then share.
+    rsh "serial=\$(tr '\\0' '\\n' < /proc/device-tree/serial-number 2>/dev/null | head -n1 \
+             | sed 's/^[[:space:]]*//; s/[[:space:]]*\$//'); \
+         case \"\$serial\" in \
+           '' | *[![:graph:]]*) exit 0 ;; \
+         esac; \
+         digest=\$(printf '%s' \"\$serial\" | sha256sum 2>/dev/null | cut -c1-4); \
+         [ \${#digest} -eq 4 ] || exit 0; \
+         printf 'duck-%s' \"\$digest\"" 2>/dev/null || true
+}
+
+# Start a probe in the background, unless one is already running.
+#
+# Backgrounded and polled rather than waited on, because it has to lose gracefully: the whole design
+# is that ssh usually answers first, and a probe still holding a radio open must not delay the run
+# that already succeeded. The verdict is written to a temporary name and renamed, so a poll can
+# never read half a line.
+ble_probe_start() {
+    [ -n "$BLE_NAME" ] || return 0
+    [ -z "$BLE_PID" ] || return 0
+
+    {
+        if cargo run -q --manifest-path "$BLE_MANIFEST" -p btd --example duck-btctl -- \
+            --name "$BLE_NAME" --pin "$BLE_PIN" wifi status \
+            >"${BLE_DIR}/out" 2>"${BLE_DIR}/err"
+        then
+            _found="$(sed -n 's/.*"ip4"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                "${BLE_DIR}/out" | head -n1)"
+            if [ -n "$_found" ]; then
+                printf 'ip %s\n' "$_found" > "${BLE_DIR}/verdict.tmp"
+            else
+                # The robot answered and reported no IPv4 address, which is not a failed probe —
+                # it is the diagnosis, and a far better one than silence.
+                printf 'no-address\n' > "${BLE_DIR}/verdict.tmp"
+            fi
+        else
+            printf 'failed\n' > "${BLE_DIR}/verdict.tmp"
+        fi
+        mv -f "${BLE_DIR}/verdict.tmp" "${BLE_DIR}/verdict"
+    } >/dev/null 2>&1 &
+
+    BLE_PID=$!
+}
+
+# The probe's verdict if it has one, consumed so each is acted on once. 1 while it is still working.
+#
+# Prints and nothing else. Reaping the job and clearing `BLE_PID` belong to the caller, because this
+# is read through a command substitution — a subshell — and an assignment made in here would be
+# discarded with it. That is not a hypothetical tidiness point: `BLE_PID` would have stayed set for
+# the rest of the run, `ble_probe_start` would have returned early on every call, and the fallback
+# would have had exactly one attempt at a board whose `btd` needs a minute to come up.
+ble_verdict() {
+    [ -n "$BLE_DIR" ] || return 1
+    [ -f "${BLE_DIR}/verdict" ] || return 1
+
+    cat "${BLE_DIR}/verdict"
+    rm -f "${BLE_DIR}/verdict"
+}
+
+# Why the last probe failed, as `duck-btctl` put it.
+#
+# Its own words rather than a paraphrase, and not matched on either: it explains a name nobody
+# answers to, two robots answering to one, a missing adapter and a refused PIN, each differently and
+# better than this script could. Matching on those strings would be one more thing to keep in step.
+ble_failure() {
+    [ -n "$BLE_DIR" ] || return 0
+    [ -f "${BLE_DIR}/err" ] || return 0
+    # Compiler output on a first run is many lines of nothing anyone wants; the last line is the
+    # error itself.
+    grep -v '^ *$' "${BLE_DIR}/err" 2>/dev/null | tail -n1 || true
+}
+
+ble_stop() {
+    if [ -n "$BLE_PID" ]; then
+        kill -TERM "$BLE_PID" 2>/dev/null || true
+        wait "$BLE_PID" 2>/dev/null || true
+        BLE_PID=""
+    fi
+    # A verdict nobody read is about a wait that is over. Left behind, it would be the first thing
+    # the *next* wait saw — an address from before the board rebooted again.
+    [ -z "$BLE_DIR" ] || rm -f "${BLE_DIR}/verdict" "${BLE_DIR}/verdict.tmp"
+}
+
+# How long the last wait took, for whoever has to report it.
+WAITED=0
+
+# Wait until $HOST answers, adopting a new address if the robot reports one over Bluetooth. 0 when
+# the board answers — possibly somewhere new — and 1 when the budget ran out. Sets $WAITED.
+#
+# Wall clock, not a sum of sleeps. A probe that takes longer than expected must eat into the budget
+# rather than extend it: the sum-of-sleeps version could not time out at all while a probe was
+# blocked, which is precisely the failure this loop is here to survive.
+wait_for_board() {
+    _budget="$1"
+    _began="$(date +%s)"
+    _dots=0
+    BLE_SAID=""
+    ble_probe_start
+
+    until alive 10; do
+        _verdict="$(ble_verdict || true)"
+        if [ -n "$_verdict" ]; then
+            # Reaped here rather than in `ble_verdict`, which cannot: see its comment.
+            [ -z "$BLE_PID" ] || wait "$BLE_PID" 2>/dev/null || true
+            BLE_PID=""
+        fi
+
+        case "$_verdict" in
+            "ip "*)
+                _reported="${_verdict#ip }"
+                if [ "$_reported" = "$HOST_ONLY" ]; then
+                    # Nothing to adopt, and still worth saying: the board is up and answering, so
+                    # what this is waiting for is sshd rather than a boot.
+                    ble_say "the robot is up and reports ${_reported}, the address already in use,
+             so this is waiting on sshd rather than on the board"
+                else
+                    ble_say "the robot reports ${_reported}, and ${HOST_ONLY} was its old lease.
+             Everything after this is addressed there."
+                    adopt_address "$_reported"
+                fi
+                ;;
+            no-address)
+                ble_say "the robot is up and has no IPv4 address, so it never got a lease.
+             Phase 2 downloads a release, so it cannot finish in this state — but NetworkManager
+             may still be trying, so this keeps waiting."
+                ;;
+            failed)
+                ble_say "nothing usable yet — $(ble_failure)"
+                ;;
+        esac
+
+        # Re-armed only on a verdict, so there is one probe at a time and one radio in use. A probe
+        # that has just failed is worth repeating: the commonest reason by far is a board whose
+        # `btd` has not finished starting.
+        if [ -n "$_verdict" ]; then
+            ble_probe_start
+        fi
+
+        WAITED="$(( $(date +%s) - _began ))"
+        if [ "$WAITED" -ge "$_budget" ]; then
+            [ "$_dots" = 0 ] || echo
+            ble_stop
+            return 1
+        fi
+        printf '.'
+        _dots=1
+        sleep 3
+    done
+
+    WAITED="$(( $(date +%s) - _began ))"
+    [ "$_dots" = 0 ] || echo
+    ble_stop
+    return 0
 }
 
 # ── checks that are cheaper to fail now than halfway ─────────────────────────
@@ -229,6 +588,53 @@ elif [ ! -f "$DEV_KEY" ]; then
   board that should only take releases."
 fi
 
+# ── arrange the Bluetooth fallback, while ssh still works ────────────────────
+#
+# All of it happens here, before anything has been changed, because every part of it needs a working
+# ssh connection — and after the reboot is precisely when there may not be one. A fallback that has
+# to reach the board to arm itself is no fallback at all.
+if [ -n "$NO_BLE" ]; then
+    say "not using Bluetooth to re-find the board (--no-ble)"
+elif ! command -v cargo >/dev/null 2>&1; then
+    warn "no cargo on this machine, so Bluetooth cannot be used to re-find the board if its
+  address changes across the reboot. Not fatal — the board finishes on its own either way, and
+  the wait below is what it always was. Install Rust to get the fallback."
+elif [ ! -f "$BLE_MANIFEST" ]; then
+    warn "${BLE_MANIFEST} is not there, so this is not being run from a clone and duck-btctl
+  cannot be built — no Bluetooth fallback if the board's address changes across the reboot."
+else
+    BLE_NAME="$(learn_ble_name)"
+    if [ -z "$BLE_NAME" ]; then
+        warn "cannot tell what name this board will advertise over Bluetooth, so there is no
+  fallback if its address changes across the reboot. A board whose bootloader leaves
+  /proc/device-tree/serial-number empty is named after its hostname, which is the same on every
+  board flashed from one image — so a probe could not tell this robot from the next one, and
+  guessing is worse than waiting."
+    else
+        BLE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/provision-ble.XXXXXX")"
+
+        # Both the probe and the scratch go, whichever way this script ends. A radio left held open
+        # by an orphaned `cargo run` is the one piece of litter here that a later run would notice.
+        #
+        # Only EXIT does the cleaning, and the signals just exit — which is what makes Ctrl-C still
+        # *stop* this. A handler on INT that returns rather than exiting resumes the script at the
+        # next line, so the ten-second grace `provision.sh` prints before rebooting would have
+        # become uninterruptible from here: the one place Ctrl-C is documented to work.
+        trap 'ble_stop; [ -z "$BLE_DIR" ] || rm -rf "$BLE_DIR"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
+        if rsh "systemctl is-active --quiet btd" >/dev/null 2>&1; then
+            BLE_LIVE=1
+            say "this board advertises as '${BLE_NAME}', and btd is running — so Bluetooth can
+    re-find it if its address changes"
+        else
+            say "this board will advertise as '${BLE_NAME}'. btd is not running on it yet, so
+    Bluetooth can only answer once the install reaches it — a few minutes into phase 2"
+        fi
+    fi
+fi
+
 # ── put what the board needs where the board can reach it ────────────────────
 
 if [ -n "$DEV_KEY" ]; then
@@ -267,12 +673,22 @@ echo
 _env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
 [ -z "$REF" ]     || _env="${_env} DUCK_REF='${REF}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
+[ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
+
+# The name is a flag rather than one more `DUCK_*`, because on the board it goes no further than
+# `robotctl system set-name`. Single-quoted with any quote of its own escaped: a name is free text,
+# and this whole string is handed to a shell on the board — `Pierre's duck` would otherwise arrive
+# as a syntax error rather than as a name.
+_args=""
+if [ -n "$ROBOT_NAME" ]; then
+    _args=" --name '$(printf '%s' "$ROBOT_NAME" | sed "s/'/'\\\\''/g")'"
+fi
 
 # `-t` so sudo can prompt for a password, and the exit status deliberately ignored: this
 # command ends by rebooting the machine it is running on, so ssh reporting a dropped connection
 # is the *expected* outcome. Whether it worked is decided below, by looking at the board.
 ssh -t -o StrictHostKeyChecking=accept-new "$HOST" \
-    "sudo env ${_env} sh /tmp/provision.sh" || true
+    "sudo env ${_env} sh /tmp/provision.sh${_args}" || true
 
 echo
 say "waiting for ${HOST} to come back (up to ${BOOT_TIMEOUT}s)"
@@ -287,27 +703,35 @@ while [ "$(( $(date +%s) - _start ))" -lt 20 ]; do
     sleep 2
 done
 
-# Wall clock, not a sum of sleeps. A probe that takes longer than expected must eat into the
-# budget rather than extend it — the sum-of-sleeps version could not time out at all while a
-# probe was blocked, which is precisely the failure this loop is here to survive.
-_start="$(date +%s)"
-_elapsed=0
-until alive 10; do
-    _elapsed="$(( $(date +%s) - _start ))"
-    if [ "$_elapsed" -ge "$BOOT_TIMEOUT" ]; then
-        die "no answer from ${HOST} after ${_elapsed}s.
+_was="$HOST_ONLY"
+if ! wait_for_board "$BOOT_TIMEOUT"; then
+    # Why the fallback did not save this, which is the part the operator cannot see. Said only when
+    # it explains something: with a live `btd` and a name, the probe already reported its own
+    # failure while the dots were going past.
+    _why=""
+    if [ -z "$BLE_NAME" ]; then
+        _why="
+  Bluetooth was not used here, and a new address is exactly what it would have found."
+    elif [ -z "$BLE_LIVE" ]; then
+        _why="
+  Bluetooth had nothing to report, which is expected on a board being provisioned for the first
+  time: btd is installed by phase 2, so there was nothing to ask until the install reached it."
+    fi
+
+    die "no answer from ${HOST} after ${WAITED}s.
   That does not mean provisioning failed. The board resumes by itself at boot, so this is a
   viewer that lost sight of it — the board may well be finishing right now. Look directly:
     ssh -t ${HOST} 'sudo tail -f ${LOG}'
   If it is genuinely unreachable: a failed wifi cutover makes the backstop restore netplan and
   reboot, which costs a second boot, and NetworkManager may come back on a different DHCP lease
-  than netplan had — so check for a new address before concluding the board is down."
-    fi
-    printf '.'
-    sleep 3
-done
-echo
-say "back after ~$(( $(date +%s) - _start ))s"
+  than netplan had — so check for a new address before concluding the board is down.${_why}"
+fi
+
+if [ "$HOST_ONLY" = "$_was" ]; then
+    say "back after ~${WAITED}s"
+else
+    say "back after ~${WAITED}s, at ${HOST_ONLY}"
+fi
 
 # ── phase 2, which is running unattended on the board ────────────────────────
 
@@ -372,13 +796,58 @@ while :; do
         _quiet=$((_quiet + 3))
     fi
 
-    if ! still_provisioning; then
+    # Captured rather than tested, because `set -e` would take a bare non-zero return as a
+    # failure of this script.
+    _left=0
+    still_provisioning || _left=$?
+    if [ "$_left" = 1 ]; then
         # One more read before leaving. `provision.sh` writes its closing lines and *then*
         # removes the state file, so a loop that breaks the moment the file is gone drops the
         # last thing it said — including which token ended up where, and whether the board came
         # out a dev board. Which is the part worth reading.
         drain_log || true
         break
+    fi
+
+    # Phase 2 stopped with an error. The log already says why — it is streamed above — so this
+    # ends rather than adding a diagnosis of its own, and names the two commands worth running.
+    if [ "$_left" = 3 ]; then
+        drain_log || true
+        echo
+        die "provisioning failed on ${HOST_ONLY}; the reason is the last thing in the log above.
+  The board is reachable and whatever ran before the failure is in place, so this is a step to
+  fix rather than a board to reflash:
+    ssh ${HOST} 'systemctl status ${UNIT_NAME}'
+    ssh -t ${HOST} 'sudo cat ${LOG}'"
+    fi
+
+    # The board went away mid-install. Not the end of provisioning — it carries on without this
+    # watcher — and not necessarily a fault either: the wifi backstop reboots the board when a
+    # cutover does not take, and NetworkManager can come back on a lease netplan never had.
+    #
+    # So this is the second place a new address is worth going to look for, and it reuses the same
+    # race the reboot does.
+    if [ "$_left" = 2 ]; then
+        _was="$HOST_ONLY"
+        echo
+        warn "lost contact with ${HOST_ONLY} while it was still provisioning. Looking for it."
+        if ! wait_for_board "$BOOT_TIMEOUT"; then
+            die "${HOST_ONLY} stopped answering after ${WAITED}s of looking, and provisioning had
+  not finished. The board carries on by itself, so this is a lost viewer rather than a failed
+  install — but it does need finding. It is most likely on a new DHCP lease: check your router's
+  leases, and then:
+    ssh -t <new address> 'sudo tail -f ${LOG}'"
+        fi
+        if [ "$HOST_ONLY" = "$_was" ]; then
+            say "back after ~${WAITED}s; resuming the log"
+        else
+            say "back after ~${WAITED}s at ${HOST_ONLY}; resuming the log"
+            # The log is the same file on the same board, so the byte offset still holds. What can
+            # differ is how it is read: the reader was chosen against a connection that has since
+            # been replaced, and the group membership behind it is per-login.
+            choose_log_reader || true
+        fi
+        _quiet=0
     fi
 
     # A board that has stopped writing and still has a state file has either failed or is

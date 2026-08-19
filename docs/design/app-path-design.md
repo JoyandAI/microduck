@@ -138,6 +138,18 @@ One service, **one characteristic**. A client reads it once for the robot's API 
 NDJSON request bytes to it, and subscribes to it for answers — the same JSON-RPC lines every other
 transport carries. The read is not optional; see §5 for why it exists.
 
+**The version it returns is for saying so, not for refusing.** `API_VERSION` says the two peers were
+not built together; it does not say which calls stop working, and on this link it is usually none of
+them. Nothing across it checks the number — `configd` gates no `net.*` or `system.*` call on a
+version, `updaterd` requires no handshake before `update.status`, and `updaterd`'s `hello` no longer
+refuses on it either. So a client that refuses on skew refuses calls the robot would have answered —
+and it refuses them on the transport that exists for a robot with no network, where `net.connect` is
+the way out of the skew. `duck-btctl` warns and proceeds, and an app should do the same: surface the
+mismatch, let the call go, and report the JSON-RPC error if a method whose shape changed is actually
+reached. Those errors name themselves — `METHOD_NOT_FOUND` for a route this release does not have,
+`INVALID_PARAMS` for a parameter it does not know — which is what makes proceeding safe rather than
+merely optimistic.
+
 **No framing header.** The newline that already separates NDJSON messages is the frame delimiter in
 both directions. That is safe rather than lucky: `serde_json` escapes a newline inside a string as
 `\n`, so a raw `0x0A` never appears inside a serialised object — the same property that makes NDJSON
@@ -254,7 +266,7 @@ is nowhere to send the answer.
 
 ### 3.3 One thing the mobile app will hit: do not scan with a service filter  · **measured**
 
-`btctl` is a test tool and deliberately not much more — the real client is a phone app. But one of its
+`duck-btctl` is a test tool and deliberately not much more — the real client is a phone app. But one of its
 bugs is a property of CoreBluetooth rather than of the tool, so it is worth writing down before
 someone rediscovers it on iOS.
 
@@ -268,7 +280,7 @@ could only match peripherals the filtered scan had already returned.
 The app should scan unfiltered and discriminate its own candidates, strongest evidence first:
 advertised UUID, then a known name or a stored peripheral identifier, and treat "serves our
 characteristic" as the only authoritative identity test — it is knowable solely after connecting. An
-iOS app has a better third tier than `btctl` does, `retrievePeripherals(withIdentifiers:)`, which
+iOS app has a better third tier than `duck-btctl` does, `retrievePeripherals(withIdentifiers:)`, which
 `btleplug` does not expose; storing the identifier after a first successful connection is the right
 move there and removes the guesswork entirely.
 
@@ -278,7 +290,7 @@ appears.
 
 ### 3.4 The robot has to advertise often enough to be caught  · **measured**
 
-`btctl` reported `no robot found` on roughly half its runs, and for a while that was read as flakiness
+`duck-btctl` reported `no robot found` on roughly half its runs, and for a while that was read as flakiness
 in the tool — or as the gamepad, whose LE link shares the radio. It was neither. `btd` registered its
 advertisement without an interval, so BlueZ used the kernel's default of **1.28 s**, and a central
 scanning at a low duty cycle does not catch a 1.28 s advertiser reliably.
@@ -320,7 +332,7 @@ it: arrivals per device with signal strength, then the robot's silences.
 | 1.28 s, the default | 16 | 7.5 s | 30.8 s | 7 |
 | 100-150 ms | 151 | 0.8 s | 3.8 s | **0** |
 
-Nine times as often, and — the part that matters — nothing left within a factor of two of `btctl`'s
+Nine times as often, and — the part that matters — nothing left within a factor of two of `duck-btctl`'s
 eight-second window, so the failure it was diagnosed from cannot occur. The robot went from 34th of
 106 devices heard to 7th of 74.
 
@@ -508,7 +520,7 @@ rather than 1, a PIN keeping its leading zero, and no passphrase in the log. Plu
 which is a real cross-link check: `btd` is the only binary pulling C beyond `zstd`, because `bluer`
 links libdbus built from vendored source by `zig cc`.
 
-`btctl` (`cargo run -p btd --example btctl`) is the phone's stand-in and the only way to exercise
+`duck-btctl` (`cargo run -p btd --example duck-btctl`) is the phone's stand-in and the only way to exercise
 the radio. An **example, not a binary**, so `btleplug` never reaches the robot; `btleplug` rather
 than `bluer` because it must run on a developer's Mac. It reuses `btd::framing`, so the chunking is
 genuinely the client half of the robot's own code rather than a reimplementation free to agree with
@@ -587,11 +599,12 @@ bump would rename every robot in the field, and nobody would ever connect the tw
 Four hex characters is 65 536 possibilities, so three robots in a room collide about once in 22 000
 times. This is a default meant to be *distinguishable*, not a unique key.
 
-A name of more than **8 characters** does not fit the 31 bytes of a legacy advertisement once flags
-and the 128-bit service UUID are counted, so it travels in the scan response — a second exchange a
-central can miss. `duck-c51b` is 9, one over. Dropping to three hex characters would fit, at 4 096
-possibilities; whether that trade is worth taking is unmeasured, because it depends on how BlueZ
-packs the two payloads.
+The name travels in the **scan response**, not the advertisement, and now always will: flags (3),
+the 128-bit service UUID (18) and the address field (8, see below) spend 29 of the 31 bytes a legacy
+advertisement holds. Before the address it was 21, and a name of 8 characters or fewer could have
+fitted alongside — `duck-c51b` is 9, one over, so in practice it never did. A scan response is a
+second exchange a central can miss on its own, which is why a device reported with no name and no
+services is a plausible robot rather than something to filter out.
 
 #### The advertised name is the one the robot was given
 
@@ -603,16 +616,59 @@ three comments in the tree described the intended behaviour as though it existed
 The reconcile runs alongside the adapter watch inside one bring-up, so losing the radio ends both —
 and the next bring-up asks again, which is what picks up a rename made while Bluetooth was down.
 
+**A robot has two names, and both are set.** The advertisement carries a Local Name; the adapter
+separately serves a GAP Device Name (`0x2A00`) that BlueZ takes from `Adapter.Alias` and defaults to
+the hostname. Setting only the first meant a renamed robot advertised `duck-c51b` and answered
+`radxa-zero3` to anyone who read the characteristic — and reading it is what a central does on
+connecting. BlueZ then caches the answer over the advertised name, so on Linux a robot was
+`duck-c51b` until first contact and `radxa-zero3` after it, and `--name duck-c51b` stopped finding
+it; CoreBluetooth keeps both and reports `radxa-zero3 [duck-c51b]`. A phone's own Bluetooth settings
+shows the GAP name, which is the case that matters most here and the one no tool in this tree could
+see. `advertise` sets the alias alongside the advertisement, so every path that publishes a name
+publishes both. A client that cached the old name keeps it until it is forgotten, which is a client
+problem with a client fix.
+
 Reconciled rather than event-driven, deliberately. `btd` forwards `system.setName` without reading
 the reply — interpreting replies is what this daemon avoids — and re-asking the moment it forwards
 one races the write it just forwarded. Polling is fewer moving parts and covers renames made through
-`robotctl`, which never cross `btd` at all. `--name` pins the advertisement for bench work. An
-unreachable `configd` falls back to the hostname: `btd` is on the recovery path and has to come up
-when the rest of the robot has not.
+`robotctl`, which never cross `btd` at all. `--name` pins the *name* for bench work — the reconcile
+loop still runs, because the address below moves whether or not the name does. An unreachable
+`configd` falls back to the hostname: `btd` is on the recovery path and has to come up when the rest
+of the robot has not.
+
+#### The advertisement carries the robot's IPv4 address
+
+`duck-btctl scan` connects to nothing, which is what makes it the command to reach for when a robot
+is unreachable — and it is why a listing can only report what an advertisement carries. So the
+question a listing is most often read to answer, *where do I ssh?*, had no answer in it: the address
+is in `net.status`, and reading that costs a connection, a bond and the PIN, per robot.
+
+Four bytes of IPv4 go in a manufacturer-data field under company id `0xFFFF` — the id the Bluetooth
+SIG reserves for internal and interoperability testing, which is the right one for a project that
+has not been assigned one. Anyone may use that id, so **the field is not an identity check**: it is
+read only from a device that also advertised the service UUID, which is the discriminator.
+
+**The SSID is not in it and cannot be.** An SSID is up to 32 bytes on its own, against the 6 bytes
+of payload the budget above leaves. It stays a `wifi status` question, and that is the one to ask
+when the address in a listing says something surprising.
+
+A robot with no address advertises `0.0.0.0` rather than dropping the field, so a listing can tell
+three states apart: an address, a robot with no network, and a robot on a release from before this
+existed, which broadcasts no field at all. Collapsing the last two would send the reader to check
+wifi on a robot that needs an update.
+
+The address is reconciled on the same tick as the name, every few seconds — far faster than a DHCP
+lease moves, and the point is the other case: whoever just ran `wifi connect` is waiting to read the
+address it produced. `configd` failing to answer keeps the last known address rather than clearing
+it, or a `configd` restart would deregister and re-register the advertisement every tick with a
+client watching the address blink. And if BlueZ ever refuses an advertisement carrying the field,
+`btd` retries without it: an advertisement with no address is a robot someone can still reach, and a
+refused one is a robot gone dark.
 
 #### Provisioning can name a board, and does not have to
 
-`DUCK_NAME` makes `provision.sh` call `robotctl system set-name` at the end. Optional on purpose:
+`provision.sh --name`, which `provision-board.sh --name` passes through, calls
+`robotctl system set-name` at the end. Optional on purpose:
 the derived default already distinguishes a board, so provisioning *improves* on a working name
 rather than being what supplies one. That is what makes this survive a board flashed by hand, which
 was the objection that ruled out assigning identity at provisioning time.
@@ -656,11 +712,6 @@ robots advertising at once and a client choosing correctly — is not testable o
 either three of them or a fake peripheral. Worth saying plainly rather than leaving the green suite
 to imply otherwise.
 
-### 8.3 `API_VERSION` skew
-
-`hello` should refuse only when the client is *newer* than the daemon —
-`install-path-gap.md` covers it. Small, self-contained, and it has already cost an hour twice.
-
 ### 8.4 PIN attempts across reconnects
 
 §5.6. Three wrong PINs close the session; nothing counts across reconnects, so a peer retries
@@ -677,7 +728,7 @@ line (`serving BLE ... address=`):
 - `50:37:CD:16:2B:EC` — two `btd` starts within one boot, 10:04 and 10:05
 - `50:37:CD:16:1B:92` — every boot after, 10:18 onward, fifteen of them
 
-Between them: no reflash. Nothing done to the board but BLE connections through `btctl` and gamepad
+Between them: no reflash. Nothing done to the board but BLE connections through `duck-btctl` and gamepad
 pairing. The top four bytes held; only the low two moved, which fits a driver that generates an
 address once behind a vendor prefix and caches it rather than reading one out of the module. `configd`
 never power-cycles the adapter — it only powers one on that is off — so pad pairing has no obvious

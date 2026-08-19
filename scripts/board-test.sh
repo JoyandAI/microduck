@@ -491,6 +491,11 @@ chmod +x /stub/curl /stub/find /stub/systemctl
 touch /usr/local/lib/libonnxruntime.so.9.9.9
 ln -sf libonnxruntime.so.9.9.9 /usr/local/lib/libonnxruntime.so
 
+# The motd directory the login banner installs into. Present on the image, so the fixture has to
+# have it too or install_login_banner correctly does nothing and the assertion below would be
+# testing the fixture rather than the installer.
+mkdir -p /etc/update-motd.d
+
 # A BlueZ config with [General] but no Privacy key — the insert-after-[General] branch, which
 # is the one a stock Armbian image takes.
 mkdir -p /etc/bluetooth
@@ -531,10 +536,10 @@ grep -q "^console=display$" /boot/armbianEnv.txt
 test "$(grep -c uart2-m0 /boot/armbianEnv.txt)" = 1
 echo "    [ok] setup-board is idempotent on a second run"
 
-# The gamepad setting, which is the kind that fails silently — and which this script had
-# BACKWARDS until a board proved it. `Privacy = device` makes an Xbox controller reject LE Secure
-# Connections pairing with `DHKey check failed (0x0b)`, because that check covers both addresses
-# and privacy pairs from a resolvable private one. See `configure_bluetooth`.
+# The gamepad setting, which is the kind that fails silently — and whose polarity this script has
+# now had both ways round. `Privacy = device` is what a Radxa Zero 3W was measured bonding an Xbox
+# controller under on 2026-08-18, and what microduck_runtime ships; see `configure_bluetooth` for
+# the earlier DHKey-check observation that argued the other way.
 #
 # It is the only part of gamepad readiness left in this script: reading the pad belongs to
 # padd.service and its `input` group now, and pairing one is `robotctl pad pair`.
@@ -542,22 +547,54 @@ echo "    [ok] setup-board is idempotent on a second run"
 # No apostrophes and no single quotes anywhere in this string. It is passed to the container
 # single-quoted, so one would end it early and run the rest on the host — which is exactly what
 # happened once, and it presented as a grep failing on a file the fixture had just written.
-grep -qE "^Privacy = off$" /etc/bluetooth/main.conf
-echo "    [ok] setup-board sets Privacy = off, which is what lets a pad bond"
+# Without --weird-ble it must touch nothing: most boards bond a pad under the BlueZ default, and
+# imposing `device` on them would make robotctl pause btd for every pairing for no reason.
+if grep -qE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf; then
+    echo "    [FAIL] setup-board set Privacy without --weird-ble"
+    exit 1
+fi
+if [ -e /var/lib/robot/weird-ble ]; then
+    echo "    [FAIL] setup-board wrote the weird-ble marker without the flag"
+    exit 1
+fi
+echo "    [ok] without --weird-ble, setup-board leaves Privacy and the marker alone"
 
-# Idempotent too: the second run above must not have added a duplicate key, which BlueZ
-# would read as a conflicting setting.
+# And with it: the setting, and the marker robotctl reads to decide whether to pause btd.
+DUCK_WEIRD_BLE=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
+    > /tmp/weird.log 2>&1
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
+echo "    [ok] --weird-ble sets Privacy = device, which is what lets such a board bond a pad"
+test -f /var/lib/robot/weird-ble \
+    || { echo "    [FAIL] the weird-ble marker was not written"; exit 1; }
+test "$(stat -c %a /var/lib/robot/weird-ble)" = "644" \
+    || { echo "    [FAIL] the marker is not readable by robotctl"; exit 1; }
+echo "    [ok] --weird-ble leaves the marker robotctl reads, mode 644"
+
+# Idempotent: a second flagged run must not add a duplicate key, which BlueZ would read as a
+# conflicting setting.
+DUCK_WEIRD_BLE=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
+    > /tmp/weird2.log 2>&1
 test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
 echo "    [ok] Privacy is set exactly once"
 
-# The upgrade case, which is every board provisioned so far: the wrong value is already in the
-# file and has to be corrected rather than left alone. An absent setting and a wrong one need
-# different work, and only the first was ever tested.
-sed -i "s|^Privacy = off|Privacy = device|" /etc/bluetooth/main.conf
-ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board3.log 2>&1
-grep -qE "^Privacy = off$" /etc/bluetooth/main.conf
+# The upgrade case: a board carrying the other value already, which has to be corrected rather than
+# left alone. An absent setting and a wrong one need different work, and only the first was tested
+# when this was written.
+sed -i "s|^Privacy = device|Privacy = off|" /etc/bluetooth/main.conf
+DUCK_WEIRD_BLE=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
+    >/tmp/board3.log 2>&1
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
 test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
-echo "    [ok] a board carrying Privacy = device is corrected to off"
+echo "    [ok] with --weird-ble, a board carrying Privacy = off is corrected to device"
+
+# And a board that already has the workaround must not lose it because someone re-provisioned
+# without the flag — that would leave Privacy = device with nothing pausing btd, which is the
+# silent version of the bug the flag exists for.
+ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board4.log 2>&1
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
+test -f /var/lib/robot/weird-ble \
+    || { echo "    [FAIL] a re-run without the flag removed the marker"; exit 1; }
+echo "    [ok] a re-run without --weird-ble leaves an already-configured board alone"
 
 # ── the generated preinstall hook ──
 #
@@ -757,6 +794,14 @@ getent passwd btd >/dev/null \
     || { echo "    [FAIL] the btd user was not created"; exit 1; }
 echo "    [ok] robot group and btd user exist, sysusers drop-ins installed"
 
+# The login banner, which exists because a board silently reverted a branch build and nothing said
+# so. Asserted executable: motd drop-ins that are not are skipped without a word.
+test -x /etc/update-motd.d/40-robot \
+    || { echo "    [FAIL] the login banner was not installed executable"; exit 1; }
+grep -q "robotctl update status" /etc/update-motd.d/40-robot \
+    || { echo "    [FAIL] the banner does not report a rolled-back update"; exit 1; }
+echo "    [ok] the login banner is installed and reports a rolled-back update"
+
 # Through `current`, not at a versioned directory: the symlink has to follow the active
 # release, or robotctl on PATH silently pins to whichever release installed it.
 link="$(readlink /usr/local/bin/robotctl)"
@@ -798,6 +843,42 @@ echo "    [ok] daemon-reload precedes every enable, and configd precedes btd"
 # board that has no golden release yet anyway.
 grep -q "^enable robot-boot-check.timer$" /stub/systemctl.log \
     || { echo "    [FAIL] the boot recovery timer was never enabled"; exit 1; }
+
+# DUCK_NO_START, which exists to separate a board-level fault from the daemons: install
+# everything, start nothing, and leave the next boot clean too.
+#
+# `enable` is asserted absent as well as `enable --now`. An enabled-but-not-started unit would come
+# up on the reboot, and the reboot is the whole point — stopping a daemon does not undo what it
+# pushed to a subsystem, so the measurement needs a boot with nothing of ours ever running.
+: > /stub/systemctl.log
+DUCK_NO_START=1 PATH="/stub:$PATH" sh /bin/scripts/install.sh > /tmp/nostart.log 2>&1 || {
+    echo "    [FAIL] install.sh with DUCK_NO_START exited non-zero"
+    cat /tmp/nostart.log
+    exit 1
+}
+# `if`, not `grep && fail`: this script runs under set -e, and a grep that finds nothing — the
+# passing case here — would make the whole list non-zero and abort before reaching the verdict.
+if grep -q "^enable" /stub/systemctl.log; then
+    echo "    [FAIL] DUCK_NO_START enabled a unit:"
+    grep "^enable" /stub/systemctl.log
+    exit 1
+fi
+if grep -q "^start" /stub/systemctl.log; then
+    echo "    [FAIL] DUCK_NO_START started a unit"
+    exit 1
+fi
+# And it takes down what a previous install left running, rather than only declining to enable.
+# Skipping the enable on a board that already runs these leaves all five up while the script
+# reports that nothing is — which is how the first attempt at this measurement was wasted.
+for unit in updaterd robotd configd btd padd; do
+    grep -q "^disable --now ${unit}.service$" /stub/systemctl.log \
+        || { echo "    [FAIL] DUCK_NO_START did not disable ${unit}.service"; exit 1; }
+done
+# Still an install: the units belong on disk whether or not anything runs them.
+test -f /etc/systemd/system/robotd.service \
+    || { echo "    [FAIL] DUCK_NO_START skipped installing the units"; exit 1; }
+echo "    [ok] DUCK_NO_START installs the units and enables nothing"
+
 grep -q "^enable --now robot-boot-check" /stub/systemctl.log \
     && { echo "    [FAIL] the boot recovery check was started during provisioning"; exit 1; }
 for script in robot-rescue robot-boot-check; do

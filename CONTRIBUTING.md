@@ -45,8 +45,8 @@ another.
 To run a change on a real robot without publishing it, `scripts/dev-push.sh <user@board>` builds
 here and installs there as an ordinary gated update. It cross-compiles with `cargo zigbuild` by
 default, or with `--docker` builds inside the board's userland instead, which needs no toolchain
-set up at all. Setup and the one-time first push:
-[`docs/robot/cheatsheet-dev.md`](docs/robot/cheatsheet-dev.md).
+set up at all. Setup, the flags and the failure modes:
+[`docs/robot/dev-push.md`](docs/robot/dev-push.md).
 
 ## The layout
 
@@ -57,12 +57,13 @@ padd/           gamepad → intents — an ordinary socket client, no privileged
 updater/        engine + updaterd
 robotd/         control daemon
 configd/        wifi · robot name · pairing PIN · reboot · gamepad pairing
-btd/            the BLE front door, plus btctl (a laptop client, never shipped)
+btd/            the BLE front door, plus duck-btctl (a laptop client, never shipped)
 robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
 scripts/        provision-board.sh · dev-push.sh + dev-build.Dockerfile (from your machine) ·
                 provision.sh → setup-board.sh · migrate-network.sh · install.sh (on the board) ·
+                pad-link-test.sh · pad-stack-report.sh (gamepad radio, on the board) ·
                 board-test.sh (CI)
 docs/           robot/ (using one) · design/ (how it works) · project/ (roadmap, records)
 ```

@@ -82,6 +82,13 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::CONFIG)]
     config_socket: PathBuf,
 
+    /// Path to `padd`'s raw input tap, which `monitor` reads the pad's own event stream from.
+    ///
+    /// Optional in the only sense that matters: nothing fails when it is absent. `monitor` says the
+    /// tap is not there and carries on showing the robot.
+    #[arg(long, global = true, default_value = proto::socket::PAD)]
+    pad_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -454,6 +461,11 @@ enum UpdateCommand {
         /// robot's trusted set and `allow_dev_keys` is on, so a customer robot refuses it
         /// exactly as it refuses `--ref`.
         ///
+        /// **Not under /tmp or /var/tmp.** `updaterd.service` sets `PrivateTmp=yes`, so the
+        /// daemon that reads this directory has its own pair of those and neither is the one
+        /// a shell copied into. Preflight names that case rather than letting it surface as a
+        /// missing manifest in a directory the caller can plainly see.
+        ///
         /// `conflicts_with = "staging"` because a directory has no channels — the source
         /// layer says so too, and being told at parse time is better than after a connection.
         #[arg(long, value_name = "DIR", conflicts_with = "staging")]
@@ -563,6 +575,10 @@ struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
+    /// Which daemon is on the other end. The connect failure names it too, but that happens
+    /// before there is a `Self` to keep it in — this copy is for [`Client::hello_result`]'s skew
+    /// warning, which has to say which of three sockets disagreed.
+    service: &'static str,
 }
 
 impl Client {
@@ -578,7 +594,7 @@ impl Client {
     /// `systemctl status` for it. Hardcoding "updaterd" told anyone diagnosing a stopped
     /// `robotd` to go check the wrong service — a diagnostic that points at the wrong
     /// place is worse than none.
-    fn connect_to(service: &str, path: &std::path::Path) -> Result<Self, Failure> {
+    fn connect_to(service: &'static str, path: &std::path::Path) -> Result<Self, Failure> {
         let stream = UnixStream::connect(path)
             .map_err(|e| Failure::new(exit::UNREACHABLE, unreachable_hint(service, path, &e)))?;
         let writer = stream
@@ -588,6 +604,7 @@ impl Client {
             reader: BufReader::new(stream),
             writer,
             next_id: 1,
+            service,
         })
     }
 
@@ -650,30 +667,29 @@ impl Client {
         }
     }
 
-    /// Refuse a protocol mismatch loudly rather than sending requests the daemon
-    /// might misread. A stale `robotctl` in someone's shell is normal.
+    /// Confirm the daemon is answering JSON-RPC before sending it a command.
+    ///
+    /// **A liveness check, not a gate.** It used to be one: a daemon whose `API_VERSION` differed
+    /// refused the handshake and every command failed here, including the `update apply` that ends
+    /// the skew. No daemon refuses on that number now — see [`proto::API_VERSION`] — so what remains
+    /// is worth keeping for its own sake, because it turns a socket that accepts and then says
+    /// nothing into a failure before the real call goes out.
     fn hello(&mut self) -> Result<(), Failure> {
         self.hello_result().map(|_| ())
     }
 
-    /// As [`Self::hello`], but returns what the daemon said about itself.
-    ///
-    /// `version` needs the payload rather than a pass/fail, and needs it even when the
-    /// daemon speaks a different API version — "these two are out of step" is the single
-    /// most useful thing the command can report, so refusing to print it would defeat the
-    /// purpose. The protocol check still fails for every *other* command.
+    /// As [`Self::hello`], but returns what the daemon said about itself, which is what
+    /// `version` and `health` report.
     fn hello_result(&mut self) -> Result<proto::HelloResult, Failure> {
         let response = self.call(&proto::Call::Hello(proto::HelloParams {
             api_version: proto::API_VERSION,
         }))?;
         if let Some(error) = response.error {
-            // The daemon's message is passed through unadorned. It used to gain
-            // "robotctl and updaterd are out of step; install matching versions" here, which was
-            // true and not actionable — the daemon now says which of the two is behind and what
-            // to do, which this side cannot know, and two remedies would disagree.
+            // Passed through unadorned. This side cannot add a remedy the daemon does not
+            // already know, and two remedies would disagree.
             return Err(Failure::new(exit::FAILED, error.message));
         }
-        response
+        let hello: proto::HelloResult = response
             .result
             .and_then(|r| serde_json::from_value(r).ok())
             .ok_or_else(|| {
@@ -681,8 +697,36 @@ impl Client {
                     exit::FAILED,
                     "daemon answered hello in an unexpected shape".to_owned(),
                 )
-            })
+            })?;
+        warn_once_about_skew(self.service, hello.api_version);
+        Ok(hello)
     }
+}
+
+/// Say that this client and a daemon were not built together, once per run.
+///
+/// The daemon writes the same pair of versions to its journal and serves the call anyway, which is
+/// the right answer for the machine and an incomplete one for the person typing: they see the
+/// eventual `unknown method` or `unknown field` and nothing connecting it to a stale binary. One
+/// line of stderr closes that gap.
+///
+/// **Once**, because `version` and `health` ask three daemons and a real skew involves all three —
+/// this client is either from the installed release or it is not, so three lines would be three
+/// copies of one fact. And on stderr, because stdout is what `--json` pipes into something.
+fn warn_once_about_skew(service: &str, theirs: u32) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+
+    if theirs == proto::API_VERSION || SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "warning: {service} speaks API v{theirs} and this robotctl speaks v{}, so they were not \
+         built together. Carrying on — a call that cannot be served will name itself. \
+         `/usr/local/bin/robotctl` follows the installed release: older than the daemon means this \
+         is a copy from somewhere else, newer means the few seconds after an update.",
+        proto::API_VERSION
+    );
 }
 
 // ── version reporting ────────────────────────────────────────────────────────
@@ -971,11 +1015,6 @@ fn render_health(report: &HealthReport) -> String {
             }
         }
     }
-    if !report.software.units.is_empty() {
-        let _ = writeln!(out, "\nunits");
-        out.push_str(&render_units(&report.software.units, 2));
-    }
-
     for component in &report.software.components {
         let _ = writeln!(
             out,
@@ -990,6 +1029,14 @@ fn render_health(report: &HealthReport) -> String {
         if let Some(attempt) = &component.last_attempt {
             let _ = writeln!(out, "  {:<9} last update {attempt}", "");
         }
+    }
+
+    // After the installed lines rather than between them and the daemons above, because it has a
+    // heading and they do not: a block inserted there ends the `software` block early and adopts
+    // `daemon 0.5.0 installed` as one more unit — which reads as a systemd unit named `daemon`.
+    if !report.software.units.is_empty() {
+        let _ = writeln!(out, "\nunits");
+        out.push_str(&render_units(&report.software.units, 2));
     }
 
     // Same shape `robotctl version` uses, blank line and all: these are often multi-line —
@@ -1751,6 +1798,155 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The unit paused while a pad bonds. See [`BtdPaused`].
+const BTD_UNIT: &str = "btd.service";
+
+/// Where a board provisioned with `--weird-ble` says so. Written by `scripts/setup-board.sh`.
+///
+/// Under /var/lib rather than in a release directory: it is a fact about the board, and it has to
+/// survive an update and a rollback.
+const WEIRD_BLE_MARKER: &str = "/var/lib/robot/weird-ble";
+
+/// Was this board provisioned with `--weird-ble`?
+///
+/// A marker rather than re-deriving the answer from `Privacy = device` in `main.conf`: an explicit
+/// record of the decision someone made cannot be confused with a setting that arrived some other
+/// way, and there is no parsing to get subtly wrong.
+///
+/// Absent answers `false`, which is the right default — most boards need nothing.
+fn needs_the_ble_workaround() -> bool {
+    std::path::Path::new(WEIRD_BLE_MARKER).exists()
+}
+
+/// Run `systemctl` and say whether it succeeded, with its output discarded.
+///
+/// Discarded because every call here has something better to say than systemd does: a stop that
+/// fails is reported as what it means for the pairing, not as an exit status.
+fn systemctl(args: &[&str]) -> bool {
+    std::process::Command::new("systemctl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `btd` stopped for the length of a pad pairing, and started again afterwards.
+///
+/// **A temporary workaround for a board that is going away, and deliberately in the CLI rather than
+/// in a daemon.** Measured on a Radxa Zero 3W on 2026-08-19: with `btd` running, a pad cannot form a
+/// *new* bond — the bisect in `docs/project/pad-minimal-pairing.md` narrows it to `btd` and nothing
+/// else, one variable, reproducible both ways. An existing bond is unaffected: a bonded pad connects
+/// and drives with the whole stack up, which is what makes stopping `btd` for one pairing a complete
+/// answer rather than a degradation.
+///
+/// Why not in `btd` or `configd`. The fault is the aic8800 radio behaving badly with an adapter that
+/// both advertises as a peripheral and acts as central at once; the chip and the board are not what
+/// ships. Teaching `btd` to drop its advertisement would be real work against hardware with no
+/// future, and having `configd` drive `btd.service` would put a dependency between them that
+/// `docs/design/architecture.md` §1.1 keeps out on purpose — `btd` is in the recovery path.
+///
+/// So it lives at the edge, in one place, in the command a human runs. **Delete this whole type when
+/// the radio changes**; nothing else has to be unpicked.
+///
+/// Applied only on a board provisioned with `--weird-ble`, which is what sets `Privacy = device` and
+/// leaves the marker this looks for.
+///
+/// Stopping `btd` is only half of it: what it already pushed to the controller outlives the process,
+/// so the adapter is power-cycled too. See [`reset_the_adapter`].
+///
+/// A guard rather than a stop and a start around the call, so `btd` comes back on every path out —
+/// including the error ones, which is where a pairing is most likely to end.
+struct BtdPaused {
+    /// Was it running when we arrived? Only then is starting it again correct: a board with `btd`
+    /// deliberately disabled must not have it switched on by pairing a gamepad.
+    restart: bool,
+}
+
+impl BtdPaused {
+    fn for_pairing() -> Self {
+        // Only where the workaround is needed. A board at BlueZ's default bonds a pad with `btd`
+        // running, and stopping it there would take the phone path down for no reason.
+        if !needs_the_ble_workaround() {
+            return Self { restart: false };
+        }
+
+        // Only restarted if it was running: a board with `btd` deliberately disabled must not have
+        // it switched on by pairing a gamepad.
+        let restart = if systemctl(&["is-active", "--quiet", BTD_UNIT]) {
+            if systemctl(&["stop", BTD_UNIT]) {
+                eprintln!("paused btd while the pad bonds; it comes back on its own");
+                true
+            } else {
+                // Not fatal: the pairing may still work, and refusing to try would be worse than
+                // trying and saying why it might fail. This is also what an unprivileged run looks
+                // like, where the call below is about to be refused anyway.
+                eprintln!(
+                    "warning: could not stop btd, so this pairing may fail on this board. Try:\n \
+                     sudo systemctl stop btd"
+                );
+                false
+            }
+        } else {
+            false
+        };
+
+        reset_the_adapter();
+        Self { restart }
+    }
+}
+
+/// Power the adapter down and up, which is what actually makes a pad bond here.
+///
+/// Stopping `btd` is not enough on its own. Its advertisement and the IO capability its default
+/// pairing agent gave the controller outlive the process — a daemon does not undo what it pushed to
+/// a subsystem when it dies — and a pad still refuses to bond. Every manual pairing that worked had
+/// a **reboot** after stopping `btd`; measured 2026-08-19, a power cycle substitutes for it, which is
+/// what keeps `pad pair` one command instead of two with a reboot between.
+///
+/// Done unconditionally on a marker board, even when `btd` was already stopped: it may have run
+/// earlier this boot and left the same residue, and a board someone stopped `btd` on by hand should
+/// not pair differently from one where this did it.
+///
+/// `bluetoothctl power off/on` and **not** `systemctl restart bluetooth`, which on this board leaves
+/// the kernel holding hci0 while bluetoothd reports "No default controller available" until a reboot.
+/// This is an adapter power toggle through mgmt; the daemon stays up.
+fn reset_the_adapter() {
+    let cycled = bluetoothctl(&["power", "off"]) && bluetoothctl(&["power", "on"]);
+    if !cycled {
+        eprintln!(
+            "warning: could not power-cycle the Bluetooth adapter, so this pairing may fail. \
+             A reboot has the same effect."
+        );
+        return;
+    }
+    // The controller comes back through `off-enabling` before it is usable, and the discovery below
+    // starts immediately. Short enough not to be felt against a discovery window measured in tens
+    // of seconds.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+/// Run `bluetoothctl` and say whether it succeeded, with its output discarded.
+fn bluetoothctl(args: &[&str]) -> bool {
+    std::process::Command::new("bluetoothctl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+impl Drop for BtdPaused {
+    fn drop(&mut self) {
+        if self.restart && !systemctl(&["start", BTD_UNIT]) {
+            eprintln!(
+                "warning: could not start btd again, so the phone path is down until:\n    \
+                 sudo systemctl start btd"
+            );
+        }
+    }
+}
+
 /// The gamepad, through `configd`.
 ///
 /// `pair` is the only command here that takes a while — discovery is held open while someone holds
@@ -1783,6 +1979,11 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
              button on the top edge (not the Xbox button, which switches it off)"
         );
     }
+
+    // Held until this function returns, so `btd` is restored on every path out including the
+    // failures. See `BtdPaused` — temporary, and only for `pair`: `status` and `forget` neither
+    // need the radio quiet nor should disturb it.
+    let _btd = matches!(command, PadCommand::Pair { .. }).then(BtdPaused::for_pairing);
 
     let result = result_of(client.call(&call)?)?;
     if json {
@@ -1884,11 +2085,11 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
                 }
                 proto::PadPairFailure::Rejected => {
                     "Bluetooth refused the pairing. If this fails every time, check \
-                     /etc/bluetooth/main.conf: `Privacy = device` stops a pad bonding at all — it \
-                     rejects the pairing with `DHKey check failed` — and `Privacy = off` is what \
-                     works. Fix it with scripts/setup-board.sh and reboot, since it does not apply \
-                     until then. Otherwise the pad had probably left pairing mode: press Sync \
-                     again and re-run this while its light is flashing quickly"
+                     /etc/bluetooth/main.conf: the `Privacy` setting decides whether a pad can \
+                     bond at all, and it should read `Privacy = device`. Fix it with \
+                     scripts/setup-board.sh and reboot, since it does not apply until then. \
+                     Otherwise the pad had probably left pairing mode: press Sync again and \
+                     re-run this while its light is flashing quickly"
                 }
                 proto::PadPairFailure::Other => "pairing failed",
             };
@@ -2156,7 +2357,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return run_version(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }
         Namespace::Monitor { hz, json } => {
-            return monitor::run(&cli.robot_socket, hz, json);
+            return monitor::run(&cli.robot_socket, &cli.pad_socket, hz, json);
         }
         // Pure codegen: no socket, no daemon, no root. It must keep working on a robot
         // where nothing is running, since that is where an operator most wants to type
@@ -3002,6 +3203,26 @@ mod tests {
         let out = render_health(&report);
         assert!(out.contains("pinned to 0.1.9"), "{out}");
         assert!(out.contains("ROLLED BACK"), "{out}");
+    }
+
+    /// The installed release stays in the `software` block, below the daemons and above `units`.
+    ///
+    /// The component lines carry no heading of their own, so whatever block is printed before them
+    /// takes them: with `units` in between, `daemon    0.2.0 installed` renders under it and reads
+    /// as a sixth systemd unit called `daemon`. Ordering is the whole of the fix, which is exactly
+    /// the kind of thing a later edit undoes without noticing.
+    #[test]
+    fn the_installed_release_is_not_rendered_as_a_unit() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.units = vec![
+            unit("robotd", proto::UnitState::Active, Some("0.2.0")),
+            unit("padd", proto::UnitState::Inactive, None),
+        ];
+
+        let out = render_health(&report);
+        let installed = out.find("daemon    0.2.0 installed").expect(&out);
+        let units = out.find("\nunits\n").expect(&out);
+        assert!(installed < units, "{out}");
     }
 
     /// The summary line for one update attempt, including the reason a revert happened —

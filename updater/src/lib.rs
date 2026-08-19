@@ -74,6 +74,31 @@ pub enum Error {
         candidate: semver::Version,
     },
 
+    /// `--staging` resolved to a candidate older than what the board is running, which means
+    /// the staging channel has nothing newer to offer.
+    ///
+    /// Distinct from [`Self::WouldDowngrade`] because the operator's next move is different.
+    /// That one is a rollback-attack guard: it says a *mirror* may have gone backwards, and
+    /// the right response is to distrust the source. This one says the source is fine and the
+    /// channel is simply behind — usually because the last releases were promoted straight to
+    /// stable and published no candidate. Answering "refusing to downgrade" sent the one
+    /// person who hit it looking for a broken mirror.
+    ///
+    /// Only [`crate::proto::Target::Staging`] reaches it. `StagingExact` is how someone names
+    /// an older candidate deliberately, so the message names that command as the way past.
+    #[error(
+        "the newest release candidate is {candidate}, and this board is already on \
+         {installed} — nothing more recent is available on the staging channel. A release \
+         promoted straight to stable publishes no candidate, so staging stays at the last \
+         version that had one. There is nothing here to test. To install this older candidate \
+         anyway, name it:\n  robotctl update apply {component} --staging --version {candidate}"
+    )]
+    StagingBehind {
+        component: String,
+        installed: semver::Version,
+        candidate: semver::Version,
+    },
+
     /// The candidate does not contain a binary an installed unit execs.
     ///
     /// Carries a preformatted message rather than its parts, because the useful half is the
@@ -96,6 +121,24 @@ pub enum Error {
 
     #[error("network error: {0}")]
     Network(String),
+
+    /// The release exists but carries no assets, which is what every release looks like until
+    /// its build finishes uploading them.
+    ///
+    /// Distinct from [`Self::Network`] because the old answer — "has no asset named
+    /// \"manifest.json\" (has: )" under a "network error" prefix — describes a malformed
+    /// release and a broken link, and it is neither. The release is fine and the board is
+    /// online; the artifacts are minutes away. Both people who hit it went looking for the
+    /// wrong thing.
+    #[error(
+        "release {tag} has no assets yet, so there is nothing here to install. Its build has \
+         not finished uploading them — publishing a release creates it before that build \
+         starts, so the first few minutes of every release look like this and nothing is wrong \
+         with it. The release page lists the assets as they land:\n  \
+         https://github.com/{repo}/releases/tag/{tag}\nRun the same command again once they \
+         are there."
+    )]
+    ReleaseNotReady { repo: String, tag: String },
 
     /// Signature or hash mismatch. Never retried automatically — a failure here
     /// means the bytes are not ours.
@@ -148,8 +191,20 @@ impl Error {
             Error::UnknownComponent(_) => code::UNKNOWN_COMPONENT,
             Error::NotInstalled { .. } => code::NOT_INSTALLED,
             Error::WouldDowngrade { .. } => code::WOULD_DOWNGRADE,
+            // Shares the downgrade code rather than adding one, for the reason `WouldOrphanUnit`
+            // shares `INCOMPATIBLE` below: to a client this is the same answer — "refused, the
+            // target is older than what is installed" — and what a person needs is the message.
+            // A new code would be an `API_VERSION` bump for a refusal no client branches on.
+            Error::StagingBehind { .. } => code::WOULD_DOWNGRADE,
             Error::Busy => code::BUSY,
             Error::Network(_) => code::NETWORK,
+            // Shares the network code rather than adding one, for the reason `StagingBehind`
+            // shares the downgrade code above — with a second reason here. To a client this is
+            // the same answer as any other fetch that came up empty, and the one behaviour a
+            // client should have is the one `NETWORK` already asks for: retry later. That is
+            // exactly right for a release whose upload is still in flight, so a new code would
+            // be an `API_VERSION` bump that changed no client's mind about what to do.
+            Error::ReleaseNotReady { .. } => code::NETWORK,
             Error::Verification(_) => code::VERIFICATION_FAILED,
             Error::Incompatible(_) => code::INCOMPATIBLE,
             // Shares the incompatible code rather than adding one, for the reason `SelfTest`

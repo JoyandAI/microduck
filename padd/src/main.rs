@@ -52,9 +52,20 @@
 //! either would stop being the unprivileged client whose whole value is having no special
 //! access. It lives in `configd`, next to wifi.
 //!
+//! ## It also hands out the pad's raw input
+//!
+//! One socket, read-only, for `pad.input` and nothing else — `src/tap.rs`, and it does not make this
+//! a privileged process. It exists because `padd` is the reason a stalled radio is invisible: the
+//! sticks are *polled*, so the last known value keeps being sent at 50 Hz whether or not the pad is
+//! still talking, and every surface downstream then shows a robot with a live driver. The event
+//! stream one layer below has the evidence, so it is passed out unaltered rather than summarised.
+//! `robotctl monitor` draws it; `docs/robot/pair-a-gamepad.md` says how to read it.
+//!
 //! For development against a board: `ssh -L /tmp/robotd.sock:/run/robotd.sock duck`, then
 //! point `--socket` at the forwarded path. Pad on your laptop, robot on the bench, no code.
-//! `systemctl stop padd` first, or two processes fight over the sticks.
+//! `systemctl stop padd` first, or two processes fight over the sticks. Run that way, `--tap-socket`
+//! wants a path you can write — `/run/padd/` belongs to the unit — and on a Mac there is no tap at
+//! all, since it reads evdev.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -64,6 +75,31 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use duck_ipc_proto as proto;
 use gilrs::{Axis, Button, Gilrs};
+
+#[cfg(target_os = "linux")]
+mod tap;
+
+/// The raw tap, on a platform with no evdev to read.
+///
+/// A `padd` on a Mac still drives a pad — that is the bench setup in the crate docs above, and it
+/// would be a poor trade to lose it over a debug facility. It serves no tap, and `robotctl monitor`
+/// finds no socket and says so, which is the truth rather than an empty stream.
+#[cfg(not(target_os = "linux"))]
+mod tap {
+    pub struct Tap;
+
+    impl Tap {
+        pub fn serve(_socket: &std::path::Path) -> std::io::Result<Self> {
+            Err(std::io::Error::other(
+                "the raw pad tap reads evdev, which only Linux has",
+            ))
+        }
+
+        pub fn watch(&self, _pad: &gilrs::Gamepad<'_>) {}
+
+        pub fn idle(&self) {}
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "padd", about = "Drive the robot from a gamepad", version)]
@@ -100,6 +136,13 @@ struct Args {
     /// the network itself decides how far the head actually goes.
     #[arg(long, default_value_t = 2.5)]
     max_head: f64,
+
+    /// Where to serve the raw input tap: the pad's own event stream, for `robotctl monitor`.
+    ///
+    /// Read-only, and nothing on the driving path depends on it — if the socket cannot be created
+    /// `padd` says so once and drives anyway.
+    #[arg(long, default_value = proto::socket::PAD)]
+    tap_socket: PathBuf,
 }
 
 /// How long to wait between checks when there is no pad.
@@ -154,6 +197,20 @@ fn main() -> std::process::ExitCode {
         Err(e) => {
             tracing::error!(error = %e, "no gamepad subsystem");
             return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    // Before robotd's socket on purpose: a `padd` that cannot reach `robotd` exits and is retried
+    // by systemd, and the tap is the one thing here that could have told someone why the pad looked
+    // dead. Its own failure is logged and stepped over — see `--tap-socket`.
+    let tap = match tap::Tap::serve(&args.tap_socket) {
+        Ok(tap) => Some(tap),
+        Err(e) => {
+            tracing::warn!(
+                error = %e, socket = %args.tap_socket.display(),
+                "no raw pad tap — `robotctl monitor` cannot show the pad's own event stream"
+            );
+            None
         }
     };
 
@@ -234,6 +291,9 @@ fn main() -> std::process::ExitCode {
                 tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
                 driving = false;
             }
+            if let Some(tap) = tap.as_ref() {
+                tap.idle();
+            }
             std::thread::sleep(IDLE_POLL);
             continue;
         };
@@ -241,6 +301,13 @@ fn main() -> std::process::ExitCode {
         if !driving {
             tracing::warn!(pad = pad.name(), "pad connected — driving");
             driving = true;
+        }
+
+        // Every tick rather than on the transition above: a pad that drops and comes back between
+        // two ticks never clears `driving`, and it comes back as a different event node often
+        // enough that a tap following the old one would report the rest of the session as silence.
+        if let Some(tap) = tap.as_ref() {
+            tap.watch(&pad);
         }
 
         if toggle_head {

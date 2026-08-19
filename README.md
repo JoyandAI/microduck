@@ -37,11 +37,26 @@ robot     healthy
   cpu       52 °C
 
 software
-  updaterd  0.1.4 (rev abc1234)
-  robotd    0.1.5 (rev def5678)
-  daemon    0.1.5 installed
-            last update 0.1.4 → 0.1.5: applied
+  updaterd  0.5.0 (rev abc1234)
+  robotd    0.5.0 (rev abc1234)
+  configd   0.5.0 (rev abc1234)
+  daemon    0.5.0 installed
+            last update 0.4.1 → 0.5.0: applied
+
+units
+  updaterd  active · 0.5.0 (rev abc1234)
+  robotd    active · 0.5.0 (rev abc1234)
+  configd   active · 0.5.0 (rev abc1234)
+  btd       active · 0.5.0 (rev abc1234)
+  padd      active · 0.5.0 (rev abc1234)
 ```
+
+The two software blocks answer different questions. `software` is what each daemon that serves a
+socket says about itself, and what is installed on the board; `units` is what systemd says about
+every unit a release manages — including `btd` and `padd`, which answer no version query and can
+only be reported from outside — with the release each process was actually launched from. That second one
+is the question after an update: a daemon still running the old binary shows a release older than
+the installed one, and the report names the restart that fixes it.
 
 ## Drive it
 
@@ -149,6 +164,13 @@ that has already recovered is still visible. The bottom border names the policy 
 because `walk` is a mode two releases with different gaits both report — and "which network is
 this?" is the first question when comparing them.
 
+`p` opens the gamepad's raw input: every evdev report from the pad `padd` is driving from, the
+sticks and buttons as the kernel delivered them, and the gaps between reports as a trace. That last
+part is the reason it exists — `padd` resends the last stick value at 50 Hz, so a radio that has
+stopped delivering still looks like a live driver in the `asked` column above it, and the robot walks
+on a command nobody is giving. Reading it is in
+[pair a gamepad](docs/robot/pair-a-gamepad.md#when-it-drops-while-you-are-driving).
+
 `q` quits, `↑`/`↓` scroll the joint list, `u` switches the angles between degrees and radians.
 Angles are degrees on screen — joints, head and the yaw rate. Redirected or piped it prints one
 line per tick instead, so `> run.log` and `| grep FALLEN` behave, and those numbers stay radians
@@ -202,6 +224,22 @@ sudo robotctl update rollback daemon
 `daemon` covers every binary. On a dev board this installs the latest *stable* release, which is
 usually a downgrade — use `--ref` below instead.
 
+A release candidate — published, not yet promoted — is flagged as a prerelease, and a plain `apply`
+skips those so no robot drifts onto a build nobody has validated. Ask for one by name:
+
+```bash
+sudo robotctl update apply --staging daemon
+```
+
+To pick a candidate rather than the newest one:
+
+```bash
+sudo robotctl update apply --staging --version 0.5.1 daemon
+```
+
+The flag applies to that one command and leaves nothing switched on, so the next `apply` is back
+on stable. This is what a canary robot runs before a promotion.
+
 ## Put your branch on the robot
 
 Make sure the board has been through the [dev install](docs/robot/install-dev.md) first — a board that
@@ -241,8 +279,55 @@ scripts/dev-push.sh radxa@<board>
 
 It builds here, signs with the dev key, copies the release to the board and applies it — same
 verification, same health gate, same auto-rollback, about a minute instead of a push and a CI run.
-Setup and the one-time first push are in the
-[dev board cheat sheet](docs/robot/cheatsheet-dev.md).
+Setup and the one-time first push are in [`dev-push.md`](docs/robot/dev-push.md).
+
+## Cut a release
+
+Releases are built and signed in CI, never on a laptop. Two tags: the pre-release goes to a canary
+robot, and the release promotes exactly those bytes.
+
+Bump `version` under `[workspace.package]` in `Cargo.toml` first — 0.5.0 to 0.5.1 here. `xtask
+package` refuses a tag that disagrees with it, which is what stops a robot reporting a version it
+is not running. Then refresh the lockfile:
+
+```bash
+cargo update --workspace
+```
+
+Merge that, then from `main`:
+
+```bash
+git tag daemon-staging-v0.5.1 && git push --tags
+```
+
+CI builds it, signs it, verifies it through the real update engine and publishes it as a
+prerelease. Watch it:
+
+```bash
+gh run list --workflow release
+```
+
+Once it is green, on the canary robot:
+
+```bash
+sudo robotctl update apply --staging daemon
+```
+
+Drive it. When it holds up, from `main` again:
+
+```bash
+git tag daemon-v0.5.1 && git push --tags
+```
+
+That promotes the staging build rather than rebuilding it — the same bytes, re-signed with the key
+customer robots trust. Creating the release in the GitHub UI instead of pushing the tag does the
+same thing.
+
+A `daemon-v` tag with no staging build behind it is allowed and builds directly. Both are signed
+the same way, so the difference is validation rather than authenticity, and the release notes say
+which one happened. Key custody and the `promote` workflow — including `min_supported`, for forcing
+robots off a bad release — are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing) and
+[`docs/project/ci-setup.md`](docs/project/ci-setup.md).
 
 ## Where next
 
@@ -251,7 +336,8 @@ Setup and the one-time first push are in the
 | | |
 |---|---|
 | [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: wifi, updates, rollback, pinning, logs. |
-| [Dev board cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, `btctl`, and the restart traps after an update. |
+| [Dev board cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, and the restart traps after an update. |
+| [`duck-btctl` cheat sheet](docs/robot/duck-btctl.md) | Every `duck-btctl` command: the robot over Bluetooth, from a laptop, with no network. |
 | [Setting up a dev board](docs/robot/install-dev.md) | From nothing, and the fix when `--ref` is refused. |
 | [How it works](docs/design/) | The control loop, the update engine, the service split, the BLE path. |
 

@@ -189,7 +189,20 @@ impl GithubReleases {
     }
 
     /// The API download URL for a named asset. Pair it with [`OCTET_STREAM`].
-    fn asset_url(release: &Release, name: &str) -> Result<String, Error> {
+    ///
+    /// A release with *no* assets at all is reported separately, because it is not the same
+    /// situation as a missing one. Assets are uploaded at the end of a release build, so an
+    /// empty release is every release for the few minutes before that finishes — a state to
+    /// wait out, not a fault to investigate. A release that has assets but not this one is the
+    /// fault case, and there the list of what *is* there is the whole diagnostic.
+    fn asset_url(&self, release: &Release, name: &str) -> Result<String, Error> {
+        if release.assets.is_empty() {
+            return Err(Error::ReleaseNotReady {
+                repo: self.repo.clone(),
+                tag: release.tag_name.clone(),
+            });
+        }
+
         release
             .assets
             .iter()
@@ -228,7 +241,7 @@ impl GithubReleases {
         };
 
         let release = self.release_for_tag(&tag).await?;
-        let api_url = Self::asset_url(&release, &name)?;
+        let api_url = self.asset_url(&release, &name)?;
         tracing::debug!(%tag, %name, "resolved asset through the release API");
         Ok((api_url, Some(OCTET_STREAM)))
     }
@@ -236,9 +249,9 @@ impl GithubReleases {
     async fn signed_manifest(&self, tag: &str) -> Result<SignedBytes<Manifest>, Error> {
         let release = self.release_for_tag(tag).await?;
 
-        let manifest_url = Self::asset_url(&release, &self.manifest_asset)?;
+        let manifest_url = self.asset_url(&release, &self.manifest_asset)?;
         let sig_name = format!("{}{SIG_SUFFIX}", self.manifest_asset);
-        let sig_url = Self::asset_url(&release, &sig_name)?;
+        let sig_url = self.asset_url(&release, &sig_name)?;
 
         let bytes = http::get_bytes(&self.client, &manifest_url, Some(OCTET_STREAM)).await?;
         let signature = http::get_bytes(&self.client, &sig_url, Some(OCTET_STREAM)).await?;
@@ -463,9 +476,41 @@ mod tests {
                 url: "https://api.github.com/repos/ORG/robot-daemon/releases/assets/1".into(),
             }],
         };
-        let err = GithubReleases::asset_url(&release, "manifest.json").unwrap_err();
+        let err = source().asset_url(&release, "manifest.json").unwrap_err();
         // A support ticket needs to see what *was* there.
         assert!(err.to_string().contains("other.txt"), "{err}");
+    }
+
+    /// A release whose build has not uploaded yet must not read as a broken release.
+    ///
+    /// This is what an operator hits by running `update apply --staging` in the minutes after
+    /// publishing, and the old answer — `network error: ... has no asset named "manifest.json"
+    /// (has: )` — pointed at the two things that were not wrong: the release, and the network.
+    #[test]
+    fn an_empty_release_says_its_build_has_not_finished() {
+        let release = Release {
+            tag_name: "daemon-staging-v0.5.1".into(),
+            draft: false,
+            prerelease: true,
+            assets: vec![],
+        };
+
+        let err = source().asset_url(&release, "manifest.json").unwrap_err();
+        assert!(
+            matches!(err, Error::ReleaseNotReady { .. }),
+            "an empty release is a wait, not a fetch failure, got {err:?}"
+        );
+
+        let msg = err.to_string();
+        // The tag, so it is clear *which* release, and where to watch it land.
+        assert!(msg.contains("daemon-staging-v0.5.1"), "{msg}");
+        assert!(
+            msg.contains("https://github.com/ORG/robot-daemon/releases/tag/daemon-staging-v0.5.1"),
+            "{msg}"
+        );
+        // And none of the vocabulary that sent people debugging the wrong thing.
+        assert!(!msg.contains("network"), "{msg}");
+        assert!(!msg.contains("no asset named"), "{msg}");
     }
 
     /// **A manifest must not redirect the asset lookup at another repository.**

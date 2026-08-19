@@ -457,11 +457,11 @@ impl Engine {
         // would reject every branch install. Rollback and reset-to-golden move backwards on
         // purpose without passing through here.
         //
-        // The two `Staging` targets are unguarded for the `Exact` reason and not the `Ref`
-        // one: a candidate carries a plain version that normally sorts *above* the installed
-        // release, so the guard would rarely fire — but when it did, it would be refusing a
-        // reinstall of the candidate a board had just rolled back from, which is exactly the
-        // move someone reaches for while investigating that rollback.
+        // `StagingExact` is unguarded for the `Exact` reason: naming a candidate is how someone
+        // reinstalls the one a board just rolled back from, which is exactly the move they reach
+        // for while investigating that rollback. Bare `Staging` *is* guarded, but by
+        // [`staging_has_nothing_newer`] below rather than by this — the refusals are not the same
+        // claim, and this one's message would be actively misleading there.
         //
         // `from_dir` is exempt for the `Exact` reason. The guard defends against a *mirror*
         // that has gone backwards, and a directory named on the command line by somebody with
@@ -475,6 +475,27 @@ impl Engine {
             && manifest.version < *installed
         {
             return Err(Error::WouldDowngrade {
+                installed: installed.clone(),
+                candidate: manifest.version,
+            });
+        }
+
+        // `--staging` on a board that is ahead of the candidate channel. Reachable the moment a
+        // release is promoted straight to stable — which is a supported path, `release.yml` calls
+        // it "build → STABLE directly (no staging release exists; NOT canaried)" — because the
+        // staging scan then keeps answering with the last version that did publish a candidate.
+        //
+        // Refused rather than installed. Every layer below here behaved correctly when it was
+        // not: the artifact verified, the swap happened, a unit that the older release does not
+        // contain failed to start, and the update reverted. But the operator asked for "the one
+        // being tested" and there is no such thing, so the answer is a sentence rather than a
+        // rollback — and `orphan` cannot be that sentence, since it only sees a stale unit, not a
+        // stale channel.
+        if let Some(installed) =
+            staging_has_nothing_newer(&target, installed.as_ref(), &manifest.version)
+        {
+            return Err(Error::StagingBehind {
+                component: component.to_owned(),
                 installed: installed.clone(),
                 candidate: manifest.version,
             });
@@ -1284,13 +1305,6 @@ impl Engine {
                 continue;
             }
 
-            tracing::warn!(
-                component = %pending.component,
-                version = %pending.version,
-                boots = pending.boots,
-                "pending update never confirmed healthy; reverting"
-            );
-
             // A trial for a component that has since been removed from config must
             // not wedge startup; clear it and move on.
             let Ok(cfg) = self.config.component(&pending.component).cloned() else {
@@ -1301,6 +1315,65 @@ impl Engine {
                 self.boot_counter.confirm(&pending.component)?;
                 continue;
             };
+
+            // **The budget decides when to ask; the robot decides whether to revert.**
+            //
+            // A trial reaching this point means no apply ever confirmed it — the usual cause being
+            // an apply that was killed before its gate ran, which is what happens when the
+            // release's own `hooks/postinstall` restarts `updaterd` mid-apply. It does *not* mean
+            // the release is bad, and reverting one that is working replaces the code under
+            // whoever is looking at the robot, having told them nothing.
+            //
+            // So the same three-way question `health_gate` asks, in the same words, because the
+            // reasoning is identical:
+            //
+            //   - healthy: the release works. Confirm it. The budget was spent counting boots on a
+            //     release that was fine all along.
+            //   - degraded: the robot is not working *for a reason a rollback cannot fix* — no
+            //     servo power, a loose bus, absent hardware. Reverting hides a hardware fault
+            //     behind a software change, and the next release will be reverted too.
+            //   - anything else: revert, as before. `robotd` not answering, or answering
+            //     unhealthy, is the case this budget exists for.
+            //
+            // Only for a socket gate. `HealthCheck::None` has nothing to ask, and `Command` answers
+            // a two-way question — there is no "degraded" in an exit status.
+            if let HealthCheck::Socket { .. } = cfg.health {
+                match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
+                    crate::robot::Health::Healthy => {
+                        tracing::warn!(
+                            component = %pending.component,
+                            version = %pending.version,
+                            boots = pending.boots,
+                            "trial was never confirmed, but the robot is healthy on it; \
+                             committing instead of reverting"
+                        );
+                        self.boot_counter.confirm(&pending.component)?;
+                        continue;
+                    }
+                    crate::robot::Health::Degraded(reason) => {
+                        tracing::warn!(
+                            component = %pending.component,
+                            version = %pending.version,
+                            boots = pending.boots,
+                            reason = %reason,
+                            "trial was never confirmed and the robot is degraded for a reason this \
+                             release cannot have caused and a rollback cannot fix; committing"
+                        );
+                        self.boot_counter.confirm(&pending.component)?;
+                        continue;
+                    }
+                    // Fall through to the revert below, which logs why.
+                    _ => {}
+                }
+            }
+
+            tracing::warn!(
+                component = %pending.component,
+                version = %pending.version,
+                boots = pending.boots,
+                "pending update never confirmed healthy; reverting"
+            );
+
             let store = self.store(&pending.component)?;
 
             // §8.2's chain: previous → golden. Escalate past `previous` when it is
@@ -1712,6 +1785,7 @@ impl Engine {
             available_bytes: available,
             interrupt_sessions: options.interrupt_sessions,
             robot_query_timeout: ROBOT_QUERY_TIMEOUT,
+            from_dir: options.from_dir.as_deref(),
         }
         .run()
         .await?;
@@ -1804,6 +1878,31 @@ impl Reverted {
             ),
         }
     }
+}
+
+/// Is this a bare `--staging` whose newest candidate is *older* than what the board runs?
+///
+/// Returns the installed version when so, purely so the caller can build the refusal without
+/// unwrapping the option a second time.
+///
+/// A predicate rather than a let-chain at the call site because the interesting content is which
+/// targets it answers for, and that is worth a test. `Target::Staging` only:
+///
+/// - `StagingExact` names an older candidate on purpose — see the call site.
+/// - `Latest` has its own guard, which makes a different claim.
+/// - `Ref` and `Exact` are exempt from both, for reasons the call site states.
+///
+/// Equality is not "behind": that a candidate has been promoted to exactly what is installed is
+/// what `AlreadyCurrent` reports, above this and more usefully.
+fn staging_has_nothing_newer<'a>(
+    target: &crate::proto::Target,
+    installed: Option<&'a semver::Version>,
+    candidate: &semver::Version,
+) -> Option<&'a semver::Version> {
+    if !matches!(target, crate::proto::Target::Staging) {
+        return None;
+    }
+    installed.filter(|installed| candidate < *installed)
 }
 
 /// The program that drives units. A constant so tests can substitute a stub for it.
@@ -2246,6 +2345,124 @@ async fn run_systemctl(mut command: tokio::process::Command, what: &str) -> Resu
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod staging_channel_tests {
+    use super::*;
+    use crate::proto::Target;
+
+    fn v(s: &str) -> semver::Version {
+        semver::Version::parse(s).expect("a version")
+    }
+
+    /// The incident, in one assertion. A board on stable `0.4.0` asking for the newest candidate
+    /// when the last candidate published was `0.2.0`: 0.3.0 and 0.4.0 were promoted straight to
+    /// stable, so the staging scan still answers `0.2.0`.
+    #[test]
+    fn a_candidate_older_than_the_board_is_reported() {
+        assert_eq!(
+            staging_has_nothing_newer(&Target::Staging, Some(&v("0.4.0")), &v("0.2.0")),
+            Some(&v("0.4.0"))
+        );
+    }
+
+    /// The ordinary case, which must stay silent: a candidate ahead of the board is the entire
+    /// point of the channel.
+    #[test]
+    fn a_candidate_ahead_of_the_board_is_not() {
+        assert_eq!(
+            staging_has_nothing_newer(&Target::Staging, Some(&v("0.4.0")), &v("0.5.0")),
+            None
+        );
+    }
+
+    /// A candidate equal to what is installed is `AlreadyCurrent`, which the caller answers
+    /// before reaching here. Reporting it as a stale channel would be both wrong and worse.
+    #[test]
+    fn a_candidate_equal_to_the_board_is_not_behind() {
+        assert_eq!(
+            staging_has_nothing_newer(&Target::Staging, Some(&v("0.4.0")), &v("0.4.0")),
+            None
+        );
+    }
+
+    /// A first install has nothing to be behind. Guarding it would make `--staging` unusable on a
+    /// freshly flashed board, which is one of the two boards that ever uses the flag.
+    #[test]
+    fn a_board_with_nothing_installed_is_never_behind() {
+        assert_eq!(
+            staging_has_nothing_newer(&Target::Staging, None, &v("0.2.0")),
+            None
+        );
+    }
+
+    /// Every other target, at a version that *would* trip this if the variant were not checked.
+    ///
+    /// The load-bearing one is `StagingExact`: it is the way past the refusal this function
+    /// produces, so guarding it too would leave a board that can neither install the candidate
+    /// nor be told why. The rest have their own guards or their own exemptions.
+    #[test]
+    fn no_other_target_is_this_functions_business() {
+        for target in [
+            Target::StagingExact(v("0.2.0")),
+            Target::Latest,
+            Target::Exact(v("0.2.0")),
+            Target::Ref("my-branch".into()),
+        ] {
+            assert_eq!(
+                staging_has_nothing_newer(&target, Some(&v("0.4.0")), &v("0.2.0")),
+                None,
+                "{target:?} must not be refused as a stale staging channel"
+            );
+        }
+    }
+
+    /// The message is the deliverable — the rollback it replaces was already correct, and what
+    /// was missing was a sentence saying the channel had nothing newer. So: the two versions, the
+    /// reason there is nothing there, and a command that can be pasted.
+    #[test]
+    fn the_refusal_says_the_channel_is_behind_and_what_to_type() {
+        let text = Error::StagingBehind {
+            component: "daemon".into(),
+            installed: v("0.4.0"),
+            candidate: v("0.2.0"),
+        }
+        .to_string();
+
+        assert!(text.contains("newest release candidate is 0.2.0"), "{text}");
+        assert!(text.contains("already on 0.4.0"), "{text}");
+        assert!(
+            text.contains("nothing more recent is available on the staging channel"),
+            "{text}"
+        );
+        assert!(
+            text.contains("robotctl update apply daemon --staging --version 0.2.0"),
+            "{text}"
+        );
+        // Not the other refusal's words. Someone told "refusing to downgrade" goes looking for a
+        // mirror that has gone backwards, and there isn't one.
+        assert!(!text.contains("downgrade"), "{text}");
+    }
+
+    /// Both refusals answer the same JSON-RPC code, so a client that already handles one handles
+    /// this. Pinned because the reasoning is a choice — see [`Error::code`].
+    #[test]
+    fn it_answers_the_downgrade_code() {
+        assert_eq!(
+            Error::StagingBehind {
+                component: "daemon".into(),
+                installed: v("0.4.0"),
+                candidate: v("0.2.0"),
+            }
+            .code(),
+            Error::WouldDowngrade {
+                installed: v("0.4.0"),
+                candidate: v("0.2.0"),
+            }
+            .code()
+        );
+    }
 }
 
 #[cfg(test)]

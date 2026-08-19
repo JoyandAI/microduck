@@ -491,13 +491,7 @@ impl Server {
         match call {
             Call::Hello(params) => {
                 if params.api_version != proto::API_VERSION {
-                    return Response::err(
-                        Some(id),
-                        proto::Error::new(
-                            proto::code::PROTOCOL_MISMATCH,
-                            protocol_mismatch(params.api_version),
-                        ),
-                    );
+                    note_version_skew(params.api_version);
                 }
                 Response::ok(
                     Some(id),
@@ -641,6 +635,18 @@ impl Server {
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
                     "net.*, system.* and pad.* are served by configd, not updaterd",
+                ),
+            ),
+
+            // `pad.input` is the one call in that namespace `configd` does *not* answer, so it
+            // cannot share the arm above: sending someone to `configd` for it would cost them the
+            // same wrong-socket round trip this arm exists to save.
+            Call::PadInput => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "pad.input is served by padd itself, on /run/padd/pad.sock — unlike the rest \
+                     of pad.*, which configd answers",
                 ),
             ),
 
@@ -861,33 +867,33 @@ impl Server {
     }
 }
 
-/// Why the handshake failed, and what the operator does about it.
+/// A client built against another `API_VERSION` is written down, not turned away.
 ///
-/// The refusal is an exact `!=` in both directions, and stays one — see [`proto::API_VERSION`] for
-/// why accepting an older client is a promise this protocol cannot keep. What was missing is not
-/// leniency but a remedy: the old text named both versions and stopped there, on a board where the
-/// two halves are a symlink and a running process and neither is obvious to reach.
+/// **This was a refusal, and the refusal was aimed at the wrong thing.** It fired on two numbers
+/// differing, while what it existed to prevent is a *call this release cannot serve* — and those are
+/// not the same event. Most bumps here add a namespace (v5's `pad.*`, v8's `pad.input`) and cost an
+/// older client nothing, so most of what the gate stopped were calls this daemon would have answered
+/// correctly. `hello` precedes every `robotctl` command, so the price of one differing digit was
+/// every command at once: `update apply`, which is how a skew ends, and `version`, which is how it
+/// gets diagnosed. On a board where the client is a symlink into `current` and the daemon is a
+/// resident process mid-restart of itself, that window opens on the ordinary path, not a broken one.
 ///
-/// The direction is the whole diagnosis, so it decides the sentence:
+/// **What refuses now is the call itself.** A method this release does not have comes back
+/// `METHOD_NOT_FOUND` naming it, and a `params` member it does not know comes back `INVALID_PARAMS`
+/// naming that — both from `proto::Request::as_call`, both narrower than a handshake can be, and both
+/// there already. The gate was a blunter second copy of them.
 ///
-/// - **Client newer.** Almost always the seconds after an update, while `updaterd` is restarting
-///   itself into the release `robotctl` already follows. Retrying is the fix, and saying so stops
-///   this reading as a broken install.
-/// - **Client older.** `robotctl` on PATH is a symlink into `current`, so it cannot lag by
-///   construction; a client that does is a copy from somewhere else — a scp'd binary, a laptop
-///   build, a shell open since before the update.
-fn protocol_mismatch(client: u32) -> String {
-    let daemon = proto::API_VERSION;
-    let remedy = if client > daemon {
-        "this client is from a newer release than the running updaterd, which is normal for a few \
-         seconds after an update while updaterd restarts itself — retry, and if it persists, \
-         `systemctl restart updaterd`"
-    } else {
-        "this client is from an older release than the running updaterd. `/usr/local/bin/robotctl` \
-         is a symlink into `current` and follows the installed release, so a client this old is a \
-         copy from somewhere else — use that one"
-    };
-    format!("client speaks API v{client}, daemon speaks v{daemon}: {remedy}")
+/// So the pair of versions goes to the journal, where it turns a later shape error from a puzzle into
+/// a diagnosis, and `HelloResult::api_version` hands the client the same fact so it can say so
+/// itself. `duck-btctl` reached this conclusion from the far end of the link first — see
+/// `btd/examples/duck-btctl.rs`.
+fn note_version_skew(client: u32) {
+    tracing::warn!(
+        client,
+        daemon = proto::API_VERSION,
+        "a client was built against a different API version — serving it anyway; a method this \
+         release does not have, or a parameter it does not know, will be refused by name"
+    );
 }
 
 async fn write_line<T: serde::Serialize>(

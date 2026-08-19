@@ -183,6 +183,17 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // unpredictably-lagged view it could not reason about. `robot.health` is the question an
         // app actually has.
         RobotSubscribe(_) => None,
+
+        // The same objection as `robot.subscribe`, only more so: this is every evdev event the pad
+        // sends, over a hundred reports a second, and it exists to *measure the cadence of its own
+        // delivery*. Carried over BLE the measurement would be of the phone's link rather than the
+        // pad's, which is worse than refusing — it would be a number that looks like an answer.
+        //
+        // It is also not `btd`'s to forward. Every route here goes to one of three sockets `btd`
+        // holds, and this one is served by `padd`, which is deliberately not among them: `padd` is
+        // the unprivileged client whose whole value is having no special access, and giving the BLE
+        // transport a connection to it would be the first thing to make that untrue.
+        PadInput => None,
     }
 }
 

@@ -47,11 +47,43 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-./scripts/provision-board.sh radxa@192.168.1.42
+./scripts/provision-board.sh --weird-ble --name <MY_COOL_ROBOT_NAME> radxa@192.168.1.42
 ```
 
 That sends your dev key, starts provisioning, waits out the reboot, streams the log, and ends on
 `robotctl health`.
+
+### Why `--weird-ble` is in that command
+
+Roughly half the Radxa Zero 3W units here cannot bond a gamepad under BlueZ's default settings, and
+nothing measurable tells them apart from the ones that can — same kernel, same BlueZ, same firmware
+bytes. So the flag is the default here: a board that needed it and was provisioned without it
+presents as a gamepad that will not pair, for no visible reason — and every plausible cause you
+chase first is somewhere else entirely. A board that did not need it pays a smaller price, described
+below.
+
+**Drop it once you know the board is fine.** On a board that bonds a pad under the defaults, the flag
+buys nothing and costs something real: `Privacy = device` means a pad cannot form a *new* bond while
+`btd` advertises, so `robotctl pad pair` has to stop `btd` and power-cycle the adapter for every
+pairing. To find out, and to undo it:
+
+```bash
+sudo rm /var/lib/robot/weird-ble
+```
+
+```bash
+sudo sed -i '/^Privacy = device/d' /etc/bluetooth/main.conf && sudo reboot
+```
+
+Then pair a pad. If it bonds, that board never needed the flag — provision it without one next time.
+If it does not, put both back with the copy of the script provisioning leaves on the board:
+
+```bash
+sudo DUCK_WEIRD_BLE=1 /usr/local/sbin/robot-setup-board && sudo reboot
+```
+
+Both are workarounds for the aic8800 radio, not properties of the design; they go when the radio
+does. [`pair-a-gamepad.md`](pair-a-gamepad.md) has the detail.
 
 It is a **viewer**, not the thing doing the work — provisioning installs a systemd unit that
 resumes at boot, so the board finishes whether or not you are still watching. Ctrl-C costs you
@@ -61,9 +93,21 @@ nothing, and you can pick the log back up:
 ssh -t radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
 ```
 
-Useful flags: `--ref BRANCH` provisions from a branch, `--local` sends this clone's
-`provision.sh` instead of fetching it (which is how to test a change to the provisioning scripts
-without merging first), and `--no-dev-key` makes a board that only takes releases.
+`--ref BRANCH` provisions from a branch: its scripts run the bring-up, and its build of the daemon
+is installed on top. `golden` stays the stable release — it is the boot recovery net's fallback, and
+a branch build as golden would give a broken branch a broken fallback — while `current` is the
+branch.
+
+Provisioning **fails** if that build cannot be installed, or if it is installed and then rolled back
+by the health gate. A dev board quietly running the stable release when a branch was asked for is the
+worst failure to debug: everything looks installed and the code under test is not there. Give CI its
+minute or two before provisioning, and check with `gh run list --branch BRANCH` if it stops.
+
+Other useful flags: `--name Ducky` names the robot instead of leaving it the `duck-7f3a` it derives
+from its own serial (`robotctl system set-name` changes it later, so this only saves a command),
+`--local` sends this clone's `provision.sh` instead of fetching it (which is how to test a change to
+the provisioning scripts without merging first), and `--no-dev-key` makes a board that only takes
+releases.
 
 ## Check it worked
 
@@ -99,6 +143,27 @@ is. The raw ssh error for this is a wall of text about a possible attack.
 
 This matters more than it sounds, because DHCP leases get reused — the address that was one
 board last week is a different board today, with a different key.
+
+## When the board comes back at a different address
+
+The wifi cutover in the middle of provisioning can leave the board on a different lease than the
+one you gave. `provision-board.sh` goes looking: while it waits for ssh it also asks the robot over
+Bluetooth what address it ended up with, and adopts the answer.
+
+```
+  bluetooth: the robot reports 192.168.1.57, and 192.168.1.42 was its old lease.
+```
+
+Nothing to do — the rest of the run is addressed there.
+
+Three things stop it working, and it says which:
+
+- It needs `cargo` and this clone, because `duck-btctl` is an example rather than an installed binary.
+- It can only ask once `btd` is running, which on a board being provisioned for the first time is a
+  few minutes into phase 2.
+- The robot reports its **wifi** address, so a board you reach over ethernet is not covered.
+
+`--no-ble` turns it off. A robot that has been given its own pairing PIN needs it in `DUCK_PIN`.
 
 ## Making an existing board take dev builds
 
@@ -177,8 +242,8 @@ daemon, with the health gate and auto-rollback:
 sudo robotctl update apply daemon --from /media/usb/release
 ```
 
-That is also what `scripts/dev-push.sh` ends with; the
-[dev board cheat sheet](cheatsheet-dev.md) has the laptop-to-board path.
+That is also what `scripts/dev-push.sh` ends with; [`dev-push.md`](dev-push.md) is the
+laptop-to-board path.
 
 The rest of this section is the **bare-board** case: a factory or offline install, before there is
 a daemon to ask. It is `updaterd` rather than `robotctl` for that reason, and `updaterd` is

@@ -51,17 +51,35 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// # The rule, since a bump has consequences and nothing else states them
 ///
 /// **A bump promises nothing in either direction.** It is not "additive unless stated": v5 was
-/// additive and v4 was not, and the constant does not distinguish them. So `updaterd` refuses on an
-/// exact `!=`, and that stays deliberate rather than pending — accepting an older client would
-/// promise backward compatibility on every past and future bump, with no mechanism to keep it and
-/// no way to make a non-additive change afterwards. There is one user and one robot; a promise is
-/// worth less here than the freedom to change the wire shape.
+/// additive and v4 was not, and the constant does not distinguish them. Every binary on a board is
+/// expected to come from one release, and the install path is what delivers that.
 ///
-/// **What a bump therefore costs.** Every client on a board must come from the same release as
-/// `updaterd`, and for a few seconds after an update they do not: `robotctl` is a symlink into
+/// **No daemon refuses a call because this number differs.** `updaterd` used to refuse `hello` on
+/// an exact `!=`. The premise was sound — a bump promises nothing — and the conclusion did not
+/// follow from it: what actually breaks a mismatched peer is a *route it cannot reach* or a
+/// *parameter shape that moved*, and each of those refuses itself, by name, on the one call that
+/// cannot be served. A gate on the handshake fired on all of them instead, including the calls that
+/// were perfectly serveable and including `update apply`, which is how a skew ends. The difference
+/// is now *reported* — in `updaterd`'s journal, and in [`HelloResult::api_version`] for a client to
+/// compare against its own — and refused nowhere. See `updater/src/ipc.rs`.
+///
+/// **What refuses instead, and it is narrower on purpose.** A method this release does not have is
+/// [`code::METHOD_NOT_FOUND`] naming the method ([`Request::as_call`]). A member of `params` this
+/// release does not know is [`code::INVALID_PARAMS`] naming the member, because every params type
+/// denies unknown fields — which is the strictness the handshake was reaching for, moved to where it
+/// can tell a changed call from an unchanged one. Both were wanted regardless of the gate: v7 added
+/// `ApplyOptions::from_dir`, and an older `updaterd` that merely *ignored* it would have installed
+/// from its configured source while the operator believed they were sideloading a directory. Silence
+/// was the danger there, not disagreement. It reaches only forward — a daemon built before this
+/// cannot refuse what it was already ignoring — which is one more reason the bump is still worth
+/// making.
+///
+/// **What a bump therefore costs.** Two peers from different releases are still not interchangeable:
+/// a method whose shape moved will fail. It fails on that method now rather than on the handshake,
+/// and for the few seconds after an update it costs nothing at all — `robotctl` is a symlink into
 /// `current`, so it follows the new release immediately, while `updaterd` is mid-restart of itself.
-/// Retrying is the fix. A client that is *persistently* older is a copy taken from somewhere other
-/// than `/usr/local/bin/robotctl`. Both directions are named in the refusal — `updater/src/ipc.rs`.
+/// A client that is *persistently* older is a copy taken from somewhere other than
+/// `/usr/local/bin/robotctl`.
 /// # v7 — `ApplyOptions::from_dir`
 ///
 /// First ships in 0.5.0, which is therefore the version a board has to be on before
@@ -71,14 +89,29 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// That is the reason to bump rather than a reason not to: serde ignores what it does not know, so a
 /// v6 `updaterd` would accept `update.apply --from /some/dir` and quietly install from its
 /// *configured* source instead — a mirror of the release the operator meant to sideload, or nothing
-/// at all. Refusing the call outright is what this constant is for.
+/// at all.
 ///
-/// # v8 — the skill intents
+/// Refusing the call outright is what the handshake used to be for, and it is now the params
+/// decoder's job: an unknown member of `params` is an [`code::INVALID_PARAMS`] naming the member. A
+/// v6 daemon predates that and still ignores the field, which is exactly why the bump stays — it is
+/// the honest label for two peers that do not share a release.
+/// # v8 — `pad.input`
+///
+/// A namespace addition of the kind v5 was, and it bumps for the same stated reason: the constant
+/// says "these two peers were not built together", not "nothing you knew has changed".
+///
+/// **What it costs here is smaller than usual, and worth being precise about.** The new method is
+/// served by `padd` on a socket of its own, so no existing client loses anything by not knowing it,
+/// and a `robotctl` that asks an older `padd` for it finds no socket at all rather than a refusal.
+/// The bump lands on nothing that refuses: it records that two peers differ, and the rule that every
+/// binary on a board comes from one release is kept by the install path rather than by a handshake.
+///
+/// # v9 — the skill intents
 ///
 /// `robot.do` (ground pick, kicks, sit↔stand), `robot.pose` (standing body pose),
 /// `robot.mouth`, `robot.shutdown` (sit, then power off) and `robot.mode` (walk vs roller),
 /// ported from `microduck_runtime`. Additive, and bumps anyway, per the rule above.
-pub const API_VERSION: u32 = 8;
+pub const API_VERSION: u32 = 9;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -93,6 +126,13 @@ pub mod socket {
     pub const UPDATER: &str = super::DEFAULT_SOCKET;
     pub const ROBOT: &str = "/run/robotd.sock";
     pub const CONFIG: &str = "/run/configd.sock";
+    /// `padd`'s raw input tap — [`super::method::PAD_INPUT`], and nothing else.
+    ///
+    /// Under `/run/padd/` because that is `padd`'s `RuntimeDirectory=`, which is the only place a
+    /// process running under `ProtectSystem=strict` may create a file. systemd removes the
+    /// directory when the unit stops, so a socket left behind cannot outlive the daemon that
+    /// would have answered on it.
+    pub const PAD: &str = "/run/padd/pad.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -314,6 +354,23 @@ pub mod method {
     pub const PAD_PAIR: &str = "pad.pair";
     /// Forget a pad, so it stops reconnecting.
     pub const PAD_FORGET: &str = "pad.forget";
+
+    /// Subscribe to the raw input stream of the pad `padd` is driving from.
+    ///
+    /// **The one method in this namespace `padd` answers itself**, on [`super::socket::PAD`]
+    /// rather than `configd`'s socket. That is not a lapse in the split above: the three calls
+    /// before it are Bluetooth *configuration*, and this is the input device — which only the
+    /// process already reading it can name, since it is the node gilrs picked.
+    ///
+    /// It exists for one question the rest of the system cannot answer. `padd` polls the last
+    /// known stick value and keeps sending it at 50 Hz, so a radio that stops delivering reports
+    /// still produces fresh intents: `robotd` sees a live driver, the deadman never fires, and the
+    /// robot walks on a stale command. Nothing in `robot.state` can show that. The raw event
+    /// stream can, because a report that never arrived leaves a measurable hole in the cadence.
+    pub const PAD_INPUT: &str = "pad.input";
+
+    /// One report from the pad, pushed after [`PAD_INPUT`].
+    pub const PAD_REPORT: &str = "pad.report";
 }
 
 /// JSON-RPC error codes.
@@ -332,6 +389,12 @@ pub mod code {
     // Application-specific.
     pub const BUSY: i32 = 1;
     pub const UNKNOWN_COMPONENT: i32 = 2;
+    /// Retired: nothing emits this any more. A version *difference* is logged and served, and
+    /// what refuses is the route that is genuinely missing — see [`super::API_VERSION`].
+    ///
+    /// The constant stays, and the number is not reused, because a board running an `updaterd`
+    /// from 0.5.1 or earlier still answers `hello` with it and `robotctl` still maps it to an
+    /// exit status. Deleting it would make that board's refusal read as a generic failure.
     pub const PROTOCOL_MISMATCH: i32 = 3;
     pub const PREFLIGHT_FAILED: i32 = 4;
     pub const NETWORK: i32 = 5;
@@ -445,6 +508,8 @@ pub enum Call {
     PadStatus,
     PadPair(PadPairParams),
     PadForget(PadForgetParams),
+    /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
+    PadInput,
 }
 
 impl Call {
@@ -492,6 +557,7 @@ impl Call {
             Call::PadStatus => method::PAD_STATUS,
             Call::PadPair(_) => method::PAD_PAIR,
             Call::PadForget(_) => method::PAD_FORGET,
+            Call::PadInput => method::PAD_INPUT,
         }
     }
 
@@ -586,7 +652,8 @@ impl Call {
             | Call::SystemServices
             | Call::SystemReboot
             | Call::SystemPairingPin
-            | Call::PadStatus => Value::Object(serde_json::Map::new()),
+            | Call::PadStatus
+            | Call::PadInput => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -651,6 +718,7 @@ impl Call {
                 Call::PadPair(decode(params.or(Some(&empty)))?)
             }
             method::PAD_FORGET => Call::PadForget(decode(params)?),
+            method::PAD_INPUT => Call::PadInput,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -718,6 +786,24 @@ impl Request {
     /// Read a robot-state notification back.
     pub fn as_state(&self) -> Option<RobotState> {
         if self.method != method::ROBOT_STATE {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A raw-pad notification: no `id`, so no response is expected.
+    pub fn notify_pad_report(report: &PadReport) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::PAD_REPORT.to_owned(),
+            params: Some(serde_json::to_value(report).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a raw-pad notification back.
+    pub fn as_pad_report(&self) -> Option<PadReport> {
+        if self.method != method::PAD_REPORT {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -856,12 +942,26 @@ impl From<&str> for ComponentId {
     }
 }
 
+/// Every params type below denies unknown fields, and this is the one place that is worth saying
+/// why rather than repeating it fourteen times.
+///
+/// `serde` ignores what it does not know, so without this a client from another release can send a
+/// member that changes what a call *means* and be told nothing: v7's `ApplyOptions::from_dir` is the
+/// worked example — a daemon that ignores it installs from its configured source while the operator
+/// believes they are sideloading a directory. Refusing it names the member, on the one call that
+/// cannot be served, which is what [`API_VERSION`]'s handshake gate was standing in for until it was
+/// removed for firing on every other call too.
+///
+/// The robot-intent types (`MoveParams`, `HeadParams`, …) had it from the start; the updater and
+/// config ones did not, because the gate was covering for them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HelloParams {
     pub api_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentParams {
     pub component: ComponentId,
 }
@@ -1070,6 +1170,7 @@ pub enum Target {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApplyOptions {
     /// Run every check (fetch, verify, compatibility, space) and stop before the symlink
     /// swap.
@@ -1098,6 +1199,7 @@ pub struct ApplyOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApplyParams {
     pub component: ComponentId,
     pub target: Target,
@@ -1106,12 +1208,14 @@ pub struct ApplyParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectParams {
     pub component: ComponentId,
     pub version: semver::Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PinParams {
     pub component: ComponentId,
     /// `None` unpins.
@@ -1119,6 +1223,7 @@ pub struct PinParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogParams {
     pub limit: usize,
 }
@@ -1131,6 +1236,7 @@ pub struct LogParams {
 /// `btd` and `robotctl` all log calls, and the credential-carrying one must not be readable
 /// afterwards by anyone who can run `journalctl`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetConnectParams {
     pub ssid: String,
     /// `None` for an open network. Either a passphrase or a 64-hex pre-shared key;
@@ -1159,11 +1265,13 @@ impl std::fmt::Debug for NetConnectParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetForgetParams {
     pub ssid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetNameParams {
     pub name: String,
 }
@@ -1174,6 +1282,7 @@ pub struct SetNameParams {
 /// is the only thing standing between a paired-but-unauthenticated peer and the robot, and a
 /// journal is the wrong place for it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticateParams {
     pub pin: String,
 }
@@ -1203,6 +1312,7 @@ pub struct AuthenticateResult {
 /// and a `u32` would store that as 0 and display it as "0". The robot and the phone must agree
 /// on six characters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetPairingPinParams {
     pub pin: String,
 }
@@ -1211,6 +1321,7 @@ pub struct SetPairingPinParams {
 
 /// Pair the gamepad that is in pairing mode now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PadPairParams {
     /// Which pad, when the address is already known. **Omit it in the normal case**: the point of
     /// this call is not having to find a MAC address first, so the robot looks for a pad that
@@ -1234,6 +1345,7 @@ pub struct PadPairParams {
 /// room any more — a colleague's controller that still steals the bond on boot — so identifying it
 /// by its current connection state would name the wrong thing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PadForgetParams {
     pub mac: String,
 }
@@ -1897,8 +2009,10 @@ pub enum UnitState {
 /// **This exists to answer "which version is actually running", which nothing else could.**
 /// `updaterd`, `robotd` and `configd` report their build over their own sockets, so a running
 /// daemon that did not restart into a new release is already visible for those three. `btd` and
-/// `padd` serve no socket, and asking them is not an option — the process that needs interrogating
-/// is by definition the *old* one, which cannot have learned a new way to answer.
+/// `padd` cannot be asked, and the reason is not merely that they have no service socket — `padd`
+/// does serve one, for [`method::PAD_INPUT`] and nothing else. It is that the process which needs
+/// interrogating is by definition the *old* one, which cannot have learned a new way to answer,
+/// whatever socket it is holding.
 ///
 /// So it is read from outside the process: systemd knows the PID, and `/proc/<pid>/exe` resolves to
 /// the real path the binary was executed from. Since a release installs to `…/releases/<version>/`
@@ -1937,8 +2051,8 @@ pub enum PadPairFailure {
     /// No Bluetooth adapter. On this board `hci0` does not exist until roughly 73 seconds after
     /// power-on, so this is a real answer early in a boot and not necessarily broken hardware.
     NoAdapter,
-    /// BlueZ refused the bond. The classic cause on this board is `Privacy = device` missing from
-    /// `/etc/bluetooth/main.conf` — the pad pairs and drops straight back out.
+    /// BlueZ refused the bond. The classic cause on this board is the `Privacy` setting in
+    /// `/etc/bluetooth/main.conf` — see `configd::bluez` for which value and why.
     Rejected,
     Other,
 }
@@ -1963,6 +2077,232 @@ pub struct PadForgetResult {
     /// False when no such pad was bonded — not an error, and a client should not present it as
     /// one. Same contract as [`ForgetResult`].
     pub removed: bool,
+}
+
+// ── pad input, as the kernel delivers it ─────────────────────────────────────
+
+/// How the cadence of raw pad reports is judged.
+///
+/// Shared so the live view in `robotctl monitor` and `scripts/pad-link-test.sh` reach the same
+/// verdict about the same link: two tools that disagree about what counts as a stall are two tools
+/// nobody can compare. The script keeps its own copies of these numbers deliberately — it is a
+/// `/bin/sh` file that has to run on a board with none of this compiled — and names them there.
+pub mod pad_link {
+    /// Under this, a late report is invisible to whoever is driving. Over it, the robot feels
+    /// sticky.
+    pub const NOTABLE_MS: u64 = 100;
+
+    /// Where `robotd` zeroes the velocity: the default of its `safety.deadman_ms`. A gap past this
+    /// is not a latency complaint, it is the robot stopping.
+    pub const DEADMAN_MS: u64 = 500;
+
+    /// Past this, silence is the operator rather than the radio.
+    ///
+    /// An evdev device sends nothing while nothing moves, so a pad at rest is indistinguishable
+    /// from a link that has stopped delivering — except by duration. A link silent this long would
+    /// have hit its supervision timeout and dropped, and a drop is visible on its own. Counting
+    /// quiet as a stall is how the first real measurement of this robot reported a 75-second
+    /// breach of the deadman on a link that never faltered.
+    pub const IDLE_MS: u64 = 5000;
+}
+
+/// The pad's input device, as the kernel describes it.
+///
+/// Sent when a subscriber attaches and again whenever the device changes, because every number in
+/// a [`PadFrame`] is meaningless without it: `ABS_X = 1583` is a stick position only once you know
+/// the axis runs −32768..32767 on this pad and 0..65535 on the next one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadInputDevice {
+    /// As the pad calls itself: "Xbox Wireless Controller".
+    pub name: String,
+    /// The event node being read, `/dev/input/event5`.
+    ///
+    /// Worth reporting because it *changes*: a pad that drops and comes back is often a different
+    /// number, and one stale path in a log is how two sessions get read as one.
+    pub node: String,
+    /// The pad's address, as the kernel has it. This is what ties a report stream to a `btmon`
+    /// capture of the same link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique: Option<String>,
+    /// `0x0005` for Bluetooth, `0x0003` for USB — [`Self::over_bluetooth`].
+    pub bus: u16,
+    pub vendor: u16,
+    pub product: u16,
+    /// Every absolute axis the device declares, with the range its values live in.
+    pub axes: Vec<PadAxis>,
+    /// Every button it declares. The whole list, not the ones this build has a use for: a pad
+    /// whose Start does nothing is a pad someone needs to see the raw code of.
+    pub buttons: Vec<PadKey>,
+}
+
+impl PadInputDevice {
+    /// Bus id of a Bluetooth device, from `linux/input.h`.
+    pub const BUS_BLUETOOTH: u16 = 0x0005;
+    /// Bus id of a USB device.
+    pub const BUS_USB: u16 = 0x0003;
+
+    /// Is this pad on the radio at all?
+    ///
+    /// A pad on a cable has no link to measure, and saying so beats reporting a flawless one —
+    /// `pad-link-test.sh` refuses to run in that case for the same reason.
+    pub fn over_bluetooth(&self) -> bool {
+        self.bus == Self::BUS_BLUETOOTH
+    }
+}
+
+/// One absolute axis, with the range and the noise floor the driver claims for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadAxis {
+    /// The evdev code: `ABS_X` is 0.
+    pub code: u16,
+    /// `ABS_X`, as `linux/input-event-codes.h` spells it.
+    pub name: String,
+    pub min: i32,
+    pub max: i32,
+    /// The driver's own dead zone for this axis, in axis units.
+    ///
+    /// A *hardware* claim about where centre stops being centre, and worth having next to the
+    /// live value: a stick whose rest position sits outside it is a stick that will creep,
+    /// whatever `padd`'s own `--deadzone` then does about it.
+    pub flat: i32,
+    /// Changes smaller than this the driver considers noise.
+    pub fuzz: i32,
+    /// Where the axis was when the device was described, so a subscriber starts with the whole
+    /// picture rather than with whatever moves first.
+    pub value: i32,
+}
+
+/// One button, and whether it was held when the device was described.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadKey {
+    /// The evdev code: `BTN_SOUTH` is 0x130.
+    pub code: u16,
+    pub name: String,
+    pub pressed: bool,
+}
+
+/// What arrives on a [`method::PAD_INPUT`] subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "report", rename_all = "snake_case")]
+pub enum PadReport {
+    /// A pad's event node is open and reports are coming. Sent on subscribing if a pad is already
+    /// connected, and again each time one appears, so a subscriber has one code path for "already
+    /// there" and "turned up later".
+    Attached { device: Box<PadInputDevice> },
+    /// One report, as the kernel framed it.
+    Frame(PadFrame),
+    /// The node closed: the pad dropped, was switched off, or `padd` stopped reading it.
+    Detached {
+        /// Why, in `padd`'s words. Not a code — nothing acts on this, and the honest answer is
+        /// usually an errno the operator wants verbatim.
+        why: String,
+    },
+}
+
+/// One report from the pad: everything the kernel delivered between two `SYN_REPORT`s.
+///
+/// **The report, not the event, is the unit of a radio's cadence.** One flick of a stick is four
+/// events in a single report, and counting events instead turns one late report into four.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadFrame {
+    /// Reports since this device attached, counted by `padd`.
+    ///
+    /// A hole in it means the *socket* fell behind — see [`Self::socket_dropped`]. A report the
+    /// pad never sent leaves no hole at all, which is the whole difficulty of measuring this:
+    /// absence is not an event, and only the clock can find it.
+    pub seq: u64,
+    /// The kernel's timestamp on the report, microseconds since the epoch.
+    ///
+    /// **Not the time `padd` read it.** `input_event.time` is stamped as the kernel takes the
+    /// report off the transport, so a cadence measured from it is the pad's own and survives
+    /// `padd` being scheduled late. It is also what lines this stream up against a `btmon`
+    /// capture of the same seconds.
+    pub at_us: u64,
+    /// Microseconds since the previous report. Absent for the first one after attaching, where
+    /// there is nothing to measure from.
+    ///
+    /// **Signed, because it can genuinely be negative.** `input_event.time` is `CLOCK_REALTIME`,
+    /// which is the price of [`Self::at_us`] lining up with a `btmon` capture: a board with no RTC
+    /// gets its clock stepped once its first NTP reply lands, and that step falls between two
+    /// reports of a link that never faltered. A negative gap is that step, and reading it as a
+    /// 40-year stall — or clamping it to zero and calling it the fastest report ever seen — are
+    /// both worse than saying so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_us: Option<i64>,
+    /// Every event in the report, in the order the kernel delivered them.
+    pub events: Vec<PadEvent>,
+    /// `SYN_DROPPED` preceded this report: the kernel discarded events because **this reader**
+    /// fell behind.
+    ///
+    /// It says nothing about the radio, and it makes [`Self::since_us`] here meaningless — the
+    /// events that would have filled the gap were thrown away before anyone saw them.
+    #[serde(default, skip_serializing_if = "not")]
+    pub after_drop: bool,
+    /// Reports this subscriber missed because its own socket was behind, since the last frame it
+    /// did receive.
+    ///
+    /// A slow client and a stalled radio produce the same silence, and a debug view that cannot
+    /// tell them apart is one that invents faults. `padd` never blocks its reader on a subscriber:
+    /// it drops, counts, and says so here.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub socket_dropped: u64,
+}
+
+/// One evdev event, as it came off the device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadEvent {
+    /// The evdev type, numerically: `EV_SYN` 0, `EV_KEY` 1, `EV_ABS` 3.
+    pub kind: u16,
+    pub code: u16,
+    pub value: i32,
+    /// `ABS_X`, `BTN_SOUTH`, `SYN_REPORT` — the name `linux/input-event-codes.h` gives this
+    /// type/code pair, so a captured line reads without a lookup table beside it. Numeric for a
+    /// code the kernel headers this was built against do not name.
+    pub name: String,
+}
+
+impl PadEvent {
+    /// `EV_SYN` — bookkeeping: the report boundary, and the dropped marker.
+    pub const SYNCHRONIZATION: u16 = 0x00;
+    /// `EV_KEY` — a button changed state.
+    pub const KEY: u16 = 0x01;
+    /// `EV_ABS` — an absolute axis moved.
+    pub const ABSOLUTE: u16 = 0x03;
+
+    /// Did an axis move? The value is then a position in that axis's own range — see
+    /// [`PadAxis::min`] and [`PadAxis::max`], which is why it cannot be read without them.
+    pub fn is_axis(&self) -> bool {
+        self.kind == Self::ABSOLUTE
+    }
+
+    /// Did a button change? `value` is 0 for released and non-zero for held: 1 on a press and 2 on
+    /// an autorepeat, which a pad does not send but a reader must not mistake for a release.
+    pub fn is_button(&self) -> bool {
+        self.kind == Self::KEY
+    }
+}
+
+/// Answer to [`Call::PadInput`].
+///
+/// `accepted` is not "a pad is connected". A subscription with no pad is normal and is half the
+/// point: `padd` runs from boot waiting for one, and watching for it to appear is exactly what
+/// this stream is for. The pad, when there is one, arrives as [`PadReport::Attached`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadInputResult {
+    pub accepted: bool,
+    /// Why not, when it was refused — a platform with no evdev to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `skip_serializing_if` for a `bool` that is false by default.
+fn not(b: &bool) -> bool {
+    !*b
+}
+
+/// `skip_serializing_if` for a counter that is zero on every healthy frame.
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Re-exported so consumers spell version types with the *same* `semver` this crate
@@ -2447,6 +2787,41 @@ mod tests {
         assert_eq!(malformed.as_call().unwrap_err().code, code::INVALID_PARAMS);
     }
 
+    /// A `params` member this release does not know is refused, and named, for every method that
+    /// takes parameters.
+    ///
+    /// Pinned across all of them rather than left to fourteen `deny_unknown_fields` attributes being
+    /// remembered, because this is where the strictness the `hello` handshake used to supply now
+    /// lives — see [`API_VERSION`]. A params type added without the attribute fails here.
+    ///
+    /// Methods taking *no* parameters are exempt by design: `parse` ignores whatever arrived for
+    /// them, so that `{}`, `null` and an absent member all mean the same call.
+    #[test]
+    fn an_unknown_params_member_is_refused_by_name() {
+        for call in every_call() {
+            let Value::Object(mut params) = call.params() else {
+                panic!(
+                    "{} serialised its params as something other than an object",
+                    call.method()
+                );
+            };
+            if params.is_empty() {
+                continue;
+            }
+            params.insert("from_a_later_release".to_owned(), Value::Bool(true));
+
+            let error = Call::parse(call.method(), Some(&Value::Object(params)))
+                .expect_err(&format!("{} accepted an unknown member", call.method()));
+            assert_eq!(error.code, code::INVALID_PARAMS, "{}", call.method());
+            assert!(
+                error.message.contains("from_a_later_release"),
+                "{}: {}",
+                call.method(),
+                error.message
+            );
+        }
+    }
+
     /// A no-parameter method must accept whatever a client sent for `params` — `{}`, `null`
     /// or nothing at all. Refusing one of those would be a protocol trap with no upside.
     #[test]
@@ -2596,6 +2971,124 @@ mod tests {
         };
         let line = serde_json::to_string(&sick).unwrap();
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), sick);
+    }
+
+    /// The three shapes a pad subscriber has to tell apart travel under one tag, and a frame
+    /// keeps every field a cadence is measured from. A `Frame` that deserialised as `Attached`
+    /// would present a dropped link as a fresh device.
+    #[test]
+    fn pad_reports_round_trip_under_their_tag() {
+        let attached = PadReport::Attached {
+            device: Box::new(PadInputDevice {
+                name: "Xbox Wireless Controller".into(),
+                node: "/dev/input/event5".into(),
+                unique: Some("78:86:2e:bb:13:28".into()),
+                bus: PadInputDevice::BUS_BLUETOOTH,
+                vendor: 0x045e,
+                product: 0x0b13,
+                axes: vec![PadAxis {
+                    code: 0,
+                    name: "ABS_X".into(),
+                    min: -32768,
+                    max: 32767,
+                    flat: 128,
+                    fuzz: 16,
+                    value: -3,
+                }],
+                buttons: vec![PadKey {
+                    code: 0x130,
+                    name: "BTN_SOUTH".into(),
+                    pressed: false,
+                }],
+            }),
+        };
+        let frame = PadReport::Frame(PadFrame {
+            seq: 412,
+            at_us: 1_755_500_000_123_456,
+            since_us: Some(7_920),
+            events: vec![
+                PadEvent {
+                    kind: 3,
+                    code: 0,
+                    value: -1583,
+                    name: "ABS_X".into(),
+                },
+                PadEvent {
+                    kind: 0,
+                    code: 0,
+                    value: 0,
+                    name: "SYN_REPORT".into(),
+                },
+            ],
+            after_drop: false,
+            socket_dropped: 0,
+        });
+        let detached = PadReport::Detached {
+            why: "read failed: No such device (os error 19)".into(),
+        };
+
+        for report in [attached, frame, detached] {
+            let line = serde_json::to_string(&Request::notify_pad_report(&report)).unwrap();
+            assert!(line.contains(r#""method":"pad.report""#), "{line}");
+            let back: Request = serde_json::from_str(&line).unwrap();
+            assert!(back.is_notification(), "a report answers nothing");
+            assert_eq!(back.as_pad_report().unwrap(), report, "{line}");
+        }
+    }
+
+    /// The two counters that only ever mean bad news stay off a healthy frame, which is most of
+    /// them at 125 reports a second — and a reader must still see `false` and `0` rather than a
+    /// missing field it has to interpret.
+    #[test]
+    fn a_clean_frame_carries_neither_alarm() {
+        let clean = PadFrame {
+            seq: 1,
+            at_us: 10,
+            since_us: None,
+            events: vec![],
+            after_drop: false,
+            socket_dropped: 0,
+        };
+        let line = serde_json::to_string(&clean).unwrap();
+        assert!(!line.contains("after_drop"), "{line}");
+        assert!(!line.contains("socket_dropped"), "{line}");
+        assert!(!line.contains("since_us"), "{line}");
+        assert_eq!(serde_json::from_str::<PadFrame>(&line).unwrap(), clean);
+
+        let troubled = PadFrame {
+            after_drop: true,
+            socket_dropped: 3,
+            since_us: Some(640_000),
+            ..clean
+        };
+        let line = serde_json::to_string(&troubled).unwrap();
+        assert!(line.contains(r#""after_drop":true"#), "{line}");
+        assert!(line.contains(r#""socket_dropped":3"#), "{line}");
+        assert_eq!(serde_json::from_str::<PadFrame>(&line).unwrap(), troubled);
+    }
+
+    /// A pad on a cable is not a link with nothing wrong with it — it is a link that is not
+    /// there. `pad-link-test.sh` refuses to measure one, and the live view has to say the same.
+    #[test]
+    fn a_usb_pad_is_not_on_the_radio() {
+        let usb = PadInputDevice {
+            name: "Xbox Wireless Controller".into(),
+            node: "/dev/input/event5".into(),
+            unique: None,
+            bus: PadInputDevice::BUS_USB,
+            vendor: 0,
+            product: 0,
+            axes: vec![],
+            buttons: vec![],
+        };
+        assert!(!usb.over_bluetooth());
+        assert!(
+            PadInputDevice {
+                bus: PadInputDevice::BUS_BLUETOOTH,
+                ..usb
+            }
+            .over_bluetooth()
+        );
     }
 
     /// `move` and `loop` are Rust keywords, so the fields are renamed on the wire. A typo

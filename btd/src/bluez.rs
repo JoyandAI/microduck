@@ -23,6 +23,7 @@
 //! **Untested against hardware.** It type-checks for aarch64 and has never met a real central.
 //! Treat what follows as intent until someone connects a phone.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,13 +91,18 @@ const ADV_INTERVAL_MAX: Duration = Duration::from_millis(150);
 /// waiting for the motor bus rather than giving up on it.
 const ADAPTER_RETRY: Duration = Duration::from_secs(5);
 
-/// How long to wait for `configd` to say what the robot is called.
+/// How long to wait for `configd` to say what the robot is called, or what address it has.
 ///
 /// Nothing is blocked on the answer — unlike the PIN, where BlueZ holds a pairing exchange open —
 /// so this is generous enough to survive a loaded board rather than tuned for a spinner.
-const NAME_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// It bounds [`ask_address`] as much as [`ask_name`], and that matters more there: `net.status`
+/// costs `configd` a handful of D-Bus round trips to NetworkManager, and NetworkManager mid-scan is
+/// slow. A late answer costs one poll's worth of a stale address, which is what the fallback in
+/// those two functions is for.
+const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often the advertised name is reconciled with `configd`'s.
+/// How often the advertisement is reconciled with what `configd` says — the name, and the address.
 ///
 /// **Polled rather than event-driven, deliberately.** `btd` forwards `system.setName` to `configd`
 /// without reading the reply (`upstream::Pool` merges lines for the client, and interpreting them
@@ -109,7 +115,14 @@ const NAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// cost is a socket connect and one line every few seconds, forever, which is far below the noise
 /// floor of a daemon that already waits 73 seconds for a radio. A `system.*` notification from
 /// `configd` would be the tidier answer and is a protocol change nobody needs yet.
-const NAME_POLL: Duration = Duration::from_secs(5);
+///
+/// **The address is asked on the same tick, at the same cadence**, which is faster than a DHCP
+/// lease could ever move. Two questions rather than one is a second socket connect and a `net.status`
+/// that `configd` answers out of NetworkManager, and splitting the cadences would buy back some of
+/// that at the price of a second timer and an address that lags a `wifi connect` by half a minute.
+/// The robot has just been given a network at that moment, and the address is the thing whoever did
+/// it is waiting to read.
+const ADV_POLL: Duration = Duration::from_secs(5);
 
 /// Serve BLE for as long as this process lives, across an adapter that comes and goes.
 ///
@@ -211,11 +224,23 @@ async fn serve_on_an_adapter(
         None
     };
 
+    // `bd_addr` rather than `address`, because the advertisement now carries an IPv4 one too and a
+    // journal with both spelled `address` reads as one field contradicting itself.
+    //
+    // `max_adv_len` is logged because it is the budget `crate::adv` is written against: the payload
+    // fits 31 bytes, and a controller that reports less is the one place that assumption fails. It
+    // is the first thing to read if a robot ever advertises its name but no address.
     tracing::warn!(
         adapter = adapter.name(),
-        address = %adapter.address().await?,
+        bd_addr = %adapter.address().await?,
         service = %SERVICE_UUID,
         pairing = require_pairing,
+        max_adv_len = adapter
+            .supported_advertising_capabilities()
+            .await
+            .ok()
+            .flatten()
+            .map(|caps| caps.max_advertisement_length),
         "serving BLE"
     );
 
@@ -224,9 +249,15 @@ async fn serve_on_an_adapter(
     // carried `/etc/hostname` while `system.setName` wrote a name nothing ever read: every board
     // flashed from one image appeared as `radxa-zero3`, and renaming one changed nothing a phone
     // could see, not even after a restart.
-    let advertised = match &name.pinned {
-        Some(pinned) => pinned.clone(),
-        None => ask_name(&sockets, &name.fallback).await,
+    let advertised = Advertised {
+        name: match &name.pinned {
+            Some(pinned) => pinned.clone(),
+            None => ask_name(&sockets, &name.fallback).await,
+        },
+        // Asked before the first advertisement rather than left to the first reconcile tick: a
+        // robot that boots onto a network it already knows would otherwise broadcast `0.0.0.0` for
+        // the first few seconds, and a listing cannot tell that from a robot with no wifi at all.
+        address: ask_address(&sockets, None).await,
     };
     let handle = Some(advertise(&adapter, &advertised).await?);
 
@@ -287,7 +318,7 @@ async fn serve_on_an_adapter(
                     write: true,
                     // Write-without-response as well: a chunked request needs no ATT
                     // acknowledgement per chunk. A client that wants a *refusal* to be visible
-                    // must use the acknowledged form, which is why `btctl` does.
+                    // must use the acknowledged form, which is why `duck-btctl` does.
                     write_without_response: true,
                     encrypt_write: require_pairing,
                     // No `.await` between receiving a chunk and enqueueing it. BlueZ dispatches
@@ -440,58 +471,153 @@ async fn serve_on_an_adapter(
     // handles to nothing and advertising nothing, with no way back short of a restart nobody knew
     // to perform. Returning hands the caller a bring-up on the adapter's next appearance.
     //
-    // The name is reconciled *alongside* that wait rather than after it, so losing the adapter ends
-    // both: whichever finishes first ends the bring-up, and the reconcile is dropped with the
-    // advertisement handle it owns.
+    // The advertisement is reconciled *alongside* that wait rather than after it, so losing the
+    // adapter ends both: whichever finishes first ends the bring-up, and the reconcile is dropped
+    // with the advertisement handle it owns.
+    //
+    // It runs even when `--name` pins the name, because the address moves on its own and a pinned
+    // name never meant a frozen advertisement — before the address was in it, the two were the same
+    // thing. So the pin suppresses the *question*, not the loop.
     if name.pinned.is_some() {
-        tracing::info!(name = %advertised, "--name pins the advertisement; not reconciling");
-        watch_adapter(&adapter).await;
-    } else {
-        tokio::select! {
-            () = watch_adapter(&adapter) => {}
-            // Never completes on its own.
-            () = reconcile_name(&adapter, &for_reconcile, advertised, handle) => {}
-        }
+        tracing::info!(
+            name = %advertised.name,
+            "--name pins the advertised name; only the address is reconciled"
+        );
+    }
+    tokio::select! {
+        () = watch_adapter(&adapter) => {}
+        // Never completes on its own.
+        () = reconcile_advertisement(
+            &adapter,
+            &for_reconcile,
+            advertised,
+            name.pinned.is_some(),
+            handle,
+        ) => {}
     }
     Ok(())
 }
 
-/// Advertise the service under `name`.
+/// What the advertisement says about the robot: what it is called, and where it is on the network.
+///
+/// One struct rather than two arguments threaded through the reconcile loop, so that "has anything
+/// moved" is one comparison. Adding a third field would otherwise mean finding every place that
+/// compares the pair — and `crate::adv` explains why there is no room for a third field anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Advertised {
+    name: String,
+    /// `None` is a robot with no IPv4 address, which goes out as `0.0.0.0` — see [`crate::adv`] for
+    /// why the field is broadcast either way.
+    address: Option<Ipv4Addr>,
+}
+
+impl std::fmt::Display for Advertised {
+    /// For the journal, where the interesting line is the one that says what changed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.address {
+            Some(address) => write!(f, "{} at {address}", self.name),
+            None => write!(f, "{} with no address", self.name),
+        }
+    }
+}
+
+/// Advertise the service under this name and address, and make the name the adapter's too.
 ///
 /// The handle deregisters on drop, so the caller holds it for as long as the robot should be
 /// visible.
+///
+/// **Both names, because a robot has two and only one of them used to be set.** The advertisement
+/// carries a Local Name; the adapter separately serves a GAP Device Name (`0x2A00`), which BlueZ
+/// takes from `Adapter.Alias` and which defaults to the hostname. So a renamed robot advertised
+/// `duck-5b21` while answering `radxa-zero3` to anyone who read the characteristic — and a client
+/// that read it kept the answer:
+///
+/// - **BlueZ caches it over the advertised name.** `Device1.Name` is what `btleplug` reports, so
+///   on Linux a robot is `duck-5b21` until the first connection and `radxa-zero3` after it, and
+///   `duck-btctl --name duck-5b21` then finds nothing. Two scans a minute apart disagreed;
+/// - **CoreBluetooth keeps both**, and `btleplug` joins them as `radxa-zero3 [duck-5b21]`;
+/// - **a phone's Bluetooth settings shows the GAP name**, which is the case that matters most and
+///   the one nothing in this repo could see.
+///
+/// Setting the alias is therefore part of naming the robot rather than a nicety, and it belongs
+/// here so that no path can publish a name without it: [`reconcile_advertisement`] re-advertises on
+/// every rename and comes through this function to do it. The alias persists in BlueZ's own state,
+/// so the write is skipped when it already says the right thing.
+///
+/// A failure to set it is logged and not propagated. The alias is worth less than being visible at
+/// all, and returning an error here would take the advertisement down with it.
+///
+/// **The address field is dropped rather than allowed to fail the registration.** The arithmetic in
+/// [`crate::adv`] says the payload fits, but the byte that overflows a legacy advertisement is the
+/// controller's to count, not ours — and BlueZ refuses the whole registration when it does not fit.
+/// On a robot whose only front door may be BLE, that trade is not close: an advertisement with no
+/// address is a robot someone can still reach, and a refused one is a robot that has gone dark. Same
+/// reasoning as the alias above, one step further down.
 async fn advertise(
     adapter: &bluer::Adapter,
-    name: &str,
+    advertised: &Advertised,
 ) -> bluer::Result<bluer::adv::AdvertisementHandle> {
-    adapter
-        .advertise(Advertisement {
-            service_uuids: [SERVICE_UUID].into_iter().collect(),
-            discoverable: Some(true),
-            local_name: Some(name.to_owned()),
-            min_interval: Some(ADV_INTERVAL_MIN),
-            max_interval: Some(ADV_INTERVAL_MAX),
-            ..Default::default()
-        })
-        .await
+    let name = advertised.name.as_str();
+    if adapter.alias().await.ok().as_deref() != Some(name)
+        && let Err(e) = adapter.set_alias(name.to_owned()).await
+    {
+        tracing::warn!(error = %e, name, "cannot set the adapter alias; the GAP name stays stale");
+    }
+
+    let advertisement = |address: Option<Vec<u8>>| Advertisement {
+        service_uuids: [SERVICE_UUID].into_iter().collect(),
+        manufacturer_data: address
+            .map(|data| [(crate::adv::COMPANY_ID, data)].into_iter().collect())
+            .unwrap_or_default(),
+        discoverable: Some(true),
+        local_name: Some(name.to_owned()),
+        min_interval: Some(ADV_INTERVAL_MIN),
+        max_interval: Some(ADV_INTERVAL_MAX),
+        ..Default::default()
+    };
+
+    let with_address = advertisement(Some(crate::adv::address_data(advertised.address)));
+    match adapter.advertise(with_address).await {
+        Ok(handle) => Ok(handle),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "BlueZ refused the advertisement carrying the address; retrying without it, so \
+                 `duck-btctl scan` will show this robot with no address at all"
+            );
+            adapter.advertise(advertisement(None)).await
+        }
+    }
 }
 
-/// Keep the advertised name in step with `configd`'s. Never returns.
+/// Keep the advertisement in step with what `configd` says — name and address. Never returns.
 ///
-/// Owns the advertisement handle, because changing the name means deregistering one advertisement
-/// and registering another — nothing else may be holding it while that happens.
-async fn reconcile_name(
+/// Owns the advertisement handle, because changing either means deregistering one advertisement and
+/// registering another — nothing else may be holding it while that happens.
+///
+/// `pinned_name` is `--name`: the name is then this process's own and there is nobody to ask about
+/// it, so only the address is reconciled. The loop still runs, because a pinned name does not pin a
+/// DHCP lease.
+async fn reconcile_advertisement(
     adapter: &bluer::Adapter,
     sockets: &Sockets,
-    mut advertised: String,
+    mut advertised: Advertised,
+    pinned_name: bool,
     mut handle: Option<bluer::adv::AdvertisementHandle>,
 ) {
     loop {
-        tokio::time::sleep(NAME_POLL).await;
+        tokio::time::sleep(ADV_POLL).await;
 
-        let current = ask_name(sockets, &advertised).await;
+        let current = Advertised {
+            name: if pinned_name {
+                advertised.name.clone()
+            } else {
+                ask_name(sockets, &advertised.name).await
+            },
+            address: ask_address(sockets, advertised.address).await,
+        };
         // `handle` is `None` only after a failed re-advertise, and then the robot is invisible —
-        // so retry regardless of whether the name moved.
+        // so retry regardless of whether anything moved.
         if current == advertised && handle.is_some() {
             continue;
         }
@@ -504,16 +630,16 @@ async fn reconcile_name(
         match advertise(adapter, &current).await {
             Ok(new) => {
                 if current == advertised {
-                    tracing::info!(name = %current, "advertising again after a failure");
+                    tracing::info!(advertising = %current, "advertising again after a failure");
                 } else {
-                    tracing::info!(from = %advertised, to = %current, "renamed; advertising");
+                    tracing::info!(from = %advertised, to = %current, "advertisement changed");
                 }
                 handle = Some(new);
                 advertised = current;
             }
             // Left for the next tick rather than fatal, and never propagated: this is inside a
             // bring-up whose whole point is that radio faults do not end the process.
-            Err(e) => tracing::error!(error = %e, name = %current, "cannot advertise"),
+            Err(e) => tracing::error!(error = %e, advertising = %current, "cannot advertise"),
         }
     }
 }
@@ -530,7 +656,7 @@ async fn ask_name(sockets: &Sockets, fallback: &str) -> String {
         "configd",
         socket,
         &duck_ipc_proto::Call::SystemInfo,
-        NAME_TIMEOUT,
+        ASK_TIMEOUT,
     )
     .await
     .and_then(|response| {
@@ -542,6 +668,49 @@ async fn ask_name(sockets: &Sockets, fallback: &str) -> String {
         Err(e) => {
             tracing::debug!(error = %e, fallback, "configd would not say the robot's name");
             fallback.to_owned()
+        }
+    }
+}
+
+/// What `configd` says the robot's IPv4 address is, or `last` if it will not say.
+///
+/// **The two failures are not the same answer, and conflating them made the advertisement flap.**
+/// `configd` reporting no address is a robot that is not on wifi, and that clears the field.
+/// `configd` not answering — restarting, or NetworkManager taking longer than [`ASK_TIMEOUT`] —
+/// says nothing about the robot's network, and clearing the field on it would deregister and
+/// re-register the advertisement on every tick for as long as the outage lasted, with a client
+/// watching the address blink. So an outage keeps the last known address, exactly as [`ask_name`]
+/// keeps the last known name.
+///
+/// Only IPv4, because only IPv4 fits — see [`crate::adv`].
+///
+/// `debug` rather than `warn` for the same reason as [`ask_name`]: this runs every few seconds.
+async fn ask_address(sockets: &Sockets, last: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    let socket = sockets.path(crate::route::Upstream::Config);
+    match crate::upstream::ask(
+        "configd",
+        socket,
+        &duck_ipc_proto::Call::NetStatus,
+        ASK_TIMEOUT,
+    )
+    .await
+    .and_then(|response| {
+        response
+            .result_as::<duck_ipc_proto::NetStatusResult>()
+            .map_err(|e| e.to_string())
+    }) {
+        // Parsed rather than trusted: `ip4` is whatever NetworkManager put in `address-data`, and a
+        // string this cannot parse is not something to broadcast four bytes of.
+        Ok(status) => status.ip4.and_then(|address| match address.parse() {
+            Ok(address) => Some(address),
+            Err(e) => {
+                tracing::warn!(error = %e, address, "configd reported an unparseable IPv4 address");
+                None
+            }
+        }),
+        Err(e) => {
+            tracing::debug!(error = %e, "configd would not say the robot's address");
+            last
         }
     }
 }
