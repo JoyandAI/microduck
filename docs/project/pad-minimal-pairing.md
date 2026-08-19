@@ -129,14 +129,23 @@ scp scripts/setup-board.sh scripts/migrate-network.sh pierre@BOARD:~/
 | step | what it adds | pad pairs? | notes |
 |---|---|---|---|
 | 0 | nothing — the minimal sequence above | yes | the control |
-| 1 | `sudo sh ~/setup-board.sh` — overlays, `console=display`, getty mask, onnxruntime | | |
-| 2 | `sudo sh ~/migrate-network.sh` — netplan → NetworkManager | | |
-| 3 | `sudo -E sh ~/install.sh`, then `systemctl disable --now updaterd robotd configd btd padd` | | |
+| 1 | `sudo sh ~/setup-board.sh` — overlays, `console=display`, getty mask, onnxruntime | **yes** | |
+| 2 | `sudo sh ~/migrate-network.sh` — netplan → NetworkManager | **yes** | |
+| 3 | `sudo -E sh ~/install.sh` | **no** | the bisect point |
 | 4 | `systemctl enable --now updaterd` | | |
 | 5 | `... robotd` | | |
 | 6 | `... configd` | | |
 | 7 | `... btd` | | |
 | 8 | `... padd` | | |
+
+Ran 2026-08-19, pairing manually with `bluetoothctl` at each step and removing the pad again
+afterwards. Steps 1 and 2 bond fine; `install.sh` is where it stops. So the board bring-up, the
+device-tree overlays, the console move and the NetworkManager cutover are all exonerated.
+
+What is left to split inside `install.sh`: the files it writes, versus the five daemons it starts.
+`systemctl disable --now updaterd robotd configd btd padd` and a reboot separates them. `btd` is
+the one to enable first — it is the only one that touches BlueZ, advertising as a peripheral,
+setting `Pairable`, and holding the default pairing agent.
 
 Reboot after each step, and clear **both** halves of the bond before each attempt: `pad forget`
 or `bluetoothctl remove` on the board, and the pad held in pairing mode. An Xbox pad keeps one
