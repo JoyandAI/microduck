@@ -156,7 +156,7 @@ impl Pool {
     pub async fn send(&mut self, upstream: Upstream, lane: Lane, line: &str) -> io::Result<()> {
         let key = (upstream, lane);
         if !self.conns.contains_key(&key) {
-            let conn = self.open(upstream).await?;
+            let conn = self.open(upstream, lane).await?;
             self.conns.insert(key, conn);
         }
 
@@ -190,7 +190,7 @@ impl Pool {
         }
     }
 
-    async fn open(&self, upstream: Upstream) -> io::Result<Conn> {
+    async fn open(&self, upstream: Upstream, lane: Lane) -> io::Result<Conn> {
         let path = self.sockets.path(upstream);
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(path))
             .await
@@ -198,7 +198,10 @@ impl Pool {
 
         let (read, write) = stream.into_split();
         let replies = self.replies.clone();
-        let label = format!("{upstream:?}");
+        // The lane is in the label because there are now several connections to each service,
+        // and "Updater closed" without it names four possible sockets — including the progress
+        // stream, whose closing is ordinary, and the operation lane, whose closing is not.
+        let label = format!("{upstream:?}/{lane:?}");
 
         // The read half is pumped for the session's lifetime. Responses and notifications are
         // the same thing to us: a line to forward. That is what makes `update.subscribe`'s
@@ -225,7 +228,7 @@ impl Pool {
             tracing::debug!(upstream = %label, "upstream closed");
         });
 
-        tracing::debug!(upstream = ?upstream, path = %path.display(), "connected");
+        tracing::debug!(upstream = ?upstream, lane = ?lane, path = %path.display(), "connected");
         Ok(Conn { write })
     }
 }
