@@ -106,6 +106,12 @@ FORCE_REINSTALL="$ENV_FORCE"
 # `setup-board.sh` for the split this exists for.
 WEIRD_BLE="$ENV_WEIRD_BLE"
 
+# The branch the operator asked for, or empty. Kept apart from `REF` because they answer different
+# questions: `REF` is always set — it defaults to `main` — and says where the *scripts* come from,
+# while this says whether a *branch build of the daemon* was asked for. Provisioning plainly with no
+# `--ref` must install the stable release, not `main`'s dev build.
+ASKED_REF="$ENV_REF"
+
 # ── paths ────────────────────────────────────────────────────────────────────
 
 SELF=/usr/local/sbin/robot-provision
@@ -220,6 +226,7 @@ save_state() {
         printf 'DUCK_FORCE_REINSTALL=%s\n' "$FORCE_REINSTALL"
         printf 'DUCK_NAME=%s\n' "$NAME"
         printf 'DUCK_WEIRD_BLE=%s\n' "$WEIRD_BLE"
+        printf 'DUCK_ASKED_REF=%s\n' "$ASKED_REF"
         printf 'PROVISION_BOOT_ID=%s\n' "$(boot_id)"
     } > "$STATE"
 }
@@ -240,6 +247,7 @@ load_state() {
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
     NAME="${ENV_NAME:-${DUCK_NAME:-}}"
     WEIRD_BLE="${ENV_WEIRD_BLE:-${DUCK_WEIRD_BLE:-}}"
+    ASKED_REF="${ENV_REF:-${DUCK_ASKED_REF:-}}"
     RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
     return 0
 }
@@ -522,9 +530,56 @@ phase_two() {
     fi
     sh "$tmp"
 
+    apply_asked_ref
     name_the_robot
 
     finish
+}
+
+# Install the daemon that `--ref BRANCH` last built, when a branch was asked for.
+#
+# `install.sh` cannot do this itself: it resolves the release through GitHub`s `/releases/latest`,
+# which excludes pre-releases, and every branch build is one. So provisioning brings the board up on
+# the stable release and this puts the branch build on top — which is also the right arrangement
+# rather than a workaround. The first release installed becomes **golden**, the boot recovery net`s
+# fallback, and a branch build as golden would give a broken branch a broken fallback. This way
+# `golden` stays stable and `current` is the branch.
+#
+# **Fatal, not a warning.** A dev board asked to run a branch and quietly running the stable release
+# instead is the failure that is worst to debug: everything looks installed and the code under test
+# is not there. Better to stop with the reason.
+#
+# The check is on what is *running*, not on the exit status, because `apply` has a health gate: a
+# branch build that fails it is rolled back to stable and the apply reports that honestly — leaving
+# exactly the silent board this exists to prevent.
+apply_asked_ref() {
+    [ -n "$ASKED_REF" ] || return 0
+
+    say "installing the daemon that ${ASKED_REF} last built"
+    if ! robotctl update apply daemon --ref "$ASKED_REF"; then
+        die "could not install the ${ASKED_REF} build of the daemon.
+  This board is running the stable release, which is not what was asked for. Common causes:
+    - CI has not published it yet. A push builds for a minute or two; check:
+        gh run list --branch ${ASKED_REF}
+    - this is not a dev board, so a dev-signed build is refused. Provisioning installs the key
+      unless --no-dev-key was passed:  grep -c 'DEV BOARD' ${LOG}
+    - the branch has no build at all, which is normal for a docs-only branch.
+  Then:  sudo robotctl update apply daemon --ref ${ASKED_REF}"
+    fi
+
+    live="$(readlink /opt/robot/daemon/current 2>/dev/null | sed 's|releases/||')"
+    case "$live" in
+        *-dev.*)
+            say "running ${live}"
+            ;;
+        *)
+            die "asked for ${ASKED_REF} and this board is running ${live}.
+  The apply was accepted and then rolled back, which means the branch build failed its health
+  gate. The board is on the stable release and working; the branch is what needs looking at:
+    journalctl -u updaterd -b --no-pager
+    journalctl -u robotd -b --no-pager"
+            ;;
+    esac
 }
 
 # Give this board the name the operator asked for, if they asked for one.

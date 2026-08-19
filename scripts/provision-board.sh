@@ -17,11 +17,11 @@
 # come back, streams the log the unattended half writes, and ends on `robotctl health` — so
 # provisioning is one command with continuous output instead of three with a gap.
 #
-#   --ref BRANCH      take the provisioning *scripts* from a branch instead of main.
-#                     NOT the daemon: install.sh resolves the release through
-#                     /releases/latest, which excludes pre-releases, so a branch build is
-#                     never what gets installed. Put one on afterwards with
-#                     `sudo robotctl update apply daemon --ref BRANCH`.
+#   --ref BRANCH      provision from a branch: its scripts run the bring-up, and its build of
+#                     the daemon is installed on top of the stable release. Provisioning FAILS
+#                     if that build cannot be installed or is rolled back — a dev board quietly
+#                     running stable when a branch was asked for is worse than a clear stop.
+#                     Needs the branch build to exist, so give CI its minute or two first.
 #   --forget-host-key drop this host's key from known_hosts first. Reflashing the card
 #                     regenerates the board's host keys, so the same address then presents a
 #                     different one and ssh refuses outright — see `probe`.

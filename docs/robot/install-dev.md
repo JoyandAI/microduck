@@ -61,12 +61,15 @@ nothing, and you can pick the log back up:
 ssh -t radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
 ```
 
-`--ref BRANCH` takes the provisioning **scripts** from a branch — `provision.sh`,
-`setup-board.sh`, `migrate-network.sh`, `install.sh`. It does **not** install that branch's daemon:
-`install.sh` resolves the release through GitHub's `/releases/latest`, which excludes pre-releases,
-and every branch build is one. So a board provisioned with `--ref BRANCH` comes up running the
-stable release with that branch's scripts, which is a genuinely useful thing and not the whole test.
-Put the branch's daemon on afterwards, as below.
+`--ref BRANCH` provisions from a branch: its scripts run the bring-up, and its build of the daemon
+is installed on top. `golden` stays the stable release — it is the boot recovery net's fallback, and
+a branch build as golden would give a broken branch a broken fallback — while `current` is the
+branch.
+
+Provisioning **fails** if that build cannot be installed, or if it is installed and then rolled back
+by the health gate. A dev board quietly running the stable release when a branch was asked for is the
+worst failure to debug: everything looks installed and the code under test is not there. Give CI its
+minute or two before provisioning, and check with `gh run list --branch BRANCH` if it stops.
 
 Other useful flags: `--local` sends this clone's
 `provision.sh` instead of fetching it (which is how to test a change to the provisioning scripts
