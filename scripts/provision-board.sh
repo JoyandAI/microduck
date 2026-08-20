@@ -37,9 +37,16 @@
 #                     deploy/dev-key/team.dev.pub.
 #   --dev-key PATH    somewhere else to find it.
 #   --no-ble          do not use Bluetooth to re-find the board. See below for what that costs.
-#   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all. Sets
-#                     `Privacy = device` and leaves /var/lib/robot/weird-ble, which makes
-#                     `robotctl pad pair` stop `btd` and power-cycle the adapter for a pairing.
+#   --pause-btd-on-pair
+#                     for a Radxa Zero 3W that pairs a gamepad only while `btd` is out of the way.
+#                     Leaves /var/lib/robot/weird-ble, which makes `robotctl pad pair` stop `btd`
+#                     and power-cycle the adapter for the pairing window — and **does not touch
+#                     `Privacy`**. This is what a board wants when a pad pairs and then flaps with
+#                     `PIN or Key Missing`: that is `Privacy = device` on a board that needed only
+#                     the pause. Try this before `--weird-ble`.
+#   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all, even with
+#                     `btd` paused. Implies `--pause-btd-on-pair`, and additionally sets
+#                     `Privacy = device`.
 #                     **The default in docs/robot/install-dev.md**, because about half these
 #                     boards need it and nothing measurable says which — and a board that needed
 #                     it and did not get it presents as a pad that will not pair, for no visible
@@ -98,6 +105,7 @@ NO_DEV_KEY=""
 USE_LOCAL=""
 NO_BLE=""
 WEIRD_BLE=""
+PAUSE_BTD=""
 # The name to give the robot. Not `BLE_NAME` below, which points the other way: the name this board
 # already answers to, used to find it again after the reboot.
 ROBOT_NAME=""
@@ -172,6 +180,7 @@ while [ $# -gt 0 ]; do
         --no-dev-key) NO_DEV_KEY=1; shift ;;
         --no-ble)     NO_BLE=1; shift ;;
         --weird-ble)  WEIRD_BLE=1; shift ;;
+        --pause-btd-on-pair) PAUSE_BTD=1; shift ;;
         --local)      USE_LOCAL=1; shift ;;
         -h|--help)    usage 0 ;;
         -*)           die "unknown option: $1" ;;
@@ -674,6 +683,7 @@ _env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
 [ -z "$REF" ]     || _env="${_env} DUCK_REF='${REF}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
 [ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
+[ -z "$PAUSE_BTD" ]  || _env="${_env} DUCK_PAUSE_BTD=1"
 
 # The name is a flag rather than one more `DUCK_*`, because on the board it goes no further than
 # `robotctl system set-name`. Single-quoted with any quote of its own escaped: a name is free text,
