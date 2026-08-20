@@ -31,7 +31,7 @@ use ratatui::widgets::{
     Block, Cell, Paragraph, RenderDirection, Row, Sparkline, Table, TableState,
 };
 
-use crate::{Client, Failure, exit};
+use crate::{Client, Failure, duck, exit};
 
 /// Tracking error at the edge of a deviation bar, radians.
 ///
@@ -101,6 +101,17 @@ const GAP_SAMPLES: usize = 600;
 /// five seconds between attempts, so this will usually catch it on the second or third try — and
 /// short enough that a pad tap started after the monitor turns up while somebody is still watching.
 const PAD_RETRY: Duration = Duration::from_secs(2);
+
+/// Columns the tables keep for themselves before the 3D robot view gets any: the joints
+/// table with its bar, plus borders and slack. The view only ever eats width the tables
+/// were not using, so opening it never truncates a number.
+const DUCK_MAIN_MIN: u16 = 84;
+
+/// The robot view's width, columns. Below the minimum a duck is a smudge, so the view
+/// silently waits for a wider terminal rather than drawing one; past the maximum the
+/// extra cells stop adding legibility and the tables can breathe instead.
+const DUCK_MIN_WIDTH: u16 = 26;
+const DUCK_MAX_WIDTH: u16 = 62;
 
 /// Gaps the cadence figure is averaged over.
 ///
@@ -507,6 +518,20 @@ fn live(
                         view.toggle_pad();
                         fresh = true;
                     }
+                    // The 3D robot view. On by default — it appears whenever the
+                    // terminal is wide enough — so the key mostly exists to turn it off.
+                    KeyCode::Char('d') => {
+                        view.toggle_duck();
+                        fresh = true;
+                    }
+                    KeyCode::Char('[') => {
+                        view.orbit_duck(-0.25);
+                        fresh = true;
+                    }
+                    KeyCode::Char(']') => {
+                        view.orbit_duck(0.25);
+                        fresh = true;
+                    }
                     _ => {}
                 },
                 // A resize changes what fits, and the next frame may be a whole period away.
@@ -770,6 +795,11 @@ struct View {
     /// Why there is no robot stream, when there is none. `None` means one is connected, so an
     /// absent state is merely one that has not arrived yet.
     no_robot: Option<String>,
+    /// The 3D robot view's camera and pixel cache.
+    duck: duck::DuckView,
+    /// Is the robot view wanted? Distinct from whether it is *drawn*: it also needs a
+    /// state to pose from, a terminal wide enough, and a model that parsed.
+    show_duck: bool,
 }
 
 impl View {
@@ -788,6 +818,8 @@ impl View {
             pad: PadView::default(),
             show_pad: no_robot.is_some(),
             no_robot,
+            duck: duck::DuckView::new(),
+            show_duck: true,
         }
     }
 
@@ -797,6 +829,14 @@ impl View {
 
     fn toggle_pad(&mut self) {
         self.show_pad = !self.show_pad;
+    }
+
+    fn toggle_duck(&mut self) {
+        self.show_duck = !self.show_duck;
+    }
+
+    fn orbit_duck(&mut self, radians: f32) {
+        self.duck.orbit(radians);
     }
 
     /// Move the joint window. Clamped on render, where the number of rows that fit is known.
@@ -892,6 +932,11 @@ impl View {
         // number that says whether the others can be trusted at all. Capped at six because a
         // mostly-flat rate drawn twenty rows tall is a wall of ink, not more information.
         //
+        // The 3D view takes the right edge first, when it is wanted and there is room —
+        // width the tables were never using — and everything below lays out in what is
+        // left, exactly as it did before the view existed.
+        let (area, duck) = self.duck_split(area);
+
         // The pad block, when open, sits directly under the header rather than at the bottom: it is
         // the *source* of the command the header reports, and the frame then reads top to bottom in
         // the order the robot does — sticks, command, joints, loop rate.
@@ -925,6 +970,49 @@ impl View {
             &mut TableState::new().with_offset(scroll),
         );
         frame.render_widget(self.trace(), trace);
+        if let Some(duck) = duck {
+            self.render_duck(frame, duck);
+        }
+    }
+
+    /// Carve the robot view's column off the right, when it is wanted and fits.
+    fn duck_split(
+        &self,
+        area: ratatui::layout::Rect,
+    ) -> (ratatui::layout::Rect, Option<ratatui::layout::Rect>) {
+        if !self.show_duck || duck::model().is_none() {
+            return (area, None);
+        }
+        let spare = area.width.saturating_sub(DUCK_MAIN_MIN);
+        if spare < DUCK_MIN_WIDTH {
+            return (area, None);
+        }
+        let [main, duck] = Layout::horizontal([
+            Constraint::Min(DUCK_MAIN_MIN),
+            Constraint::Length(spare.min(DUCK_MAX_WIDTH)),
+        ])
+        .areas(area);
+        (main, Some(duck))
+    }
+
+    /// The robot, drawn: the baked sim model posed by the measured joints and tilted by
+    /// the IMU. See [`duck`] for what this is for and how it stays cheap.
+    fn render_duck(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let (Some(model), Some(state)) = (duck::model(), self.latest.as_ref()) else {
+            return;
+        };
+        let block = Block::bordered()
+            .title(" robot ")
+            .title_bottom(Line::from(" d hides · [ ] orbits ").dim().right_aligned());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.duck.draw(
+            model,
+            &state.joints,
+            state.safety.gravity,
+            inner,
+            frame.buffer_mut(),
+        );
     }
 
     /// The whole-robot block: what was asked of it, what it did, and what it can feel.
@@ -948,13 +1036,20 @@ impl View {
             .title_top(
                 // The units key is named next to the others because a reader who does not know
                 // it exists has no way to discover that the numbers could be radians instead.
+                // The robot view is only named here while it is hidden: visible, it
+                // carries its own caption, and this title clips on a narrow terminal.
                 Line::from(format!(
-                    " q quits · ↑↓ scrolls · u {} · p {} ",
+                    " q quits · ↑↓ scrolls · u {} · p {}{} ",
                     self.units.toggled().name(),
                     if self.show_pad {
                         "hides the pad"
                     } else {
                         "the raw pad"
+                    },
+                    if self.show_duck {
+                        ""
+                    } else {
+                        " · d the robot"
                     }
                 ))
                 .dim()
@@ -2367,6 +2462,9 @@ mod tests {
     /// A view with a pad attached and the block open.
     fn watching_a_pad() -> View {
         let mut view = View::new(20, None);
+        // The subject here is the pad: the robot view is on by default, and the width
+        // it takes at 110 columns is width these goldens assume the pad block has.
+        view.toggle_duck();
         assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
         feed(
             &mut view,
@@ -2740,6 +2838,9 @@ mod tests {
         let mut view = View::new(20, None);
         feed(&mut view, Update::State(Box::new(a_state())));
         view.toggle_pad();
+        // The sentence under test sits at the clipped end of the pad's title; the robot
+        // view would take the columns it is asserted into.
+        view.toggle_duck();
         feed(
             &mut view,
             Update::Pad(Box::new(proto::PadReport::Attached {
