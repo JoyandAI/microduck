@@ -391,16 +391,17 @@ fn main() -> std::process::ExitCode {
         // request lands near the end of the current one, so "held" is spelled "resent every
         // tick" — as a notification, because fifty answered requests a second would spend
         // their time waiting on replies, and the press above already got the real answer.
-        if pad.is_pressed(Button::West) && !roulade {
-            if let Err(e) = notify(
+        if pad.is_pressed(Button::West)
+            && !roulade
+            && let Err(e) = notify(
                 &mut stream,
                 &proto::Call::RobotDo(proto::DoParams {
                     skill: proto::Skill::Roulade,
                 }),
-            ) {
-                tracing::error!(error = %e, "send failed");
-                return std::process::ExitCode::FAILURE;
-            }
+            )
+        {
+            tracing::error!(error = %e, "send failed");
+            return std::process::ExitCode::FAILURE;
         }
 
         // Select held two seconds: sit down, then power off. Sent once per hold — the
