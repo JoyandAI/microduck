@@ -258,6 +258,12 @@ struct RobotState {
     policy_kick_left: Option<String>,
     policy_kick_right: Option<String>,
     policy_roulade: Option<String>,
+    /// Whether this robot can make a sound at all: audio enabled, and a bank with wavs in
+    /// it. Same job as the `policy_*` fields above — false is "this robot cannot do that",
+    /// which is what lets `dispatch` refuse a `robot.sound` with a reason instead of
+    /// accepting it into silence. Read once at startup, like the policies: the postinstall
+    /// renders the bank and restarts robotd, so a bank cannot appear under a running one.
+    has_voice: bool,
     /// `walk` or `roller` — constant for the life of the process; `robot.mode` reports it.
     mode: &'static str,
     /// Whether a fall preempts anything (`fall_limp` or `fall_recover`). When false —
@@ -314,6 +320,7 @@ impl RobotState {
             policy_kick_left: named_policy(params, |p| p.kick_left.clone()),
             policy_kick_right: named_policy(params, |p| p.kick_right.clone()),
             policy_roulade: named_policy(params, |p| p.roulade.clone()),
+            has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             mode: params.policy.mode.as_str(),
             fall_gate: params.safety.fall_limp || params.safety.fall_recover,
             fallen: AtomicBool::new(false),
@@ -1067,7 +1074,7 @@ async fn control_loop<T: RobotIo>(
         && model.exists()
     {
         match pet_detect::worker::PetHandle::spawn(pet_detect::worker::PetConfig {
-            alsa_device: format!("{},0", params.audio.device),
+            alsa_device: params.audio.capture_device(),
             model_path: model.clone(),
             enter_threshold: params.audio.pet_enter_threshold,
             exit_threshold: params.audio.pet_exit_threshold,
@@ -1233,14 +1240,21 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
-        // Sounds: one-shot tags queued by clients, and the wheee hold as a level — held
-        // only while `padd`'s re-notifications stay fresh, so a client that dies mid-ride
-        // leaves a ride that lands instead of looping forever.
+        // Sounds: the wheee hold as a level, then the one-shot tags queued by clients. In
+        // that order, because the ride owns the PCM while it lasts — the one-shots have to
+        // see the ride this tick started (they wait) or the release this tick did (they
+        // play). The hold is held only while `padd`'s re-notifications stay fresh; a client
+        // that dies mid-ride leaves a ride that lands rather than one that loops forever.
         if let Some(voice) = voice.as_mut() {
+            let hold = if powered_off {
+                intents::WheeeHold::Released
+            } else {
+                intents.wheee_hold()
+            };
+            voice.wheee(hold);
             for tag in intents.take_sounds() {
                 voice.play(tag.as_str(), false);
             }
-            voice.wheee(intents.wheee_held() && !powered_off);
 
             // Petting: coo, exactly when the prototype coos — not fallen, no scripted move
             // in flight. The verdict is used bare here (not the armed fall gate): this is a
@@ -1683,6 +1697,21 @@ fn named_policy(
     pick(&policy).as_deref().and_then(file_name)
 }
 
+/// Whether a voice bank has anything to play. One directory walk at startup: the bank is a
+/// tree of per-tag directories, and an empty one (postinstall's `ensure-bank` failed, which
+/// the hook deliberately downgrades to a warning) is exactly the case a `robot.sound` must
+/// not answer "accepted" to.
+fn has_any_wav(bank: &std::path::Path) -> bool {
+    let Ok(tags) = std::fs::read_dir(bank) else {
+        return false;
+    };
+    tags.filter_map(Result::ok).any(|tag| {
+        std::fs::read_dir(tag.path()).is_ok_and(|mut wavs| {
+            wavs.any(|w| w.is_ok_and(|w| w.path().extension().is_some_and(|ext| ext == "wav")))
+        })
+    })
+}
+
 fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
     use duck_control::safety::Limit;
     match limit {
@@ -1983,12 +2012,25 @@ fn dispatch(
             proto::Response::ok(Some(id), &result)
         }
 
-        // A sound is queued for the loop's next tick, and never refused: unlike a skill it
-        // moves nothing, and a chirp out of a fallen robot is diagnostics, not danger. A
-        // robot with audio disabled just stays quiet.
+        // A sound is queued for the loop's next tick. Never refused for *circumstance* —
+        // unlike a skill it moves nothing, and a chirp out of a fallen robot is
+        // diagnostics, not danger — but refused when this robot has no voice at all, the
+        // same way `robot.do` refuses a skill that was never configured.
+        //
+        // That refusal is the whole value of `robotctl quack`: its job is to tell you which
+        // duck you are talking to, and an accepted-then-silent quack inverts the answer —
+        // you hear nothing, conclude you are on the wrong duck, and go looking.
         proto::Call::RobotSound(p) => {
-            intents.request_sound(*p);
-            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+            let result = if state.has_voice {
+                intents.request_sound(*p);
+                proto::IntentResult::accepted()
+            } else {
+                proto::IntentResult::refused(
+                    "this robot has no voice: audio is disabled, or its bank is empty \
+                     (run `sounds ensure-bank`)",
+                )
+            };
+            proto::Response::ok(Some(id), &result)
         }
 
         // Sit, then power the machine off. Never refused for being inconvenient — a robot
@@ -2355,6 +2397,56 @@ mod tests {
             .result_as()
             .expect("robot.mode must deserialize as ModeResult");
         assert_eq!(mode.mode, "walk");
+    }
+
+    /// `robotctl quack` exists to answer "which duck am I talking to", and it answers by
+    /// making a noise. A robot that cannot make one must say so — accepting the call and
+    /// staying silent inverts the answer, sending whoever asked off to look for a duck they
+    /// were already connected to.
+    #[test]
+    fn robot_sound_is_refused_by_a_robot_with_no_voice() {
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+        let quack = || {
+            proto::Call::RobotSound(proto::SoundParams {
+                tag: proto::SoundTag::Chirp,
+                hold: None,
+            })
+        };
+
+        // Audio off: the robot is quiet by configuration, and says so.
+        let mut params = Params::default();
+        params.audio.enabled = false;
+        let mute = RobotState::new(&params, false, false);
+        let refused: proto::IntentResult = dispatch(&mute, &intents, id(), &quack())
+            .result_as()
+            .unwrap();
+        assert!(!refused.accepted);
+        assert!(refused.reason.is_some(), "a refusal must say why");
+        assert!(intents.take_sounds().is_empty(), "a refusal must not queue");
+
+        // Audio on, but the bank never rendered (`ensure-bank` failed, which the
+        // postinstall downgrades to a warning): same silence, so the same answer.
+        let empty = std::env::temp_dir().join(format!("bank-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let mut params = Params::default();
+        params.audio.bank = empty.clone();
+        let bankless = RobotState::new(&params, false, false);
+        let refused: proto::IntentResult = dispatch(&bankless, &intents, id(), &quack())
+            .result_as()
+            .unwrap();
+        assert!(!refused.accepted, "an empty bank is a robot with no voice");
+
+        // A rendered bank: accepted, and actually queued for the loop to play.
+        std::fs::create_dir_all(empty.join("chirp")).unwrap();
+        std::fs::write(empty.join("chirp/chirp_a.wav"), b"RIFF").unwrap();
+        let voiced = RobotState::new(&params, false, false);
+        let accepted: proto::IntentResult = dispatch(&voiced, &intents, id(), &quack())
+            .result_as()
+            .unwrap();
+        assert!(accepted.accepted);
+        assert_eq!(intents.take_sounds(), vec![proto::SoundTag::Chirp]);
+        std::fs::remove_dir_all(&empty).ok();
     }
 
     /// A skill whose network was never configured is refused at the door with a reason —

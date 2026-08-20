@@ -74,6 +74,19 @@ impl AudioParams {
         self.pet_detect.unwrap_or(mode == Mode::Walk)
     }
 
+    /// The capture PCM for the mic worker: the playback device with subdevice 0. Only
+    /// appended when the operator has not already spelled a subdevice out — `plughw:aic3104`
+    /// in `robotd.toml` is the default and needs it, but the equally natural full spec
+    /// `plughw:aic3104,0` would otherwise become `plughw:aic3104,0,0`, which no card
+    /// answers to. That lands the worker in its restart loop for the life of the daemon.
+    pub fn capture_device(&self) -> String {
+        if self.device.contains(',') {
+            self.device.clone()
+        } else {
+            format!("{},0", self.device)
+        }
+    }
+
     /// The classifier path, or `None` when disabled with the `"none"` sentinel.
     pub fn pet_model_resolved(&self) -> Option<PathBuf> {
         match &self.pet_model {
@@ -518,6 +531,24 @@ mod tests {
         let path = dir.join("robotd.toml");
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    /// The capture device is derived from the playback one, and the derivation must be
+    /// idempotent: an operator who writes the full ALSA spec gets the device they wrote,
+    /// not one with a second subdevice glued on that no card answers to.
+    #[test]
+    fn the_capture_device_does_not_double_its_subdevice() {
+        let plain = AudioParams {
+            device: "plughw:aic3104".to_owned(),
+            ..AudioParams::default()
+        };
+        assert_eq!(plain.capture_device(), "plughw:aic3104,0");
+
+        let spelled_out = AudioParams {
+            device: "plughw:aic3104,0".to_owned(),
+            ..AudioParams::default()
+        };
+        assert_eq!(spelled_out.capture_device(), "plughw:aic3104,0");
     }
 
     /// An unprovisioned board must still come up. A daemon that refuses to start because a

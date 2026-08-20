@@ -293,7 +293,14 @@ pub mod method {
     pub const ROBOT_MOUTH: &str = "robot.mouth";
     /// Play one of the robot's voice-bank sounds — chirp, greet, coo... `wheee` is the
     /// held ride: `hold: true` starts it and must keep arriving (a notification per tick,
-    /// like the mouth) or the ride ends; `hold: false` releases it deliberately.
+    /// like the mouth) or the ride ends; `hold: false` releases it deliberately. The two
+    /// endings differ: a deliberate release cuts the ride, a hold that stops arriving plays
+    /// it out through its end segment.
+    ///
+    /// Refused, with a reason, by a robot that has no voice — audio disabled, or no bank
+    /// rendered. Sounds are never refused for circumstance (a chirp out of a fallen robot
+    /// is diagnostics, not danger), but "accepted" from a robot that cannot make a sound
+    /// would make `robotctl quack` lie about which duck answered.
     pub const ROBOT_SOUND: &str = "robot.sound";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";

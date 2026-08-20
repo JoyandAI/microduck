@@ -8,17 +8,40 @@
 //!    that plays goes through this one struct, owned by the control loop.
 //!  - **The wheee ride streams into a single `aplay`**: start → loop (repeating while held)
 //!    → end, written by a paced thread so the pipe never queues more than ~250 ms — else
-//!    the release would land that late. Cutting the ride kills the child and the writer
-//!    exits on the broken pipe.
+//!    the release would land that late. The ride has *two* exits, and they are not the
+//!    same: a client that says "released" cuts it (kill the child, the writer exits on the
+//!    broken pipe), while a hold that merely went stale lands it — the writer is let out of
+//!    its loop and writes the end segment into a pipe that is still open. Only the second
+//!    one ever plays `wheee_end_*`, which is why [`Ride`] is a state and not a bool.
 //!
 //! Playing is spawning: nothing here blocks the 50 Hz tick except the deliberately blocking
-//! goodbye peck right before power-off, when there is no tick left to miss.
+//! goodbye peck right before power-off, when there is no tick left to miss — and that one is
+//! bounded, because a wedged PCM must not be able to hold up the power-off.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::intents::WheeeHold;
+
+/// How long the blocking goodbye peck may hold up the power-off. The longest bank sound is
+/// well under a second; this is a ceiling on a wedged PCM, not a playback budget.
+const BLOCKING_PLAY_MAX: Duration = Duration::from_millis(1500);
+
+/// What the wheee ride is doing. `Landing` exists because the end segment takes real time
+/// to play and the trigger keeps asking during it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ride {
+    /// No ride. The PCM is free for one-shots.
+    Off,
+    /// The writer thread is streaming start → loop into an open pipe.
+    Riding,
+    /// The writer is on the end segment, or `aplay` is draining it. Reaped when the child
+    /// exits; a fresh press supersedes it.
+    Landing,
+}
 
 /// The player. Constructed once by the control loop; `None`-like when the bank is missing —
 /// every play degrades to a debug line, so a robot without a generated bank (or a codec)
@@ -27,10 +50,13 @@ pub struct Sound {
     bank: PathBuf,
     device: String,
     child: Option<Child>,
-    /// The wheee rider loops while this is true. Shared with the writer thread.
+    /// The wheee rider loops while this is true. Shared with the writer thread; clearing
+    /// it *without* killing the child is what makes the end segment play.
     wheee_held: Arc<AtomicBool>,
-    /// Whether the current child is a wheee ride (a plain sound must not flip the flag).
-    wheee_riding: bool,
+    /// What the ride is doing. Not a bool: a plain sound must not flip it, and "landing"
+    /// (the end segment is being written) has to be told apart from both "riding" and
+    /// "off", or the trigger restarts a ride that is still finishing.
+    ride: Ride,
     /// Bank missing is logged once, not per press.
     warned_missing: bool,
 }
@@ -42,7 +68,7 @@ impl Sound {
             device,
             child: None,
             wheee_held: Arc::new(AtomicBool::new(false)),
-            wheee_riding: false,
+            ride: Ride::Off,
             warned_missing: false,
         }
     }
@@ -67,9 +93,11 @@ impl Sound {
         Some(files.swap_remove(nanos % files.len()))
     }
 
-    fn kill_current(&mut self) {
+    /// Stop whatever is on the PCM, now. The ride's abrupt exit, and what every one-shot
+    /// does to its predecessor.
+    fn stop_child(&mut self) {
         self.wheee_held.store(false, Ordering::Relaxed);
-        self.wheee_riding = false;
+        self.ride = Ride::Off;
         if let Some(mut child) = self.child.take()
             && let Ok(None) = child.try_wait()
         {
@@ -78,10 +106,47 @@ impl Sound {
         }
     }
 
+    /// The ride's *other* exit: let the writer out of its loop but leave the pipe open, so
+    /// it writes the end segment and `aplay` drains it. The child stays parented here and
+    /// is reaped by [`Self::reap_landing`] on a later tick.
+    fn land_ride(&mut self) {
+        self.wheee_held.store(false, Ordering::Relaxed);
+        self.ride = Ride::Landing;
+        if self.child.is_none() {
+            // Nothing to land (the degraded path's one-shot already finished, or never
+            // spawned): the PCM is free again straight away.
+            self.ride = Ride::Off;
+        }
+    }
+
+    /// Free the PCM once a landing ride has actually finished. Called per tick while
+    /// landing, which is the only cadence available — nothing here waits.
+    fn reap_landing(&mut self) {
+        match self.child.as_mut().map(|c| c.try_wait()) {
+            None | Some(Ok(Some(_))) | Some(Err(_)) => {
+                self.child = None;
+                self.ride = Ride::Off;
+            }
+            Some(Ok(None)) => {}
+        }
+    }
+
     /// Play a voice-bank sound, cutting off any still-playing one. `blocking` waits for
     /// playback — used right before poweroff so the goodbye peck is heard.
     pub fn play(&mut self, tag: &str, blocking: bool) {
-        self.kill_current();
+        // A ride owns the single-client PCM for as long as it lasts. Cutting it for a
+        // 200 ms chirp would restart the wheee from its start segment on every press of the
+        // other trigger — and holding both triggers is the expected way to use them, since
+        // either one opens the mouth. The one-shot is dropped, not queued: it is an event,
+        // and an event that arrives during a ride is stale by the time the ride ends.
+        //
+        // The blocking goodbye peck is the exception, and the only one: it is the last
+        // sound this process makes, so it takes the PCM off whatever holds it.
+        if self.ride != Ride::Off && !blocking {
+            tracing::debug!(tag, "sound skipped: the wheee ride has the PCM");
+            return;
+        }
+        self.stop_child();
         let Some(wav) = self.pick(tag) else {
             if !self.warned_missing {
                 self.warned_missing = true;
@@ -100,29 +165,44 @@ impl Sound {
             .stderr(Stdio::null())
             .spawn();
         match child {
-            Ok(mut c) if blocking => {
-                let _ = c.wait();
-            }
+            Ok(mut c) if blocking => wait_bounded(&mut c, BLOCKING_PLAY_MAX),
             Ok(c) => self.child = Some(c),
             Err(e) => tracing::debug!(error = %e, tag, "aplay failed"),
         }
     }
 
-    /// The held ride, level-driven: the loop calls this every tick with "is the trigger
-    /// (freshly) held". The rising edge starts the ride, the falling edge cuts it — the
-    /// prototype's release kills the streaming aplay outright, and the writer thread exits
-    /// on the broken pipe.
-    pub fn wheee(&mut self, held: bool) {
-        if held && !self.wheee_riding {
-            self.start_wheee();
-        } else if !held && self.wheee_riding {
-            self.kill_current();
+    /// The ride, level-driven: the loop calls this every tick with what the wheee hold
+    /// currently says. The rising edge starts it; the two ways of stopping are different
+    /// sounds, which is the whole point of [`WheeeHold`] carrying three states.
+    pub fn wheee(&mut self, hold: WheeeHold) {
+        match hold {
+            // A press during a landing ride supersedes it — `start_wheee` takes the PCM.
+            WheeeHold::Held if self.ride != Ride::Riding => self.start_wheee(),
+            WheeeHold::Held => {}
+            // The client said "released": cut it, as the prototype does.
+            WheeeHold::Released if self.ride != Ride::Off => self.stop_child(),
+            // The hold went stale — the client stopped re-notifying, or stopped existing.
+            // Land the ride rather than chopping it: nobody asked for a cut.
+            WheeeHold::Decayed if self.ride == Ride::Riding => self.land_ride(),
+            WheeeHold::Decayed if self.ride == Ride::Landing => self.reap_landing(),
+            WheeeHold::Released | WheeeHold::Decayed => {}
         }
+    }
+
+    /// A bank with no wheee triads — a half-rendered `ensure-bank`, or a bank from before
+    /// the wheee was segmented. Fall back to the plain one-shot, and *latch the ride
+    /// anyway*: the trigger asks every 20 ms, and without a latch this path would fork,
+    /// exec and kill `aplay` fifty times a second (plus a `read_dir` and three ~110 KB
+    /// reads per tick) for as long as the trigger is down, with nothing audible to show
+    /// for it. Landing it is a no-op — there is no end segment to write.
+    fn degraded_wheee(&mut self) {
+        self.play("wheee", false);
+        self.ride = Ride::Riding;
     }
 
     /// Stream start → loop (while held) → end into one `aplay`, so the loop wraps gap-free.
     fn start_wheee(&mut self) {
-        self.kill_current();
+        self.stop_child();
         let dir = self.bank.join("wheee");
         let mut letters: Vec<String> = std::fs::read_dir(&dir)
             .map(|rd| {
@@ -139,7 +219,7 @@ impl Sound {
             .unwrap_or_default();
         if letters.is_empty() {
             // A bank without triads (or no bank): the one-shot path says what's wrong.
-            self.play("wheee", false);
+            self.degraded_wheee();
             return;
         }
         letters.sort();
@@ -152,7 +232,7 @@ impl Sound {
         let (Some((rate, start_pcm)), Some((_, loop_pcm)), Some((_, end_pcm))) =
             (seg("start"), seg("loop"), seg("end"))
         else {
-            self.play("wheee", false);
+            self.degraded_wheee();
             return;
         };
         let child = Command::new("aplay")
@@ -180,7 +260,7 @@ impl Sound {
             return;
         };
         self.child = Some(child);
-        self.wheee_riding = true;
+        self.ride = Ride::Riding;
         self.wheee_held.store(true, Ordering::Relaxed);
         let held = self.wheee_held.clone();
 
@@ -224,7 +304,8 @@ impl Sound {
                         }
                     }
                 }
-                // Released without being killed (the hold decayed): land the ride.
+                // Out of the loop with the pipe still open: the hold decayed and
+                // `land_ride` cleared the flag without killing us. Play the ride out.
                 for chunk in end_pcm.chunks(CHUNK) {
                     if !send(&mut stdin, chunk) {
                         return;
@@ -233,6 +314,28 @@ impl Sound {
             })
             .ok();
     }
+}
+
+/// Wait for a child, but not forever. The goodbye peck runs with `poweroff()` on the next
+/// line: if the PCM wedges — it is single-client, and the ride this just killed does not
+/// release the device synchronously — an unbounded `wait()` leaves the robot powered on with
+/// its intents already disabled, which is worse than a clipped goodbye.
+fn wait_bounded(child: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Err(_) => return,
+            Ok(None) if Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    tracing::warn!(
+        ?timeout,
+        "aplay did not finish in time; going on without it"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Read a PCM wav: (sample_rate, raw S16LE payload). A minimal RIFF chunk walk — enough for
@@ -286,8 +389,55 @@ mod tests {
     fn a_missing_bank_is_silent_not_fatal() {
         let mut sound = Sound::new(PathBuf::from("/nonexistent/bank"), "default".into());
         sound.play("chirp", false);
-        sound.wheee(true);
-        sound.wheee(false);
+        sound.wheee(WheeeHold::Held);
+        sound.wheee(WheeeHold::Released);
         assert!(sound.child.is_none());
+        assert_eq!(sound.ride, Ride::Off);
+    }
+
+    /// A bank whose `wheee/` holds no triads (a half-rendered `ensure-bank`, or a bank from
+    /// before the wheee was segmented) must latch the ride on the fallback. Without the
+    /// latch the trigger re-enters `start_wheee` every 20 ms for as long as it is held —
+    /// a `read_dir` and an `aplay` spawn/kill pair, fifty times a second, silently.
+    #[test]
+    fn a_bank_without_wheee_triads_latches_instead_of_respawning() {
+        let dir = std::env::temp_dir().join(format!("sound-triads-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("wheee")).unwrap();
+        let mut sound = Sound::new(dir.clone(), "null".into());
+
+        sound.wheee(WheeeHold::Held);
+        assert_eq!(sound.ride, Ride::Riding, "the fallback must latch");
+        sound.wheee(WheeeHold::Held);
+        assert_eq!(sound.ride, Ride::Riding, "a held trigger must not re-enter");
+        sound.wheee(WheeeHold::Released);
+        assert_eq!(sound.ride, Ride::Off);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two exits are different sounds, and only one of them plays `wheee_end_*`: a
+    /// client that says "released" gets the cut, a hold that goes stale gets the landing.
+    /// Both must end at `Off` — a ride that cannot leave `Landing` blocks every one-shot.
+    #[test]
+    fn a_decayed_hold_lands_and_a_release_cuts() {
+        let dir = std::env::temp_dir().join(format!("sound-exits-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("wheee")).unwrap();
+        let mut sound = Sound::new(dir.clone(), "null".into());
+
+        // Decay: land, then reap. No child ever spawned here, so the reap is immediate —
+        // on a real ride it takes as many ticks as the end segment lasts.
+        sound.wheee(WheeeHold::Held);
+        sound.wheee(WheeeHold::Decayed);
+        assert_eq!(
+            sound.ride,
+            Ride::Off,
+            "a landing ride with no child frees the PCM"
+        );
+
+        // Release: cut, straight to Off, and the writer's loop flag is down either way.
+        sound.wheee(WheeeHold::Held);
+        sound.wheee(WheeeHold::Released);
+        assert_eq!(sound.ride, Ride::Off);
+        assert!(!sound.wheee_held.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

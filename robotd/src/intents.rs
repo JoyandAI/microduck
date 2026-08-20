@@ -83,8 +83,24 @@ const SKILL_ROULADE: u32 = 1 << 4;
 
 /// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
 /// (20 ms) while the trigger is down, so anything much older means the client stopped
-/// holding — or stopped existing. Either way the ride lands instead of looping forever.
+/// holding — or stopped existing. The stale hold lands the ride instead of looping forever.
 pub const WHEEE_HOLD_FRESH: Duration = Duration::from_millis(300);
+
+/// What the wheee level says, as the loop consumes it. Three states rather than a bool
+/// because the two ways of *not* being held are different sounds: a client that spells out
+/// `hold: false` wants the ride cut where it stands (the prototype's release), while a hold
+/// that simply stopped arriving wants the ride played out through its end segment — nobody
+/// asked for a cut there, the client just went away. Collapsing them loses the end segment
+/// entirely, since a cut ride's writer only ever sees a broken pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheeeHold {
+    /// A `hold: true` fresh enough to trust.
+    Held,
+    /// A client that is still there and said to stop.
+    Released,
+    /// A hold that went stale — the client stopped re-notifying, or stopped existing.
+    Decayed,
+}
 
 pub struct Intents {
     /// Epoch for every stamp. `Instant` so the clock cannot run backwards under us.
@@ -271,12 +287,18 @@ impl Intents {
         .collect()
     }
 
-    /// The wheee hold as the loop consumes it: held, and only recently enough to trust —
-    /// see [`WHEEE_HOLD_FRESH`].
-    pub fn wheee_held(&self) -> bool {
+    /// The wheee hold as the loop consumes it — see [`WheeeHold`] for why "not held" is
+    /// two answers and not one.
+    pub fn wheee_hold(&self) -> WheeeHold {
         let stamp = self.wheee.load();
-        stamp.value
-            && Duration::from_micros(self.now_us().saturating_sub(stamp.at_us)) < WHEEE_HOLD_FRESH
+        if !stamp.value {
+            return WheeeHold::Released;
+        }
+        if Duration::from_micros(self.now_us().saturating_sub(stamp.at_us)) < WHEEE_HOLD_FRESH {
+            WheeeHold::Held
+        } else {
+            WheeeHold::Decayed
+        }
     }
 
     /// Ask for the sit-then-power-off sequence.
@@ -351,6 +373,39 @@ impl Intents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hold's three states, which the ride's two different exits depend on. A `false`
+    /// from a live client and a `true` that went stale must not read the same: one cuts the
+    /// ride, the other plays it out.
+    #[test]
+    fn a_stale_hold_reads_as_decayed_not_released() {
+        use duck_ipc_proto::{SoundParams, SoundTag};
+        let intents = Intents::new();
+        assert_eq!(
+            intents.wheee_hold(),
+            WheeeHold::Released,
+            "nothing has ever held it"
+        );
+
+        intents.request_sound(SoundParams {
+            tag: SoundTag::Wheee,
+            hold: Some(true),
+        });
+        assert_eq!(intents.wheee_hold(), WheeeHold::Held);
+
+        std::thread::sleep(WHEEE_HOLD_FRESH + Duration::from_millis(50));
+        assert_eq!(
+            intents.wheee_hold(),
+            WheeeHold::Decayed,
+            "a client that stopped re-notifying is not a client that released"
+        );
+
+        intents.request_sound(SoundParams {
+            tag: SoundTag::Wheee,
+            hold: Some(false),
+        });
+        assert_eq!(intents.wheee_hold(), WheeeHold::Released);
+    }
 
     /// Before any client has spoken, the twist must already look stale. A robot that comes
     /// up believing it has a live driver would run its deadman timer down from `now`,
