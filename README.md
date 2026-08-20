@@ -339,7 +339,7 @@ robots off a bad release — are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing)
 | [Dev board cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, and the restart traps after an update. |
 | [`duck-btctl` cheat sheet](docs/robot/duck-btctl.md) | Every `duck-btctl` command: the robot over Bluetooth, from a laptop, with no network. |
 | [Setting up a dev board](docs/robot/install-dev.md) | From nothing, and the fix when `--ref` is refused. |
-| [How it works](docs/design/) | The control loop, the update engine, the service split, the BLE path. |
+| [How it works](docs/design/architecture.md) | The whole system on one page — five daemons, one bus, how an update reaches the robot — then a page per part. |
 
 ### Contributing
 
