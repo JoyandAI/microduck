@@ -33,9 +33,9 @@
 //! ## Roller mode
 //!
 //! At startup this asks `robot.mode`. On a roller robot the stick mapping becomes the
-//! prototype's roller preset — asymmetric forward/brake (0.6 / 0.5), no strafe, ±1.0 rad/s
-//! heading — and A triggers the crouch that lives in the ground-pick slot. Kicks and
-//! sit↔stand have no policies there and the robot refuses them politely.
+//! prototype's roller preset — asymmetric forward/brake (0.6 / 0.5), no strafe, ±0.3 rad/s
+//! heading — and A triggers the crouch that lives in the ground-pick slot. The other
+//! skills ride along on wheels, as the rebased roller line has them.
 //!
 //! ## On the robot, this runs itself
 //!
@@ -163,10 +163,11 @@ const BODY_MAX_Z_DOWN: f64 = 0.025;
 const BODY_MAX_ANGLE: f64 = 0.2618;
 
 /// The prototype's roller-mode stick shaping: push and brake are asymmetric, there is no
-/// strafe, and heading is capped at 1.0 rad/s regardless of the walking limits.
+/// strafe, and heading is capped at 0.3 rad/s regardless of the walking limits — the
+/// roller launch line's `--max-angular-vel 0.3`, unchanged across both of its eras.
 const ROLLER_PUSH: f64 = 0.6;
 const ROLLER_BRAKE: f64 = 0.5;
-const ROLLER_YAW: f64 = 1.0;
+const ROLLER_YAW: f64 = 0.3;
 
 /// What the sticks drive. Head and body-pose are modal because two sticks cannot express
 /// nine degrees of freedom; the toggles are the prototype's Y and B buttons.
