@@ -680,6 +680,10 @@ mod bench {
     use super::*;
     use ratatui::{buffer::Buffer, layout::Rect};
 
+    /// What happened to the view since the last frame, for the stopwatch to arrange:
+    /// the camera turned, the robot moved, or nothing at all.
+    type Step<'a> = &'a mut dyn FnMut(&mut DuckView, u32, &mut [f64; 15]);
+
     /// Not a benchmark harness, a stopwatch: `cargo test -p robotctl --release
     /// frame_cost -- --nocapture` prints what the view costs per frame, split into the
     /// three paths a live monitor actually takes — a full re-raster (the camera or the
@@ -697,34 +701,27 @@ mod bench {
             let mut buf = Buffer::empty(area);
             let joints = [0.1f64; 15];
 
-            let mut time =
-                |view: &mut DuckView,
-                 n: u32,
-                 mut step: Box<dyn FnMut(&mut DuckView, u32, &mut [f64; 15])>| {
-                    let mut j = joints;
-                    let start = std::time::Instant::now();
-                    for i in 0..n {
-                        step(view, i, &mut j);
-                        view.draw(model, &j, [0.05, 0.02, -1.0], area, &mut buf);
-                    }
-                    start.elapsed() / n
-                };
+            let mut time = |view: &mut DuckView, n: u32, step: Step| {
+                let mut j = joints;
+                let start = std::time::Instant::now();
+                for i in 0..n {
+                    step(view, i, &mut j);
+                    view.draw(model, &j, [0.05, 0.02, -1.0], area, &mut buf);
+                }
+                start.elapsed() / n
+            };
 
             // Every frame re-rasters: the camera moved, which bypasses the pose cache.
-            let raster = time(&mut view, 200, Box::new(|v, _, _| v.orbit(0.013)));
+            let raster = time(&mut view, 200, &mut |v, _, _| v.orbit(0.013));
             // Every frame re-rasters: the pose moved past the 0.3° quantum. The cache's
             // 80 ms gate is what spares the board this at 50 Hz; it is bypassed here by
             // clearing the stamp, because the gate is the thing being priced.
-            let pose = time(
-                &mut view,
-                200,
-                Box::new(|v, i, j| {
-                    j[3] = 0.1 + 0.02 * f64::from(i);
-                    v.cached = None;
-                }),
-            );
+            let pose = time(&mut view, 200, &mut |v, i, j| {
+                j[3] = 0.1 + 0.02 * f64::from(i);
+                v.cached = None;
+            });
             // Nothing changed: the path a 50 Hz stream takes ~5 frames out of 6.
-            let blit = time(&mut view, 500, Box::new(|_, _, _| {}));
+            let blit = time(&mut view, 500, &mut |_, _, _| {});
 
             println!(
                 "{w:>3}x{h:<3} cells   raster {raster:>10.2?}   pose-change {pose:>10.2?}   cached blit {blit:>10.2?}"
