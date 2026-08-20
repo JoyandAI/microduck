@@ -353,8 +353,8 @@ fn pump(
             return Err(anyhow::anyhow!("odd byte count from arecord"));
         }
         i16_buf.clear();
-        for chunk in buf[..n].chunks_exact(2) {
-            i16_buf.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        for chunk in buf[..n].as_chunks::<2>().0 {
+            i16_buf.push(i16::from_le_bytes(*chunk));
         }
         let samples = i16_to_f32(&i16_buf);
         let (events, _p) = detector.push_samples(&samples)?;
