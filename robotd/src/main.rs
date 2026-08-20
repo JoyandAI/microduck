@@ -1,20 +1,19 @@
 //! `robotd` — the robot control daemon.
 //!
-//! **Slice 1** (`docs/design/robotd-design.md` §4): a control loop that drives the real bus at the
-//! real rate and holds the pose it started in. No observations, no policy, no intents.
+//! The 50 Hz control loop, the `robot.*` socket, and the health the updater gates on
+//! (`docs/design/robotd-design.md` §1.4, §3.4).
 //!
-//! It is not walking yet because that is not what it is for yet. The update engine is
-//! finished and has never run on hardware, and its auto-rollback is only meaningful if
-//! `robot.health` means something — today it means "the loop ticked once", so every
-//! rollback tested so far tested a placeholder. Slice 1 makes health honest: **the loop is
-//! meeting its deadline**. A loop running at 60% of target is alive, answers every request,
-//! and is badly broken.
+//! **Health is why the daemon has the shape it does.** The updater's auto-rollback is only
+//! meaningful if `robot.health` means something, and it used to mean "the loop ticked once" —
+//! so every rollback was tested against a placeholder. It now means **the loop is meeting its
+//! deadline**: a loop running at 60% of target is alive, answers every request, and is badly
+//! broken.
 //!
-//! Holding a pose is also the right thing to be doing while someone deliberately breaks
-//! releases at a bench: the bus sees the real load at the real rate, and nothing falls over
-//! when a bad build lands.
+//! Holding the pose with no policy (`policy.enabled = false`) stays the right thing to be doing
+//! while someone deliberately breaks releases at a bench: the bus sees the real load at the
+//! real rate, and nothing falls over when a bad build lands.
 //!
-//! Every one of the four methods must be answerable *while the robot is in a bad state*,
+//! Every method must be answerable *while the robot is in a bad state*,
 //! since that is exactly when it is asked. So the IPC side reads atomics the control loop
 //! publishes and never calls into the loop — a wedged loop reports itself unhealthy rather
 //! than hanging the caller.

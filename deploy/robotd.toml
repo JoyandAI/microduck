@@ -2,7 +2,7 @@
 #
 # Installed to /etc/robot/robotd.toml. Read once at startup, not watched: changing
 # anything here needs `systemctl restart robotd`. Live reload is deferred
-# (docs/design/robotd-design.md §7.2).
+# (docs/design/robotd-design.md §4.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
 # per-robot configuration rather than a shipped default, so it must survive an update

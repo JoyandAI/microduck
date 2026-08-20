@@ -199,7 +199,7 @@ Your paths survive updates. Delete the lines to go back to the policy the releas
 
 A policy that could not be loaded reports **unhealthy** — `robotctl health` and the bottom of
 `monitor` both name the reason. The shape a policy has to have, and what else is checked at
-load, are in [`docs/design/robotd-design.md`](docs/design/robotd-design.md) §5.3.
+load, are in [`docs/design/robotd-design.md`](docs/design/robotd-design.md) §2.3.
 
 ## Keep it up to date
 
