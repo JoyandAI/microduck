@@ -921,6 +921,46 @@ mod tests {
         }
     }
 
+    /// Every policy file in `policies/` must be packaged, at every packaging site.
+    ///
+    /// The `--include` list exists in three copies (the two workflows and `dev-push.sh`), and
+    /// the copies drift: the skills branch added six policies to `_build-release.yml` and
+    /// `dev-push.sh` and missed `dev.yml` — whose builds are exactly what `--ref <branch>`
+    /// installs. The release carried two of eight networks, `robotd` failed its health gate on
+    /// the first missing one, and the board rolled back. The repo directory is the one list
+    /// everything else must follow: a vendored `.onnx` nobody ships is dead weight, and a
+    /// shipped one nobody vendored is this test's compile-time cousin, the missing file.
+    #[test]
+    fn every_policy_in_the_repo_is_packaged() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let mut policies: Vec<String> = std::fs::read_dir(root.join("policies"))
+            .expect("policies/ must exist")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".onnx"))
+            .collect();
+        policies.sort();
+        assert!(
+            policies.len() >= 8,
+            "expected the vendored policy set, found {policies:?}"
+        );
+
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            for policy in &policies {
+                let expected = format!("=policies/{policy}");
+                assert!(
+                    text.contains(&expected),
+                    "{site} does not package policies/{policy}. \
+                     Add:  --include \"policies/{policy}=policies/{policy}\""
+                );
+            }
+        }
+    }
+
     /// The stable manifest names an artifact URL under the stable tag — so the workflow
     /// that creates that release must actually upload the artifact to it.
     ///

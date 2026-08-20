@@ -33,11 +33,64 @@ struct Stamped<T> {
     at_us: u64,
 }
 
+/// The body-pose intent, as the loop consumes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PoseIntent {
+    /// z, roll, pitch — the order the observation's body block uses.
+    pub body: [f64; 3],
+    /// While true the loop glides toward `body`; false snaps it back to nominal at once,
+    /// which is the prototype's B-button exit.
+    pub active: bool,
+}
+
+impl Default for PoseIntent {
+    fn default() -> Self {
+        Self {
+            body: [0.0; 3],
+            active: false,
+        }
+    }
+}
+
+/// Pending one-shot skill requests, taken once per tick.
+///
+/// Booleans rather than a queue: within one 20 ms tick a second press of the same button
+/// means nothing extra, and two *different* requests both deserve to be seen — which a
+/// single last-writer slot would lose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkillRequests {
+    pub ground_pick: bool,
+    pub kick_left: bool,
+    pub kick_right: bool,
+    pub sit_toggle: bool,
+    /// Start a roll — or, arriving while one runs, chain another. Clients hold a button
+    /// down by sending this every tick, so unlike the others it is a *level* in practice.
+    pub roulade: bool,
+}
+
+impl SkillRequests {
+    pub fn any(&self) -> bool {
+        self.ground_pick || self.kick_left || self.kick_right || self.sit_toggle || self.roulade
+    }
+}
+
+// Bit positions for the skill-request mask.
+const SKILL_GROUND_PICK: u32 = 1 << 0;
+const SKILL_KICK_LEFT: u32 = 1 << 1;
+const SKILL_KICK_RIGHT: u32 = 1 << 2;
+const SKILL_SIT_TOGGLE: u32 = 1 << 3;
+const SKILL_ROULADE: u32 = 1 << 4;
+
 pub struct Intents {
     /// Epoch for every stamp. `Instant` so the clock cannot run backwards under us.
     epoch: Instant,
     twist: ArcSwap<Stamped<[f64; 3]>>,
     head: ArcSwap<Stamped<[f64; 4]>>,
+    /// Standing body pose. Unstamped: `active: false` is its own "nobody is posing".
+    pose: ArcSwap<PoseIntent>,
+    /// Mouth opening, 0..1, as `f64::to_bits`. Continuous like the twist, unstamped like
+    /// the pose — a mouth left open by a dead client is exactly what the prototype does.
+    mouth: std::sync::atomic::AtomicU64,
     /// Whether the policy should drive. Discrete, so a plain flag rather than a slot.
     enabled: AtomicBool,
     /// A pending `robot.init` / `robot.relax`, as [`PowerRequest`].
@@ -49,6 +102,11 @@ pub struct Intents {
     /// It lives with the intents because this is where the loop reads what clients asked for, and
     /// because the loop is the only thing that may touch the bus — the IPC task cannot do it itself.
     power: AtomicU8,
+    /// Pending skill requests, a bitmask taken (swapped to zero) once per tick. A mask
+    /// rather than one slot so two different buttons in the same tick both arrive.
+    skills: std::sync::atomic::AtomicU32,
+    /// A shutdown was requested. A level, not an edge: once asked, the sequence runs.
+    shutdown: AtomicBool,
 }
 
 /// What a client asked for, once.
@@ -68,6 +126,11 @@ pub struct Snapshot {
     /// is harmless; a stale velocity walks the robot into a wall.
     pub twist_age: Duration,
     pub enabled: bool,
+    /// The body-pose intent. The loop smooths `body` into `command.body` itself, because
+    /// smoothing is per-tick state the intent slots must not own.
+    pub pose: PoseIntent,
+    /// Mouth opening, 0..1.
+    pub mouth: f64,
 }
 
 impl Default for Intents {
@@ -92,8 +155,12 @@ impl Intents {
                 value: [0.0; 4],
                 at_us: 0,
             }),
+            pose: ArcSwap::from_pointee(PoseIntent::default()),
+            mouth: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
+            skills: std::sync::atomic::AtomicU32::new(0),
+            shutdown: AtomicBool::new(false),
         }
     }
 
@@ -120,8 +187,58 @@ impl Intents {
         self.set_twist([0.0; 3]);
     }
 
+    pub fn set_pose(&self, pose: PoseIntent) {
+        self.pose.store(Arc::new(pose));
+    }
+
+    pub fn set_mouth(&self, open: f64) {
+        self.mouth
+            .store(open.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Queue a one-shot skill for the loop's next tick.
+    pub fn request_skill(&self, skill: duck_ipc_proto::Skill) {
+        let bit = match skill {
+            duck_ipc_proto::Skill::GroundPick => SKILL_GROUND_PICK,
+            duck_ipc_proto::Skill::KickLeft => SKILL_KICK_LEFT,
+            duck_ipc_proto::Skill::KickRight => SKILL_KICK_RIGHT,
+            duck_ipc_proto::Skill::SitToggle => SKILL_SIT_TOGGLE,
+            duck_ipc_proto::Skill::Roulade => SKILL_ROULADE,
+        };
+        self.skills
+            .fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take the pending skill requests, leaving none. Once per tick, like the power request.
+    pub fn take_skills(&self) -> SkillRequests {
+        let bits = self.skills.swap(0, std::sync::atomic::Ordering::Relaxed);
+        SkillRequests {
+            ground_pick: bits & SKILL_GROUND_PICK != 0,
+            kick_left: bits & SKILL_KICK_LEFT != 0,
+            kick_right: bits & SKILL_KICK_RIGHT != 0,
+            sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
+            roulade: bits & SKILL_ROULADE != 0,
+        }
+    }
+
+    /// Ask for the sit-then-power-off sequence.
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Take a pending shutdown request. Taken rather than read so the sequence starts once.
+    pub fn take_shutdown(&self) -> bool {
+        self.shutdown.swap(false, Ordering::Relaxed)
+    }
+
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// The current enable state — what `robot.enable`'s `toggle` flips. The loop reads its
+    /// copy through [`Self::snapshot`]; this is for the IPC side, which owns the toggle.
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
     }
 
     /// Ask the loop to power the joints and stand up.
@@ -155,16 +272,20 @@ impl Intents {
         let now = self.now_us();
         let twist = self.twist.load();
         let head = self.head.load();
+        let pose = **self.pose.load();
         Snapshot {
             command: Command {
                 twist: twist.value,
                 head: head.value,
-                // No `pose` intent yet, so the body block stays at its nominal zero — which
-                // is the encoding the policies were trained with, not a placeholder.
+                // The loop owns the smoothing that turns the pose intent into this block;
+                // the raw target travels in `pose` below. Nominal zero is the trained
+                // encoding, not a placeholder.
                 body: BodyPose::default(),
             },
             twist_age: Duration::from_micros(now.saturating_sub(twist.at_us)),
             enabled: self.enabled.load(Ordering::Relaxed),
+            pose,
+            mouth: f64::from_bits(self.mouth.load(std::sync::atomic::Ordering::Relaxed)),
         }
     }
 }

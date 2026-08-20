@@ -148,8 +148,20 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // slow and too constrained for the full surface, and teleop belongs on WebRTC's
         // unreliable `teleop` datachannel where a stale command is dropped rather than
         // retransmitted (§5.2). A 20-byte notification budget and a link that does not exist for
-        // the first ~73s of a boot is not a control transport.
-        RobotMove(_) | RobotHead(_) | RobotEnable(_) => None,
+        // the first ~73s of a boot is not a control transport. The skills, the body pose and
+        // the mouth are motor control like the rest.
+        RobotMove(_) | RobotHead(_) | RobotEnable(_) | RobotDo(_) | RobotPose(_)
+        | RobotMouth(_) => None,
+
+        // Powering the machine off from a phone in the room is `system.reboot` without the
+        // coming back. The sit-then-power-off flow wants whoever asked to be watching the
+        // robot, and that is `robotctl` or the pad's long-press, deliberately.
+        RobotShutdown => None,
+
+        // Constant for the life of the process, and only a stick-mapping hint for local
+        // clients like `padd`. An app gets the same answer through `system.info` territory
+        // when it ever needs one; no reason to open another read to the radio today.
+        RobotMode => None,
 
         // Power to the joints. A phone button that drops the robot on the floor is not one to
         // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
@@ -450,7 +462,10 @@ mod tests {
                 head_roll: 0.0,
             }),
             proto::Call::RobotStop,
-            proto::Call::RobotEnable(proto::EnableParams { on: true }),
+            proto::Call::RobotEnable(proto::EnableParams {
+                on: true,
+                toggle: false,
+            }),
             proto::Call::RobotInit,
             proto::Call::RobotRelax,
             proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),

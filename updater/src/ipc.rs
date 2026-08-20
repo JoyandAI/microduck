@@ -599,6 +599,11 @@ impl Server {
             | Call::RobotEnable(_)
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotDo(_)
+            | Call::RobotPose(_)
+            | Call::RobotMouth(_)
+            | Call::RobotShutdown
+            | Call::RobotMode
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(

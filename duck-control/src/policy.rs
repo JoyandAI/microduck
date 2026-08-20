@@ -1,8 +1,10 @@
-//! The ONNX policy.
+//! The ONNX policies.
 //!
-//! Two sessions — walking and standing — chosen by the magnitude of the velocity command,
-//! which is exactly what `microduck_runtime` does. No skill abstraction: it can arrive when
-//! the third skill does, and until then it would be a seam nothing has tested.
+//! Walking and standing are chosen by the magnitude of the velocity command, exactly as
+//! `microduck_runtime` does; the skill networks — sit↔stand, ground pick, the two kicks —
+//! are selected explicitly by the scheduler in `robotd`, which owns the priority rules.
+//! Every network shares the one 61-D observation layout, so a skill is a session choice
+//! plus a command-block encoding, never a new contract.
 //!
 //! **Everything is validated at load, not at inference.** A bundle with the wrong
 //! observation width, the wrong action count, or a missing ONNX Runtime must fail while the
@@ -166,11 +168,57 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// A loaded policy pair.
+/// Which network drives a tick.
+///
+/// The choice is the caller's — the skill scheduler in `robotd` owns the priority rules —
+/// and this enum is how it names its choice. Asking for a network that is not loaded falls
+/// back to walking rather than panicking, but the scheduler is expected to check `has_*`
+/// first; the fallback exists so a race cannot kill the control thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Net {
+    Walk,
+    Stand,
+    /// Commanded sit↔stand: the twist `vx` slot carries a posture flag, 1 = sit, 0 = stand.
+    SitStand,
+    /// Phase-scripted ground pick; the twist slots carry `[cos φ, sin φ, 0]`.
+    GroundPick,
+    KickLeft,
+    KickRight,
+    /// Episodic forward roll; trained with every command slot at zero, and it starts
+    /// rolling the moment it is switched in.
+    Roulade,
+}
+
+/// Which policy files to load. `walk` is mandatory; every other slot is a capability the
+/// robot simply does not have when `None`.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyPaths {
+    pub walk: PathBuf,
+    pub stand: Option<PathBuf>,
+    pub sitstand: Option<PathBuf>,
+    pub ground_pick: Option<PathBuf>,
+    pub kick_left: Option<PathBuf>,
+    pub kick_right: Option<PathBuf>,
+    pub roulade: Option<PathBuf>,
+}
+
+/// The loaded networks.
+///
+/// A configured path that fails to load fails the whole load — the policies ship inside the
+/// release, so a missing or corrupt file is a broken bundle, and the right outcome is
+/// "unhealthy, roll it back", not a robot that silently lost its kick.
 pub struct Policy {
     walk: Session,
     stand: Option<Session>,
+    sitstand: Option<Session>,
+    ground_pick: Option<Session>,
+    kick_left: Option<Session>,
+    kick_right: Option<Session>,
+    roulade: Option<Session>,
     standing_threshold: f64,
+    /// Roller mode and fall-recovery mode reserve the standing network (roller has none;
+    /// fall recovery keeps it for getting up), so command magnitude must never select it.
+    standing_disabled: bool,
 }
 
 impl Policy {
@@ -178,39 +226,48 @@ impl Policy {
     ///
     /// `stand` is optional: without it the walking policy runs at every velocity, which is
     /// what a single-policy bundle does.
-    pub fn load(
-        walk: &Path,
-        stand: Option<&Path>,
-        standing_threshold: f64,
-    ) -> Result<Self, PolicyError> {
+    pub fn load(paths: &PolicyPaths, standing_threshold: f64) -> Result<Self, PolicyError> {
         ensure_runtime()?;
 
         // Everything below calls into `ort`, and `ort` panics on failures it considers
         // unrecoverable — so the whole of it, and nothing else, goes inside the catch.
         catching_ort_panics(move || {
-            let mut walk_session = open(walk)?;
-            let mut stand_session = match stand {
-                Some(path) => Some(open(path)?),
-                None => None,
-            };
-
             // Warm up before the loop ever calls this. The first inference is always an
             // outlier — lazy initialisation, cold pages, first-touch faults — and paying that
             // on tick one would look exactly like a control loop that missed its deadline.
             // It also proves ONNX Runtime is actually present and usable, which with
             // `load-dynamic` is not known until something is run.
             let zero = Observation::zeroed();
-            run(&mut walk_session, walk, &zero)?;
-            if let (Some(session), Some(path)) = (stand_session.as_mut(), stand) {
-                run(session, path, &zero)?;
+            fn open_warm(path: &Path, zero: &Observation) -> Result<Session, PolicyError> {
+                let mut session = open(path)?;
+                run(&mut session, path, zero)?;
+                Ok(session)
+            }
+            fn open_opt(
+                path: &Option<PathBuf>,
+                zero: &Observation,
+            ) -> Result<Option<Session>, PolicyError> {
+                path.as_deref().map(|p| open_warm(p, zero)).transpose()
             }
 
             Ok(Self {
-                walk: walk_session,
-                stand: stand_session,
+                walk: open_warm(&paths.walk, &zero)?,
+                stand: open_opt(&paths.stand, &zero)?,
+                sitstand: open_opt(&paths.sitstand, &zero)?,
+                ground_pick: open_opt(&paths.ground_pick, &zero)?,
+                kick_left: open_opt(&paths.kick_left, &zero)?,
+                kick_right: open_opt(&paths.kick_right, &zero)?,
+                roulade: open_opt(&paths.roulade, &zero)?,
                 standing_threshold,
+                standing_disabled: false,
             })
         })
+    }
+
+    /// Reserve the standing network: command magnitude no longer selects it, and only an
+    /// explicit [`Net::Stand`] from the caller (fall recovery, body pose) reaches it.
+    pub fn set_standing_disabled(&mut self, disabled: bool) {
+        self.standing_disabled = disabled;
     }
 
     /// Whether the standing policy would be chosen for this command.
@@ -218,22 +275,55 @@ impl Policy {
     /// Separate from [`Self::infer`] because the caller needs the same answer to decide
     /// gains and action scale, and asking twice must not be able to disagree.
     pub fn will_stand(&self, twist_magnitude: f64) -> bool {
-        self.stand.is_some() && twist_magnitude <= self.standing_threshold
+        self.stand.is_some()
+            && !self.standing_disabled
+            && twist_magnitude <= self.standing_threshold
     }
 
     pub fn has_standing(&self) -> bool {
         self.stand.is_some()
     }
 
-    /// One inference. `standing` should come from [`Self::will_stand`].
+    pub fn has_sitstand(&self) -> bool {
+        self.sitstand.is_some()
+    }
+
+    pub fn has_ground_pick(&self) -> bool {
+        self.ground_pick.is_some()
+    }
+
+    pub fn has_roulade(&self) -> bool {
+        self.roulade.is_some()
+    }
+
+    pub fn has_kick(&self, left: bool) -> bool {
+        if left {
+            self.kick_left.is_some()
+        } else {
+            self.kick_right.is_some()
+        }
+    }
+
+    /// One inference on the named network. A missing optional network falls back to
+    /// walking — the scheduler checks `has_*` before asking, so reaching the fallback is a
+    /// bug, but a wrong gait beats a dead control thread.
     pub fn infer(
         &mut self,
         observation: &Observation,
-        standing: bool,
+        net: Net,
     ) -> Result<[f32; ACTION_LEN], PolicyError> {
-        let session = match (standing, self.stand.as_mut()) {
-            (true, Some(stand)) => stand,
-            _ => &mut self.walk,
+        let session = match net {
+            Net::Walk => None,
+            Net::Stand => self.stand.as_mut(),
+            Net::SitStand => self.sitstand.as_mut(),
+            Net::GroundPick => self.ground_pick.as_mut(),
+            Net::KickLeft => self.kick_left.as_mut(),
+            Net::KickRight => self.kick_right.as_mut(),
+            Net::Roulade => self.roulade.as_mut(),
+        };
+        let session = match session {
+            Some(session) => session,
+            None => &mut self.walk,
         };
         run(session, Path::new("<loaded>"), observation)
     }
@@ -344,6 +434,23 @@ mod tests {
         assert!(!stands(false, 0.0), "no standing policy, zero command");
         assert!(stands(true, 0.0), "standing policy, zero command");
         assert!(!stands(true, 0.5), "standing policy, walking command");
+    }
+
+    /// Roller and fall-recovery modes reserve the standing network, so the magnitude rule
+    /// must be inert while `standing_disabled` is set — otherwise a roller duck at zero
+    /// stick would swap to a network trained for legs it is not standing on.
+    #[test]
+    fn disabling_standing_beats_the_magnitude_rule() {
+        let threshold = DEFAULT_STANDING_THRESHOLD;
+        let stands = |has_stand: bool, disabled: bool, magnitude: f64| {
+            has_stand && !disabled && magnitude <= threshold
+        };
+
+        assert!(stands(true, false, 0.0));
+        assert!(
+            !stands(true, true, 0.0),
+            "disabled must win at zero command"
+        );
     }
 
     /// **The panic contract.** A panic out of `ort` must come back as a `PolicyError`, because

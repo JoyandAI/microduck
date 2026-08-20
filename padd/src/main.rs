@@ -1,13 +1,41 @@
 //! `padd` — a gamepad, as an intent client.
 //!
-//! It has no privileged access to the robot. It reads a pad, turns sticks into velocity and
-//! head targets, and sends them over `robotd`'s socket like any other client.
+//! It has no privileged access to the robot. It reads a pad, turns sticks and buttons into
+//! intents, and sends them over `robotd`'s socket like any other client.
 //!
 //! That is the point of it being a separate process rather than a thread inside `robotd`.
 //! The intent API is the path the app, the SDK and any remote client will use, and here it
 //! gets exercised every day by whoever is working on the robot — so it cannot quietly rot
 //! the way an API only the phone app uses inevitably would. The cost is a socket hop: tens
 //! of microseconds against a 20 ms tick.
+//!
+//! ## The mapping is the prototype's
+//!
+//! Muscle memory carries over from `microduck_runtime`:
+//!
+//! ```text
+//! Start        toggle the policy
+//! Y (North)    head mode — sticks pose the head
+//! B (East)     body-pose mode — sticks lean and crouch the standing robot
+//! A (South)    ground pick
+//! LB / RB      left / right kick
+//! DPad-Down    sit ↔ stand
+//! RT / LT      mouth (either trigger; the max wins)
+//! Select, 2 s  sit down, then power off
+//! ```
+//!
+//! Head and body-pose mode both zero the velocity while active, as the prototype does — a
+//! robot that keeps walking because you started posing its head is a bad surprise.
+//!
+//! Smoothing lives in `robotd` (`[control] cmd_alpha` / `head_alpha`), not here: this
+//! process sends raw targets, so every client gets the same feel.
+//!
+//! ## Roller mode
+//!
+//! At startup this asks `robot.mode`. On a roller robot the stick mapping becomes the
+//! prototype's roller preset — asymmetric forward/brake (0.6 / 0.5), no strafe, ±0.3 rad/s
+//! heading — and A triggers the crouch that lives in the ground-pick slot. The other
+//! skills ride along on wheels, as the rebased roller line has them.
 //!
 //! ## On the robot, this runs itself
 //!
@@ -20,9 +48,9 @@
 //! `robotd`'s deadman holds the robot on its own. Inventing a zero command instead would mask a
 //! disconnected pad as someone's decision to stop.
 //!
-//! Pairing is **not** done here, and that is the same decision as everything above: bonding a
-//! device needs root and BlueZ, and a `padd` holding either would stop being the unprivileged client
-//! whose whole value is having no special access. It lives in `configd`, next to wifi.
+//! Pairing is **not** done here: bonding a device needs root and BlueZ, and a `padd` holding
+//! either would stop being the unprivileged client whose whole value is having no special
+//! access. It lives in `configd`, next to wifi.
 //!
 //! ## It also hands out the pad's raw input
 //!
@@ -87,20 +115,26 @@ struct Args {
     hz: u32,
 
     /// Deflection below this counts as centre. Analogue sticks rarely rest at exactly zero,
-    /// and without this the robot creeps.
-    #[arg(long, default_value_t = 0.12)]
+    /// and without this the robot creeps. The prototype's value.
+    #[arg(long, default_value_t = 0.1)]
     deadzone: f64,
 
-    /// Full-deflection forward/strafe speed, m/s.
-    #[arg(long, default_value_t = 0.15)]
+    /// Full-deflection forward/strafe speed, m/s. The prototype's alpha default.
+    #[arg(long, default_value_t = 0.3)]
     max_linear: f64,
 
+    /// Full-deflection backward speed, m/s — the prototype caps reverse separately.
+    #[arg(long, default_value_t = 0.3)]
+    max_linear_backward: f64,
+
     /// Full-deflection turn rate, rad/s.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.5)]
     max_angular: f64,
 
-    /// Full-deflection head travel, radians.
-    #[arg(long, default_value_t = 0.5)]
+    /// Full-deflection head travel, radians. The head command feeds the policy's
+    /// observation rather than a servo directly, so this is the prototype's generous 2.5 —
+    /// the network itself decides how far the head actually goes.
+    #[arg(long, default_value_t = 2.5)]
     max_head: f64,
 
     /// Where to serve the raw input tap: the pad's own event stream, for `robotctl monitor`.
@@ -119,13 +153,29 @@ struct Args {
 /// switches a pad on and is not a background load.
 const IDLE_POLL: Duration = Duration::from_millis(500);
 
-/// Sticks drive either the body or the head, never both — the prototype does the same, on
-/// its X button. Two sticks cannot express five degrees of freedom, and a modal toggle is
-/// clearer than a chord.
+/// Select held this long sits the robot down and powers it off.
+const SHUTDOWN_HOLD: Duration = Duration::from_secs(2);
+
+/// Body-pose stick ranges, from the training env via the prototype: z is asymmetric
+/// (little headroom up at the standing height, more crouch down), angles capped at ~15°.
+const BODY_MAX_Z_UP: f64 = 0.010;
+const BODY_MAX_Z_DOWN: f64 = 0.025;
+const BODY_MAX_ANGLE: f64 = 0.2618;
+
+/// The prototype's roller-mode stick shaping: push and brake are asymmetric, there is no
+/// strafe, and heading is capped at 0.3 rad/s regardless of the walking limits — the
+/// roller launch line's `--max-angular-vel 0.3`, unchanged across both of its eras.
+const ROLLER_PUSH: f64 = 0.6;
+const ROLLER_BRAKE: f64 = 0.5;
+const ROLLER_YAW: f64 = 0.3;
+
+/// What the sticks drive. Head and body-pose are modal because two sticks cannot express
+/// nine degrees of freedom; the toggles are the prototype's Y and B buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Body,
+    Drive,
     Head,
+    BodyPose,
 }
 
 fn main() -> std::process::ExitCode {
@@ -172,18 +222,33 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    let mut next_id = 1u64;
+
+    // Which robot is this? A roller duck wants the roller stick shaping. Asked once —
+    // the answer cannot change while robotd lives, and neither process outlives a restart
+    // of the other in practice (systemd restarts both on update).
+    let roller = match request(&mut stream, &mut next_id, &proto::Call::RobotMode) {
+        Ok(Some(answer)) => match answer.result_as::<proto::ModeResult>() {
+            Ok(mode) => mode.mode == "roller",
+            Err(_) => false,
+        },
+        _ => false,
+    };
     tracing::warn!(
         socket = %args.socket.display(),
         hz = args.hz,
-        "driving — Start toggles the policy, North toggles head mode, East stops"
+        roller,
+        "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
+         LB/RB kicks, DPad-Down sit, triggers mouth, Select (2s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
-    let mut mode = Mode::Body;
-    let mut enabled = false;
-    let mut next_id = 1u64;
+    let mut mode = Mode::Drive;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
+    let mut select_held_since: Option<Instant> = None;
+    let mut shutdown_sent = false;
 
     loop {
         let tick = Instant::now();
@@ -191,14 +256,28 @@ fn main() -> std::process::ExitCode {
         // Drain the queue so axis polling below sees present state, and catch button
         // *edges* — a held Start must toggle once, not fifty times a second.
         let mut toggle_enable = false;
-        let mut toggle_mode = false;
-        let mut stop = false;
+        let mut toggle_head = false;
+        let mut toggle_body = false;
+        let mut ground_pick = false;
+        let mut kick_left = false;
+        let mut kick_right = false;
+        let mut sit_toggle = false;
+        let mut roulade = false;
         while let Some(event) = gilrs.next_event() {
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
                     Button::Start => toggle_enable = true,
-                    Button::North => toggle_mode = true,
-                    Button::East => stop = true,
+                    Button::North => toggle_head = true,
+                    Button::East => toggle_body = true,
+                    Button::South => ground_pick = true,
+                    // X on an Xbox pad. Press = one roulade; holding it chains rolls,
+                    // which the resend below carries.
+                    Button::West => roulade = true,
+                    // gilrs names the bumpers `LeftTrigger`/`RightTrigger`; the analog
+                    // triggers are `LeftTrigger2`/`RightTrigger2`.
+                    Button::LeftTrigger => kick_left = true,
+                    Button::RightTrigger => kick_right = true,
+                    Button::DPadDown => sit_toggle = true,
                     _ => {}
                 }
             }
@@ -235,44 +314,154 @@ fn main() -> std::process::ExitCode {
             tap.watch(&pad);
         }
 
-        if toggle_mode {
-            mode = match mode {
-                Mode::Body => Mode::Head,
-                Mode::Head => Mode::Body,
+        if toggle_head {
+            mode = if mode == Mode::Head {
+                Mode::Drive
+            } else {
+                Mode::Head
             };
             tracing::info!(?mode, "mode");
         }
-
-        if toggle_enable {
-            enabled = !enabled;
-            let call = proto::Call::RobotEnable(proto::EnableParams { on: enabled });
-            if let Err(e) = request(&mut stream, &mut next_id, &call) {
-                tracing::error!(error = %e, "enable failed");
-                return std::process::ExitCode::FAILURE;
+        if toggle_body {
+            let leaving = mode == Mode::BodyPose;
+            mode = if leaving { Mode::Drive } else { Mode::BodyPose };
+            tracing::info!(?mode, "mode");
+            if leaving {
+                // The prototype's B-button exit snaps the body back to nominal at once.
+                if let Err(e) = notify(
+                    &mut stream,
+                    &proto::Call::RobotPose(proto::PoseParams {
+                        active: false,
+                        ..Default::default()
+                    }),
+                ) {
+                    tracing::error!(error = %e, "send failed");
+                    return std::process::ExitCode::FAILURE;
+                }
             }
-            tracing::warn!(enabled, "policy");
         }
 
-        if stop {
-            if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotStop) {
-                tracing::error!(error = %e, "stop failed");
-                return std::process::ExitCode::FAILURE;
+        if toggle_enable {
+            // The robot owns the toggle. A local on/off belief here drifts from the
+            // robot's the moment anything else moves it — robot.relax, the shutdown
+            // sequence, either side restarting — and a stale belief turns Start into a
+            // button that does nothing every other press. `toggle` flips the robot's own
+            // state; turning OFF returns it to the home pose (the prototype's "returning
+            // to default pose"), so turning on always starts the policy from home.
+            let call = proto::Call::RobotEnable(proto::EnableParams {
+                on: false,
+                toggle: true,
+            });
+            match request(&mut stream, &mut next_id, &call) {
+                Err(e) => {
+                    tracing::error!(error = %e, "enable failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                Ok(response) => {
+                    // The robot names the state it ended in; that is the log, since padd
+                    // no longer has a belief of its own to report.
+                    let outcome = response
+                        .and_then(|r| r.result_as::<proto::IntentResult>().ok())
+                        .and_then(|r| r.reason)
+                        .unwrap_or_else(|| "toggled".to_owned());
+                    tracing::warn!(%outcome, "policy");
+                }
             }
-            tracing::warn!("stop");
+        }
+
+        // One-shot skills. Answered, because "refused, and here is why" is a real outcome —
+        // there may be no kick policy on this robot, or another move mid-flight.
+        for (fired, skill) in [
+            (ground_pick, proto::Skill::GroundPick),
+            (kick_left, proto::Skill::KickLeft),
+            (kick_right, proto::Skill::KickRight),
+            (sit_toggle, proto::Skill::SitToggle),
+            (roulade, proto::Skill::Roulade),
+        ] {
+            if fired {
+                let call = proto::Call::RobotDo(proto::DoParams { skill });
+                if let Err(e) = request(&mut stream, &mut next_id, &call) {
+                    tracing::error!(error = %e, "skill request failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+
+        // X held: keep the roulade chain alive. The robot chains another roll when a
+        // request lands near the end of the current one, so "held" is spelled "resent every
+        // tick" — as a notification, because fifty answered requests a second would spend
+        // their time waiting on replies, and the press above already got the real answer.
+        if pad.is_pressed(Button::West)
+            && !roulade
+            && let Err(e) = notify(
+                &mut stream,
+                &proto::Call::RobotDo(proto::DoParams {
+                    skill: proto::Skill::Roulade,
+                }),
+            )
+        {
+            tracing::error!(error = %e, "send failed");
+            return std::process::ExitCode::FAILURE;
+        }
+
+        // Select held two seconds: sit down, then power off. Sent once per hold — the
+        // robot owns the sequence from there, and a second request would be a no-op anyway.
+        if pad.is_pressed(Button::Select) {
+            let held = select_held_since.get_or_insert(tick);
+            if tick.duration_since(*held) >= SHUTDOWN_HOLD && !shutdown_sent {
+                shutdown_sent = true;
+                tracing::warn!("Select held — asking the robot to sit and power off");
+                if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotShutdown) {
+                    tracing::error!(error = %e, "shutdown request failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        } else {
+            select_held_since = None;
+            shutdown_sent = false;
         }
 
         let deadzone = |v: f32| {
             let v = v as f64;
             if v.abs() < args.deadzone { 0.0 } else { v }
         };
-        let left_y = deadzone(pad.value(Axis::LeftStickY));
         let left_x = deadzone(pad.value(Axis::LeftStickX));
-        let right_y = deadzone(pad.value(Axis::RightStickY));
+        let left_y = deadzone(pad.value(Axis::LeftStickY));
         let right_x = deadzone(pad.value(Axis::RightStickX));
+        let right_y = deadzone(pad.value(Axis::RightStickY));
+
+        // Either trigger opens the mouth; the max wins, as in the prototype (where RT also
+        // chirps and LT rides the wheee — the sounds return with the audio stack).
+        let trigger = |b: Button| pad.button_data(b).map(|d| d.value()).unwrap_or(0.0) as f64;
+        let mouth = trigger(Button::RightTrigger2).max(trigger(Button::LeftTrigger2));
+        if let Err(e) = notify(
+            &mut stream,
+            &proto::Call::RobotMouth(proto::MouthParams { open: mouth }),
+        ) {
+            tracing::error!(error = %e, "send failed");
+            return std::process::ExitCode::FAILURE;
+        }
 
         let call = match mode {
-            Mode::Body => proto::Call::RobotMove(proto::MoveParams {
-                vx: left_y * args.max_linear,
+            Mode::Drive if roller => proto::Call::RobotMove(proto::MoveParams {
+                // The prototype's roller shaping: push harder than you can brake, no
+                // strafe, heading capped independently of the walking limits.
+                vx: left_y
+                    * if left_y >= 0.0 {
+                        ROLLER_PUSH
+                    } else {
+                        ROLLER_BRAKE
+                    },
+                vy: 0.0,
+                vyaw: -right_x * ROLLER_YAW,
+            }),
+            Mode::Drive => proto::Call::RobotMove(proto::MoveParams {
+                vx: left_y
+                    * if left_y >= 0.0 {
+                        args.max_linear
+                    } else {
+                        args.max_linear_backward
+                    },
                 // `vy` is positive to the left; stick-left reads negative on every pad
                 // gilrs normalises.
                 vy: -left_x * args.max_linear,
@@ -290,11 +479,34 @@ fn main() -> std::process::ExitCode {
                     tracing::error!(error = %e, "send failed");
                     return std::process::ExitCode::FAILURE;
                 }
+                // The prototype's alpha mapping, signs included (its head_pitch/head_yaw
+                // joint axes are inverted relative to stick direction — verified on
+                // hardware there, kept verbatim here).
                 proto::Call::RobotHead(proto::HeadParams {
-                    neck_pitch: left_y * args.max_head,
-                    head_pitch: right_y * args.max_head,
-                    head_yaw: right_x * args.max_head,
-                    head_roll: left_x * args.max_head,
+                    neck_pitch: right_y * args.max_head,
+                    head_pitch: -left_y * args.max_head,
+                    head_yaw: -left_x * args.max_head,
+                    head_roll: right_x * args.max_head,
+                })
+            }
+            Mode::BodyPose => {
+                if let Err(e) = notify(
+                    &mut stream,
+                    &proto::Call::RobotMove(proto::MoveParams::default()),
+                ) {
+                    tracing::error!(error = %e, "send failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                proto::Call::RobotPose(proto::PoseParams {
+                    z: left_y
+                        * if left_y >= 0.0 {
+                            BODY_MAX_Z_UP
+                        } else {
+                            BODY_MAX_Z_DOWN
+                        },
+                    pitch: right_y * BODY_MAX_ANGLE,
+                    roll: right_x * BODY_MAX_ANGLE,
+                    active: true,
                 })
             }
         };
@@ -323,7 +535,11 @@ fn notify(stream: &mut UnixStream, call: &proto::Call) -> std::io::Result<()> {
 /// Answered, unlike the continuous ones, because "refused, and here is why" is a real
 /// outcome — safety declines to enable a policy on a fallen robot — and a client that
 /// ignored it would leave the operator wondering why nothing happened.
-fn request(stream: &mut UnixStream, next_id: &mut u64, call: &proto::Call) -> std::io::Result<()> {
+fn request(
+    stream: &mut UnixStream,
+    next_id: &mut u64,
+    call: &proto::Call,
+) -> std::io::Result<Option<proto::Response>> {
     let id = proto::Id::Number(*next_id);
     *next_id += 1;
     let mut line = serde_json::to_vec(&proto::Request::call(id, call))?;
@@ -338,15 +554,18 @@ fn request(stream: &mut UnixStream, next_id: &mut u64, call: &proto::Call) -> st
 
     match serde_json::from_str::<proto::Response>(&answer) {
         Ok(response) => {
-            if let Some(error) = response.error {
+            if let Some(error) = &response.error {
                 tracing::warn!(code = error.code, message = %error.message, "refused");
             } else if let Ok(result) = response.result_as::<proto::IntentResult>()
                 && !result.accepted
             {
                 tracing::warn!(reason = ?result.reason, "not accepted");
             }
+            Ok(Some(response))
         }
-        Err(e) => tracing::warn!(error = %e, raw = %answer.trim(), "unparsable answer"),
+        Err(e) => {
+            tracing::warn!(error = %e, raw = %answer.trim(), "unparsable answer");
+            Ok(None)
+        }
     }
-    Ok(())
 }
