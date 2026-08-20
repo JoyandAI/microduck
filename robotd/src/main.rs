@@ -23,6 +23,7 @@ mod control;
 mod intents;
 mod params;
 mod soc;
+mod sound;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1053,6 +1054,47 @@ async fn control_loop<T: RobotIo>(
     let mut recovery = Recovery::Idle;
     let mut warned_imu_warming = false;
 
+    // The voice, and the ear. Both optional equipment: a robot without a codec or a bank
+    // walks identically — the player degrades to a debug line, and the mic worker is only
+    // spawned when configured, with its own retry loop when arecord flaps.
+    let mut voice = params
+        .audio
+        .enabled
+        .then(|| sound::Sound::new(params.audio.bank.clone(), params.audio.device.clone()));
+    let pet: Option<pet_detect::worker::PetHandle> = if params.audio.enabled
+        && params.audio.pet_detect_resolved(params.policy.mode)
+        && let Some(model) = params.audio.pet_model_resolved()
+        && model.exists()
+    {
+        match pet_detect::worker::PetHandle::spawn(pet_detect::worker::PetConfig {
+            alsa_device: format!("{},0", params.audio.device),
+            model_path: model.clone(),
+            enter_threshold: params.audio.pet_enter_threshold,
+            exit_threshold: params.audio.pet_exit_threshold,
+        }) {
+            Ok(handle) => {
+                tracing::warn!(model = %model.display(), "petting detection listening");
+                Some(handle)
+            }
+            Err(e) => {
+                // Not unhealthy: the classifier is a feature, not the robot. A missing
+                // model on a release that ships one is caught by the packaging tripwires.
+                tracing::warn!(error = %e, "petting detection unavailable");
+                None
+            }
+        }
+    } else {
+        // Configured on but nothing to run: a bench robotd, a board that predates the
+        // model, or audio off. Quietly so on purpose — the mic is optional equipment.
+        None
+    };
+
+    // Say hello in this robot's own voice as the control loop comes up, as the prototype
+    // does — the greet is also the audible "robotd is running" on a headless board.
+    if let Some(voice) = voice.as_mut() {
+        voice.play("greet", false);
+    }
+
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
@@ -1191,6 +1233,42 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
+        // Sounds: one-shot tags queued by clients, and the wheee hold as a level — held
+        // only while `padd`'s re-notifications stay fresh, so a client that dies mid-ride
+        // leaves a ride that lands instead of looping forever.
+        if let Some(voice) = voice.as_mut() {
+            for tag in intents.take_sounds() {
+                voice.play(tag.as_str(), false);
+            }
+            voice.wheee(intents.wheee_held() && !powered_off);
+
+            // Petting: coo, exactly when the prototype coos — not fallen, no scripted move
+            // in flight. The verdict is used bare here (not the armed fall gate): this is a
+            // sound cue, and cooing while face-down would be worse than staying quiet.
+            if let Some(pet) = pet.as_ref() {
+                while let Some(ev) = pet.try_recv_event() {
+                    match ev {
+                        pet_detect::PettingEvent::Start => {
+                            let calm =
+                                !safety.fallen() && controller.as_ref().is_none_or(|c| !c.busy());
+                            if calm {
+                                tracing::info!("petting started");
+                                voice.play("coo", false);
+                            } else {
+                                tracing::debug!("petting detected (ignored: busy or down)");
+                            }
+                        }
+                        pet_detect::PettingEvent::End => tracing::debug!("petting ended"),
+                    }
+                }
+                // Ambient sound events have no consumer until the autonomous brain arrives;
+                // surfaced at debug so mic tuning on a bench has data to look at.
+                while let Some(ev) = pet.try_recv_sound() {
+                    tracing::debug!(event = ?ev, "ambient sound");
+                }
+            }
+        }
+
         // The sit-then-power-off sequence: `robot.shutdown`, or a genuinely empty pack.
         // The battery reading is a ~10 s EMA refreshed once a second, so a load sag cannot
         // reach the floor — a pack that gets there is spent.
@@ -1205,6 +1283,10 @@ async fn control_loop<T: RobotIo>(
                 && controller.as_ref().is_some_and(|c| c.has_sitstand());
             if can_sit {
                 tracing::warn!(battery_empty, "shutdown: sitting down before power off");
+                // Goodbye peck; non-blocking — it plays out during the sit.
+                if let Some(voice) = voice.as_mut() {
+                    voice.play("peck", false);
+                }
                 controller
                     .as_mut()
                     .expect("can_sit checked the controller")
@@ -1214,6 +1296,11 @@ async fn control_loop<T: RobotIo>(
                 tracing::warn!(battery_empty, "shutdown: cutting torque and powering off");
                 if let Err(e) = safety.set_torque(false) {
                     tracing::warn!(error = %e, "cannot cut torque before power off");
+                }
+                // Goodbye peck; blocking, so it is heard before the poweroff kills this
+                // process's cgroup. The one deliberate block in the loop, on its last tick.
+                if let Some(voice) = voice.as_mut() {
+                    voice.play("peck", true);
                 }
                 intents.set_enabled(false);
                 powered_off = true;
@@ -1849,6 +1936,11 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
             intents.request_skill(p.skill);
             true
         }
+        // Same story for the wheee hold, which arrives per tick while the trigger is down.
+        proto::Call::RobotSound(p) => {
+            intents.request_sound(*p);
+            true
+        }
         _ => false,
     }
 }
@@ -1889,6 +1981,14 @@ fn dispatch(
                 proto::IntentResult::accepted()
             };
             proto::Response::ok(Some(id), &result)
+        }
+
+        // A sound is queued for the loop's next tick, and never refused: unlike a skill it
+        // moves nothing, and a chirp out of a fallen robot is diagnostics, not danger. A
+        // robot with audio disabled just stays quiet.
+        proto::Call::RobotSound(p) => {
+            intents.request_sound(*p);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
         // Sit, then power the machine off. Never refused for being inconvenient — a robot

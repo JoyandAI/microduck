@@ -359,6 +359,11 @@ cp "$BIN"/robotd staged/
 cp "$BIN"/configd staged/
 cp "$BIN"/btd staged/
 cp "$BIN"/padd staged/
+# The voice generator (postinstall renders the per-robot bank with it) and the
+# mic classifier pair — pet-detect for live listening, pet-features for training.
+cp "$BIN"/sounds staged/
+cp "$BIN"/pet-detect staged/
+cp "$BIN"/pet-features staged/
 
 # No `--base-url`: the manifest `LocalDir` reads names the artifact by bare filename, and
 # `package` leaves it bare when no base is given.
@@ -398,7 +403,8 @@ cargo run -p xtask -- package \
     --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
     --include "policies/roller.onnx=policies/roller.onnx" \
     --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx" \
-    --include "policies/roulade.onnx=policies/roulade.onnx"
+    --include "policies/roulade.onnx=policies/roulade.onnx" \
+    --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx"
 
 
 echo "==> signing with $KEY"

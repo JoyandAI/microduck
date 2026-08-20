@@ -195,3 +195,26 @@ mode = "walk"
 # floor (6.6 V — the same value the battery percentage maps to 0%). The EMA moves over
 # ~10 s, so a load sag cannot trip it; reaching 6.6 requires a genuinely spent pack.
 # battery_empty_shutdown = true
+
+[audio]
+# The robot's voice (the seeded synth bank under /var/lib/robot/sounds — rendered by the
+# release's postinstall, `sounds ensure-bank`) and its ear (the petting classifier on the
+# onboard mic). All optional equipment: a board without the codec walks identically and
+# stays quiet, and nothing here reaches a health verdict.
+# enabled = true
+
+# ALSA playback device — the TLV320AIC3104 codec that setup-board.sh brings up. The mic
+# worker captures from "<device>,0".
+# device = "plughw:aic3104"
+
+# Where the voice bank lives.
+# bank = "/var/lib/robot/sounds"
+
+# Listen for petting on the onboard mic and coo about it. Unset resolves per mode, as the
+# prototype's launcher did: on for walking, off for the roller. The model ships in the
+# release (models/pet_detect.onnx); "none" disables it outright; thresholds are the
+# classifier's hysteresis (enter above, leave below).
+# pet_detect = true
+# pet_model = ".../current/models/pet_detect.onnx"
+# pet_enter_threshold = 0.95
+# pet_exit_threshold = 0.85

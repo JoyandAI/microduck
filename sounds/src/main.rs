@@ -1,0 +1,190 @@
+//! `sounds` — render and audition the robot's voice bank.
+//!
+//! `ensure-bank` is what the release's postinstall hook runs: it replaces the prototype's
+//! `generate_sounds.sh` (venv + numpy + ffmpeg) with one binary that renders the per-robot
+//! bank in place, idempotently. Everything else is bench tooling: hear a seed before it
+//! ships, regenerate a bank by hand, print the personality behind a voice.
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use sounds::{BANK_VERSION, Personality, hardware_seed, render, render_all, to_wav};
+
+#[derive(Parser)]
+#[command(
+    name = "sounds",
+    about = "The robot's voice: seedable duck vocalisations",
+    version
+)]
+struct Args {
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Print the personality traits behind a seed.
+    Show {
+        #[arg(long)]
+        seed: Option<u32>,
+    },
+    /// Render one sound to a wav file.
+    Render {
+        tag: String,
+        out: PathBuf,
+        #[arg(long)]
+        seed: Option<u32>,
+        #[arg(long, default_value_t = 0)]
+        variant: u32,
+    },
+    /// Render every tag × variant into a directory (the layout robotd plays from).
+    RenderAll {
+        out_dir: PathBuf,
+        #[arg(long)]
+        seed: Option<u32>,
+    },
+    /// Synthesize one sound and play it through aplay.
+    Play {
+        tag: String,
+        #[arg(long)]
+        seed: Option<u32>,
+        #[arg(long, default_value_t = 0)]
+        variant: u32,
+        /// ALSA device; the robot's codec by default.
+        #[arg(long, default_value = "plughw:aic3104")]
+        device: String,
+    },
+    /// Make sure this robot's voice bank exists and is current — render it if not.
+    ///
+    /// Idempotent: a marker records the seed and bank version, and a matching bank is left
+    /// alone, so this can (and does) run on every release install.
+    EnsureBank {
+        /// Where the bank lives. robotd plays from here.
+        #[arg(long, default_value = "/var/lib/robot/sounds")]
+        dir: PathBuf,
+        /// Regenerate even when the marker matches.
+        #[arg(long)]
+        force: bool,
+        /// Override the hardware-derived seed (bench use).
+        #[arg(long)]
+        seed: Option<u32>,
+    },
+}
+
+/// The seed to voice: given, or derived from the hardware.
+fn resolve_seed(seed: Option<u32>) -> Result<u32> {
+    match seed {
+        Some(s) => Ok(s),
+        None => hardware_seed().context("no --seed given and no hardware id to derive one"),
+    }
+}
+
+fn show(p: &Personality) {
+    println!("  seed               {}", p.seed);
+    println!("  pitch_center_hz    {:.1}", p.pitch_center_hz);
+    println!("  register           {:+.2}", p.register);
+    println!("  pitch_spread       {:.2}", p.pitch_spread);
+    println!("  glide_bias         {:+.2}", p.glide_bias);
+    println!("  brightness         {:.2}", p.brightness);
+    println!("  tilt               {:.2}", p.tilt);
+    println!("  nasal              {:.2}", p.nasal);
+    println!("  harmonic_skew      {:+.2}", p.harmonic_skew);
+    println!("  formant_n          {}", p.formant_n);
+    println!("  formant_gain       {:.2}", p.formant_gain);
+    println!("  vibrato_rate_hz    {:.1}", p.vibrato_rate_hz);
+    println!("  vibrato_depth      {:.2}", p.vibrato_depth);
+    println!("  jitter_depth       {:.2}", p.jitter_depth);
+    println!("  breath             {:.2}", p.breath);
+    println!("  quackiness         {:.2}", p.quackiness);
+    println!("  am_rate_hz         {:.1}", p.am_rate_hz);
+    println!("  am_depth           {:.2}", p.am_depth);
+    println!("  warble_hz          {:.1}", p.warble_hz);
+    println!("  warble_depth       {:.2}", p.warble_depth);
+    println!("  attack_sharpness   {:.2}", p.attack_sharpness);
+    println!("  speed              {:.2}", p.speed);
+}
+
+fn main() -> Result<()> {
+    match Args::parse().command {
+        Cmd::Show { seed } => {
+            let p = Personality::from_seed(resolve_seed(seed)?);
+            show(&p);
+        }
+        Cmd::Render {
+            tag,
+            out,
+            seed,
+            variant,
+        } => {
+            let p = Personality::from_seed(resolve_seed(seed)?);
+            to_wav(&render(&tag, &p, variant)?, &out)?;
+            println!("wrote {}", out.display());
+        }
+        Cmd::RenderAll { out_dir, seed } => {
+            let p = Personality::from_seed(resolve_seed(seed)?);
+            let paths = render_all(&p, &out_dir)?;
+            println!("wrote {} files under {}", paths.len(), out_dir.display());
+        }
+        Cmd::Play {
+            tag,
+            seed,
+            variant,
+            device,
+        } => {
+            let p = Personality::from_seed(resolve_seed(seed)?);
+            let buf = render(&tag, &p, variant)?;
+            // Pipe raw PCM into aplay; fall back to the default device off the robot.
+            let play = |device: Option<&str>| -> Result<bool> {
+                let mut cmd = Command::new("aplay");
+                cmd.args(["-q", "-t", "raw", "-f", "S16_LE", "-c", "1", "-r"])
+                    .arg(sounds::SR.to_string());
+                if let Some(d) = device {
+                    cmd.args(["-D", d]);
+                }
+                let mut child = cmd.stdin(Stdio::piped()).spawn().context("running aplay")?;
+                let pcm: Vec<u8> = sounds::synth::to_i16(&buf)
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes())
+                    .collect();
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin.write_all(&pcm)?;
+                }
+                Ok(child.wait()?.success())
+            };
+            if !play(Some(&device))? && !play(None)? {
+                bail!("aplay failed on both {device} and the default device");
+            }
+        }
+        Cmd::EnsureBank { dir, force, seed } => {
+            let seed = resolve_seed(seed)?;
+            let marker = format!("{seed}:{BANK_VERSION}");
+            let marker_path = dir.join(".seed");
+            if !force && std::fs::read_to_string(&marker_path).is_ok_and(|m| m.trim() == marker) {
+                println!(
+                    "voice bank already generated for seed {seed} (v{BANK_VERSION}) — nothing to do (--force to regenerate)"
+                );
+                return Ok(());
+            }
+            let p = Personality::from_seed(seed);
+            println!("voice seed {seed} (bank v{BANK_VERSION}) — this robot's personality:");
+            show(&p);
+            // Render beside the target and swap, so a power cut mid-render cannot leave a
+            // half-bank that the marker calls complete.
+            let staging = dir.with_extension("new");
+            let _ = std::fs::remove_dir_all(&staging);
+            let paths = render_all(&p, &staging)?;
+            std::fs::write(staging.join(".seed"), &marker)?;
+            let _ = std::fs::remove_dir_all(&dir);
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&staging, &dir)
+                .with_context(|| format!("moving the bank into {}", dir.display()))?;
+            println!("voice bank ({} sounds) at {}", paths.len(), dir.display());
+        }
+    }
+    Ok(())
+}

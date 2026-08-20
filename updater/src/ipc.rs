@@ -600,6 +600,7 @@ impl Server {
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotDo(_)
+            | Call::RobotSound(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotShutdown

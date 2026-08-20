@@ -475,6 +475,206 @@ free_motor_port() {
 # The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon here leaves
 # the kernel holding hci0 while bluetoothd reports "No default controller available", which needs a
 # reboot to clear.
+# ── audio: the TLV320AIC3104 codec (speaker + microphone) ─────────────────────────────────
+#
+# The robot's voice and ear. Ported from the prototype installer's audio bring-up, and like
+# everything it did, every step here fails *soft* — a board without working audio walks
+# identically, so nothing below is allowed to stop the provisioning.
+#
+# Five layers, each idempotent:
+#   1. alsa-utils (aplay/arecord/amixer) + the DKMS toolchain + dtc.
+#   2. The Armbian *vendor* (BSP 6.1) kernel: the codec's I²S clock tree only exists there,
+#      and the DKMS module builds against its headers.
+#   3. Device-tree overlays, compiled from the sources vendored in deploy/audio/: the
+#      hardware i2c3 bus on header pins 3/5, and the codec + I²S sound card grafted onto it.
+#      (The prototype also kept a bit-banged i2c-gpio fallback; it was the revert path for
+#      rise-time trouble that never came back, and it is not carried here.)
+#   4. The codec driver itself, out of tree via DKMS — the vendor kernel does not build
+#      SND_SOC_AIC3X, which is why a stock board has no aic3104 card.
+#   5. Mixer levels at boot: aic3104-init.service, running the vendored amixer script
+#      before robotd so the greet is audible.
+#
+# The voice bank itself is NOT provisioned here — the release's postinstall renders it with
+# the `sounds` binary the release carries, seeded from the SoC serial.
+
+# Fetch a repository file (deploy/audio/...) into $2. The token, when given, rides along —
+# same reasoning as fetch_cmd, done rather than printed.
+fetch_repo_file() {
+    if [ -n "$TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer $TOKEN" "${RAW%/scripts}/$1" -o "$2"
+    else
+        curl -fsSL "${RAW%/scripts}/$1" -o "$2"
+    fi
+}
+
+# Add one word to armbianEnv's overlays= line, preserving order (the codec overlay must
+# come after its bus overlay — it grafts the codec node onto the bus that overlay enables).
+ensure_overlay_word() {
+    if ! grep -Eq '^overlays=' "$ENV_TXT"; then
+        echo "overlays=$1" >> "$ENV_TXT"
+        needs_reboot=1
+    elif ! grep -E '^overlays=' "$ENV_TXT" | grep -qw "$1"; then
+        sed -i "s/^overlays=\(.*\)\$/overlays=\1 $1/" "$ENV_TXT"
+        needs_reboot=1
+    fi
+}
+
+configure_audio() {
+    say "audio: TLV320AIC3104 codec bring-up"
+
+    # 1. Packages.
+    audio_pkgs="alsa-utils device-tree-compiler dkms gcc make"
+    missing=""
+    for pkg in $audio_pkgs; do
+        dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+    done
+    if [ -n "$missing" ]; then
+        say "installing:$missing"
+        apt-get update -qq || true
+        # shellcheck disable=SC2086  # word-splitting the package list is the point
+        apt-get install -y -qq $missing \
+            || { warn "apt failed — audio will not work on this board"; return 0; }
+    fi
+
+    # 2. The vendor kernel, with headers for the DKMS build.
+    if ! dpkg -s linux-image-vendor-rk35xx >/dev/null 2>&1 \
+        || ! dpkg -s linux-dtb-vendor-rk35xx >/dev/null 2>&1 \
+        || ! dpkg -s linux-headers-vendor-rk35xx >/dev/null 2>&1; then
+        say "installing the Armbian vendor kernel (the codec's I²S tree lives there)"
+        apt-get update -qq || true
+        if apt-get install -y linux-image-vendor-rk35xx linux-dtb-vendor-rk35xx \
+            linux-headers-vendor-rk35xx; then
+            needs_reboot=1
+        else
+            warn "could not install the vendor kernel — audio will not work"
+            return 0
+        fi
+    fi
+    vendor_ver=$(find /lib/modules -maxdepth 1 -name '*-vendor-rk35xx' 2>/dev/null | sort -V | tail -1 | xargs -r basename)
+    if [ -z "$vendor_ver" ]; then
+        warn "no vendor kernel under /lib/modules — audio will not work"
+        return 0
+    fi
+    # Make it the active kernel. The apt postinst repoints these on a fresh install;
+    # re-asserted here for idempotent re-runs where the 'current' kernel touched them last.
+    for pair in "Image:vmlinuz-$vendor_ver" "uInitrd:uInitrd-$vendor_ver" "dtb:dtb-$vendor_ver"; do
+        link="${pair%%:*}"; target="${pair#*:}"
+        if [ -e "/boot/$target" ] && [ "$(readlink "/boot/$link")" != "$target" ]; then
+            say "pointing /boot/$link -> $target"
+            ln -sfn "$target" "/boot/$link"
+            needs_reboot=1
+        fi
+    done
+    depmod "$vendor_ver" 2>/dev/null || true
+
+    # 3. Overlays: compile the vendored sources against the vendor kernel's overlay dir.
+    dtbo_dir="/boot/dtb-${vendor_ver}/rockchip/overlay"
+    [ -d "$dtbo_dir" ] || dtbo_dir=$(find /boot -maxdepth 3 -type d -path '*/rockchip/overlay' 2>/dev/null | head -1)
+    if [ -n "$dtbo_dir" ]; then
+        for ov_name in i2c3-pihat aic3104-i2c3; do
+            ov_tmp=$(mktemp -d)
+            if fetch_repo_file "deploy/audio/${ov_name}.dts" "$ov_tmp/src.dts" \
+                && dtc -@ -I dts -O dtb -o "$ov_tmp/out.dtbo" "$ov_tmp/src.dts" 2>/dev/null; then
+                if [ ! -f "$dtbo_dir/rk3568-${ov_name}.dtbo" ] \
+                    || ! cmp -s "$ov_tmp/out.dtbo" "$dtbo_dir/rk3568-${ov_name}.dtbo"; then
+                    say "installing overlay rk3568-${ov_name}.dtbo"
+                    cp "$ov_tmp/out.dtbo" "$dtbo_dir/rk3568-${ov_name}.dtbo"
+                    needs_reboot=1
+                fi
+                ensure_overlay_word "$ov_name"
+            else
+                warn "could not fetch or compile ${ov_name}.dts — audio will not work"
+            fi
+            rm -rf "$ov_tmp"
+        done
+    else
+        warn "no rockchip overlay directory under /boot — audio overlays not installed"
+    fi
+
+    # 4. The codec driver, via DKMS. Versioned by the vendored dkms.conf, so a source bump
+    #    upstream re-deploys cleanly.
+    dkms_tmp=$(mktemp -d)
+    dkms_ok=1
+    for f in dkms.conf Makefile tlv320aic3x.c tlv320aic3x.h tlv320aic3x-i2c.c; do
+        fetch_repo_file "deploy/audio/aic3x-dkms/$f" "$dkms_tmp/$f" || { dkms_ok=0; break; }
+    done
+    if [ "$dkms_ok" = 1 ]; then
+        dkms_ver=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p' "$dkms_tmp/dkms.conf")
+        dkms_src="/usr/src/aic3x-$dkms_ver"
+        deploy_needed=0
+        for f in dkms.conf Makefile tlv320aic3x.c tlv320aic3x.h tlv320aic3x-i2c.c; do
+            cmp -s "$dkms_tmp/$f" "$dkms_src/$f" || deploy_needed=1
+        done
+        if [ "$deploy_needed" = 1 ]; then
+            say "deploying aic3x DKMS sources to $dkms_src"
+            dkms remove "aic3x/$dkms_ver" --all >/dev/null 2>&1 || true
+            mkdir -p "$dkms_src"
+            cp "$dkms_tmp"/* "$dkms_src/"
+        fi
+        if dkms status "aic3x/$dkms_ver" 2>/dev/null | grep "$vendor_ver" | grep -q installed; then
+            say "aic3x DKMS module already installed"
+        else
+            # Armbian ships the vendor headers without built host tools; DKMS needs modpost.
+            if [ -d "/usr/src/linux-headers-$vendor_ver" ] \
+                && [ ! -x "/usr/src/linux-headers-$vendor_ver/scripts/mod/modpost" ]; then
+                say "rebuilding the vendor headers' host tools (modpost)"
+                dpkg-reconfigure linux-headers-vendor-rk35xx >/dev/null 2>&1 || true
+            fi
+            say "building the aic3x codec driver via DKMS (takes a minute)"
+            if dkms install "aic3x/$dkms_ver" -k "$vendor_ver"; then
+                say "aic3x DKMS module installed for $vendor_ver"
+                needs_reboot=1
+            else
+                warn "DKMS build failed — audio will not work"
+                warn "see /var/lib/dkms/aic3x/$dkms_ver/build/make.log"
+            fi
+        fi
+    else
+        warn "could not fetch the aic3x DKMS sources — audio will not work"
+    fi
+    rm -rf "$dkms_tmp"
+
+    # 5. Mixer levels at boot. The service polls for the card (the probe is deferred until
+    #    the DKMS module autoloads), sets the speaker path and routes the onboard mic.
+    init_tmp=$(mktemp)
+    if fetch_repo_file "deploy/audio/aic3104-init.sh" "$init_tmp"; then
+        if [ ! -f /usr/local/bin/aic3104-init.sh ] \
+            || ! cmp -s "$init_tmp" /usr/local/bin/aic3104-init.sh; then
+            say "installing /usr/local/bin/aic3104-init.sh"
+            install -m 755 "$init_tmp" /usr/local/bin/aic3104-init.sh
+        fi
+        svc_tmp=$(mktemp)
+        cat > "$svc_tmp" <<'UNIT'
+[Unit]
+Description=TLV320AIC3104 mixer init
+After=systemd-modules-load.service
+# No ConditionPathExists: the sound card probe is deferred until the DKMS codec module
+# autoloads, so the card can appear seconds into boot — the script polls for it instead.
+Before=robotd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aic3104-init.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        if [ ! -f /etc/systemd/system/aic3104-init.service ] \
+            || ! cmp -s "$svc_tmp" /etc/systemd/system/aic3104-init.service; then
+            say "installing aic3104-init.service"
+            install -m 644 "$svc_tmp" /etc/systemd/system/aic3104-init.service
+            systemctl daemon-reload
+        fi
+        systemctl is-enabled --quiet aic3104-init.service \
+            || systemctl enable aic3104-init.service >/dev/null 2>&1 || true
+        rm -f "$svc_tmp"
+    else
+        warn "could not fetch aic3104-init.sh — the mixer stays at power-on levels"
+    fi
+    rm -f "$init_tmp"
+}
+
 configure_bluetooth() {
     if [ -z "$WEIRD_BLE" ] && [ -z "$PAUSE_BTD" ]; then
         # Reported rather than silent, because a board that needs either workaround and was
@@ -767,6 +967,7 @@ main() {
     check_network
     free_motor_port
     configure_bluetooth
+    configure_audio
     install_onnxruntime
     report
 }

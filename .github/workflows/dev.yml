@@ -101,6 +101,11 @@ jobs:
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
           cp target/aarch64-unknown-linux-gnu/release/padd staged/
+          # The voice generator (postinstall renders the per-robot bank with it) and the
+          # mic classifier pair — pet-detect for live listening, pet-features for training.
+          cp target/aarch64-unknown-linux-gnu/release/sounds staged/
+          cp target/aarch64-unknown-linux-gnu/release/pet-detect staged/
+          cp target/aarch64-unknown-linux-gnu/release/pet-features staged/
 
           # Same contents as a real release: a dev build that omitted the units or robotd
           # would fail its own restart step on the board and roll itself back, which is a
@@ -137,7 +142,8 @@ jobs:
             --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
             --include "policies/roller.onnx=policies/roller.onnx" \
             --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx" \
-            --include "policies/roulade.onnx=policies/roulade.onnx"
+            --include "policies/roulade.onnx=policies/roulade.onnx" \
+            --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx"
 
 
           # `--ref` resolves a *tag*, and the manifest it fetches is the asset named

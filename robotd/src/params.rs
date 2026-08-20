@@ -26,6 +26,62 @@ pub struct Params {
     pub update_gate: UpdateGate,
     pub policy: PolicyParams,
     pub safety: SafetyParams,
+    pub audio: AudioParams,
+}
+
+/// `[audio]` — the voice and the microphone. All optional equipment: a robot without a
+/// codec (or a bank) walks identically and stays quiet, so nothing here reaches a health
+/// verdict.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AudioParams {
+    /// Master switch: no sounds, no mic worker.
+    pub enabled: bool,
+    /// ALSA playback device — the TLV320AIC3104 codec.
+    pub device: String,
+    /// Where the per-robot voice bank lives. The release's postinstall renders it there
+    /// (`sounds ensure-bank`), seeded from the SoC serial.
+    pub bank: PathBuf,
+    /// Listen for petting on the onboard mic. Absent resolves per mode, as the prototype's
+    /// launcher does: on for walking, off for the roller (its launch line dropped
+    /// `--pet-detect`).
+    pub pet_detect: Option<bool>,
+    /// The petting classifier. Absent means the release's copy; the literal `"none"`
+    /// disables it outright.
+    pub pet_model: Option<PathBuf>,
+    /// Probability above which petting starts, and below which it ends (hysteresis).
+    pub pet_enter_threshold: f32,
+    pub pet_exit_threshold: f32,
+}
+
+impl Default for AudioParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            device: "plughw:aic3104".to_owned(),
+            bank: PathBuf::from("/var/lib/robot/sounds"),
+            pet_detect: None,
+            pet_model: None,
+            pet_enter_threshold: 0.95,
+            pet_exit_threshold: 0.85,
+        }
+    }
+}
+
+impl AudioParams {
+    /// Whether the mic worker runs, resolved against the drive mode.
+    pub fn pet_detect_resolved(&self, mode: Mode) -> bool {
+        self.pet_detect.unwrap_or(mode == Mode::Walk)
+    }
+
+    /// The classifier path, or `None` when disabled with the `"none"` sentinel.
+    pub fn pet_model_resolved(&self) -> Option<PathBuf> {
+        match &self.pet_model {
+            Some(p) if is_none_sentinel(p) => None,
+            Some(p) => Some(p.clone()),
+            None => Some(PathBuf::from(RELEASE_DIR).join("models/pet_detect.onnx")),
+        }
+    }
 }
 
 /// Which drive configuration this robot runs. One robot, two personalities: legs, or the

@@ -81,6 +81,11 @@ const SKILL_KICK_RIGHT: u32 = 1 << 2;
 const SKILL_SIT_TOGGLE: u32 = 1 << 3;
 const SKILL_ROULADE: u32 = 1 << 4;
 
+/// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
+/// (20 ms) while the trigger is down, so anything much older means the client stopped
+/// holding — or stopped existing. Either way the ride lands instead of looping forever.
+pub const WHEEE_HOLD_FRESH: Duration = Duration::from_millis(300);
+
 pub struct Intents {
     /// Epoch for every stamp. `Instant` so the clock cannot run backwards under us.
     epoch: Instant,
@@ -107,6 +112,11 @@ pub struct Intents {
     skills: std::sync::atomic::AtomicU32,
     /// A shutdown was requested. A level, not an edge: once asked, the sequence runs.
     shutdown: AtomicBool,
+    /// Pending one-shot sound tags, a bitmask taken once per tick like the skills.
+    sounds: std::sync::atomic::AtomicU32,
+    /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
+    /// and the loop reads value + age so a dead client's ride decays instead of looping.
+    wheee: ArcSwap<Stamped<bool>>,
 }
 
 /// What a client asked for, once.
@@ -161,6 +171,11 @@ impl Intents {
             power: AtomicU8::new(POWER_NONE),
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
+            sounds: std::sync::atomic::AtomicU32::new(0),
+            wheee: ArcSwap::from_pointee(Stamped {
+                value: false,
+                at_us: 0,
+            }),
         }
     }
 
@@ -219,6 +234,49 @@ impl Intents {
             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
             roulade: bits & SKILL_ROULADE != 0,
         }
+    }
+
+    /// Queue a sound for the loop's next tick. The wheee is the exception — it is a level,
+    /// not an event, so it lands in its stamped slot instead of the mask (a bare
+    /// `tag: wheee` with no `hold` is a hold that immediately starts decaying: one short
+    /// ride).
+    pub fn request_sound(&self, params: duck_ipc_proto::SoundParams) {
+        use duck_ipc_proto::SoundTag;
+        if params.tag == SoundTag::Wheee {
+            self.wheee.store(Arc::new(Stamped {
+                value: params.hold.unwrap_or(true),
+                at_us: self.now_us(),
+            }));
+            return;
+        }
+        let bit = 1u32 << (params.tag as u32);
+        self.sounds
+            .fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take the pending one-shot sounds, leaving none. Once per tick.
+    pub fn take_sounds(&self) -> Vec<duck_ipc_proto::SoundTag> {
+        use duck_ipc_proto::SoundTag;
+        let bits = self.sounds.swap(0, std::sync::atomic::Ordering::Relaxed);
+        [
+            SoundTag::Alarm,
+            SoundTag::Greet,
+            SoundTag::Inquire,
+            SoundTag::Peck,
+            SoundTag::Chirp,
+            SoundTag::Coo,
+        ]
+        .into_iter()
+        .filter(|tag| bits & (1u32 << (*tag as u32)) != 0)
+        .collect()
+    }
+
+    /// The wheee hold as the loop consumes it: held, and only recently enough to trust —
+    /// see [`WHEEE_HOLD_FRESH`].
+    pub fn wheee_held(&self) -> bool {
+        let stamp = self.wheee.load();
+        stamp.value
+            && Duration::from_micros(self.now_us().saturating_sub(stamp.at_us)) < WHEEE_HOLD_FRESH
     }
 
     /// Ask for the sit-then-power-off sequence.
