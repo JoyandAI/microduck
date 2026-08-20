@@ -1032,10 +1032,7 @@ impl View {
                 caption.push(Span::raw(" · no skills").dim());
             } else {
                 caption.push(Span::raw(" · skills ").dim());
-                caption.push(Span::styled(
-                    skills.join("+"),
-                    Style::new().fg(Color::Cyan),
-                ));
+                caption.push(Span::styled(skills.join("+"), Style::new().fg(Color::Cyan)));
             }
         }
         if let Some(why) = policy.unavailable.as_deref() {

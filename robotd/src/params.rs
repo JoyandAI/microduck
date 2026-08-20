@@ -608,7 +608,12 @@ mod tests {
                 .ends_with("alpha_sitstand.onnx"),
             "the rebased roller line keeps the sit"
         );
-        assert!(p.kick_left.as_ref().unwrap().ends_with("ball_kick_left.onnx"));
+        assert!(
+            p.kick_left
+                .as_ref()
+                .unwrap()
+                .ends_with("ball_kick_left.onnx")
+        );
         assert!(
             p.kick_right
                 .as_ref()

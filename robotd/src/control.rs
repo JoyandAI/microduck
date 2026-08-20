@@ -515,7 +515,10 @@ mod tests {
         assert_eq!(s.kick_duration, 0.5);
         assert_eq!(s.roulade_duration, 1.0, "one roll, the measured time");
         assert_eq!(s.roulade_action_scale, 1.0);
-        assert_eq!(s.roulade_gain_ratio, 1.0, "a roll runs at full walking gain");
+        assert_eq!(
+            s.roulade_gain_ratio, 1.0,
+            "a roll runs at full walking gain"
+        );
     }
 
     /// Standing must drop the gain. Running the standing policy at walking stiffness is a

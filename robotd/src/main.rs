@@ -2333,7 +2333,10 @@ mod tests {
         .result_as()
         .unwrap();
         assert!(!down.accepted);
-        assert!(!intents.take_skills().sit_toggle, "a refusal must not queue");
+        assert!(
+            !intents.take_skills().sit_toggle,
+            "a refusal must not queue"
+        );
     }
 
     /// The pose and mouth intents land in their slots like move and head do — including via

@@ -70,11 +70,7 @@ pub struct SkillRequests {
 
 impl SkillRequests {
     pub fn any(&self) -> bool {
-        self.ground_pick
-            || self.kick_left
-            || self.kick_right
-            || self.sit_toggle
-            || self.roulade
+        self.ground_pick || self.kick_left || self.kick_right || self.sit_toggle || self.roulade
     }
 }
 

@@ -948,8 +948,8 @@ mod tests {
         );
 
         for site in PACKAGING_SITES {
-            let text = std::fs::read_to_string(root.join(site))
-                .unwrap_or_else(|e| panic!("{site}: {e}"));
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
             for policy in &policies {
                 let expected = format!("=policies/{policy}");
                 assert!(
