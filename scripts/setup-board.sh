@@ -48,15 +48,27 @@ CMDLINE="${CMDLINE:-/proc/cmdline}"
 
 BT_CONF=/etc/bluetooth/main.conf
 
-# Does this board need the Bluetooth workarounds? `--weird-ble` on provision-board.sh.
+# Does this board need `Privacy = device`? `--weird-ble` on provision-board.sh.
 #
-# Off by default: most Zero 3W units bond a pad under BlueZ's own default and want nothing from
+# Off by default: some Zero 3W units bond a pad under BlueZ's own default and want nothing from
 # this script. See `configure_bluetooth`.
 WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
+
+# Does `robotctl pad pair` have to pause `btd` on this board? `--pause-btd-on-pair`.
+#
+# Separate from `WEIRD_BLE` because they fix different faults, and a board can need this one
+# without wanting `Privacy = device` — measured, see `configure_bluetooth`. `--weird-ble` implies
+# it, so every board provisioned before this flag existed keeps behaving the same way.
+PAUSE_BTD="${DUCK_PAUSE_BTD:-}"
 
 # Where the answer is left for `robotctl`, which has to pause `btd` while a pad bonds on such a
 # board. Under /var/lib rather than in a release directory: it is a fact about this board and must
 # survive an update and a rollback.
+#
+# The name is now narrower than what it means — it marks "pause btd for a pairing", which is no
+# longer tied to `Privacy = device`. Kept as-is deliberately: `robotctl` reads this exact path, and
+# renaming it would make every board already carrying one stop pausing `btd` with nothing to say
+# why. Rename both together, or neither.
 WEIRD_BLE_MARKER=/var/lib/robot/weird-ble
 
 # A gamepad is paired with `sudo robotctl pad pair` on the installed release, with the pad held in
@@ -430,26 +442,63 @@ free_motor_port() {
 # pairing reaching the last SMP step and the pad answering `DHKey check failed (0x0b)`. That was
 # `device` with `btd` running — the interaction above, not evidence against the setting.
 #
-# Both are workarounds for the aic8800 radio, which is not what ships. When the radio changes, this
-# flag and `BtdPaused` in robotctl/src/main.rs both go.
+# ## Two faults, two flags
+#
+# `--weird-ble` used to do both halves of the workaround at once, and on `50:37:CD:16:1D:90` that
+# combination cannot be made to work. Measured there on 2026-08-19, one variable at a time, daemon
+# 0.6.0 throughout:
+#
+#   | Privacy | btd paused for the pairing | result                                          |
+#   |---------|----------------------------|-------------------------------------------------|
+#   | off     | no                         | pairing dies ~800us after Encryption Change     |
+#   |         |                            | with Remote User Terminated (0x13)              |
+#   | off     | YES                        | bonds, held 45/45 samples, real input, driving   |
+#   | device  | yes                        | bonds, then flaps: 46x PIN or Key Missing (0x06) |
+#
+# So the two halves fix different faults and are not a package:
+#
+#   - **`btd` advertising breaks a NEW bond.** Pausing it for the pairing window fixes that, and it
+#     is what makes the aic8800 driver build irrelevant — every earlier failure blamed on the driver
+#     had `btd` advertising, which was the uncontrolled variable.
+#   - **`Privacy = device` breaks RECONNECTION** on a board that does not need it. A clean bond then
+#     flaps with `PIN or Key Missing`, on either driver build, whether or not the bond was made under
+#     `device`. On such a board the flag is not merely unnecessary, it is harmful — and it fails in a
+#     worse way than not pairing at all, because it looks like it worked.
+#
+# Hence `--pause-btd-on-pair` for the first alone. `--weird-ble` still implies it, so nothing that
+# was provisioned before this behaves differently. A board that pairs with the pause and `off` wants
+# the new flag; a board that cannot bond under `off` at all still wants `--weird-ble`.
+#
+# Both are workarounds for the aic8800 radio, which is not what ships. When the radio changes, both
+# flags and `BtdPaused` in robotctl/src/main.rs all go.
 #
 # The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon here leaves
 # the kernel holding hci0 while bluetoothd reports "No default controller available", which needs a
 # reboot to clear.
 configure_bluetooth() {
-    if [ -z "$WEIRD_BLE" ]; then
-        # Reported rather than silent, because a board that needs the workaround and was provisioned
-        # without the flag presents as a pad that will not pair for no visible reason.
-        say "leaving bluetooth Privacy alone (no --weird-ble); a pad that will not bond may need it"
-        # The marker is deliberately *not* removed here. Without the flag this function changes
+    if [ -z "$WEIRD_BLE" ] && [ -z "$PAUSE_BTD" ]; then
+        # Reported rather than silent, because a board that needs either workaround and was
+        # provisioned without the flag presents as a pad that will not pair for no visible reason.
+        say "leaving bluetooth alone (no --weird-ble, no --pause-btd-on-pair)"
+        say "  a pad that pairs and then flaps wants neither; one that will not pair wants one"
+        # The marker is deliberately *not* removed here. Without a flag this function changes
         # nothing, so a board that has `Privacy = device` still has it — and clearing the marker
         # would leave `robotctl` no longer pausing `btd` on a board that still needs it, which is
-        # the silent version of the bug this whole flag exists for. Undoing it is a hand edit.
+        # the silent version of the bug these flags exist for. Undoing it is a hand edit.
         return 0
     fi
 
     if [ ! -f "$BT_CONF" ]; then
         warn "no ${BT_CONF}; skipping the gamepad Bluetooth settings"
+        return 0
+    fi
+
+    # The marker alone, for a board that pairs under `off` once `btd` is out of the way. Returns
+    # before touching `Privacy`, which is the whole point of the flag: on such a board `device` is
+    # what breaks it.
+    if [ -z "$WEIRD_BLE" ]; then
+        write_pause_marker
+        say "left Privacy alone (--pause-btd-on-pair without --weird-ble)"
         return 0
     fi
 
@@ -468,23 +517,36 @@ configure_bluetooth() {
     fi
 
     # Written after the setting, so the marker never claims a board is configured that is not.
+    write_pause_marker
+}
+
+# The marker `robotctl` reads to decide whether to pause `btd` for a pairing.
+#
+# Its own function because both flags write it and only one of them touches `Privacy` — which is the
+# distinction this whole section exists to make.
+write_pause_marker() {
     if [ -f "$WEIRD_BLE_MARKER" ]; then
-        say "weird-ble marker already at ${WEIRD_BLE_MARKER}"
-    else
-        mkdir -p "$(dirname "$WEIRD_BLE_MARKER")"
-        cat > "$WEIRD_BLE_MARKER" <<'MARKER'
-# This board was provisioned with --weird-ble.
-#
-# Its Bluetooth cannot bond a gamepad under BlueZ's default Privacy = off, so
-# /etc/bluetooth/main.conf sets Privacy = device. Under that setting a pad cannot form a new bond
-# while btd advertises, so `robotctl pad pair` stops btd for the pairing window and starts it again.
-#
-# Both are workarounds for the aic8800 radio. Delete this file, unset Privacy, and drop BtdPaused
-# from robotctl when the radio changes.
-MARKER
-        chmod 644 "$WEIRD_BLE_MARKER"
-        say "wrote ${WEIRD_BLE_MARKER} so robotctl pauses btd while a pad bonds"
+        say "btd-pause marker already at ${WEIRD_BLE_MARKER}"
+        return 0
     fi
+    mkdir -p "$(dirname "$WEIRD_BLE_MARKER")"
+    cat > "$WEIRD_BLE_MARKER" <<'MARKER'
+# This board needs btd paused while a gamepad bonds.
+#
+# On the aic8800 radio a pad cannot form a NEW bond while btd advertises, so `robotctl pad pair`
+# stops btd for the pairing window, power-cycles the adapter, and starts btd again afterwards. An
+# existing bond is unaffected: a bonded pad connects and drives with the whole stack up.
+#
+# This says nothing about Privacy. A board provisioned with --pause-btd-on-pair keeps BlueZ's
+# default (off); one provisioned with --weird-ble also has Privacy = device because it cannot bond
+# under off at all. Setting device on a board that did not need it makes a bond flap with
+# `PIN or Key Missing` instead, so the two are deliberately separate.
+#
+# A workaround for a radio that is not what ships. Delete this file and drop BtdPaused from
+# robotctl when the radio changes.
+MARKER
+    chmod 644 "$WEIRD_BLE_MARKER"
+    say "wrote ${WEIRD_BLE_MARKER} so robotctl pauses btd while a pad bonds"
 }
 
 # What the board looks like now. Printed whether or not anything was changed, because "is
@@ -504,17 +566,28 @@ report() {
   will not drive anything."
     fi
 
-    # Gamepad readiness. This board's part of it is one setting; who may read the pad is
+    # Gamepad readiness. This board's part of it is two independent settings; who may read the pad is
     # `padd.service`'s business now, and pairing one is `sudo robotctl pad pair`.
+    #
+    # Both are reported, because the pair of them is what says which of the three configurations a
+    # board is in — and the advice for a pad that will not bond depends on which one is missing.
+    if [ -f "$WEIRD_BLE_MARKER" ]; then
+        printf '  %-22s %s\n' "btd on pairing" "paused — the marker is set"
+    else
+        printf '  %-22s %s\n' "btd on pairing" \
+            "not paused — a pad that will not bond wants --pause-btd-on-pair"
+    fi
+
     if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
-        # Worth naming the consequence every time: this is the board where `robotctl pad pair` stops
-        # btd for the pairing window, and someone reading this should know that is expected.
-        printf '  %-22s %s\n' "bluetooth privacy" "device — pad pair pauses btd"
+        # Worth naming the consequence every time: `device` is what makes a bond flap on a board
+        # that only needed the pause, and that failure looks like success at first.
+        printf '  %-22s %s\n' "bluetooth privacy" \
+            "device — drop --weird-ble if a bond flaps with PIN or Key Missing"
     else
         # Covers both `off` and absent, which behave the same. Named as a possible cause rather than
-        # a fault: most boards bond a pad exactly like this.
+        # a fault: with btd paused, most boards bond a pad exactly like this.
         printf '  %-22s %s\n' "bluetooth privacy" \
-            "off — if a pad will not bond, re-provision with --weird-ble"
+            "off — if a pad will not bond even with btd paused, try --weird-ble"
     fi
 
     # The device node is what gilrs opens, so this is the only claim that matters.

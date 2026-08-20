@@ -559,6 +559,23 @@ if [ -e /var/lib/robot/weird-ble ]; then
 fi
 echo "    [ok] without --weird-ble, setup-board leaves Privacy and the marker alone"
 
+# --pause-btd-on-pair alone: the marker, and Privacy left at the BlueZ default. That is the
+# combination a board wants when a pad pairs and then flaps -- measured on 50:37:CD:16:1D:90, where
+# off plus the pause bonds and holds 45/45 while device flaps with PIN or Key Missing.
+DUCK_PAUSE_BTD=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
+    > /tmp/pause.log 2>&1
+test -f /var/lib/robot/weird-ble \
+    || { echo "    [FAIL] --pause-btd-on-pair did not write the marker"; exit 1; }
+if grep -qE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf; then
+    echo "    [FAIL] --pause-btd-on-pair set Privacy; it must not"
+    exit 1
+fi
+echo "    [ok] --pause-btd-on-pair writes the marker and leaves Privacy alone"
+
+# Removed again so the --weird-ble cases below still prove that THEY write the marker, rather than
+# passing on one this case left behind.
+rm -f /var/lib/robot/weird-ble
+
 # And with it: the setting, and the marker robotctl reads to decide whether to pause btd.
 DUCK_WEIRD_BLE=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
     > /tmp/weird.log 2>&1
@@ -566,6 +583,8 @@ grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
 echo "    [ok] --weird-ble sets Privacy = device, which is what lets such a board bond a pad"
 test -f /var/lib/robot/weird-ble \
     || { echo "    [FAIL] the weird-ble marker was not written"; exit 1; }
+# --weird-ble implies the pause, so a board provisioned before --pause-btd-on-pair existed keeps
+# behaving exactly as it did.
 test "$(stat -c %a /var/lib/robot/weird-ble)" = "644" \
     || { echo "    [FAIL] the marker is not readable by robotctl"; exit 1; }
 echo "    [ok] --weird-ble leaves the marker robotctl reads, mode 644"

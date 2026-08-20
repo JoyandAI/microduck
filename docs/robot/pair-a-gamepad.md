@@ -78,19 +78,27 @@ it in pairing mode alone does not reliably do so.
 
 ## When a pad will not bond at all
 
-Some Radxa Zero 3W units cannot bond a gamepad under BlueZ's default settings — roughly half of ten,
-with nothing measurable to tell them apart from the ones that can. Re-provision such a board with
-`--weird-ble`:
+On the aic8800 radio a pad cannot form a **new** bond while `btd` is advertising. Re-provision such a
+board with `--pause-btd-on-pair`:
 
 ```bash
-./scripts/provision-board.sh --weird-ble pierre@192.168.1.42
+./scripts/provision-board.sh --pause-btd-on-pair pierre@192.168.1.42
 ```
 
-That sets `Privacy = device`, which those boards need, and leaves a marker at
-`/var/lib/robot/weird-ble`. On a board with that marker, `sudo robotctl pad pair` handles the rest by
-itself — it stops `btd`, power-cycles the adapter, pairs, and starts `btd` again. It says so as it
-goes. An existing bond is unaffected by any of this, so a paired pad connects and drives with
-everything running.
+That leaves a marker at `/var/lib/robot/weird-ble` and changes nothing else. On a board with that
+marker, `sudo robotctl pad pair` handles the rest by itself — it stops `btd`, power-cycles the
+adapter, pairs, and starts `btd` again. It says so as it goes. An existing bond is unaffected by any
+of this, so a paired pad connects and drives with everything running.
+
+Some units additionally cannot bond under BlueZ's default `Privacy = off` at all, even with `btd`
+paused. Those want `--weird-ble`, which implies the pause and also sets `Privacy = device`.
+
+**Try the pause first.** `Privacy = device` on a board that only needed the pause produces a worse
+failure than no flag at all: the pad bonds and then flaps with
+`Encryption Change: PIN or Key Missing (0x06)`, never creating an input device. If you see that, drop
+`--weird-ble` and keep the pause —
+[`install-dev.md`](install-dev.md#the-three-configurations-and-how-to-tell-which-you-have) has the
+table and the commands to move a board between the two.
 
 Pairing by hand on such a board needs the same two steps:
 
