@@ -38,6 +38,7 @@ use std::process::ExitCode;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 
+mod duck;
 mod monitor;
 
 /// Exit codes. Stable — CI asserts on these.
