@@ -667,6 +667,11 @@ impl Server {
     }
 
     /// Run a read-only engine call, falling back to nothing if the engine is busy.
+    ///
+    /// The `Err` here IS the wire answer, ready to send — that is the point of the shape,
+    /// not an accident of it, so clippy's size advice (box the error) would trade one heap
+    /// allocation per refusal for nothing: both variants are consumed immediately.
+    #[allow(clippy::result_large_err)]
     async fn with_engine<T, F>(&self, id: Id, f: F) -> Result<T, Response>
     where
         F: FnOnce(&Engine) -> Result<T, crate::Error>,
@@ -818,7 +823,9 @@ impl Server {
     /// a unix socket is the only transport able to answer (`architecture.md` §2.2).
     ///
     /// Returns the refusal as a ready-made response, so a caller cannot forget to act
-    /// on a denial.
+    /// on a denial. Which is also why the `Err` is a full `Response` and clippy's
+    /// large-error advice is declined — see `with_engine`.
+    #[allow(clippy::result_large_err)]
     async fn authorise(
         &self,
         id: &Id,
