@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -236,6 +237,23 @@ impl PetHandle {
     }
 }
 
+/// Backoff between restarts of a capture that will not stay up: doubling from 250 ms to a
+/// cap. A board where `arecord` exists but the codec does not — `configure_audio` fails soft
+/// at every step, so a failed DKMS build leaves exactly that — makes `arecord` exit
+/// immediately on every spawn. Without a backoff on *that* path (the original only slept
+/// when the `arecord` binary itself was missing) the worker fork/execs as fast as the CPU
+/// allows for the life of the daemon, with a `warn!` per iteration into the journal.
+const RESTART_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// A capture that ran this long is not the failure this backoff is for; the delay resets.
+const RESTART_HEALTHY: Duration = Duration::from_secs(5);
+
+/// After this many consecutive immediate failures the per-restart line drops to `debug`.
+/// The backoff is at its cap by then and the warning has been said — the worker keeps
+/// trying (a codec that comes back should be heard) but stops narrating it.
+const RESTART_QUIET_AFTER: u32 = 5;
+
 fn worker_loop(
     alsa_device: &str,
     mut detector: PettingDetector,
@@ -244,21 +262,61 @@ fn worker_loop(
     shutdown: &Arc<AtomicBool>,
 ) {
     let mut sentry = SoundSentry::new();
+    let mut failures: u32 = 0;
     while !shutdown.load(Ordering::Acquire) {
+        let started = Instant::now();
         match spawn_arecord(alsa_device) {
             Ok(mut c) => {
                 if let Err(e) = pump(&mut c, &mut detector, &mut sentry, tx, tx_sound, shutdown) {
-                    tracing::warn!(error = %e, "pet worker: restarting arecord");
+                    log_restart(failures, &e.to_string());
                 }
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "pet worker: cannot start arecord — retrying in 1s");
-                thread::sleep(std::time::Duration::from_secs(1));
-            }
+            Err(e) => log_restart(failures, &e.to_string()),
+        }
+        if started.elapsed() >= RESTART_HEALTHY {
+            failures = 0;
+            continue;
+        }
+        failures = failures.saturating_add(1);
+        let backoff = RESTART_BACKOFF_MIN
+            .saturating_mul(1u32 << (failures - 1).min(8))
+            .min(RESTART_BACKOFF_MAX);
+        if failures == RESTART_QUIET_AFTER {
+            tracing::warn!(
+                device = alsa_device,
+                ?backoff,
+                "pet worker: the mic will not stay up — retrying quietly from here"
+            );
+        }
+        // Sliced, because `shutdown()` joins this thread: a 30 s sleep would be 30 s of
+        // robotd not exiting.
+        if !sleep_unless_shutdown(backoff, shutdown) {
+            return;
         }
     }
+}
+
+fn log_restart(failures: u32, error: &str) {
+    if failures < RESTART_QUIET_AFTER {
+        tracing::warn!(error, "pet worker: restarting arecord");
+    } else {
+        tracing::debug!(error, "pet worker: restarting arecord");
+    }
+}
+
+/// Sleep, waking early if shutdown is asked for. `false` means "stop".
+fn sleep_unless_shutdown(total: Duration, shutdown: &Arc<AtomicBool>) -> bool {
+    const SLICE: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        thread::sleep(SLICE.min(deadline.saturating_duration_since(Instant::now())));
+    }
+    !shutdown.load(Ordering::Acquire)
 }
 
 fn spawn_arecord(device: &str) -> Result<Child> {
@@ -285,9 +343,6 @@ fn pump(
         .ok_or_else(|| anyhow::anyhow!("arecord stdout missing"))?;
     let mut buf = [0u8; 4096];
     let mut i16_buf: Vec<i16> = Vec::with_capacity(2048);
-    // Persistent petting state (Start..End spans many seconds between events); the sentry
-    // suppresses sound events for the whole session.
-    let mut petting = false;
 
     while !shutdown.load(Ordering::Acquire) {
         let n = stdout.read(&mut buf)?;
@@ -304,16 +359,20 @@ fn pump(
         let samples = i16_to_f32(&i16_buf);
         let (events, _p) = detector.push_samples(&samples)?;
         for ev in events {
-            petting = matches!(ev, PettingEvent::Start);
             if tx.send(ev).is_err() {
                 // Receiver dropped — the daemon is shutting down.
                 return Ok(());
             }
         }
         // Ambient sound events off the same stream, muted while petting (head scratches
-        // are LOUD on this mic) + a short hangover.
+        // are LOUD on this mic) + a short hangover. Read off the detector rather than
+        // tracked here: a Start..End session spans many seconds, and `arecord` can flap
+        // inside one. The detector survives a restart (it is owned by `worker_loop`), so a
+        // local copy would come back `false` mid-session — and no second `Start` would ever
+        // re-arm it, leaving the sentry emitting head-scratch noise as `Voice` events until
+        // the probability finally fell below the exit threshold.
         let mut sounds = Vec::new();
-        sentry.push(&samples, petting, &mut sounds);
+        sentry.push(&samples, detector.is_petting(), &mut sounds);
         for sev in sounds {
             let _ = tx_sound.send(sev);
         }

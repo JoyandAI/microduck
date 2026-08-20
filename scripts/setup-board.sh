@@ -510,6 +510,15 @@ fetch_repo_file() {
 # Add one word to armbianEnv's overlays= line, preserving order (the codec overlay must
 # come after its bus overlay — it grafts the codec node onto the bus that overlay enables).
 ensure_overlay_word() {
+    # Same guard `configure_overlay` has, for the same reason — and here it matters more:
+    # without it the `echo >>` below *creates* an armbianEnv.txt that never existed, on a
+    # board that boots from something else entirely, and asks for a reboot to load it.
+    if [ ! -f "$ENV_TXT" ]; then
+        warn "no ${ENV_TXT}; not an Armbian image?
+  Load the ${1} overlay by whatever means this image provides, then re-run.
+  Everything else here will still be done."
+        return 0
+    fi
     if ! grep -Eq '^overlays=' "$ENV_TXT"; then
         echo "overlays=$1" >> "$ENV_TXT"
         needs_reboot=1

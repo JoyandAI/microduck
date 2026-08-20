@@ -207,7 +207,8 @@ robotctl quack
 
 The loudest way to tell ducks apart: every robot's voice bank is generated from its SoC
 serial (`sounds ensure-bank`, run by every release install), so the robot that answers — in
-a voice that is only its own — is the one you're SSH'd into. The robot also greets when
+a voice that is only its own — is the one you're SSH'd into. A robot with no voice — audio
+off, or no bank — says so instead of printing 🦆, so silence always means the wrong duck. The robot also greets when
 `robotd` comes up, pecks goodbye before powering off, and coos when the mic hears its head
 being scratched (walk mode; the classifier ships in the release). Audio hardware bring-up —
 codec driver, overlays, mixer — is `setup-board.sh`'s audio section, once per board.
