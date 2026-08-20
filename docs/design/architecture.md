@@ -13,6 +13,107 @@ Scope note: this describes where we're going for the **first shipped version**,
 not the current prototype (`microduck_runtime`, which is exploratory and will be
 rewritten). v1 targets a **single, well-specified hardware configuration**.
 
+## The shape of it
+
+Five daemons on one board, talking over unix sockets. One of them drives the robot; the
+other four exist so that the first one can be broken without the board becoming
+unreachable.
+
+```text
+   gamepad          phone             you, on a laptop          a GitHub release
+      │ BLE/USB        │ BLE                │ ssh                       │ https
+      ▼                ▼                    ▼                           │
+  ┌────────┐      ┌────────┐          ┌──────────┐                      │
+  │  padd  │      │  btd   │          │ robotctl │                      │
+  └───┬────┘      └───┬────┘          └────┬─────┘                      │
+      │               │  a subset of the same API                       │
+      │  robot.*      │  robot.health · update.* · net.* · pad.* · system.*
+      ▼               ▼                    ▼                            │
+  ┌──────────────────────────────────────────────────────────────────┐  │
+  │   one unix socket per service · JSON-RPC 2.0, one object a line  │  │
+  └────┬──────────────────────┬─────────────────────────┬────────────┘  │
+       ▼                      ▼                         ▼               │
+  ┌───────────┐        ┌─────────────┐           ┌─────────────┐        │
+  │  robotd   │        │  configd    │           │  updaterd   │◄───────┘
+  │ robot.*   │        │ net.* pad.* │           │ update.*    │
+  │ 50 Hz     │        │ system.*    │           │ verify      │
+  │ loop      │        │ wifi, name, │           │ swap        │
+  │ safety    │        │ pad bonding │           │ health gate │
+  └─────┬─────┘        └──────┬──────┘           └──────┬──────┘
+        │ Dynamixel           │ D-Bus                   │ systemctl restart,
+        ▼                     ▼                         │ then robot.health
+  15 servos + IMU      BlueZ · NetworkManager           ▼
+  on one UART                                    /opt/robot/daemon/current
+
+  ┌ not built ────────────────────────────────────────────────────────┐
+  │  mediad — camera, mic, perception, WebRTC, and the remote gateway │
+  └───────────────────────────────────────────────────────────────────┘
+```
+
+**`robotd` is the only thing that touches the robot.** Fifteen servos and the IMU board
+share one serial bus, and the 50 Hz control loop owns it. Clients send *intents* — "go this
+fast", "look there", "stand up" — and the safety layer inside `robotd` decides what is
+actually executable. Nothing else in the system can command a motor
+([`robotd-design.md`](robotd-design.md)).
+
+**The other three survive a dead `robotd`.** `configd`, `updaterd` and `btd` have no systemd
+dependency on it, no ML runtime, and no media stack, because they are the recovery path: a
+robot whose control loop will not start is exactly the robot someone needs to reconfigure,
+update, or roll back. That is also why config lives in `configd` and not in `robotd` (§1.1).
+
+**`btd` and `padd` own nothing.** They are transports. `btd` forwards a subset of the API
+from BLE to whichever socket answers it; `padd` reads a gamepad and sends the same intents an
+app would. Both are replaceable without touching robot behaviour, and both are exercised
+daily, so the API an app will use cannot quietly rot.
+
+**Releases are swapped, not patched.** A build lands as a whole directory under
+`/opt/robot/daemon/releases/<version>/`; `updaterd` verifies its signature, moves the
+`current` symlink, restarts the units, and then asks `robotd` whether it is healthy. If not,
+it puts the old release back on its own. A crash-loop that gets past that is caught by a boot
+counter ([`updater-design.md`](updater-design.md)).
+
+| service | owns | listens on | reaches out to |
+|---|---|---|---|
+| `robotd` | motor control, sensing, policies, safety, `robot.health` | `/run/robotd.sock` | the Dynamixel bus |
+| `configd` | wifi, robot identity and name, pairing PIN, gamepad bonding, reboot | `/run/configd.sock` | BlueZ and NetworkManager over D-Bus |
+| `updaterd` | releases: verify, install, swap, health-gate, roll back | `/run/updaterd.sock` | GitHub releases, `systemctl`, `robotd` |
+| `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | all three sockets |
+| `padd` | nothing — gamepad transport; serves a raw input tap | `/run/padd/pad.sock` (`pad.input` only) | `/run/robotd.sock` |
+| `robotctl` | nothing — the CLI, and the tool that must work on a broken robot | — | all four sockets |
+
+Where the state lives, and what survives an update:
+
+| | |
+|---|---|
+| `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration; the installer writes it once and never overwrites it |
+| `/var/lib/robot/config/config.json` | robot name and pairing PIN — a file plus `flock`, owned by `configd` (§3.1) |
+| NetworkManager profiles | wifi credentials; we never store them (§3) |
+| `/opt/robot/daemon/releases/<ver>/` | binaries, policies and shipped defaults — replaced atomically |
+| `/opt/robot/daemon/current` | the symlink that says which release is live |
+| `/run/<service>/identity.json` | what each daemon is actually running, published at startup |
+
+Everything outside `releases/<ver>/` survives both an update and a rollback. That is the
+whole rule, and it is why per-board config is not shipped in the release.
+
+How a change reaches a robot, end to end:
+
+```text
+  push a branch ──► CI builds and signs a release ──► robotctl update apply
+                                                            │
+                                                            ▼
+                                          updaterd: verify signature, unpack,
+                                          move `current`, restart the units
+                                                            │
+                                                            ▼
+                                          health gate: ask robot.health
+                                            ├─ healthy  ──► keep it
+                                            └─ not      ──► put the old one back
+```
+
+The rest of this document is the reasoning: the service split (§1), how services talk (§2),
+who owns which state (§3), the API and its transports (§4), remote access (§5), and where
+safety authority sits (§6).
+
 ## 1. Services
 
 `systemd` is the supervisor: lifecycle, restart-on-crash, ordering, watchdog.
