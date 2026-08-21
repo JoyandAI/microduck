@@ -9,8 +9,9 @@
 //!     a beam whose slant range times its downward component reaches the
 //!     sensor's height above the floor (times a safety factor, for pose error)
 //!     hit the floor, not an obstacle.
-//!   - **Too-close returns.** Inside the sensor's short-range noise band a
-//!     reading is as likely the duck's own beak as a wall.
+//!   - **Too-close returns.** Below ~10 cm the sensor's readings stop being
+//!     trustworthy — cover-glass crosstalk and pulse pile-up produce phantom
+//!     short returns — so a reading in that band is discarded as noise.
 //!
 //! The sensor pose comes from [`HeadFk::tof_in_trunk`] per frame, and the
 //! trunk's height above the floor from the MJCF itself
@@ -67,7 +68,8 @@ impl Reprojector {
     /// the prototype's tuned value.
     pub const FLOOR_SAFETY: f64 = 0.85;
 
-    /// Returns closer than this (horizontally) are noise or the robot itself.
+    /// Returns closer than this (horizontally) are discarded: under ~10 cm the
+    /// sensor's own crosstalk produces phantom short readings.
     pub const MIN_RANGE_M: f64 = 0.10;
 
     pub fn new(model: &'static Model) -> Self {

@@ -622,8 +622,8 @@ fn tof_cell(zone: tof_zone::Zone, class: Option<kinematics::tof::Zone>) -> Span<
         tof_zone::Zone::Range(metres) => {
             // The reprojection's verdict beats the colour ramp: a floor return
             // is a real distance, but it is not a thing in the way, and green
-            // is the difference on screen. Too-close returns recede — inside
-            // the noise band the number is as likely the duck's own beak.
+            // is the difference on screen. Too-close returns recede — under
+            // ~10 cm the sensor's crosstalk makes the number untrustworthy.
             match class {
                 Some(kinematics::tof::Zone::Floor) => {
                     return Span::styled(
