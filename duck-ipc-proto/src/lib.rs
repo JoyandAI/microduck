@@ -117,7 +117,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// The robot's voice: play a voice-bank tag (chirp, greet, coo, ...), with `wheee` as a
 /// held ride the client keeps alive per tick. Additive, same rule.
-pub const API_VERSION: u32 = 10;
+///
+/// # v11 — `tof.stream`
+///
+/// The head ToF sensor's 8×8 depth frames, served by `tofd` on its own socket. A new
+/// namespace, like `pad.*` was: nothing existing changes shape, and a client built before
+/// this simply never asks.
+pub const API_VERSION: u32 = 11;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -139,6 +145,11 @@ pub mod socket {
     /// directory when the unit stops, so a socket left behind cannot outlive the daemon that
     /// would have answered on it.
     pub const PAD: &str = "/run/padd/pad.sock";
+
+    /// `tofd`'s depth stream — [`super::method::TOF_STREAM`], and nothing else.
+    /// Under `/run/tofd/` for the same reason as the pad's: it is that unit's
+    /// `RuntimeDirectory=`, so systemd removes the socket when the daemon stops.
+    pub const TOF: &str = "/run/tofd/tof.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -388,6 +399,22 @@ pub mod method {
 
     /// One report from the pad, pushed after [`PAD_INPUT`].
     pub const PAD_REPORT: &str = "pad.report";
+
+    // ── tof.* ────────────────────────────────────────────────────────────────
+    /// Subscribe to the head ToF sensor's depth frames, on [`super::socket::TOF`].
+    ///
+    /// **The one method in this namespace, and `tofd` answers it itself.** Like
+    /// the pad tap, this is a sensor stream on the socket of the daemon that owns
+    /// the sensor — `robotd` is not in the path, because nothing in the control
+    /// loop reads depth and putting perception in front of it would be the
+    /// coupling `architecture.md` §1 splits `mediad` off to avoid.
+    ///
+    /// The answer describes the sensor (or says why there is none); frames then
+    /// arrive as [`TOF_FRAME`] notifications until the connection closes.
+    pub const TOF_STREAM: &str = "tof.stream";
+
+    /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
+    pub const TOF_FRAME: &str = "tof.frame";
 }
 
 /// JSON-RPC error codes.
@@ -529,6 +556,8 @@ pub enum Call {
     PadForget(PadForgetParams),
     /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
     PadInput,
+    /// Subscribe to the ToF depth stream. Answered by `tofd`.
+    TofStream,
 }
 
 impl Call {
@@ -578,6 +607,7 @@ impl Call {
             Call::PadPair(_) => method::PAD_PAIR,
             Call::PadForget(_) => method::PAD_FORGET,
             Call::PadInput => method::PAD_INPUT,
+            Call::TofStream => method::TOF_STREAM,
         }
     }
 
@@ -674,7 +704,8 @@ impl Call {
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::PadStatus
-            | Call::PadInput => Value::Object(serde_json::Map::new()),
+            | Call::PadInput
+            | Call::TofStream => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -741,6 +772,7 @@ impl Call {
             }
             method::PAD_FORGET => Call::PadForget(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
+            method::TOF_STREAM => Call::TofStream,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -826,6 +858,24 @@ impl Request {
     /// Read a raw-pad notification back.
     pub fn as_pad_report(&self) -> Option<PadReport> {
         if self.method != method::PAD_REPORT {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A depth-frame notification: no `id`, so no response is expected.
+    pub fn notify_tof_frame(frame: &TofFrame) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::TOF_FRAME.to_owned(),
+            params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a depth-frame notification back.
+    pub fn as_tof_frame(&self) -> Option<TofFrame> {
+        if self.method != method::TOF_FRAME {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -2385,6 +2435,60 @@ pub struct PadInputResult {
     pub reason: Option<String>,
 }
 
+/// Answer to [`Call::TofStream`].
+///
+/// Describes the sensor rather than merely accepting, for the same reason
+/// [`SubscribeResult`] names the policy: "subscribed" and "there is a sensor" are
+/// different facts, and a viewer that cannot tell them apart shows an empty grid
+/// for both a robot with no ToF fitted and one whose frames have not arrived yet.
+///
+/// Accepted with `sensor: None` is the ordinary state of a duck without the
+/// sensor: `tofd` runs, the socket answers, and `unavailable` says why there is
+/// nothing to show. The daemon keeps retrying, so a sensor fitted later needs no
+/// reconnect — a fresh subscription will name it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TofStreamResult {
+    pub accepted: bool,
+    /// The sensor generation that answered, e.g. `VL53L8CX`. `None` when there is
+    /// none — see `unavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor: Option<String>,
+    /// Why there is no sensor: not fitted, wrong generation, bus unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// Frame geometry, so a viewer can lay out before the first frame lands.
+    pub rows: u8,
+    pub cols: u8,
+    /// Ranging rate the sensor was started at, Hz.
+    pub hz: u8,
+}
+
+/// One 8×8 depth frame — a [`method::TOF_FRAME`] notification.
+///
+/// **Millimetres and ST's raw status, not metres.** JSON has no NaN, so a
+/// distance-only frame would have to encode "no measurement" as a magic number;
+/// carrying the status byte instead keeps the sensor's own three-way answer
+/// intact — a range, nothing in range, or a measurement that failed. The `tof`
+/// crate's `Frame::zone` is the interpretation, and consumers should use it
+/// rather than re-deriving the thresholds.
+///
+/// `distance_mm` and `status` are parallel and row-major, `rows × cols` long.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TofFrame {
+    /// Frames since this `tofd` started, so a consumer can see a gap it did not
+    /// cause. Not a wall clock: `tofd` has no business publishing one.
+    pub seq: u64,
+    /// Microseconds since `tofd` started — the sender's monotonic clock, like
+    /// [`PadFrame::at_us`].
+    pub at_us: u64,
+    pub rows: u8,
+    pub cols: u8,
+    pub distance_mm: Vec<i16>,
+    pub status: Vec<u8>,
+}
+
 /// `skip_serializing_if` for a `bool` that is false by default.
 fn not(b: &bool) -> bool {
     !*b
@@ -2770,6 +2874,7 @@ mod tests {
             Call::PadForget(PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
             }),
+            Call::TofStream,
         ]
     }
 
@@ -2781,7 +2886,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            42,
+            43,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
