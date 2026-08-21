@@ -27,6 +27,10 @@ const HEAD_JOINTS: [&str; 4] = ["neck_pitch", "head_pitch", "head_yaw", "head_ro
 pub struct HeadFk {
     model: &'static Model,
     camera: SiteId,
+    /// The MJCF's own `tof` site, when the asset carries one — the sensor's
+    /// true position, a couple of centimetres from the camera it would
+    /// otherwise borrow.
+    tof: Option<SiteId>,
     joints: [usize; 4],
 }
 
@@ -39,6 +43,7 @@ impl HeadFk {
             camera: model
                 .site("head_camera")
                 .expect("model has a head_camera site"),
+            tof: model.site("tof"),
             joints: HEAD_JOINTS
                 .map(|name| model.joint_index(name).expect("model has the head joints")),
         }
@@ -54,6 +59,34 @@ impl HeadFk {
     /// Every other joint is taken at zero — the head chain hangs from the
     /// trunk, so the legs cannot move it *within the trunk frame*.
     pub fn camera_in_trunk_cv2(&self, joints: [f64; 4]) -> Pose {
+        let site = self.site_in_trunk(self.camera, joints);
+        Pose::new(site.pos, site.quat * SITE_TO_CV2)
+    }
+
+    /// ToF sensor pose in the trunk frame: rotating a sensor-frame vector
+    /// (forward, left, up) by the result's quat expresses it in the trunk.
+    ///
+    /// Anchored on the MJCF's own `tof` site when the asset has one — the
+    /// true mount, a couple of centimetres from the camera. The prototype
+    /// borrowed the camera's position because its assets predated the site;
+    /// that stays as the fallback, and the orientation convention is the same
+    /// either way (the pin test below holds the two mounts parallel).
+    pub fn tof_in_trunk(&self, joints: [f64; 4]) -> Pose {
+        match self.tof {
+            Some(site) => {
+                let site = self.site_in_trunk(site, joints);
+                Pose::new(site.pos, site.quat * SITE_TO_CV2 * SENSOR_IN_CV2_Q)
+            }
+            None => {
+                let cam = self.camera_in_trunk_cv2(joints);
+                Pose::new(cam.pos, cam.quat * SENSOR_IN_CV2_Q)
+            }
+        }
+    }
+
+    /// A head-chain site posed by the four head joints, everything else at
+    /// zero.
+    fn site_in_trunk(&self, site: SiteId, joints: [f64; 4]) -> Pose {
         // The alpha model has 14 joints; 32 leaves room for any future duck
         // without ever touching the allocator.
         let mut angles = [0.0f64; 32];
@@ -61,17 +94,8 @@ impl HeadFk {
         for (idx, angle) in self.joints.into_iter().zip(joints) {
             angles[idx] = angle;
         }
-        let site = self
-            .model
-            .site_pose(self.camera, &angles[..self.model.num_joints()]);
-        Pose::new(site.pos, site.quat * SITE_TO_CV2)
-    }
-
-    /// ToF sensor pose in the trunk frame: rotating a sensor-frame vector
-    /// (forward, left, up) by the result's quat expresses it in the trunk.
-    pub fn tof_in_trunk(&self, joints: [f64; 4]) -> Pose {
-        let cam = self.camera_in_trunk_cv2(joints);
-        Pose::new(cam.pos, cam.quat * SENSOR_IN_CV2_Q)
+        self.model
+            .site_pose(site, &angles[..self.model.num_joints()])
     }
 
     /// Gaze IK: the head joints that point the camera at a trunk-frame point.
@@ -288,16 +312,17 @@ mod tests {
         );
     }
 
-    /// The MJCF carries a real `tof` site next to the camera. The convention
-    /// path (camera × SENSOR_IN_CV2_Q) — what the prototype shipped — must
-    /// agree with the asset's own answer: the *orientation* exactly (both
-    /// mounts face the same way), the position within the few centimetres
-    /// between the two mounts (the prototype knowingly reused the camera's).
+    /// The sensor pose sits on the MJCF's own `tof` site — exactly — and its
+    /// orientation convention matches the camera-borrowed path the prototype
+    /// used, which is only true while the asset mounts the two parallel. If a
+    /// future MJCF tilts the ToF, the orientation half of this is what fails,
+    /// and the conventions need a fresh look rather than a looser tolerance.
     #[test]
-    fn the_convention_tof_pose_agrees_with_the_mjcf_tof_site() {
+    fn the_tof_pose_sits_on_the_mjcf_tof_site() {
         let model = Model::alpha();
         let fk = HeadFk::alpha();
-        let by_convention = fk.tof_in_trunk([0.1, 0.2, -0.1, 0.05]);
+        let joints = [0.1, 0.2, -0.1, 0.05];
+        let pose = fk.tof_in_trunk(joints);
 
         let mut angles = vec![0.0; model.num_joints()];
         for (name, angle) in [
@@ -309,26 +334,18 @@ mod tests {
             angles[model.joint_index(name).expect("joint exists")] = angle;
         }
         let site = model.site_pose(model.site("tof").expect("tof site"), &angles);
-
-        for (a, b) in by_convention.pos.iter().zip(site.pos) {
-            assert!(
-                (a - b).abs() < 0.03,
-                "{:?} vs {:?}",
-                by_convention.pos,
-                site.pos
-            );
+        for (a, b) in pose.pos.iter().zip(site.pos) {
+            assert!((a - b).abs() < 1e-12, "{:?} vs {:?}", pose.pos, site.pos);
         }
-        // Orientation: the convention path borrows the camera's, which is only
-        // valid while the asset mounts the two the same way. If a future MJCF
-        // tilts the ToF, this is what should fail.
-        let camera = model.site_pose(model.site("head_camera").expect("camera site"), &angles);
-        for (a, b) in camera.quat.wxyz().iter().zip(site.quat.wxyz()) {
+
+        // Same forward axis as the camera-borrowed convention.
+        let cam = fk.camera_in_trunk_cv2(joints);
+        let borrowed = (cam.quat * SENSOR_IN_CV2_Q).rotate([1.0, 0.0, 0.0]);
+        let anchored = pose.quat.rotate([1.0, 0.0, 0.0]);
+        for (a, b) in anchored.iter().zip(borrowed) {
             assert!(
                 (a - b).abs() < 1e-9,
-                "the tof site no longer shares the camera's orientation — \
-                 stop borrowing it: {:?} vs {:?}",
-                camera.quat,
-                site.quat
+                "the tof site no longer parallels the camera: {anchored:?} vs {borrowed:?}"
             );
         }
     }

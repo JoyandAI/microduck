@@ -121,7 +121,7 @@ const DUCK_MAIN_MIN: u16 = 84;
 /// silently waits for a wider terminal rather than drawing one; past the maximum the
 /// extra cells stop adding legibility and the tables can breathe instead.
 const DUCK_MIN_WIDTH: u16 = 26;
-const DUCK_MAX_WIDTH: u16 = 62;
+const DUCK_MAX_WIDTH: u16 = 74;
 
 /// Rows the 3D view keeps for itself before the path map may take its slice —
 /// below this the duck is a smudge and the map would be the thing that did it.
@@ -1314,14 +1314,15 @@ impl View {
             .title_bottom(Line::from(" d hides · ← → orbits ").dim().right_aligned());
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        // The depth frame rides along as rays — yellow to obstacles, green to
-        // confirmed floor — so what the sensor sees is drawn where it sees it.
-        let beams = self.tof_beams();
+        // The depth frame rides along as contact points — yellow for obstacles,
+        // green for confirmed floor — so what the sensor sees is drawn where it
+        // sees it, and the view zooms out just enough to keep them in frame.
+        let markers = self.tof_markers();
         self.duck.draw(
             model,
             &state.joints,
             state.safety.gravity,
-            &beams,
+            &markers,
             inner,
             frame.buffer_mut(),
         );
@@ -1797,28 +1798,28 @@ impl View {
                 *slot = Some(f64::from(m));
             }
         }
-        Some(self.reprojector.project(&ranges, head))
+        // The trunk's own tilt and measured height, so a robot leaned by hand
+        // still calls the floor the floor. Odometry Z of zero means "no
+        // estimate" (an older robotd, or an unconverged IMU) — fall back to
+        // the model's rest height rather than believing the trunk is buried.
+        let posture = kinematics::tof::Posture {
+            gravity: state.safety.gravity,
+            trunk_height_m: (state.odom.position[2] > 0.02).then_some(state.odom.position[2]),
+        };
+        Some(self.reprojector.project(&ranges, head, &posture))
     }
 
-    /// The depth frame as rays for the 3D view: yellow to a thing, green to the
-    /// floor — the same colours the grid uses. Empty when the frame is stale,
-    /// because rays hanging where the sensor no longer looks would be a lie.
-    fn tof_beams(&self) -> Vec<duck::Beam> {
+    /// The depth frame as contact points for the 3D view: yellow for a thing,
+    /// green for confirmed floor — the same colours the grid uses. Empty when
+    /// the frame is stale, because points hanging where the sensor no longer
+    /// looks would be a lie.
+    fn tof_markers(&self) -> Vec<duck::Marker> {
         if !self.tof_arrived.is_some_and(|at| at.elapsed() <= TOF_STALE) {
             return Vec::new();
         }
         let Some(zones) = self.classified_tof() else {
             return Vec::new();
         };
-        let state = self.latest.as_ref().expect("classified implies a state");
-        let head: Vec<f64> = (5..9)
-            .filter_map(|i| state.joints.get(i).copied())
-            .collect();
-        let Ok(head) = <[f64; 4]>::try_from(head) else {
-            return Vec::new();
-        };
-        let origin = self.reprojector.sensor_in_trunk(head).pos;
-        let from = origin.map(|v| v as f32);
         zones
             .iter()
             .filter_map(|zone| {
@@ -1827,9 +1828,8 @@ impl View {
                     kinematics::tof::Zone::Floor { point } => (point, [70, 160, 80]),
                     _ => return None,
                 };
-                Some(duck::Beam {
-                    from,
-                    to: point.map(|v| v as f32),
+                Some(duck::Marker {
+                    at: point.map(|v| v as f32),
                     rgb,
                 })
             })

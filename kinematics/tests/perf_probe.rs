@@ -53,7 +53,11 @@ fn time_tof_reprojection() {
     let start = Instant::now();
     for i in 0..ITERS {
         let head = [0.0, f64::from(i % 100) * 0.001, 0.0, 0.0];
-        let zones = rp.project(black_box(&ranges), black_box(head));
+        let zones = rp.project(
+            black_box(&ranges),
+            black_box(head),
+            &kinematics::tof::Posture::default(),
+        );
         acc += zones
             .iter()
             .filter(|z| matches!(z, kinematics::tof::Zone::Hit { .. }))
