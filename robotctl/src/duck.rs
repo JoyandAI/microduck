@@ -332,14 +332,31 @@ pub struct Marker {
 /// every range as a number.
 const MARKER_REACH: f32 = 0.45;
 
+/// How long the view holds a zoom level after the last point that needed it —
+/// see [`DuckView::settle_zoom`].
+const ZOOM_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Zoom quantum, metres of framed world.
+const ZOOM_STEP: f32 = 0.05;
+
+/// What the pixels were rendered through: azimuth bits, zoom bits, width, height.
+type CameraKey = (u32, u32, usize, usize);
+
 /// Scratch the renderer reuses frame to frame, plus the one piece of view state — where
 /// the camera stands. Owned by the monitor's `View`.
 pub struct DuckView {
     /// Camera azimuth, radians. Starts on the three-quarter view the sim opens with.
     azimuth: f32,
+    /// The zoom the view is currently committed to — the framed world, metres.
+    /// Grows the instant a marker needs the room, shrinks only after
+    /// [`ZOOM_HOLD`] without one: a view that breathes at the depth sensor's
+    /// frame rate is a view nobody can read.
+    zoom: f32,
+    /// When a marker last justified the current zoom.
+    zoom_needed_at: std::time::Instant,
     /// What the pixels currently hold: the pose it was rasterized from, the camera it
     /// was seen by, and when. `None` means the pixels are nothing at all.
-    cached: Option<(u64, (u32, usize, usize), std::time::Instant)>,
+    cached: Option<(u64, CameraKey, std::time::Instant)>,
     depth: Vec<f32>,
     pixels: Vec<[u8; 3]>,
     lit: Vec<bool>,
@@ -350,6 +367,8 @@ impl DuckView {
     pub fn new() -> Self {
         Self {
             azimuth: -0.7,
+            zoom: WINDOW,
+            zoom_needed_at: std::time::Instant::now(),
             cached: None,
             depth: Vec::new(),
             pixels: Vec::new(),
@@ -361,6 +380,19 @@ impl DuckView {
     /// Swing the camera around the robot. Bound to `[` and `]` in the monitor.
     pub fn orbit(&mut self, radians: f32) {
         self.azimuth = (self.azimuth + radians).rem_euclid(std::f32::consts::TAU);
+    }
+
+    /// The zoom's hysteresis: out at once — a new far point must be seen *now* —
+    /// in only after [`ZOOM_HOLD`] with nothing needing the room, so the view
+    /// does not breathe at the depth sensor's frame rate. Quantized to
+    /// [`ZOOM_STEP`] bins so marker jitter cannot flap it either.
+    fn settle_zoom(&mut self, needed: f32, now: std::time::Instant) -> f32 {
+        let needed = (needed / ZOOM_STEP).ceil() * ZOOM_STEP;
+        if needed >= self.zoom || now.duration_since(self.zoom_needed_at) >= ZOOM_HOLD {
+            self.zoom = needed;
+            self.zoom_needed_at = now;
+        }
+        self.zoom
     }
 
     /// Pose the model and draw it into `area`, two pixels per cell.
@@ -383,13 +415,22 @@ impl DuckView {
             return;
         }
 
+        // The zoom settles before the cache is consulted, and rides in the camera
+        // key: a zoom-in fires five quiet seconds after the pose stopped changing,
+        // which is exactly when the pose key alone would say "nothing new".
+        let now = std::time::Instant::now();
+        let needed = markers
+            .iter()
+            .filter(|m| m.at[0].hypot(m.at[1]) <= MARKER_REACH)
+            .fold(WINDOW, |acc, m| acc.max(2.2 * m.at[0].hypot(m.at[1])));
+        let window = self.settle_zoom(needed, now);
+
         // Reuse the pixels when they still say the truth — same pose, or a pose newer
         // than [`RASTER_INTERVAL`] — but never across a camera change, which has to
         // land on the very next paint. Markers are part of the pose key: a new
         // depth frame is a new picture, still throttled by the same interval.
         let pose = pose_key(joints, gravity, markers);
-        let camera = (self.azimuth.to_bits(), w, h);
-        let now = std::time::Instant::now();
+        let camera = (self.azimuth.to_bits(), window.to_bits(), w, h);
         if let Some((cached_pose, cached_camera, at)) = self.cached
             && cached_camera == camera
             && (cached_pose == pose || now.duration_since(at) < RASTER_INTERVAL)
@@ -432,15 +473,6 @@ impl DuckView {
             .filter(|m| m.at[0].hypot(m.at[1]) <= MARKER_REACH)
             .map(|m| (trunk.apply(m.at), m.rgb))
             .collect();
-
-        // Zoom out just enough to keep every drawn marker in frame. The horizontal
-        // centre of the projection is the trunk's vertical axis, so a point at
-        // radius r needs a window of 2r plus margin; MARKER_REACH caps how small
-        // the robot can get.
-        let window = markers
-            .iter()
-            .filter(|m| m.at[0].hypot(m.at[1]) <= MARKER_REACH)
-            .fold(WINDOW, |acc, m| acc.max(2.2 * m.at[0].hypot(m.at[1])));
 
         // Every vertex into world space once, kept, because it is read three ways:
         // to find the floor, to shade, and to rasterize.
@@ -726,6 +758,33 @@ mod tests {
             drawn > 200,
             "only {drawn} cells drawn — the robot is missing"
         );
+    }
+
+    /// The zoom's manners: out the instant a point needs the room, back in
+    /// only after five quiet seconds — never breathing at the sensor's rate.
+    #[test]
+    fn the_zoom_backs_out_instantly_and_creeps_back_in() {
+        let mut view = DuckView::new();
+        let t0 = std::time::Instant::now();
+
+        let wide = view.settle_zoom(0.9, t0);
+        assert!(
+            (wide - 0.9).abs() < ZOOM_STEP,
+            "zooming out must be instant"
+        );
+
+        // The far point is gone, but the hold is not up: the view stays put.
+        let held = view.settle_zoom(WINDOW, t0 + std::time::Duration::from_secs(2));
+        assert_eq!(held, wide, "two quiet seconds must not zoom back in");
+
+        // A fresh far point re-arms the hold without changing the zoom.
+        view.settle_zoom(0.9, t0 + std::time::Duration::from_secs(4));
+        let still = view.settle_zoom(WINDOW, t0 + std::time::Duration::from_secs(8));
+        assert_eq!(still, wide, "the hold restarts with every far point");
+
+        // Five quiet seconds later, the view comes home.
+        let home = view.settle_zoom(WINDOW, t0 + std::time::Duration::from_secs(10));
+        assert!(home < wide, "after the hold the zoom must come back in");
     }
 
     /// A contact point must actually reach the pixels — its own colour, in
