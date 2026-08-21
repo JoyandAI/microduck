@@ -42,7 +42,11 @@ pub enum Zone {
     /// A return inside the short-range noise band ([`Reprojector::MIN_RANGE_M`]).
     TooClose,
     /// The beam reached the floor before anything stood in its way.
-    Floor,
+    Floor {
+        /// Where it touched, in the trunk frame — for drawing the ground the
+        /// robot has actually confirmed, not for avoiding.
+        point: [f64; 3],
+    },
     /// Something is there.
     Hit {
         /// The return, in the trunk frame, metres.
@@ -132,7 +136,13 @@ impl Reprojector {
             // Positive when the beam looks below the horizon.
             let downward = -dir[2];
             if above_floor > 0.0 && downward > 0.0 && r * downward >= floor_threshold {
-                zones[i] = Zone::Floor;
+                zones[i] = Zone::Floor {
+                    point: [
+                        sensor.pos[0] + r * dir[0],
+                        sensor.pos[1] + r * dir[1],
+                        sensor.pos[2] + r * dir[2],
+                    ],
+                };
                 continue;
             }
             let horizontal = r * (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
@@ -205,7 +215,14 @@ mod tests {
         let to_floor = above_floor / -dir[2];
 
         let at_floor = rp.project(&one_return(zone, to_floor), looking_down);
-        assert_eq!(at_floor[zone], Zone::Floor);
+        let Zone::Floor { point } = at_floor[zone] else {
+            panic!("expected the floor, got {:?}", at_floor[zone]);
+        };
+        assert!(
+            (point[2] + Model::alpha().trunk_height_m()).abs() < 0.02,
+            "a floor touch sits at floor height: z = {}",
+            point[2]
+        );
 
         let interrupted = rp.project(&one_return(zone, to_floor * 0.75), looking_down);
         assert!(

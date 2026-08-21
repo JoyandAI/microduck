@@ -318,6 +318,15 @@ fn attitude(gravity: [f64; 3]) -> Pose {
 /// Turning the camera skips the wait: a hand on `[` must feel the view move.
 const RASTER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 
+/// One ToF ray to overlay: trunk-frame endpoints, already classified and
+/// coloured by the caller. The view only knows how to draw it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Beam {
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    pub rgb: [u8; 3],
+}
+
 /// Scratch the renderer reuses frame to frame, plus the one piece of view state — where
 /// the camera stands. Owned by the monitor's `View`.
 pub struct DuckView {
@@ -360,6 +369,7 @@ impl DuckView {
         model: &Model,
         joints: &[f64],
         gravity: [f64; 3],
+        beams: &[Beam],
         area: Rect,
         buf: &mut Buffer,
     ) {
@@ -370,8 +380,9 @@ impl DuckView {
 
         // Reuse the pixels when they still say the truth — same pose, or a pose newer
         // than [`RASTER_INTERVAL`] — but never across a camera change, which has to
-        // land on the very next paint.
-        let pose = pose_key(joints, gravity);
+        // land on the very next paint. Beams are part of the pose key: a new depth
+        // frame is a new picture, still throttled by the same interval.
+        let pose = pose_key(joints, gravity, beams);
         let camera = (self.azimuth.to_bits(), w, h);
         let now = std::time::Instant::now();
         if let Some((cached_pose, cached_camera, at)) = self.cached
@@ -472,7 +483,65 @@ impl DuckView {
             }
         }
 
+        // The ToF rays, in the same z-buffer: they start inside the head shell, so
+        // the first samples lose the depth test and the ray visibly *emerges* from
+        // the sensor instead of floating in front of the face.
+        let trunk = attitude(gravity);
+        for beam in beams {
+            self.ray(
+                trunk.apply(beam.from),
+                trunk.apply(beam.to),
+                beam.rgb,
+                w,
+                h,
+                project,
+            );
+        }
+
         self.blit(area, buf);
+    }
+
+    /// One ray: world-space points sampled finer than a pixel, z-tested like the
+    /// grid, ending in a 2×2 blob so the *return* — the thing that is there — reads
+    /// heavier than the light that found it.
+    fn ray(
+        &mut self,
+        a: [f32; 3],
+        b: [f32; 3],
+        rgb: [u8; 3],
+        w: usize,
+        h: usize,
+        project: impl Fn([f32; 3]) -> [f32; 3],
+    ) {
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let len = dot(d, d).sqrt();
+        if !len.is_finite() {
+            return;
+        }
+        let steps = ((len / 0.006).ceil() as usize).clamp(1, 1024);
+        let mut plot = |v: [f32; 3], blob: bool| {
+            let p = project(v);
+            let reach = if blob { 1i32 } else { 0 };
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    let (x, y) = (p[0] as i32 + dx, p[1] as i32 + dy);
+                    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                        continue;
+                    }
+                    let i = y as usize * w + x as usize;
+                    if p[2] < self.depth[i] {
+                        self.depth[i] = p[2];
+                        self.pixels[i] = rgb;
+                        self.lit[i] = true;
+                    }
+                }
+            }
+        };
+        for k in 0..=steps {
+            let t = k as f32 / steps as f32;
+            plot([a[0] + t * d[0], a[1] + t * d[1], a[2] + t * d[2]], false);
+        }
+        plot(b, true);
     }
 
     /// The sim floor: grid lines on z = 0, sampled as points finer than a pixel and
@@ -595,7 +664,7 @@ fn rgb(c: [u8; 3]) -> Color {
 /// The pose, reduced to one comparable number. Angles are quantized to ~0.3° first:
 /// sensor noise wiggles every measurement, and re-rasterizing over a wiggle no cell
 /// can show would defeat the cache that keeps this view cheap.
-fn pose_key(joints: &[f64], gravity: [f64; 3]) -> u64 {
+fn pose_key(joints: &[f64], gravity: [f64; 3], beams: &[Beam]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for &j in joints {
@@ -603,6 +672,16 @@ fn pose_key(joints: &[f64], gravity: [f64; 3]) -> u64 {
     }
     for g in gravity {
         ((g * 100.0).round() as i64).hash(&mut hasher);
+    }
+    for beam in beams {
+        // Centimetre bins: finer motion than that is invisible at this resolution,
+        // and quantizing keeps sensor noise from defeating the cache entirely.
+        for v in [beam.from, beam.to] {
+            for c in v {
+                ((c * 100.0).round() as i64).hash(&mut hasher);
+            }
+        }
+        beam.rgb.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -631,7 +710,7 @@ mod tests {
         let mut view = DuckView::new();
         let area = Rect::new(0, 0, 48, 40);
         let mut buf = Buffer::empty(area);
-        view.draw(model, &[0.0; 15], [0.0, 0.0, -1.0], area, &mut buf);
+        view.draw(model, &[0.0; 15], [0.0, 0.0, -1.0], &[], area, &mut buf);
 
         let drawn = (0..40u16)
             .flat_map(|y| (0..48u16).map(move |x| (x, y)))
@@ -641,6 +720,34 @@ mod tests {
             drawn > 200,
             "only {drawn} cells drawn — the robot is missing"
         );
+    }
+
+    /// A beam must actually reach the pixels — its own colour, in front of the
+    /// robot, ending where it was told. Guards the beam path's projection and
+    /// the pose-key change that lets it re-raster.
+    #[test]
+    fn a_tof_beam_paints_its_colour() {
+        let model = model().unwrap();
+        let mut view = DuckView::new();
+        let area = Rect::new(0, 0, 48, 40);
+        let mut buf = Buffer::empty(area);
+        let beam = Beam {
+            from: [0.03, 0.0, 0.05],
+            to: [0.6, 0.0, 0.05],
+            rgb: [225, 200, 70],
+        };
+        view.draw(model, &[0.0; 15], [0.0, 0.0, -1.0], &[beam], area, &mut buf);
+
+        let painted = view.pixels.iter().filter(|p| **p == [225, 200, 70]).count();
+        assert!(painted > 10, "the beam left only {painted} pixels");
+
+        // And a new frame with the beam gone must not show a stale ray. Past
+        // the raster throttle, that is — an 80 ms-old picture is the deal the
+        // cache offers for everything, beams included.
+        std::thread::sleep(RASTER_INTERVAL + std::time::Duration::from_millis(10));
+        view.draw(model, &[0.0; 15], [0.0, 0.0, -1.0], &[], area, &mut buf);
+        let stale = view.pixels.iter().filter(|p| **p == [225, 200, 70]).count();
+        assert_eq!(stale, 0, "a vanished beam must vanish from the pixels");
     }
 
     /// Optional visual check for humans: `DUCK_DUMP=/tmp/duck.ppm cargo test -p robotctl`
@@ -663,7 +770,7 @@ mod tests {
         }
         let area = Rect::new(0, 0, 100, 100);
         let mut buf = Buffer::empty(area);
-        view.draw(model, &joints, [0.0, 0.0, -1.0], area, &mut buf);
+        view.draw(model, &joints, [0.0, 0.0, -1.0], &[], area, &mut buf);
         let (w, h) = (100usize, 200usize);
         let mut out = format!("P6 {w} {h} 255\n").into_bytes();
         for y in 0..h {
@@ -686,13 +793,26 @@ mod bench {
 
     /// Not a benchmark harness, a stopwatch: `cargo test -p robotctl --release
     /// frame_cost -- --nocapture` prints what the view costs per frame, split into the
-    /// three paths a live monitor actually takes — a full re-raster (the camera or the
-    /// pose moved), and the cached blit every other repaint gets — at the panel sizes
-    /// the layout actually deals. Run it *on the board* to know what the robot pays:
-    /// compute there is shared with the control loop this view watches.
+    /// paths a live monitor actually takes — a full re-raster (the camera or the
+    /// pose moved), the same with a worst-case beam overlay, and the cached blit every
+    /// other repaint gets — at the panel sizes the layout actually deals. Run it *on
+    /// the board* to know what the robot pays: compute there is shared with the
+    /// control loop this view watches.
     #[test]
     fn frame_cost() {
         let model = model().unwrap();
+        // Worst case: all 64 zones return, at ranges long enough to sample fully.
+        let beams: Vec<Beam> = (0..64)
+            .map(|i| Beam {
+                from: [0.03, 0.0, 0.05],
+                to: [
+                    1.5,
+                    (i % 8) as f32 * 0.05 - 0.18,
+                    (i / 8) as f32 * 0.05 - 0.18,
+                ],
+                rgb: [225, 200, 70],
+            })
+            .collect();
         // (cells wide, cells tall): the narrowest panel the layout accepts, and the
         // widest it ever grants, at a tall terminal.
         for (w, h) in [(26u16, 24u16), (44, 40), (62, 48)] {
@@ -701,30 +821,32 @@ mod bench {
             let mut buf = Buffer::empty(area);
             let joints = [0.1f64; 15];
 
-            let mut time = |view: &mut DuckView, n: u32, step: Step| {
+            let mut time = |view: &mut DuckView, n: u32, rays: &[Beam], step: Step| {
                 let mut j = joints;
                 let start = std::time::Instant::now();
                 for i in 0..n {
                     step(view, i, &mut j);
-                    view.draw(model, &j, [0.05, 0.02, -1.0], area, &mut buf);
+                    view.draw(model, &j, [0.05, 0.02, -1.0], rays, area, &mut buf);
                 }
                 start.elapsed() / n
             };
 
             // Every frame re-rasters: the camera moved, which bypasses the pose cache.
-            let raster = time(&mut view, 200, &mut |v, _, _| v.orbit(0.013));
+            let raster = time(&mut view, 200, &[], &mut |v, _, _| v.orbit(0.013));
+            // The same, drawing a full 64-ray depth frame on top.
+            let rays = time(&mut view, 200, &beams, &mut |v, _, _| v.orbit(0.013));
             // Every frame re-rasters: the pose moved past the 0.3° quantum. The cache's
             // 80 ms gate is what spares the board this at 50 Hz; it is bypassed here by
             // clearing the stamp, because the gate is the thing being priced.
-            let pose = time(&mut view, 200, &mut |v, i, j| {
+            let pose = time(&mut view, 200, &[], &mut |v, i, j| {
                 j[3] = 0.1 + 0.02 * f64::from(i);
                 v.cached = None;
             });
             // Nothing changed: the path a 50 Hz stream takes ~5 frames out of 6.
-            let blit = time(&mut view, 500, &mut |_, _, _| {});
+            let blit = time(&mut view, 500, &[], &mut |_, _, _| {});
 
             println!(
-                "{w:>3}x{h:<3} cells   raster {raster:>10.2?}   pose-change {pose:>10.2?}   cached blit {blit:>10.2?}"
+                "{w:>3}x{h:<3} cells   raster {raster:>10.2?}   +64 beams {rays:>10.2?}   pose-change {pose:>10.2?}   cached blit {blit:>10.2?}"
             );
         }
     }

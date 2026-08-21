@@ -251,6 +251,28 @@ mod tests {
             .collect()
     }
 
+    /// Not a test — a stopwatch for a full-capacity track. Run with:
+    ///
+    ///     cargo test -p robotctl --release time_the_map -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf probe, run manually with --release --nocapture"]
+    fn time_the_map() {
+        let mut map = PathMap::new();
+        for i in 0..(CAPACITY as i32 * 2) {
+            let t = f64::from(i) * 0.05;
+            map.observe(t.sin() * t * 0.01, t.cos() * t * 0.01, t);
+        }
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        let start = std::time::Instant::now();
+        const ITERS: u32 = 10_000;
+        for _ in 0..ITERS {
+            map.draw(area, &mut buf);
+        }
+        let per = start.elapsed().as_nanos() as f64 / f64::from(ITERS);
+        println!("path map: {per:.0} ns/draw at {} points", map.points.len());
+    }
+
     /// Not a test — eyes on the actual pixels. Run with:
     ///
     ///     cargo test -p robotctl path_map -- --ignored --nocapture

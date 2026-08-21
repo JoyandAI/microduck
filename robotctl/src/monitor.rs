@@ -625,7 +625,7 @@ fn tof_cell(zone: tof_zone::Zone, class: Option<kinematics::tof::Zone>) -> Span<
             // is the difference on screen. Too-close returns recede — under
             // ~10 cm the sensor's crosstalk makes the number untrustworthy.
             match class {
-                Some(kinematics::tof::Zone::Floor) => {
+                Some(kinematics::tof::Zone::Floor { .. }) => {
                     return Span::styled(
                         format!("{:>4.2} ", metres.min(9.99)),
                         Style::new().fg(Color::Green).dim(),
@@ -750,11 +750,11 @@ fn live(
                         view.toggle_duck();
                         fresh = true;
                     }
-                    KeyCode::Char('[') => {
+                    KeyCode::Char('[') | KeyCode::Left => {
                         view.orbit_duck(-0.25);
                         fresh = true;
                     }
-                    KeyCode::Char(']') => {
+                    KeyCode::Char(']') | KeyCode::Right => {
                         view.orbit_duck(0.25);
                         fresh = true;
                     }
@@ -1311,13 +1311,17 @@ impl View {
 
         let block = Block::bordered()
             .title(" robot ")
-            .title_bottom(Line::from(" d hides · [ ] orbits ").dim().right_aligned());
+            .title_bottom(Line::from(" d hides · ← → orbits ").dim().right_aligned());
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        // The depth frame rides along as rays — yellow to obstacles, green to
+        // confirmed floor — so what the sensor sees is drawn where it sees it.
+        let beams = self.tof_beams();
         self.duck.draw(
             model,
             &state.joints,
             state.safety.gravity,
+            &beams,
             inner,
             frame.buffer_mut(),
         );
@@ -1756,19 +1760,7 @@ impl View {
         // Reproject through the head FK when the robot stream is up, so the
         // grid can say which returns are just the floor. The joint indices are
         // `JOINT_NAMES` order: neck_pitch, head_pitch, head_yaw, head_roll.
-        let classified = self.latest.as_ref().and_then(|state| {
-            let head: Vec<f64> = (5..9)
-                .filter_map(|i| state.joints.get(i).copied())
-                .collect();
-            let head: [f64; 4] = head.try_into().ok()?;
-            let mut ranges = [None; kinematics::tof::ROWS * kinematics::tof::COLS];
-            for (i, slot) in ranges.iter_mut().enumerate() {
-                if let tof_zone::Zone::Range(m) = frame_zone(tof, i) {
-                    *slot = Some(f64::from(m));
-                }
-            }
-            Some(self.reprojector.project(&ranges, head))
-        });
+        let classified = self.classified_tof();
 
         let lines: Vec<Line> = (0..rows)
             .map(|row| {
@@ -1784,6 +1776,64 @@ impl View {
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The frame's zones through the head FK, when both streams are up: which
+    /// returns are floor, which are obstacles, and where each sits in the
+    /// trunk frame. The joint indices are `JOINT_NAMES` order — neck_pitch,
+    /// head_pitch, head_yaw, head_roll at 5..9.
+    fn classified_tof(
+        &self,
+    ) -> Option<[kinematics::tof::Zone; kinematics::tof::ROWS * kinematics::tof::COLS]> {
+        let tof = self.tof.as_ref()?;
+        let state = self.latest.as_ref()?;
+        let head: Vec<f64> = (5..9)
+            .filter_map(|i| state.joints.get(i).copied())
+            .collect();
+        let head: [f64; 4] = head.try_into().ok()?;
+        let mut ranges = [None; kinematics::tof::ROWS * kinematics::tof::COLS];
+        for (i, slot) in ranges.iter_mut().enumerate() {
+            if let tof_zone::Zone::Range(m) = frame_zone(tof, i) {
+                *slot = Some(f64::from(m));
+            }
+        }
+        Some(self.reprojector.project(&ranges, head))
+    }
+
+    /// The depth frame as rays for the 3D view: yellow to a thing, green to the
+    /// floor — the same colours the grid uses. Empty when the frame is stale,
+    /// because rays hanging where the sensor no longer looks would be a lie.
+    fn tof_beams(&self) -> Vec<duck::Beam> {
+        if !self.tof_arrived.is_some_and(|at| at.elapsed() <= TOF_STALE) {
+            return Vec::new();
+        }
+        let Some(zones) = self.classified_tof() else {
+            return Vec::new();
+        };
+        let state = self.latest.as_ref().expect("classified implies a state");
+        let head: Vec<f64> = (5..9)
+            .filter_map(|i| state.joints.get(i).copied())
+            .collect();
+        let Ok(head) = <[f64; 4]>::try_from(head) else {
+            return Vec::new();
+        };
+        let origin = self.reprojector.sensor_in_trunk(head).pos;
+        let from = origin.map(|v| v as f32);
+        zones
+            .iter()
+            .filter_map(|zone| {
+                let (point, rgb) = match zone {
+                    kinematics::tof::Zone::Hit { point, .. } => (point, [225, 200, 70]),
+                    kinematics::tof::Zone::Floor { point } => (point, [70, 160, 80]),
+                    _ => return None,
+                };
+                Some(duck::Beam {
+                    from,
+                    to: point.map(|v| v as f32),
+                    rgb,
+                })
+            })
+            .collect()
     }
 
     /// `tof <sensor> · <hz> · <rows>×<cols> · <n>/<total> ranged · <min>–<max> m`

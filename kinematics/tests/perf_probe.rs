@@ -38,3 +38,27 @@ fn time_site_pose() {
         println!("{label}: {per:.0} ns/query-set (acc {acc:.3})");
     }
 }
+
+#[test]
+#[ignore = "perf probe, run manually with --release --nocapture"]
+fn time_tof_reprojection() {
+    use kinematics::tof::Reprojector;
+
+    let rp = Reprojector::alpha();
+    // Worst case: all 64 zones returned something.
+    let ranges = [Some(1.2f64); kinematics::tof::ROWS * kinematics::tof::COLS];
+
+    const ITERS: u32 = 100_000;
+    let mut acc = 0usize;
+    let start = Instant::now();
+    for i in 0..ITERS {
+        let head = [0.0, f64::from(i % 100) * 0.001, 0.0, 0.0];
+        let zones = rp.project(black_box(&ranges), black_box(head));
+        acc += zones
+            .iter()
+            .filter(|z| matches!(z, kinematics::tof::Zone::Hit { .. }))
+            .count();
+    }
+    let per = start.elapsed().as_nanos() as f64 / f64::from(ITERS);
+    println!("full-frame reprojection: {per:.0} ns/frame (acc {acc})");
+}
