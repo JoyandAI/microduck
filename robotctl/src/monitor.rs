@@ -552,7 +552,7 @@ const TOF_STALE: Duration = Duration::from_millis(400);
 
 /// Said in the block's border, because the two non-numeric cells are the ones a
 /// reader has no way to guess.
-const TOF_LEGEND: &str = " · nothing in range · x could not measure · near→far ";
+const TOF_LEGEND: &str = " · nothing in range · x could not measure · green floor · near→far ";
 
 /// The near-to-far colour ramp, warm to cool.
 ///
@@ -617,9 +617,25 @@ fn frame_zone(frame: &proto::TofFrame, index: usize) -> tof_zone::Zone {
 
 /// One cell: the distance coloured by range, or a mark for the two cases that
 /// have no distance.
-fn tof_cell(zone: tof_zone::Zone) -> Span<'static> {
+fn tof_cell(zone: tof_zone::Zone, class: Option<kinematics::tof::Zone>) -> Span<'static> {
     match zone {
         tof_zone::Zone::Range(metres) => {
+            // The reprojection's verdict beats the colour ramp: a floor return
+            // is a real distance, but it is not a thing in the way, and green
+            // is the difference on screen. Too-close returns recede — inside
+            // the noise band the number is as likely the duck's own beak.
+            match class {
+                Some(kinematics::tof::Zone::Floor) => {
+                    return Span::styled(
+                        format!("{:>4.2} ", metres.min(9.99)),
+                        Style::new().fg(Color::Green).dim(),
+                    );
+                }
+                Some(kinematics::tof::Zone::TooClose) => {
+                    return Span::raw(format!("{:>4.2} ", metres.min(9.99))).dim();
+                }
+                _ => {}
+            }
             let colour = TOF_RAMP
                 .iter()
                 .find(|(limit, _)| metres < *limit)
@@ -1012,6 +1028,8 @@ struct View {
     show_duck: bool,
     /// The odometry track, drawn as a top-down map under the robot view.
     path: path_map::PathMap,
+    /// ToF beams through the head FK, so the depth grid can name the floor.
+    reprojector: kinematics::tof::Reprojector,
     /// The last depth frame, and when it arrived by this view's clock — the frame's
     /// own `at_us` is `tofd`'s, and the question here is how stale what is on
     /// screen is.
@@ -1044,6 +1062,7 @@ impl View {
             duck: duck::DuckView::new(),
             show_duck: true,
             path: path_map::PathMap::new(),
+            reprojector: kinematics::tof::Reprojector::alpha(),
             tof: None,
             tof_arrived: None,
             tof_status: None,
@@ -1734,12 +1753,33 @@ impl View {
         let per_row = usize::from(inner.width.saturating_sub(1)) / TOF_CELL;
         let drawn = cols.min(per_row.max(1));
 
+        // Reproject through the head FK when the robot stream is up, so the
+        // grid can say which returns are just the floor. The joint indices are
+        // `JOINT_NAMES` order: neck_pitch, head_pitch, head_yaw, head_roll.
+        let classified = self.latest.as_ref().and_then(|state| {
+            let head: Vec<f64> = (5..9)
+                .filter_map(|i| state.joints.get(i).copied())
+                .collect();
+            let head: [f64; 4] = head.try_into().ok()?;
+            let mut ranges = [None; kinematics::tof::ROWS * kinematics::tof::COLS];
+            for (i, slot) in ranges.iter_mut().enumerate() {
+                if let tof_zone::Zone::Range(m) = frame_zone(tof, i) {
+                    *slot = Some(f64::from(m));
+                }
+            }
+            Some(self.reprojector.project(&ranges, head))
+        });
+
         let lines: Vec<Line> = (0..rows)
             .map(|row| {
                 // A leading space so the first column is not against the border —
                 // a number touching a box edge reads as part of it.
                 let mut cells = vec![Span::raw(" ")];
-                cells.extend((0..drawn).map(|col| tof_cell(frame_zone(tof, row * cols + col))));
+                cells.extend((0..drawn).map(|col| {
+                    let i = row * cols + col;
+                    let class = classified.as_ref().and_then(|c| c.get(i).copied());
+                    tof_cell(frame_zone(tof, i), class)
+                }));
                 Line::from(cells)
             })
             .collect();

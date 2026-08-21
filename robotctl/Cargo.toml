@@ -24,6 +24,9 @@ clap_complete = "4.6.4"
 serde_json.workspace = true
 serde.workspace = true
 libc = "0.2.189"
+# Pure geometry (the ToF reprojection the monitor overlays) — deliberately NOT the `tof`
+# crate, whose vendored C driver would drag a cross C toolchain into every robotctl build.
+kinematics = { path = "../kinematics" }
 # `robotctl monitor`'s live view, and nothing else. Terminal only — no http, no crypto, no
 # async runtime, so the rule this file opens with still holds: none of the update engine's
 # tree comes in with it. Default features off because the widget set we do not draw (calendar,

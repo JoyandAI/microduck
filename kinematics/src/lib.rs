@@ -22,6 +22,7 @@ mod math;
 mod mjcf;
 
 pub mod head;
+pub mod tof;
 
 pub use math::{Pose, Quat};
 pub use mjcf::ParseError;
@@ -51,10 +52,16 @@ struct Link {
 /// queries take `&self`.
 pub struct Model {
     joint_names: Vec<String>,
+    /// `[lo, hi]` travel limits per joint, radians, straight from the MJCF.
+    joint_ranges: Vec<Option<(f64, f64)>>,
     site_names: Vec<String>,
     /// Per site, the flattened root→site chain (the site's own rest pose is the
     /// final, joint-less link).
     chains: Vec<Box<[Link]>>,
+    /// The trunk's standing height above the floor, metres — the scene's drop
+    /// height for `trunk_base`, which is where the training world puts the
+    /// floor relative to the trunk frame.
+    trunk_height: f64,
 }
 
 impl Model {
@@ -65,10 +72,12 @@ impl Model {
         // Joint indices in tree order: deterministic, and a body's joint is
         // resolvable the moment its body is visited.
         let mut joint_names = Vec::new();
+        let mut joint_ranges = Vec::new();
         let mut body_joint: Vec<Option<(usize, [f64; 3])>> = Vec::with_capacity(tree.bodies.len());
         for body in &tree.bodies {
             body_joint.push(body.joint.as_ref().map(|j| {
                 joint_names.push(j.name.clone());
+                joint_ranges.push(j.range);
                 (joint_names.len() - 1, j.axis)
             }));
         }
@@ -102,8 +111,10 @@ impl Model {
 
         Ok(Self {
             joint_names,
+            joint_ranges,
             site_names,
             chains,
+            trunk_height: tree.trunk_pos[2],
         })
     }
 
@@ -129,6 +140,20 @@ impl Model {
     /// Where a named joint lives in the angle slice. Resolve once, at setup.
     pub fn joint_index(&self, name: &str) -> Option<usize> {
         self.joint_names.iter().position(|n| n == name)
+    }
+
+    /// The joint's `[lo, hi]` travel limits, radians — `None` when the MJCF
+    /// declares none. What an IK must clamp against: the servos enforce these
+    /// mechanically, so a target beyond them is a target the robot cannot hold.
+    pub fn joint_range(&self, joint: usize) -> Option<(f64, f64)> {
+        self.joint_ranges.get(joint).copied().flatten()
+    }
+
+    /// The trunk frame's standing height above the floor, metres, as the
+    /// training scene declares it (`trunk_base`'s world drop height). A floor
+    /// filter's offset, from the asset instead of a constant.
+    pub fn trunk_height_m(&self) -> f64 {
+        self.trunk_height
     }
 
     pub fn site_names(&self) -> impl Iterator<Item = &str> {

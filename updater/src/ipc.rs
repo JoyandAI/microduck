@@ -595,6 +595,7 @@ impl Server {
             | Call::RobotRemoteSessionActive
             | Call::RobotMove(_)
             | Call::RobotHead(_)
+            | Call::RobotLook(_)
             | Call::RobotStop
             | Call::RobotEnable(_)
             | Call::RobotInit
