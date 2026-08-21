@@ -40,6 +40,7 @@ use duck_ipc_proto as proto;
 
 mod duck;
 mod monitor;
+mod path_map;
 
 /// Exit codes. Stable — CI asserts on these.
 mod exit {

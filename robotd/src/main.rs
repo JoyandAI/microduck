@@ -1087,6 +1087,11 @@ async fn control_loop<T: RobotIo>(
     let mut coast = Coast::new();
     let mut stopped_driving_at: Option<Instant> = None;
 
+    // Contact odometry, ticked at the loop's own rate on the sample the loop already
+    // read — the prototype ran it at 100 Hz on extra bus reads, which is exactly the
+    // bus pressure the spasms investigation taught this loop not to add.
+    let mut odometry = odometry::Odometry::alpha();
+
     // The sit-then-power-off sequence, and fall recovery.
     let mut shutdown_sit: Option<Instant> = None;
     let mut powered_off = false;
@@ -1164,6 +1169,13 @@ async fn control_loop<T: RobotIo>(
 
         if let Some(fresh) = fresh.as_ref() {
             safety.observe(fresh, period);
+            // Only once the orientation filter has converged: seeding the anchor from a
+            // quaternion that is still swinging would put the world origin somewhere the
+            // robot never was. A coasted tick is skipped too — repeating a stale sample
+            // into the estimator would tell it the robot froze, which it did not.
+            if safety.imu_ready() {
+                odometry.update(&fresh.positions, fresh.imu.quat);
+            }
         }
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
 
@@ -1674,6 +1686,10 @@ async fn control_loop<T: RobotIo>(
                 },
                 joints: sensors.positions.to_vec(),
                 targets: targets.to_vec(),
+                odom: proto::OdomState {
+                    position: odometry.position(),
+                    yaw: odometry.yaw(),
+                },
             });
         }
 

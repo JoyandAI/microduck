@@ -120,7 +120,7 @@ safety authority sits (§6).
 
 | Service | Owns | Notes |
 |---|---|---|
-| `robotd` | motor control, kinematics, gait policies, sensor loop, safety | RT-ish core; authoritative on anything that can hurt the robot |
+| `robotd` | motor control, kinematics, odometry, gait policies, sensor loop, safety | RT-ish core; authoritative on anything that can hurt the robot. Odometry is a struct in the loop, not a service: its inputs are exactly the sample the loop already read |
 | `mediad` | camera/mic, encode, perception, WebRTC + remote gateway | Heaviest service; also the remote API front door (§5.2) |
 | `btd` | BLE GATT server | **Transport adapter only** — owns no state (§4.1). See [`app-path-design.md`](app-path-design.md) |
 | `configd` | wifi, robot identity, power, gamepad pairing | Config must be reachable when `robotd` is dead (§3.1), and `btd` must own nothing (§4.1) — so it is neither's business but its own. Gamepad pairing is here rather than in `padd` because bonding a device needs root and BlueZ, and `padd` is deliberately an unprivileged client (§4.1) |
@@ -138,10 +138,10 @@ sensor on a bus, not a media pipeline, and it is useful long before there is a
 camera to annotate.
 
 Consumers reach it the way they reach the pad's raw stream — a subscription on the
-owning daemon's own socket (`tof.stream`), never through `robotd`. When the
-kinematics land, reprojecting a frame into the robot's own frame means combining
-`tof.frame` with joint state from `robot.state`; `tofd` publishes the sensor's
-view and does not pretend to geometry it cannot compute.
+owning daemon's own socket (`tof.stream`), never through `robotd`. Reprojecting a
+frame into the robot's own frame means combining it with joint state from
+`robot.state` through the `kinematics` crate's head FK; `tofd` publishes the
+sensor's view and does not pretend to geometry it cannot compute.
 
 ### 1.1 Invariants
 

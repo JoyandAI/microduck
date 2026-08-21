@@ -1886,6 +1886,23 @@ pub struct RobotState {
     pub joints: Vec<f64>,
     /// What was commanded, so a viewer can show tracking error rather than guessing at it.
     pub targets: Vec<f64>,
+    /// Where contact odometry believes the robot is. `default` so a frame from
+    /// a `robotd` predating the estimator still parses — zeros, like a robot
+    /// that has not moved.
+    #[serde(default)]
+    pub odom: OdomState,
+}
+
+/// The contact-odometry estimate: trunk pose in the world frame the IMU chose
+/// at boot. There is no magnetometer and no absolute reference — this frame is
+/// "wherever the robot was when it came up", which is exactly what relative
+/// motion (walked distance, turn angle, a ToF map) needs and all it promises.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OdomState {
+    /// Trunk position, metres. Z is height above the ground plane.
+    pub position: [f64; 3],
+    /// Heading, radians.
+    pub yaw: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3318,6 +3335,7 @@ mod tests {
             },
             joints: vec![0.0; 15],
             targets: vec![0.0; 15],
+            odom: OdomState::default(),
         };
 
         let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();
@@ -3400,6 +3418,29 @@ mod tests {
             !imu.frozen(),
             "a default run must never look like a dead IMU"
         );
+    }
+
+    /// A `robot.state` frame from a `robotd` predating odometry has no `odom`
+    /// key; a monitor built after it must read that as a robot at the origin,
+    /// not a parse error. Literal JSON because a struct cannot express "this
+    /// field does not exist".
+    #[test]
+    fn a_state_frame_missing_odom_still_parses() {
+        let state: RobotState = serde_json::from_str(
+            r#"{
+                "t": 1.0,
+                "move": {"requested": [0,0,0], "applied": [0,0,0]},
+                "head": [0,0,0,0],
+                "policy": "held",
+                "safety": {"fallen": false, "limp": false},
+                "loop": {"hz": 50.0, "missed": 0},
+                "joints": [],
+                "targets": []
+            }"#,
+        )
+        .expect("an old frame must parse");
+        assert_eq!(state.odom, OdomState::default());
+        assert_eq!(state.odom.position, [0.0; 3]);
     }
 
     /// Same for the bus counters, where a missing counter means "no failures" by construction.

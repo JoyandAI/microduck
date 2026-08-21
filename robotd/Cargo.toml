@@ -8,6 +8,7 @@ description = "Robot control daemon — skeleton"
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 duck-control = { path = "../duck-control" }
+odometry = { path = "../odometry" }
 pet-detect = { path = "../pet-detect" }
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true

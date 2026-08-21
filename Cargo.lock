@@ -1929,6 +1929,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kinematics"
+version = "0.8.0"
+dependencies = [
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2331,6 +2341,14 @@ dependencies = [
  "bitflags 2.13.1",
  "libc",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "odometry"
+version = "0.8.0"
+dependencies = [
+ "duck-ipc-proto",
+ "kinematics",
 ]
 
 [[package]]
@@ -2901,6 +2919,7 @@ dependencies = [
  "duck-ipc-proto",
  "libc",
  "minisign",
+ "odometry",
  "pet-detect",
  "semver",
  "serde",
@@ -2917,6 +2936,15 @@ dependencies = [
  "tracing-subscriber",
  "updater",
  "zstd",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
