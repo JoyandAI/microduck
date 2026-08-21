@@ -364,6 +364,9 @@ cp "$BIN"/padd staged/
 cp "$BIN"/sounds staged/
 cp "$BIN"/pet-detect staged/
 cp "$BIN"/pet-features staged/
+# The head ToF daemon. Its unit is packaged below; a board with no sensor
+# fitted runs it anyway and says so, which is cheaper than a special case.
+cp "$BIN"/tofd staged/
 
 # No `--base-url`: the manifest `LocalDir` reads names the artifact by bare filename, and
 # `package` leaves it bare when no base is given.
@@ -391,6 +394,8 @@ cargo run -p xtask -- package \
     --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
     --include "padd/systemd/padd.service=systemd/padd.service" \
     --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+    --include "tof/systemd/tofd.service=systemd/tofd.service" \
+    --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
     --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
     --include "docs/design/architecture.md=docs/architecture.md" \
     --include "docs/design/updater-design.md=docs/updater-design.md" \

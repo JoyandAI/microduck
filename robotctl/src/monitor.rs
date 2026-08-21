@@ -530,7 +530,6 @@ fn subscribe_to_tof(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), Stri
     }
 }
 
-
 // ── the depth matrix's cells ────────────────────────────────────────────────
 
 /// Columns one zone takes: four for `1.42`, one to separate it from its
@@ -558,9 +557,9 @@ const TOF_RAMP: [(f32, u8); 7] = [
     (0.25, 196), // scarlet — inside arm's reach
     (0.50, 202),
     (0.80, 208),
-    (1.20, 220), // amber — a room away
-    (1.80, 118), // green
-    (2.60, 51),  // cyan
+    (1.20, 220),    // amber — a room away
+    (1.80, 118),    // green
+    (2.60, 51),     // cyan
     (f32::MAX, 33), // blue — as far as it sees
 ];
 
@@ -628,9 +627,7 @@ fn tof_cell(zone: tof_zone::Zone) -> Span<'static> {
         // with the thing that is actually near.
         tof_zone::Zone::NoTarget => Span::raw("   · ").dim(),
         // Magenta: not a distance, not empty, and not to be mistaken for either.
-        tof_zone::Zone::Unusable(_) => {
-            Span::styled("   x ", Style::new().fg(Color::Magenta))
-        }
+        tof_zone::Zone::Unusable(_) => Span::styled("   x ", Style::new().fg(Color::Magenta)),
     }
 }
 
@@ -1165,7 +1162,9 @@ impl View {
                 // Named rather than folded into "waiting", because waiting for a robot that is
                 // there and waiting for one that is not need different things done about them.
                 Some(why) => {
-                    format!("no robotd: {why}\nthe pad and tof blocks still work — p and t toggle them")
+                    format!(
+                        "no robotd: {why}\nthe pad and tof blocks still work — p and t toggle them"
+                    )
                 }
                 None => "waiting for robot.state…".to_owned(),
             };
@@ -1641,13 +1640,6 @@ impl View {
         )
     }
 
-    /// The pad's own event stream: what the sticks are doing, and whether the reports carrying
-    /// that are arriving.
-    ///
-    /// The second half is the reason this exists. A stick position is also visible in the header's
-    /// `asked` column, one layer of interpretation later; the *cadence* of the reports behind it is
-    /// visible nowhere else, and it is what fails when a robot walks on a command nobody is giving.
-
     // ── the depth matrix ────────────────────────────────────────────────────
 
     /// The ToF frame as an 8×8 heatmap, one cell per zone.
@@ -1702,7 +1694,10 @@ impl View {
         let mut title = vec![Span::raw(" tof ")];
         match self.tof_status.as_ref() {
             Some(status) => {
-                let name = status.sensor.clone().unwrap_or_else(|| "no sensor".to_owned());
+                let name = status
+                    .sensor
+                    .clone()
+                    .unwrap_or_else(|| "no sensor".to_owned());
                 title.push(Span::styled(
                     name,
                     Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1781,6 +1776,12 @@ impl View {
         }
     }
 
+    /// The pad's own event stream: what the sticks are doing, and whether the reports carrying
+    /// that are arriving.
+    ///
+    /// The second half is the reason this exists. A stick position is also visible in the header's
+    /// `asked` column, one layer of interpretation later; the *cadence* of the reports behind it is
+    /// visible nowhere else, and it is what fails when a robot walks on a command nobody is giving.
     fn render_pad(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         // Before the block, because the caption has to say how many axes fit and the block is built
         // once. Two columns of border come off the width the cells get.

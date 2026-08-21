@@ -124,10 +124,24 @@ safety authority sits (§6).
 | `mediad` | camera/mic, encode, perception, WebRTC + remote gateway | Heaviest service; also the remote API front door (§5.2) |
 | `btd` | BLE GATT server | **Transport adapter only** — owns no state (§4.1). See [`app-path-design.md`](app-path-design.md) |
 | `configd` | wifi, robot identity, power, gamepad pairing | Config must be reachable when `robotd` is dead (§3.1), and `btd` must own nothing (§4.1) — so it is neither's business but its own. Gamepad pairing is here rather than in `padd` because bonding a device needs root and BlueZ, and `padd` is deliberately an unprivileged client (§4.1) |
+| `tofd` | the head ToF sensor: an 8×8 depth matrix on the HAT's I²C bus | Perception, so split from `robotd` for the reason below. Owns one sensor and publishes frames; reads nothing. A board with no sensor fitted runs it anyway and says so |
 | `updaterd` | update engine | See `updater-design.md` |
 
 Splitting `mediad` from `robotd` is deliberate: a media/perception crash must not
-take out motor control.
+take out motor control. `tofd` is the same rule applied to a smaller sensor, and
+the specifics make the case: bringing a VL53L5/8CX up uploads ~90 KB of firmware
+over I²C taking seconds, the bus is shared with the audio codec, and most ducks
+have no sensor fitted at all — a retry loop for that does not belong in the
+process that owns the motors. Nothing in the control loop reads depth, so nothing
+is lost by moving it out. It is deliberately *not* part of `mediad`: depth is a
+sensor on a bus, not a media pipeline, and it is useful long before there is a
+camera to annotate.
+
+Consumers reach it the way they reach the pad's raw stream — a subscription on the
+owning daemon's own socket (`tof.stream`), never through `robotd`. When the
+kinematics land, reprojecting a frame into the robot's own frame means combining
+`tof.frame` with joint state from `robot.state`; `tofd` publishes the sensor's
+view and does not pretend to geometry it cannot compute.
 
 ### 1.1 Invariants
 
