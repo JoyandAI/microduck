@@ -4,7 +4,7 @@
 # docs/design/architecture.md §1. `robotd`, `btd` and `mediad` join as siblings.
 [workspace]
 resolver = "3"
-members = ["btd", "configd", "duck-control", "duck-ipc-proto", "padd", "updater", "robotctl", "robotd", "test-support", "xtask"]
+members = ["btd", "configd", "duck-control", "duck-ipc-proto", "padd", "pet-detect", "sounds", "updater", "robotctl", "robotd", "test-support", "xtask"]
 
 # ONNX Runtime, which robotd dlopens to run a policy. One source of truth: `xtask package`
 # bakes these into the release's preinstall hook, and a test asserts scripts/setup-board.sh
@@ -34,6 +34,7 @@ semver = { version = "1", features = ["serde"] }
 thiserror = "2"
 tokio = "1"
 clap = { version = "4", features = ["derive"] }
+hound = "3.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio-util = "0.7"

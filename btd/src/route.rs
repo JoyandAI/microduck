@@ -153,6 +153,11 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         RobotMove(_) | RobotHead(_) | RobotEnable(_) | RobotDo(_) | RobotPose(_)
         | RobotMouth(_) => None,
 
+        // Harmless and rather charming from a phone — but it rides the same refusal as the
+        // rest of robot.* until the app path exists to want it: opening one call to the
+        // radio ahead of a client that can use it buys nothing and widens the surface.
+        RobotSound(_) => None,
+
         // Powering the machine off from a phone in the room is `system.reboot` without the
         // coming back. The sit-then-power-off flow wants whoever asked to be watching the
         // robot, and that is `robotctl` or the pad's long-press, deliberately.

@@ -131,7 +131,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **X** / square | roulade — one forward roll; hold to chain rolls |
 | **LB / RB** | left / right kick |
 | **DPad-Down** | sit ↔ stand |
-| **RT / LT** | mouth (either trigger) |
+| **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **Select**, held 2 s | sit down, then power off |
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
@@ -198,6 +198,27 @@ saved to `/tmp/pad-stack-<host>-<when>.log`. `--fingerprint` prints only the val
 between two boards, for `diff`.
 [`pair-a-gamepad.md`](pair-a-gamepad.md#is-this-board-running-the-same-stack-as-that-one) has the
 comparison.
+
+### The voice
+
+```
+robotctl quack
+```
+
+The loudest way to tell ducks apart: every robot's voice bank is generated from its SoC
+serial (`sounds ensure-bank`, run by every release install), so the robot that answers — in
+a voice that is only its own — is the one you're SSH'd into. A robot with no voice — audio
+off, or no bank — says so instead of printing 🦆, so silence always means the wrong duck. The robot also greets when
+`robotd` comes up, pecks goodbye before powering off, and coos when the mic hears its head
+being scratched (walk mode; the classifier ships in the release). Audio hardware bring-up —
+codec driver, overlays, mixer — is `setup-board.sh`'s audio section, once per board.
+
+To audition a voice or regenerate the bank by hand, the release carries the generator:
+
+```
+/opt/robot/daemon/current/bin/sounds show
+sudo /opt/robot/daemon/current/bin/sounds ensure-bank --force
+```
 
 ### Wifi (`configd`)
 

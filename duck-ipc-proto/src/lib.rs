@@ -112,7 +112,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `robot.mouth`, `robot.shutdown` (sit, then power off) and `robot.mode` (walk vs roller),
 /// ported from `microduck_runtime`; `robot.enable` gains `toggle`, the pad's Start
 /// evaluated robot-side. Additive, and bumps anyway, per the rule above.
-pub const API_VERSION: u32 = 9;
+///
+/// # v10 — `robot.sound`
+///
+/// The robot's voice: play a voice-bank tag (chirp, greet, coo, ...), with `wheee` as a
+/// held ride the client keeps alive per tick. Additive, same rule.
+pub const API_VERSION: u32 = 10;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -286,6 +291,17 @@ pub mod method {
     /// Mouth opening, 0 (closed) to 1 (open). Continuous; send as a notification. The mouth
     /// is not part of any policy — this is the only thing that moves it.
     pub const ROBOT_MOUTH: &str = "robot.mouth";
+    /// Play one of the robot's voice-bank sounds — chirp, greet, coo... `wheee` is the
+    /// held ride: `hold: true` starts it and must keep arriving (a notification per tick,
+    /// like the mouth) or the ride ends; `hold: false` releases it deliberately. The two
+    /// endings differ: a deliberate release cuts the ride, a hold that stops arriving plays
+    /// it out through its end segment.
+    ///
+    /// Refused, with a reason, by a robot that has no voice — audio disabled, or no bank
+    /// rendered. Sounds are never refused for circumstance (a chirp out of a fallen robot
+    /// is diagnostics, not danger), but "accepted" from a robot that cannot make a sound
+    /// would make `robotctl quack` lie about which duck answered.
+    pub const ROBOT_SOUND: &str = "robot.sound";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
     /// Which drive mode this `robotd` was configured with: `walk` or `roller`.
@@ -473,6 +489,8 @@ pub enum Call {
     RobotPose(PoseParams),
     /// Mouth opening. Continuous. Send as a notification.
     RobotMouth(MouthParams),
+    /// Play a voice-bank sound.
+    RobotSound(SoundParams),
     /// Sit down, then power the machine off.
     RobotShutdown,
     /// Which drive mode this robotd runs: walk or roller.
@@ -541,6 +559,7 @@ impl Call {
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
+            Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
@@ -628,6 +647,7 @@ impl Call {
             Call::RobotDo(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
+            Call::RobotSound(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
@@ -694,6 +714,7 @@ impl Call {
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
+            method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
@@ -1003,6 +1024,54 @@ pub struct HeadParams {
     pub head_pitch: f64,
     pub head_yaw: f64,
     pub head_roll: f64,
+}
+
+/// A voice-bank tag — what kind of sound, not which file: the robot picks a random
+/// variant per play, which is what keeps the duck from sounding like a stuck recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoundTag {
+    /// Sharp honk.
+    Alarm,
+    /// Wake-up quack (sometimes a double "wak-wak").
+    Greet,
+    /// Rising question.
+    Inquire,
+    /// Low "tock" — the goodbye before power-off.
+    Peck,
+    /// The mouth-trigger quack. `robotctl quack` plays this.
+    Chirp,
+    /// Drowsy, breathy — the petting response.
+    Coo,
+    /// The held joy ride: start → loop while held → end.
+    Wheee,
+}
+
+impl SoundTag {
+    /// The voice-bank directory name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SoundTag::Alarm => "alarm",
+            SoundTag::Greet => "greet",
+            SoundTag::Inquire => "inquire",
+            SoundTag::Peck => "peck",
+            SoundTag::Chirp => "chirp",
+            SoundTag::Coo => "coo",
+            SoundTag::Wheee => "wheee",
+        }
+    }
+}
+
+/// See [`method::ROBOT_SOUND`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoundParams {
+    pub tag: SoundTag,
+    /// Only meaningful for [`SoundTag::Wheee`]: `Some(true)` starts/keeps the ride,
+    /// `Some(false)` releases it. The hold decays on its own if the trues stop arriving,
+    /// so a client that dies mid-ride does not leave the robot going "wheee" forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<bool>,
 }
 
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
@@ -2664,6 +2733,10 @@ mod tests {
                 active: true,
             }),
             Call::RobotMouth(MouthParams { open: 0.5 }),
+            Call::RobotSound(SoundParams {
+                tag: SoundTag::Chirp,
+                hold: None,
+            }),
             Call::RobotShutdown,
             Call::RobotMode,
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
@@ -2708,7 +2781,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            41,
+            42,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

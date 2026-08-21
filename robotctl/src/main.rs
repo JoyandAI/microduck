@@ -122,6 +122,11 @@ enum Namespace {
         command: RobotCommand,
     },
 
+    /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
+    /// is generated from its SoC serial, so the one that answers — in a voice that is only
+    /// its own — is the one you're SSH'd into.
+    Quack,
+
     /// The gamepad. Pair one, see what is paired, forget one.
     ///
     /// Driving is not a command here: `padd.service` runs on its own and picks up whatever pad is
@@ -330,6 +335,27 @@ enum RobotCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// `robotctl quack` — the loudest way to tell ducks apart. SSH into one, quack it, and the
+/// robot that answers in its own voice is the one you're talking to: every voice bank is
+/// seeded from the SoC serial, so the voice itself is an identity.
+fn run_quack(socket: &Path) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    let result = result_of(client.call(&proto::Call::RobotSound(proto::SoundParams {
+        tag: proto::SoundTag::Chirp,
+        hold: None,
+    }))?)?;
+    let outcome: proto::IntentResult = decode(&result)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
+    println!("🦆");
+    Ok(())
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -2387,6 +2413,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
+        }
+        Namespace::Quack => {
+            return run_quack(&cli.robot_socket);
         }
         Namespace::Update { command } => command,
     };

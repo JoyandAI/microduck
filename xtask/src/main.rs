@@ -961,6 +961,29 @@ mod tests {
         }
     }
 
+    /// The petting classifier ships like the policies do, and drifts the same way: three
+    /// `--include` copies. robotd's default `pet_model` path expects `models/pet_detect.onnx`
+    /// inside the release, so a site that forgets it produces robots that silently cannot
+    /// hear — the mic worker logs "unavailable" once and everything else looks fine.
+    #[test]
+    fn the_pet_model_is_packaged_at_every_site() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        assert!(
+            root.join("pet-detect/models/pet_detect.onnx").exists(),
+            "the vendored model is gone"
+        );
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert!(
+                text.contains("=models/pet_detect.onnx"),
+                "{site} does not package the petting classifier"
+            );
+        }
+    }
+
     /// The stable manifest names an artifact URL under the stable tag — so the workflow
     /// that creates that release must actually upload the artifact to it.
     ///
