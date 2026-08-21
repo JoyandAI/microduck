@@ -106,6 +106,9 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/sounds staged/
           cp target/aarch64-unknown-linux-gnu/release/pet-detect staged/
           cp target/aarch64-unknown-linux-gnu/release/pet-features staged/
+          # The head ToF daemon. Its unit is packaged below; a board with no sensor
+          # fitted runs it anyway and says so, which is cheaper than a special case.
+          cp target/aarch64-unknown-linux-gnu/release/tofd staged/
 
           # Same contents as a real release: a dev build that omitted the units or robotd
           # would fail its own restart step on the board and roll itself back, which is a
@@ -130,6 +133,8 @@ jobs:
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "padd/systemd/padd.service=systemd/padd.service" \
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+            --include "tof/systemd/tofd.service=systemd/tofd.service" \
+            --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
             --include "docs/design/architecture.md=docs/architecture.md" \
             --include "docs/design/updater-design.md=docs/updater-design.md" \

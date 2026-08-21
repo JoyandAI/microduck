@@ -90,6 +90,13 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::PAD)]
     pad_socket: PathBuf,
 
+    /// Path to `tofd`'s depth stream, which `monitor` draws the ToF matrix from.
+    ///
+    /// Optional in the same sense as the pad tap, and more often absent: most ducks
+    /// have no ToF fitted, and `monitor` says so in the block rather than failing.
+    #[arg(long, global = true, default_value = proto::socket::TOF)]
+    tof_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -2388,7 +2395,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return run_version(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }
         Namespace::Monitor { hz, json } => {
-            return monitor::run(&cli.robot_socket, &cli.pad_socket, hz, json);
+            return monitor::run(
+                &cli.robot_socket,
+                &cli.pad_socket,
+                &cli.tof_socket,
+                hz,
+                json,
+            );
         }
         // Pure codegen: no socket, no daemon, no root. It must keep working on a robot
         // where nothing is running, since that is where an operator most wants to type

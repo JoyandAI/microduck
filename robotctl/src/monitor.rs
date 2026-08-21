@@ -71,6 +71,15 @@ const SUBSCRIBE_ID: u64 = 1;
 /// deliberate act, and everything below moving then is what the reader asked for.
 const PAD_HEIGHT: u16 = 8;
 
+/// Rows the ToF block occupies while it is open: two borders and the eight rows
+/// of an 8×8 frame.
+///
+/// Ten rows is a lot, and it is what the sensor is: an 8×8 matrix drawn as
+/// anything less is a matrix with rows missing. Closed by default for that
+/// reason, like the pad block, and everything below it moves only when the reader
+/// asks for it with `t`.
+const TOF_HEIGHT: u16 = 10;
+
 /// Rows of axis cells the pad block draws.
 ///
 /// Three fits every axis of an Xbox pad from 80 columns up, and the caption says how many were left
@@ -203,6 +212,14 @@ enum Update {
     /// daemon, and a monitor that quit because `padd` was stopped would be a monitor that stops
     /// working on every robot nobody has paired a pad to.
     PadLost(String),
+    /// One depth frame from `tofd`.
+    Tof(Box<proto::TofFrame>),
+    /// `tofd`'s answer to the subscription: which sensor, or why there is none.
+    TofStatus(Box<proto::TofStreamResult>),
+    /// The depth stream is not there, or stopped. Not fatal, for the same reason
+    /// [`Self::PadLost`] is not: it is a third daemon on a third socket, and most
+    /// ducks have no ToF fitted at all.
+    TofLost(String),
 }
 
 /// Subscribe to `robot.state` and render it until interrupted.
@@ -210,7 +227,13 @@ enum Update {
 /// Never returns `Ok` on its own: `q`/`Ctrl-C` is the exit in the live view, Ctrl-C alone in
 /// the piped one. A closed socket is an error either way — that is what `robotd` restarting
 /// mid-update looks like, and it is worth seeing rather than hanging through.
-pub fn run(robot_socket: &Path, pad_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> {
+pub fn run(
+    robot_socket: &Path,
+    pad_socket: &Path,
+    tof_socket: &Path,
+    hz: u32,
+    json: bool,
+) -> Result<(), Failure> {
     let subscribe = || {
         proto::Request::call(
             proto::Id::Number(SUBSCRIBE_ID),
@@ -247,6 +270,7 @@ pub fn run(robot_socket: &Path, pad_socket: &Path, hz: u32, json: bool) -> Resul
 
     let (tx, rx) = mpsc::channel();
     let pad_tx = tx.clone();
+    let tx_for_tof = tx.clone();
     let pad_socket = pad_socket.to_path_buf();
 
     // Held for as long as the view lives, not dropped: it is the write half of the subscription,
@@ -262,6 +286,13 @@ pub fn run(robot_socket: &Path, pad_socket: &Path, hz: u32, json: bool) -> Resul
     // blocking read on either socket must not be able to hold up the other, and `padd`'s tap goes
     // quiet for minutes at a time whenever nobody is touching the sticks.
     thread::spawn(move || read_pad(&pad_socket, &pad_tx));
+
+    // A third connection to a third daemon, and the same reasoning again: `tofd`
+    // is on most boards and its sensor is on few, so neither its absence nor its
+    // silence may hold up the two streams that are always there.
+    let tof_tx = tx_for_tof;
+    let tof_socket = tof_socket.to_path_buf();
+    thread::spawn(move || read_tof(&tof_socket, &tof_tx));
 
     let mut terminal = ratatui::init();
     let outcome = live(&mut terminal, &rx, hz, no_robot);
@@ -437,6 +468,169 @@ fn subscribe_to_pad(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), Stri
     }
 }
 
+/// Watch `tofd`'s depth stream, retrying forever.
+///
+/// Same shape as [`read_pad`] and for the same reasons: `tofd` restarts (its unit
+/// is `Restart=always`), and a duck with no sensor fitted still answers here —
+/// with a reason, which is what the block shows instead of an empty grid.
+fn read_tof(socket: &Path, tx: &mpsc::Sender<Update>) {
+    loop {
+        if let Err(why) = subscribe_to_tof(socket, tx)
+            && tx.send(Update::TofLost(why)).is_err()
+        {
+            return; // the UI is gone
+        }
+        thread::sleep(PAD_RETRY);
+    }
+}
+
+/// One connection to the depth stream, from its subscribe to whatever ended it.
+fn subscribe_to_tof(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), String> {
+    let mut client = Client::connect_to("tofd", socket).map_err(|e| e.message)?;
+    client
+        .send(&proto::Request::call(
+            proto::Id::Number(SUBSCRIBE_ID),
+            &proto::Call::TofStream,
+        ))
+        .map_err(|e| e.message)?;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        return Err(match client.reader.read_line(&mut line) {
+            Err(e) => format!("the depth stream stopped: {e}"),
+            Ok(0) => "tofd closed the depth stream".to_owned(),
+            Ok(_) => {
+                // The answer names the sensor; everything after it is a frame.
+                // Both are forwarded, and anything else is skipped rather than
+                // treated as an end — a future `tofd` may say more than this
+                // build knows how to read.
+                if let Ok(response) = serde_json::from_str::<proto::Response>(&line)
+                    && let Ok(status) = response.result_as::<proto::TofStreamResult>()
+                {
+                    if tx.send(Update::TofStatus(Box::new(status))).is_err() {
+                        return Ok(()); // the UI is gone
+                    }
+                    continue;
+                }
+                match serde_json::from_str::<proto::Request>(&line)
+                    .ok()
+                    .and_then(|r| r.as_tof_frame())
+                {
+                    Some(frame) => {
+                        if tx.send(Update::Tof(Box::new(frame))).is_err() {
+                            return Ok(()); // the UI is gone
+                        }
+                        continue;
+                    }
+                    None => continue,
+                }
+            }
+        });
+    }
+}
+
+// ── the depth matrix's cells ────────────────────────────────────────────────
+
+/// Columns one zone takes: four for `1.42`, one to separate it from its
+/// neighbour. Fixed, so the grid stays square and two columns stay comparable.
+const TOF_CELL: usize = 5;
+
+/// How long a frame may be the newest one before it is called stale. Six frames
+/// at 15 Hz — long enough that a slow repaint is not an alarm, short enough that
+/// a sensor which stopped shows up as one.
+const TOF_STALE: Duration = Duration::from_millis(400);
+
+/// Said in the block's border, because the two non-numeric cells are the ones a
+/// reader has no way to guess.
+const TOF_LEGEND: &str = " · nothing in range · x could not measure · near→far ";
+
+/// The near-to-far colour ramp, warm to cool.
+///
+/// Near is warm because near is what matters on an obstacle sensor: a hand in
+/// front of the head reads red, a far wall reads blue, and the eye finds the
+/// close thing without reading a number. Indexed rather than named colours so the
+/// steps are an actual gradient rather than whatever six things a theme calls
+/// "red" through "blue"; the thresholds are the sensor's useful span, which is
+/// centimetres to about four metres.
+const TOF_RAMP: [(f32, u8); 7] = [
+    (0.25, 196), // scarlet — inside arm's reach
+    (0.50, 202),
+    (0.80, 208),
+    (1.20, 220),    // amber — a room away
+    (1.80, 118),    // green
+    (2.60, 51),     // cyan
+    (f32::MAX, 33), // blue — as far as it sees
+];
+
+/// Re-exported so this file can name the three zone classes without depending on
+/// the whole `tof` crate: `robotctl` talks to `tofd` over a socket, and pulling in
+/// a crate that compiles two C drivers to render a grid would be a poor trade.
+mod tof_zone {
+    /// Mirrors `tof::Zone`. The interpretation rules live in the protocol's
+    /// documentation of [`duck_ipc_proto::TofFrame`], and both ends implement
+    /// them from there.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub enum Zone {
+        Range(f32),
+        NoTarget,
+        Unusable(u8),
+    }
+}
+
+/// ST's status codes for a usable range, and for "measured, nothing there".
+const TOF_STATUS_VALID: [u8; 2] = [5, 9];
+const TOF_STATUS_NO_TARGET: u8 = 255;
+
+/// One zone of a frame, interpreted — the same rules as `tof::Frame::zone`.
+///
+/// Kept in step deliberately rather than shared: the wire format is the contract
+/// between the two, and a `robotctl` that linked the driver crate to read a
+/// number would be a client that cannot be built without a C toolchain.
+fn frame_zone(frame: &proto::TofFrame, index: usize) -> tof_zone::Zone {
+    let status = frame
+        .status
+        .get(index)
+        .copied()
+        .unwrap_or(TOF_STATUS_NO_TARGET);
+    let distance = frame.distance_mm.get(index).copied().unwrap_or(0);
+    if TOF_STATUS_VALID.contains(&status) {
+        if distance > 0 {
+            return tof_zone::Zone::Range(f32::from(distance) / 1000.0);
+        }
+        return tof_zone::Zone::Unusable(status);
+    }
+    if status == TOF_STATUS_NO_TARGET {
+        return tof_zone::Zone::NoTarget;
+    }
+    tof_zone::Zone::Unusable(status)
+}
+
+/// One cell: the distance coloured by range, or a mark for the two cases that
+/// have no distance.
+fn tof_cell(zone: tof_zone::Zone) -> Span<'static> {
+    match zone {
+        tof_zone::Zone::Range(metres) => {
+            let colour = TOF_RAMP
+                .iter()
+                .find(|(limit, _)| metres < *limit)
+                .map_or(33, |(_, colour)| *colour);
+            // Four characters for every range the sensor can report: `0.42`
+            // through `9.99`, and clamped above that so a spurious huge reading
+            // cannot shift the grid sideways.
+            Span::styled(
+                format!("{:>4.2} ", metres.min(9.99)),
+                Style::new().fg(Color::Indexed(colour)),
+            )
+        }
+        // Dim, and not a number: empty space should recede rather than compete
+        // with the thing that is actually near.
+        tof_zone::Zone::NoTarget => Span::raw("   · ").dim(),
+        // Magenta: not a distance, not empty, and not to be mistaken for either.
+        tof_zone::Zone::Unusable(_) => Span::styled("   x ", Style::new().fg(Color::Magenta)),
+    }
+}
+
 /// One line of the tap: a report, a refusal, or something this build has no use for.
 fn decode_pad(line: &str) -> Option<Result<proto::PadReport, String>> {
     if let Ok(request) = serde_json::from_str::<proto::Request>(line)
@@ -516,6 +710,13 @@ fn live(
                     // someone asking about the pad, and those rows come out of the joints table.
                     KeyCode::Char('p') => {
                         view.toggle_pad();
+                        fresh = true;
+                    }
+                    // The depth matrix. Off by default: ten rows is most of a
+                    // short terminal, and only someone asking about the ToF wants
+                    // them.
+                    KeyCode::Char('t') => {
+                        view.toggle_tof();
                         fresh = true;
                     }
                     // The 3D robot view. On by default — it appears whenever the
@@ -800,6 +1001,17 @@ struct View {
     /// Is the robot view wanted? Distinct from whether it is *drawn*: it also needs a
     /// state to pose from, a terminal wide enough, and a model that parsed.
     show_duck: bool,
+    /// The last depth frame, and when it arrived by this view's clock — the frame's
+    /// own `at_us` is `tofd`'s, and the question here is how stale what is on
+    /// screen is.
+    tof: Option<proto::TofFrame>,
+    tof_arrived: Option<Instant>,
+    /// What `tofd` said about its sensor, if it has answered.
+    tof_status: Option<proto::TofStreamResult>,
+    /// Why there is no depth stream, when there is none.
+    tof_lost: Option<String>,
+    /// Is the ToF block open? Closed to begin with — see [`TOF_HEIGHT`].
+    show_tof: bool,
 }
 
 impl View {
@@ -820,11 +1032,20 @@ impl View {
             no_robot,
             duck: duck::DuckView::new(),
             show_duck: true,
+            tof: None,
+            tof_arrived: None,
+            tof_status: None,
+            tof_lost: None,
+            show_tof: false,
         }
     }
 
     fn toggle_units(&mut self) {
         self.units = self.units.toggled();
+    }
+
+    fn toggle_tof(&mut self) {
+        self.show_tof = !self.show_tof;
     }
 
     fn toggle_pad(&mut self) {
@@ -868,6 +1089,25 @@ impl View {
                 // 125 a second, for something nobody is looking at.
                 Ok(self.show_pad)
             }
+            Update::Tof(frame) => {
+                self.tof = Some(*frame);
+                self.tof_arrived = Some(Instant::now());
+                self.tof_lost = None;
+                // Same reasoning as the pad: no repaint for a block nobody has
+                // open, or this would redraw fifteen times a second unseen.
+                Ok(self.show_tof)
+            }
+            Update::TofStatus(status) => {
+                self.tof_status = Some(*status);
+                self.tof_lost = None;
+                Ok(self.show_tof)
+            }
+            Update::TofLost(why) => {
+                self.tof_lost = Some(why);
+                self.tof = None;
+                self.tof_status = None;
+                Ok(self.show_tof)
+            }
             Update::PadLost(why) => {
                 self.pad.device = None;
                 self.pad.trouble = Some(why);
@@ -905,15 +1145,27 @@ impl View {
             // different daemon over a different socket, and a robot is not a precondition for
             // watching the sticks.
             let pad_height = if self.show_pad { PAD_HEIGHT } else { 0 };
-            let [pad, rest] =
-                Layout::vertical([Constraint::Length(pad_height), Constraint::Min(3)]).areas(area);
+            let tof_height = if self.show_tof { TOF_HEIGHT } else { 0 };
+            let [pad, tof, rest] = Layout::vertical([
+                Constraint::Length(pad_height),
+                Constraint::Length(tof_height),
+                Constraint::Min(3),
+            ])
+            .areas(area);
             if self.show_pad {
                 self.render_pad(frame, pad);
+            }
+            if self.show_tof {
+                self.render_tof(frame, tof);
             }
             let waiting = match &self.no_robot {
                 // Named rather than folded into "waiting", because waiting for a robot that is
                 // there and waiting for one that is not need different things done about them.
-                Some(why) => format!("no robotd: {why}\nthe pad block still works — p toggles it"),
+                Some(why) => {
+                    format!(
+                        "no robotd: {why}\nthe pad and tof blocks still work — p and t toggle them"
+                    )
+                }
                 None => "waiting for robot.state…".to_owned(),
             };
             frame.render_widget(
@@ -941,13 +1193,15 @@ impl View {
         // the *source* of the command the header reports, and the frame then reads top to bottom in
         // the order the robot does — sticks, command, joints, loop rate.
         let pad_height = if self.show_pad { PAD_HEIGHT } else { 0 };
+        let tof_height = if self.show_tof { TOF_HEIGHT } else { 0 };
         let trace_height = area
             .height
-            .saturating_sub(HEADER_HEIGHT + pad_height + rows as u16 + 3)
+            .saturating_sub(HEADER_HEIGHT + pad_height + tof_height + rows as u16 + 3)
             .clamp(3, 6);
-        let [header, pad, joints, trace] = Layout::vertical([
+        let [header, pad, tof, joints, trace] = Layout::vertical([
             Constraint::Length(HEADER_HEIGHT),
             Constraint::Length(pad_height),
+            Constraint::Length(tof_height),
             Constraint::Min(4),
             Constraint::Length(trace_height),
         ])
@@ -963,6 +1217,11 @@ impl View {
         self.render_header(frame, header, state);
         if self.show_pad {
             self.render_pad(frame, pad);
+        }
+        // Under the pad and above the joints: the frame then reads in the order
+        // the robot does — what it was told, what it sees, what it did.
+        if self.show_tof {
+            self.render_tof(frame, tof);
         }
         frame.render_stateful_widget(
             self.joints(state, rows, visible),
@@ -1039,13 +1298,17 @@ impl View {
                 // The robot view is only named here while it is hidden: visible, it
                 // carries its own caption, and this title clips on a narrow terminal.
                 Line::from(format!(
-                    " q quits · ↑↓ scrolls · u {} · p {}{} ",
+                    " q quits · ↑↓ scrolls · u {} · p {}{}{} ",
                     self.units.toggled().name(),
                     if self.show_pad {
                         "hides the pad"
                     } else {
                         "the raw pad"
                     },
+                    // Named only while hidden, like the robot view below and for
+                    // the same reason: open, the block carries its own title, and
+                    // every character here is one the left-hand title loses.
+                    if self.show_tof { "" } else { " · t the tof" },
                     if self.show_duck {
                         ""
                     } else {
@@ -1375,6 +1638,142 @@ impl View {
             " {unit} · bar {scale} · {}–{last} of {count} · ↑↓ scrolls ",
             self.scroll + 1
         )
+    }
+
+    // ── the depth matrix ────────────────────────────────────────────────────
+
+    /// The ToF frame as an 8×8 heatmap, one cell per zone.
+    ///
+    /// **Three classes, drawn three ways**, because the sensor answers three
+    /// different things and a distance-only grid hides two of them:
+    ///
+    ///  - a range: the distance in metres, coloured near-to-far
+    ///  - nothing in range: `·`, dim — the sensor looked and the space is empty,
+    ///    which is information a map wants
+    ///  - a failed measurement: `x` — it could not tell, which is *not* the same
+    ///    as empty and must never look like it
+    ///
+    /// Row 0 is the sensor's first row as the driver reports it. No reprojection
+    /// happens anywhere in this daemon path, so this is the sensor's own frame,
+    /// not the robot's — which is exactly what someone debugging a mounting angle
+    /// wants to see.
+    fn render_tof(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let block = Block::bordered()
+            .title(Line::from(self.tof_title()))
+            .title_bottom(Line::from(TOF_LEGEND.to_owned()).dim())
+            .title_bottom(Line::from(self.tof_caption()).right_aligned());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(tof) = self.tof.as_ref() else {
+            frame.render_widget(Paragraph::new(self.tof_absence()).dim(), inner);
+            return;
+        };
+
+        let rows = usize::from(tof.rows).min(usize::from(inner.height));
+        let cols = usize::from(tof.cols);
+        // Cells are fixed-width so the grid stays a grid: a column that shrank to
+        // fit would stop being comparable with the one beside it.
+        let per_row = usize::from(inner.width.saturating_sub(1)) / TOF_CELL;
+        let drawn = cols.min(per_row.max(1));
+
+        let lines: Vec<Line> = (0..rows)
+            .map(|row| {
+                // A leading space so the first column is not against the border —
+                // a number touching a box edge reads as part of it.
+                let mut cells = vec![Span::raw(" ")];
+                cells.extend((0..drawn).map(|col| tof_cell(frame_zone(tof, row * cols + col))));
+                Line::from(cells)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// `tof <sensor> · <hz> · <rows>×<cols> · <n>/<total> ranged · <min>–<max> m`
+    fn tof_title(&self) -> Vec<Span<'static>> {
+        let mut title = vec![Span::raw(" tof ")];
+        match self.tof_status.as_ref() {
+            Some(status) => {
+                let name = status
+                    .sensor
+                    .clone()
+                    .unwrap_or_else(|| "no sensor".to_owned());
+                title.push(Span::styled(
+                    name,
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ));
+                title.push(Span::raw(format!(" · {} Hz", status.hz)));
+                title.push(Span::raw(format!(" · {}×{} ", status.rows, status.cols)));
+            }
+            None => title.push(Span::raw("connecting… ").dim()),
+        }
+
+        // What the frame on screen actually contains: how much of it is a
+        // measurement, and the range of what it measured. A grid of numbers
+        // without those two is a grid nobody can sanity-check at a glance.
+        if let Some(tof) = self.tof.as_ref() {
+            let ranges: Vec<f32> = (0..tof.distance_mm.len())
+                .filter_map(|i| match frame_zone(tof, i) {
+                    tof_zone::Zone::Range(m) => Some(m),
+                    _ => None,
+                })
+                .collect();
+            let total = tof.distance_mm.len();
+            title.push(Span::raw(format!("· {}/{total} ranged ", ranges.len())));
+            if let (Some(near), Some(far)) = (
+                ranges.iter().copied().reduce(f32::min),
+                ranges.iter().copied().reduce(f32::max),
+            ) {
+                title.push(Span::styled(
+                    format!("· {near:.2}–{far:.2} m "),
+                    Style::new().fg(Color::Cyan),
+                ));
+            }
+        }
+        title
+    }
+
+    /// The frame's own bookkeeping: which frame, and how long ago it landed.
+    ///
+    /// Staleness is measured by *this* view's clock rather than the frame's
+    /// `at_us`, which is `tofd`'s — the question a reader has is "is what I am
+    /// looking at current", and only the receiver can answer it.
+    fn tof_caption(&self) -> Vec<Span<'static>> {
+        let Some(tof) = self.tof.as_ref() else {
+            return vec![Span::raw(" ")];
+        };
+        let mut caption = vec![Span::raw(format!(" seq {} ", tof.seq)).dim()];
+        if let Some(arrived) = self.tof_arrived {
+            let age = arrived.elapsed();
+            // A frame is due every 1/hz; several periods late means the sensor
+            // stopped, not that the terminal is slow.
+            let stale = age > TOF_STALE;
+            caption.push(Span::styled(
+                format!("· {} ms ago ", age.as_millis()),
+                if stale {
+                    Style::new().fg(Color::Yellow)
+                } else {
+                    Style::new().dim()
+                },
+            ));
+        }
+        caption
+    }
+
+    /// What to say instead of a grid: `tofd` unreachable, no sensor fitted, or a
+    /// sensor that has not produced its first frame yet. Three different fixes,
+    /// so three different sentences.
+    fn tof_absence(&self) -> String {
+        if let Some(why) = self.tof_lost.as_ref() {
+            return format!("no depth stream: {why}\nretrying — tofd may be restarting");
+        }
+        match self.tof_status.as_ref() {
+            Some(status) => match status.unavailable.as_ref() {
+                Some(why) => format!("no sensor: {why}"),
+                None => "waiting for the first frame…".to_owned(),
+            },
+            None => "connecting to tofd…".to_owned(),
+        }
     }
 
     /// The pad's own event stream: what the sticks are doing, and whether the reports carrying
@@ -2476,6 +2875,110 @@ mod tests {
         view
     }
 
+    /// Stopping `tofd` must be an ordinary thing to do. The subscribe reports why
+    /// it failed and the caller retries — nothing here may panic or give up, or
+    /// `systemctl stop tofd` would take the monitor's other two streams with it.
+    #[test]
+    fn a_missing_depth_daemon_is_reported_not_fatal() {
+        let (tx, rx) = mpsc::channel();
+        let absent = std::path::Path::new("/nonexistent/tofd/tof.sock");
+
+        let why = subscribe_to_tof(absent, &tx).expect_err("there is no daemon there");
+        assert!(!why.is_empty(), "a refusal must carry a sentence");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is forwarded from a connection that never opened"
+        );
+
+        // And the view turns that sentence into something a reader can act on.
+        let mut view = View::new(20, None);
+        view.toggle_tof();
+        feed(&mut view, Update::TofLost(why));
+        let shown = render_to(&mut view, 100, 40);
+        assert!(shown.contains("no depth stream"), "{shown}");
+        assert!(shown.contains("retrying"), "{shown}");
+    }
+
+    /// The depth block costs ten rows, so it stays shut until someone asks — and
+    /// what it says when it opens depends on which of three things is true: no
+    /// `tofd`, no sensor, or a frame to draw. All three are sentences a reader can
+    /// act on, and the third is a grid.
+    #[test]
+    fn the_tof_block_is_closed_until_it_is_asked_for() {
+        let mut view = View::new(20, None);
+        feed(&mut view, Update::State(Box::new(a_state())));
+
+        let shut = render_to(&mut view, 100, 40);
+        assert!(shut.contains("t the tof"), "the key is named: {shut}");
+        assert!(!shut.contains("tof VL53"), "no block yet:\n{shut}");
+
+        // Open, with nothing on the other end: it says so rather than drawing an
+        // empty grid that looks like a sensor seeing nothing.
+        view.toggle_tof();
+        let no_daemon = render_to(&mut view, 100, 40);
+        assert!(no_daemon.contains("connecting to tofd"), "{no_daemon}");
+
+        // `tofd` is there, but no sensor is fitted — the ordinary case on a duck
+        // without the head module, and a different sentence from the one above.
+        feed(
+            &mut view,
+            Update::TofStatus(Box::new(proto::TofStreamResult {
+                accepted: true,
+                sensor: None,
+                unavailable: Some("not fitted".to_owned()),
+                rows: 8,
+                cols: 8,
+                hz: 15,
+            })),
+        );
+        let no_sensor = render_to(&mut view, 100, 40);
+        assert!(no_sensor.contains("no sensor: not fitted"), "{no_sensor}");
+
+        // A sensor and a frame: the grid, with all three zone classes drawn
+        // differently — a range, empty space, and a failed measurement.
+        feed(
+            &mut view,
+            Update::TofStatus(Box::new(proto::TofStreamResult {
+                accepted: true,
+                sensor: Some("VL53L8CX".to_owned()),
+                unavailable: None,
+                rows: 8,
+                cols: 8,
+                hz: 15,
+            })),
+        );
+        feed(&mut view, Update::Tof(Box::new(a_tof_frame())));
+        let live = render_to(&mut view, 100, 40);
+        assert!(live.contains("tof VL53L8CX"), "{live}");
+        assert!(live.contains("15 Hz"), "{live}");
+        assert!(live.contains("0.42"), "a range is a number: {live}");
+        assert!(live.contains("·"), "empty space is a dot: {live}");
+        assert!(live.contains("x"), "a failed measurement is an x: {live}");
+        assert!(
+            live.contains("62/64 ranged"),
+            "the count of what is measured: {live}"
+        );
+    }
+
+    /// A frame with one of each class: 62 ranges, one empty zone, one failure.
+    fn a_tof_frame() -> proto::TofFrame {
+        let mut distance_mm = vec![420i16; 64];
+        let mut status = vec![5u8; 64];
+        // Zone 1 measured nothing; zone 2 could not measure.
+        distance_mm[1] = 0;
+        status[1] = 255;
+        distance_mm[2] = 0;
+        status[2] = 4;
+        proto::TofFrame {
+            seq: 7,
+            at_us: 1_000_000,
+            rows: 8,
+            cols: 8,
+            distance_mm,
+            status,
+        }
+    }
+
     /// The block costs eight rows on a terminal that is already short of them, so it stays shut
     /// until someone asks — and the key that opens it is named on screen, since a reader who does
     /// not know it exists has no way to discover the pad stream is there at all.
@@ -2486,8 +2989,10 @@ mod tests {
 
         let shut = render_to(&mut view, 100, 32);
         assert!(shut.contains("p the raw pad"), "{shut}");
+        // The block's own title, not a substring the key hints could also contain
+        // — they name the pad too, and once said "…the raw pad · t the tof".
         assert!(
-            !shut.contains(" pad · "),
+            !shut.contains("pad · raw input"),
             "nothing of the pad block:\n{shut}"
         );
 

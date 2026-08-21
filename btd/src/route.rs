@@ -199,6 +199,13 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // the unprivileged client whose whole value is having no special access, and giving the BLE
         // transport a connection to it would be the first thing to make that untrue.
         PadInput => None,
+
+        // Depth frames, and the same two objections as the pad tap. A 64-zone frame
+        // fifteen times a second is a firehose into a 20-byte pipe; and it is served by
+        // `tofd`, which is not one of the three sockets `btd` holds. When a phone has a
+        // reason to see what the robot sees, it will be through `mediad`'s video path
+        // (`architecture.md` §5.2), where depth belongs next to the frame it annotates.
+        TofStream => None,
     }
 }
 

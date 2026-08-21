@@ -531,8 +531,11 @@ ensure_overlay_word() {
 configure_audio() {
     say "audio: TLV320AIC3104 codec bring-up"
 
-    # 1. Packages.
-    audio_pkgs="alsa-utils device-tree-compiler dkms gcc make"
+    # 1. Packages. i2c-tools is here rather than with the ToF below because it is
+    #    what *creates the `i2c` group* (its postinst does), and both the codec and
+    #    the ToF sit on that bus — plus `i2cdetect` is the first thing anyone runs
+    #    when a device on it goes quiet.
+    audio_pkgs="alsa-utils device-tree-compiler dkms gcc make i2c-tools"
     missing=""
     for pkg in $audio_pkgs; do
         dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
@@ -682,6 +685,38 @@ UNIT
         warn "could not fetch aic3104-init.sh — the mixer stays at power-on levels"
     fi
     rm -f "$init_tmp"
+}
+
+# ── the head ToF sensor's bus ──────────────────────────────────────────────────
+#
+# The sensor is a VL53L5CX or VL53L8CX on the *same* i2c3 bus the audio codec is
+# on, so `configure_audio` has already done the expensive part: the overlay, the
+# vendor kernel, and i2c-tools (which is what creates the `i2c` group `tofd`
+# joins). This adds the one thing left — a stable name for the bus.
+#
+# `/dev/i2c-3` is what the overlay happens to produce today, and a kernel or
+# overlay change can renumber it. A udev symlink keeps `tofd`'s default correct
+# across that. `tofd` also falls back to `/dev/i2c-3` on a board provisioned
+# before this rule existed, so neither half is load-bearing on its own.
+configure_tof() {
+    rule=/etc/udev/rules.d/99-robot-i2c-pihat.rules
+    # Two matchers, one per bus flavour the board may end up with: the RK3566's
+    # i2c3 controller by its device-tree address, and the bit-banged i2c-gpio bus
+    # by name. Only one exists at a time, so the symlink follows whichever it is.
+    content='SUBSYSTEM=="i2c-dev", KERNELS=="fe5c0000.i2c", SYMLINK+="i2c-pihat"
+SUBSYSTEM=="i2c-dev", ATTR{name}=="i2c-gpio-pihat", SYMLINK+="i2c-pihat"'
+
+    if [ -f "$rule" ] && [ "$(cat "$rule")" = "$content" ]; then
+        say "ToF: /dev/i2c-pihat rule already in place"
+        return 0
+    fi
+    say "ToF: installing the /dev/i2c-pihat udev rule"
+    printf '%s\n' "$content" > "$rule"
+    chmod 644 "$rule"
+    # Applied now as well as at the next boot, so a sensor already fitted works
+    # without one — `udevadm` failing is not worth stopping provisioning for.
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=i2c-dev 2>/dev/null || true
 }
 
 configure_bluetooth() {
@@ -977,6 +1012,7 @@ main() {
     free_motor_port
     configure_bluetooth
     configure_audio
+    configure_tof
     install_onnxruntime
     report
 }
