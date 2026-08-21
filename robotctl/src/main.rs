@@ -350,6 +350,9 @@ enum RobotCommand {
     /// conventions to remember. `robotctl robot look 1 0 0` looks straight ahead;
     /// `1 0.5 -0.1` looks ahead-left and slightly down. A point beyond the head's reach gets
     /// the closest gaze the joints allow, and says so.
+    // `allow_negative_numbers`, or `look 0.3 0 -0.3` reads `-0.3` as a flag —
+    // and looking down is the single most common thing to ask a duck.
+    #[command(allow_negative_numbers = true)]
     Look {
         x: f64,
         y: f64,
