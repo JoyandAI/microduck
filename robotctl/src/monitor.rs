@@ -31,7 +31,7 @@ use ratatui::widgets::{
     Block, Cell, Paragraph, RenderDirection, Row, Sparkline, Table, TableState,
 };
 
-use crate::{Client, Failure, duck, exit};
+use crate::{Client, Failure, duck, exit, path_map};
 
 /// Tracking error at the edge of a deviation bar, radians.
 ///
@@ -122,6 +122,14 @@ const DUCK_MAIN_MIN: u16 = 84;
 /// extra cells stop adding legibility and the tables can breathe instead.
 const DUCK_MIN_WIDTH: u16 = 26;
 const DUCK_MAX_WIDTH: u16 = 62;
+
+/// Rows the 3D view keeps for itself before the path map may take its slice —
+/// below this the duck is a smudge and the map would be the thing that did it.
+const DUCK_MIN_HEIGHT: u16 = 18;
+
+/// The path map's rows, borders included. Fixed: growing the panel with the
+/// path would push the 3D view around; the map zooms its world out instead.
+const PATH_HEIGHT: u16 = 12;
 
 /// Gaps the cadence figure is averaged over.
 ///
@@ -1002,6 +1010,8 @@ struct View {
     /// Is the robot view wanted? Distinct from whether it is *drawn*: it also needs a
     /// state to pose from, a terminal wide enough, and a model that parsed.
     show_duck: bool,
+    /// The odometry track, drawn as a top-down map under the robot view.
+    path: path_map::PathMap,
     /// The last depth frame, and when it arrived by this view's clock — the frame's
     /// own `at_us` is `tofd`'s, and the question here is how stale what is on
     /// screen is.
@@ -1033,6 +1043,7 @@ impl View {
             no_robot,
             duck: duck::DuckView::new(),
             show_duck: true,
+            path: path_map::PathMap::new(),
             tof: None,
             tof_arrived: None,
             tof_status: None,
@@ -1123,6 +1134,11 @@ impl View {
                 self.peak = self.peak.max(rate);
                 self.frames += 1;
                 self.arrived = Some(Instant::now());
+                self.path.observe(
+                    state.odom.position[0],
+                    state.odom.position[1],
+                    state.odom.yaw,
+                );
                 self.latest = Some(*state);
                 Ok(true)
             }
@@ -1261,6 +1277,19 @@ impl View {
         let (Some(model), Some(state)) = (duck::model(), self.latest.as_ref()) else {
             return;
         };
+        // The path map takes a fixed slice under the 3D view when the column is
+        // tall enough for both — the map's panel never grows; its *world* zooms.
+        let (area, map) = if area.height >= DUCK_MIN_HEIGHT + PATH_HEIGHT {
+            let [duck, map] = Layout::vertical([
+                Constraint::Min(DUCK_MIN_HEIGHT),
+                Constraint::Length(PATH_HEIGHT),
+            ])
+            .areas::<2>(area);
+            (duck, Some(map))
+        } else {
+            (area, None)
+        };
+
         let block = Block::bordered()
             .title(" robot ")
             .title_bottom(Line::from(" d hides · [ ] orbits ").dim().right_aligned());
@@ -1273,6 +1302,24 @@ impl View {
             inner,
             frame.buffer_mut(),
         );
+
+        if let Some(map) = map {
+            self.render_path(frame, map);
+        }
+    }
+
+    /// The odometry track, top-down: boot-forward is up, the origin is `+`, the
+    /// robot is `●` with a heading ray. See [`path_map`].
+    fn render_path(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let block = Block::bordered().title(" path ").title_bottom(
+            // The zoom level, or the caption is a shape with no size.
+            Line::from(format!(" {:.1} m across ", self.path.extent_m()))
+                .dim()
+                .right_aligned(),
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.path.draw(inner, frame.buffer_mut());
     }
 
     /// The whole-robot block: what was asked of it, what it did, and what it can feel.
