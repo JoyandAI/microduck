@@ -94,6 +94,28 @@ const BATTERY_EMA_ALPHA: f64 = 0.1;
 /// sitstand descent is a deliberate ~2 s glide; the prototype gives it four seconds.
 const SHUTDOWN_SIT: Duration = Duration::from_secs(4);
 
+/// How many consecutive failed bus reads the policy may drive through on the last good
+/// sample before it stops.
+///
+/// **One dropped Dynamixel transaction is ordinary** — `robotd` says so itself when it logs
+/// one — and it must therefore be *invisible*. It was not: a failed read used to stop the
+/// policy for that tick, which commanded the hold pose and reset the controller, so every
+/// ordinary dropped read produced a visible twitch. Measured on a bench robot at ~8 drops a
+/// minute with a monitor attached, which is exactly the reported "random tiny spasms".
+///
+/// Coasting is safe because the observation is *already* a tick old by construction: at
+/// 50 Hz the policy is trained on data of exactly this age, and a second tick of it is
+/// inside that. Three ticks (60 ms) covers a drop, a retry and a slow tick; past that the
+/// robot genuinely cannot see, and holding still is the honest answer.
+const COAST_TICKS: u32 = 3;
+
+/// How long driving must have been interrupted before the controller is reset.
+///
+/// The reset zeroes the action history the policy observes and drops the low-pass anchor,
+/// which is right after a real pause and is itself a discontinuity after a 20 ms hiccup —
+/// the very jolt it exists to prevent.
+const RESET_AFTER_PAUSE: Duration = Duration::from_millis(200);
+
 /// Fall recovery (`[safety] fall_recover`): the limp settle before the standing network
 /// engages, the stricter gravity threshold that counts as solidly upright, and how long it
 /// must hold. All three are the prototype's numbers.
@@ -1055,6 +1077,16 @@ async fn control_loop<T: RobotIo>(
     let mut head_ema = [0.0f64; 4];
     let mut body_ema = [0.0f64; 3];
 
+    // Coasting over a dropped bus read, and where the robot actually is.
+    //
+    // `known_positions` is updated from every sample that arrives and is what a fallback
+    // holds. It used to be `hold`, which is only assigned when driving *stops* — and the
+    // assignment needed a sample, which is the one thing a failed read does not have. So a
+    // drop mid-stride held whatever `hold` was last set to, which after bring-up is the home
+    // pose: one tick of "snap to standing" at full gain, mid-motion.
+    let mut coast = Coast::new();
+    let mut stopped_driving_at: Option<Instant> = None;
+
     // The sit-then-power-off sequence, and fall recovery.
     let mut shutdown_sit: Option<Instant> = None;
     let mut powered_off = false;
@@ -1106,7 +1138,7 @@ async fn control_loop<T: RobotIo>(
         ticker.tick().await;
         let tick_start = Instant::now();
 
-        let sensors = match safety.read() {
+        let fresh = match safety.read() {
             Ok(sensors) => {
                 state.consecutive_errors.store(0, Ordering::Relaxed);
                 Some(sensors)
@@ -1123,8 +1155,15 @@ async fn control_loop<T: RobotIo>(
             }
         };
 
-        if let Some(sensors) = sensors.as_ref() {
-            safety.observe(sensors, period);
+        // Coast over a dropped read on the last good sample — see [`COAST_TICKS`]. The
+        // distinction between "fresh" and "what the policy steps from" matters twice below:
+        // safety only observes fresh samples, so a repeat cannot feed the fall debounce, and
+        // `known_positions` only advances on fresh ones, so a coasted tick cannot pretend to
+        // know where the joints have moved to.
+        let sensors = coast.sample(fresh);
+
+        if let Some(fresh) = fresh.as_ref() {
+            safety.observe(fresh, period);
         }
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
 
@@ -1520,22 +1559,34 @@ async fn control_loop<T: RobotIo>(
         if driving && !was_driving {
             // Starting fresh: a stale previous action in the observation, or a filter
             // anchored to where the robot was a minute ago, would both show up as a lurch.
-            if let Some(controller) = controller.as_mut() {
+            //
+            // Only after a real pause, though. Past `COAST_TICKS` of a bad bus this edge
+            // fires again within a few ticks, and resetting then re-introduces exactly the
+            // discontinuity the reset is for: a zeroed action the policy observes, and a
+            // low-pass filter with no anchor.
+            if reset_on_resume(stopped_driving_at, tick_start)
+                && let Some(controller) = controller.as_mut()
+            {
                 controller.reset();
             }
         }
         if was_driving && !driving {
+            stopped_driving_at = Some(tick_start);
             if !snapshot.enabled {
                 // A deliberate stop returns to the home pose — the prototype's Start-off
                 // ("policy DISABLED - returning to default pose"). Commanded directly, no
                 // ramp: the servos do the travel at their own speed, and the robot is
                 // standing at home when Start next hands it to the policy.
                 hold = DEFAULT_POSITION;
-            } else if let Some(sensors) = sensors.as_ref() {
-                // Any other stop — IMU cooling, a read failure, the armed fall gate —
-                // freezes where it is rather than snapping anywhere. Captured once, not
-                // re-read each tick, or the hold target would sag under gravity.
-                hold = sensors.positions;
+            } else {
+                // Any other stop — IMU cooling, a blind bus, the armed fall gate — freezes
+                // where the robot *is*, from the last sample that arrived. Captured once,
+                // not re-read each tick, or the hold target would sag under gravity.
+                //
+                // Deliberately not gated on a sample arriving this tick: the stop that
+                // matters most is the one caused by a read failing, and requiring a reading
+                // then is requiring the thing that just failed.
+                hold = coast.known_positions(hold);
             }
         }
         was_driving = driving;
@@ -1695,6 +1746,59 @@ fn named_policy(
         return None;
     }
     pick(&policy).as_deref().and_then(file_name)
+}
+
+/// The sample a tick steps from, and how stale it may get.
+///
+/// Exists as a type rather than three variables in the loop because it *was* three variables
+/// in the loop, and the bug lived in the gap between them: a failed read stopped the policy
+/// for one tick, which commanded `hold` — a pose only ever assigned when driving stops, and
+/// the assignment needed a sample, which is the one thing a failed read does not have. Mid
+/// stride that meant one tick of "snap to the home pose" at full gain, then a controller
+/// reset on the way back in. Roughly eight times a minute on a loaded board.
+struct Coast {
+    last: Option<duck_control::Sensors>,
+    ticks: u32,
+}
+
+impl Coast {
+    fn new() -> Self {
+        Self {
+            last: None,
+            ticks: 0,
+        }
+    }
+
+    /// Feed a tick's read result; get back what the policy may step from.
+    fn sample(&mut self, fresh: Option<duck_control::Sensors>) -> Option<duck_control::Sensors> {
+        match fresh {
+            Some(sensors) => {
+                self.ticks = 0;
+                self.last = Some(sensors);
+                Some(sensors)
+            }
+            None if self.ticks < COAST_TICKS => {
+                self.ticks += 1;
+                self.last
+            }
+            None => None,
+        }
+    }
+
+    /// Where the joints were the last time anything was actually read — what a fallback
+    /// holds. `fallback` covers the ticks before the first successful read.
+    fn known_positions(&self, fallback: [f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
+        self.last.map_or(fallback, |sensors| sensors.positions)
+    }
+}
+
+/// Whether resuming from `stopped_at` warrants resetting the controller.
+///
+/// The reset zeroes the action history the policy observes and drops the low-pass anchor.
+/// After a real pause that is right — the robot may be somewhere else entirely. After a
+/// 20 ms bus hiccup it is itself the discontinuity the reset exists to prevent.
+fn reset_on_resume(stopped_at: Option<Instant>, now: Instant) -> bool {
+    stopped_at.is_none_or(|since| now.duration_since(since) >= RESET_AFTER_PAUSE)
 }
 
 /// Whether a voice bank has anything to play. One directory walk at startup: the bank is a
@@ -2711,6 +2815,78 @@ mod tests {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("3").unwrap(), Duration::from_secs(3));
         assert!(parse_duration("soon").is_err());
+    }
+
+    /// **The spasm.** One dropped bus read is ordinary — `robotd` logs it as such — and it
+    /// must be invisible. It was not: the tick lost its sample, so the policy stopped, the
+    /// loop commanded `hold`, and `hold` was the home pose left over from bring-up. On a
+    /// board with a monitor attached that happened ~8 times a minute, each one a jerk toward
+    /// standing mid-stride, followed by a controller reset on the way back.
+    ///
+    /// Three assertions, one per link in that chain.
+    #[test]
+    fn a_dropped_read_is_survived_rather_than_jerked_through() {
+        let mut walking = duck_control::Sensors::default();
+        walking.positions[2] = 0.9; // mid-stride, nowhere near the home pose
+        let mut coast = Coast::new();
+
+        // A fresh sample is what it says it is, and it is remembered.
+        assert_eq!(coast.sample(Some(walking)), Some(walking));
+        assert_eq!(coast.known_positions(DEFAULT_POSITION), walking.positions);
+
+        // 1. A drop keeps the policy driving on the last sample rather than dropping it.
+        for tick in 1..=COAST_TICKS {
+            assert_eq!(
+                coast.sample(None),
+                Some(walking),
+                "drop {tick} must coast, not go blind"
+            );
+        }
+
+        // 2. Past the coast the robot really is blind, and says so.
+        assert_eq!(
+            coast.sample(None),
+            None,
+            "a bus that stays down must stop the policy"
+        );
+
+        // 3. And even then the fallback holds where the robot *was*, never the home pose:
+        // this is the assertion whose absence was the bug.
+        assert_eq!(
+            coast.known_positions(DEFAULT_POSITION),
+            walking.positions,
+            "a blind tick must hold the last known pose, not snap to home"
+        );
+        assert_ne!(coast.known_positions(DEFAULT_POSITION), DEFAULT_POSITION);
+
+        // A sample arriving clears the coast, so the next drop gets the full allowance.
+        assert_eq!(coast.sample(Some(walking)), Some(walking));
+        assert_eq!(coast.sample(None), Some(walking));
+    }
+
+    /// The other half of the same jerk: coming back from a one-tick interruption must not
+    /// reset the controller, because that zeroes the action the policy observes and drops the
+    /// low-pass anchor — the discontinuity the reset is meant to avoid.
+    #[test]
+    fn a_hiccup_does_not_reset_the_controller_but_a_pause_does() {
+        let now = Instant::now();
+
+        assert!(
+            !reset_on_resume(Some(now - Duration::from_millis(20)), now),
+            "one tick of a bad bus is not a pause"
+        );
+        assert!(
+            !reset_on_resume(Some(now - (RESET_AFTER_PAUSE / 2)), now),
+            "nor is anything inside the window"
+        );
+        assert!(
+            reset_on_resume(Some(now - RESET_AFTER_PAUSE), now),
+            "a real pause resets"
+        );
+        assert!(
+            reset_on_resume(None, now),
+            "the first time the policy ever drives is a reset"
+        );
     }
 
     /// **The startup invariant.** The loop must command the pose it *found*, not the home
