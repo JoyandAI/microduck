@@ -56,9 +56,10 @@ const TRACE_SAMPLES: usize = 600;
 const IDLE_REDRAW: Duration = Duration::from_millis(250);
 
 /// Rows the robot block occupies: two borders, a four-row half for the command and the IMU
-/// side by side, then the limits and the head. Fixed, because a header that grows when a
-/// limit appears would shift every joint row down at the moment the reader is staring at one.
-const HEADER_HEIGHT: u16 = 8;
+/// side by side, then the limits, the head and the odometry. Fixed, because a header that
+/// grows when a limit appears would shift every joint row down at the moment the reader is
+/// staring at one.
+const HEADER_HEIGHT: u16 = 9;
 
 /// Request id for the subscribe call, so its answer can be told apart from the stream that
 /// follows it on the same connection.
@@ -1325,7 +1326,7 @@ impl View {
         // Command on the left, sensing on the right: two four-row columns rather than eight
         // stacked rows, because every row here is a row the joints table does not get.
         let [top, bottom] =
-            Layout::vertical([Constraint::Length(4), Constraint::Length(2)]).areas::<2>(inner);
+            Layout::vertical([Constraint::Length(4), Constraint::Length(3)]).areas::<2>(inner);
         let [asked, felt] =
             Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
                 .areas::<2>(top);
@@ -1492,7 +1493,7 @@ impl View {
         ])
     }
 
-    /// Two rows that are always present whether or not they have anything to report, because
+    /// Three rows that are always present whether or not they have anything to report, because
     /// a header that changes height moves the joints table under the reader's eyes.
     fn limits_and_head(&self, state: &proto::RobotState) -> Paragraph<'static> {
         let limits = if state.movement.limited_by.is_empty() {
@@ -1548,7 +1549,16 @@ impl View {
             ));
         }
 
-        Paragraph::new(vec![limits, Line::from(head)])
+        // Contact odometry: where the legs and IMU say the robot has walked to since boot.
+        // Yaw follows the angle-unit toggle like everything else; metres are metres.
+        let odom = Line::from(format!(
+            " odom    x {:>+6.2} m  y {:>+6.2} m  yaw {}",
+            state.odom.position[0],
+            state.odom.position[1],
+            self.units.angle(state.odom.yaw),
+        ));
+
+        Paragraph::new(vec![limits, Line::from(head), odom])
     }
 
     /// Measured against commanded, per joint, with the difference as a bar.
@@ -3437,6 +3447,7 @@ mod tests {
             },
             joints: vec![0.0; proto::JOINT_NAMES.len()],
             targets: vec![0.0; proto::JOINT_NAMES.len()],
+            odom: proto::OdomState::default(),
         }
     }
 }
