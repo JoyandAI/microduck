@@ -67,6 +67,11 @@ impl Quat {
         ]
     }
 
+    /// The inverse rotation — for a unit quaternion, the conjugate is it.
+    pub fn conjugate(self) -> Self {
+        Self::new(self.w, -self.x, -self.y, -self.z)
+    }
+
     /// As `[w, x, y, z]`, the order MJCF and every wire format here use.
     pub fn wxyz(self) -> [f64; 4] {
         [self.w, self.x, self.y, self.z]

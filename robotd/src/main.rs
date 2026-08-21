@@ -2109,6 +2109,31 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // Gaze as a point: the IK runs here, against the same MJCF the policies train on,
+        // and the answer is the joints the head was sent to — so a client can hold the gaze
+        // by resending them as `robot.head`, or notice `clamped` and move the robot instead.
+        // Never refused: an aim is an intent like `robot.head`, and the closest-possible
+        // gaze at a clamped target is still the most useful thing the head can do.
+        proto::Call::RobotLook(p) => {
+            static HEAD_FK: std::sync::LazyLock<kinematics::head::HeadFk> =
+                std::sync::LazyLock::new(kinematics::head::HeadFk::alpha);
+            let gaze = HEAD_FK.look_at([p.x, p.y, p.z], p.neck_pitch);
+            intents.set_head(gaze.joints);
+            let [neck_pitch, head_pitch, head_yaw, head_roll] = gaze.joints;
+            proto::Response::ok(
+                Some(id),
+                &proto::LookResult {
+                    head: proto::HeadParams {
+                        neck_pitch,
+                        head_pitch,
+                        head_yaw,
+                        head_roll,
+                    },
+                    clamped: gaze.clamped,
+                },
+            )
+        }
+
         // A skill request is queued for the loop's next tick. Refused here only for what
         // this side can already know — the skill was never configured, or the robot is
         // down; the loop still arbitrates against whatever move is mid-flight, exactly as
@@ -2517,6 +2542,45 @@ mod tests {
             .result_as()
             .expect("robot.mode must deserialize as ModeResult");
         assert_eq!(mode.mode, "walk");
+    }
+
+    /// `robot.look` is a promise with two halves: the head actually moves (the intent is
+    /// set), and the answer names the joints it moves to — so a client can hold the gaze by
+    /// resending them as `robot.head`. A left-of-robot target must come back with a
+    /// left-turning yaw, or the IK's sign conventions broke between the crate and the wire.
+    #[test]
+    fn robot_look_moves_the_head_and_answers_with_the_joints() {
+        let intents = Intents::new();
+        let state = RobotState::new(&Params::default(), false, false);
+        let look: proto::LookResult = dispatch(
+            &state,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLook(proto::LookParams {
+                x: 0.5,
+                y: 0.5,
+                z: 0.0,
+                neck_pitch: 0.1,
+            }),
+        )
+        .result_as()
+        .expect("robot.look must answer with a LookResult");
+
+        assert!(!look.clamped, "an ahead-left point is well inside reach");
+        assert!(look.head.head_yaw > 0.2, "left target, leftward yaw");
+        assert!((look.head.neck_pitch - 0.1).abs() < 1e-9, "posture is held");
+
+        let sent = intents.snapshot().command.head;
+        assert_eq!(
+            sent,
+            [
+                look.head.neck_pitch,
+                look.head.head_pitch,
+                look.head.head_yaw,
+                look.head.head_roll
+            ],
+            "the answer must be exactly what the head was sent"
+        );
     }
 
     /// `robotctl quack` exists to answer "which duck am I talking to", and it answers by

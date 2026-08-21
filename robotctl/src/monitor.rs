@@ -121,7 +121,7 @@ const DUCK_MAIN_MIN: u16 = 84;
 /// silently waits for a wider terminal rather than drawing one; past the maximum the
 /// extra cells stop adding legibility and the tables can breathe instead.
 const DUCK_MIN_WIDTH: u16 = 26;
-const DUCK_MAX_WIDTH: u16 = 62;
+const DUCK_MAX_WIDTH: u16 = 74;
 
 /// Rows the 3D view keeps for itself before the path map may take its slice —
 /// below this the duck is a smudge and the map would be the thing that did it.
@@ -552,7 +552,7 @@ const TOF_STALE: Duration = Duration::from_millis(400);
 
 /// Said in the block's border, because the two non-numeric cells are the ones a
 /// reader has no way to guess.
-const TOF_LEGEND: &str = " · nothing in range · x could not measure · near→far ";
+const TOF_LEGEND: &str = " · nothing in range · x could not measure · green floor · near→far ";
 
 /// The near-to-far colour ramp, warm to cool.
 ///
@@ -617,9 +617,25 @@ fn frame_zone(frame: &proto::TofFrame, index: usize) -> tof_zone::Zone {
 
 /// One cell: the distance coloured by range, or a mark for the two cases that
 /// have no distance.
-fn tof_cell(zone: tof_zone::Zone) -> Span<'static> {
+fn tof_cell(zone: tof_zone::Zone, class: Option<kinematics::tof::Zone>) -> Span<'static> {
     match zone {
         tof_zone::Zone::Range(metres) => {
+            // The reprojection's verdict beats the colour ramp: a floor return
+            // is a real distance, but it is not a thing in the way, and green
+            // is the difference on screen. Too-close returns recede — under
+            // ~10 cm the sensor's crosstalk makes the number untrustworthy.
+            match class {
+                Some(kinematics::tof::Zone::Floor { .. }) => {
+                    return Span::styled(
+                        format!("{:>4.2} ", metres.min(9.99)),
+                        Style::new().fg(Color::Green).dim(),
+                    );
+                }
+                Some(kinematics::tof::Zone::TooClose) => {
+                    return Span::raw(format!("{:>4.2} ", metres.min(9.99))).dim();
+                }
+                _ => {}
+            }
             let colour = TOF_RAMP
                 .iter()
                 .find(|(limit, _)| metres < *limit)
@@ -734,11 +750,11 @@ fn live(
                         view.toggle_duck();
                         fresh = true;
                     }
-                    KeyCode::Char('[') => {
+                    KeyCode::Char('[') | KeyCode::Left => {
                         view.orbit_duck(-0.25);
                         fresh = true;
                     }
-                    KeyCode::Char(']') => {
+                    KeyCode::Char(']') | KeyCode::Right => {
                         view.orbit_duck(0.25);
                         fresh = true;
                     }
@@ -1012,6 +1028,8 @@ struct View {
     show_duck: bool,
     /// The odometry track, drawn as a top-down map under the robot view.
     path: path_map::PathMap,
+    /// ToF beams through the head FK, so the depth grid can name the floor.
+    reprojector: kinematics::tof::Reprojector,
     /// The last depth frame, and when it arrived by this view's clock — the frame's
     /// own `at_us` is `tofd`'s, and the question here is how stale what is on
     /// screen is.
@@ -1044,6 +1062,7 @@ impl View {
             duck: duck::DuckView::new(),
             show_duck: true,
             path: path_map::PathMap::new(),
+            reprojector: kinematics::tof::Reprojector::alpha(),
             tof: None,
             tof_arrived: None,
             tof_status: None,
@@ -1292,13 +1311,18 @@ impl View {
 
         let block = Block::bordered()
             .title(" robot ")
-            .title_bottom(Line::from(" d hides · [ ] orbits ").dim().right_aligned());
+            .title_bottom(Line::from(" d hides · ← → orbits ").dim().right_aligned());
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        // The depth frame rides along as contact points — yellow for obstacles,
+        // green for confirmed floor — so what the sensor sees is drawn where it
+        // sees it, and the view zooms out just enough to keep them in frame.
+        let markers = self.tof_markers();
         self.duck.draw(
             model,
             &state.joints,
             state.safety.gravity,
+            &markers,
             inner,
             frame.buffer_mut(),
         );
@@ -1734,16 +1758,82 @@ impl View {
         let per_row = usize::from(inner.width.saturating_sub(1)) / TOF_CELL;
         let drawn = cols.min(per_row.max(1));
 
+        // Reproject through the head FK when the robot stream is up, so the
+        // grid can say which returns are just the floor. The joint indices are
+        // `JOINT_NAMES` order: neck_pitch, head_pitch, head_yaw, head_roll.
+        let classified = self.classified_tof();
+
         let lines: Vec<Line> = (0..rows)
             .map(|row| {
                 // A leading space so the first column is not against the border —
                 // a number touching a box edge reads as part of it.
                 let mut cells = vec![Span::raw(" ")];
-                cells.extend((0..drawn).map(|col| tof_cell(frame_zone(tof, row * cols + col))));
+                cells.extend((0..drawn).map(|col| {
+                    let i = row * cols + col;
+                    let class = classified.as_ref().and_then(|c| c.get(i).copied());
+                    tof_cell(frame_zone(tof, i), class)
+                }));
                 Line::from(cells)
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The frame's zones through the head FK, when both streams are up: which
+    /// returns are floor, which are obstacles, and where each sits in the
+    /// trunk frame. The joint indices are `JOINT_NAMES` order — neck_pitch,
+    /// head_pitch, head_yaw, head_roll at 5..9.
+    fn classified_tof(
+        &self,
+    ) -> Option<[kinematics::tof::Zone; kinematics::tof::ROWS * kinematics::tof::COLS]> {
+        let tof = self.tof.as_ref()?;
+        let state = self.latest.as_ref()?;
+        let head: Vec<f64> = (5..9)
+            .filter_map(|i| state.joints.get(i).copied())
+            .collect();
+        let head: [f64; 4] = head.try_into().ok()?;
+        let mut ranges = [None; kinematics::tof::ROWS * kinematics::tof::COLS];
+        for (i, slot) in ranges.iter_mut().enumerate() {
+            if let tof_zone::Zone::Range(m) = frame_zone(tof, i) {
+                *slot = Some(f64::from(m));
+            }
+        }
+        // The trunk's own tilt and measured height, so a robot leaned by hand
+        // still calls the floor the floor. Odometry Z of zero means "no
+        // estimate" (an older robotd, or an unconverged IMU) — fall back to
+        // the model's rest height rather than believing the trunk is buried.
+        let posture = kinematics::tof::Posture {
+            gravity: state.safety.gravity,
+            trunk_height_m: (state.odom.position[2] > 0.02).then_some(state.odom.position[2]),
+        };
+        Some(self.reprojector.project(&ranges, head, &posture))
+    }
+
+    /// The depth frame as contact points for the 3D view: yellow for a thing,
+    /// green for confirmed floor — the same colours the grid uses. Empty when
+    /// the frame is stale, because points hanging where the sensor no longer
+    /// looks would be a lie.
+    fn tof_markers(&self) -> Vec<duck::Marker> {
+        if !self.tof_arrived.is_some_and(|at| at.elapsed() <= TOF_STALE) {
+            return Vec::new();
+        }
+        let Some(zones) = self.classified_tof() else {
+            return Vec::new();
+        };
+        zones
+            .iter()
+            .filter_map(|zone| {
+                let (point, rgb) = match zone {
+                    kinematics::tof::Zone::Hit { point, .. } => (point, [225, 200, 70]),
+                    kinematics::tof::Zone::Floor { point } => (point, [70, 160, 80]),
+                    _ => return None,
+                };
+                Some(duck::Marker {
+                    at: point.map(|v| v as f32),
+                    rgb,
+                })
+            })
+            .collect()
     }
 
     /// `tof <sensor> · <hz> · <rows>×<cols> · <n>/<total> ranged · <min>–<max> m`

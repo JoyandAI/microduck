@@ -123,7 +123,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// The head ToF sensor's 8×8 depth frames, served by `tofd` on its own socket. A new
 /// namespace, like `pad.*` was: nothing existing changes shape, and a client built before
 /// this simply never asks.
-pub const API_VERSION: u32 = 11;
+///
+/// # v12 — `robot.look`
+///
+/// Gaze as a point instead of joint angles: `robot.head`'s doc always promised both forms,
+/// and this is the second one — the daemon runs the IK and answers with the joints it chose.
+pub const API_VERSION: u32 = 12;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -255,6 +260,9 @@ pub mod method {
     pub const ROBOT_MOVE: &str = "robot.move";
     /// Head joint targets. Continuous; send as a notification.
     pub const ROBOT_HEAD: &str = "robot.head";
+    /// Point the camera at a trunk-frame point; the daemon runs the gaze IK.
+    /// Discrete; send as a request — the answer says what the head will do.
+    pub const ROBOT_LOOK: &str = "robot.look";
     /// Stop moving — zero the velocity. Not "go limp".
     pub const ROBOT_STOP: &str = "robot.stop";
     /// Turn policy execution on or off.
@@ -504,6 +512,8 @@ pub enum Call {
     RobotMove(MoveParams),
     /// Continuous. Send as a notification.
     RobotHead(HeadParams),
+    /// Discrete. Send as a request; the answer is [`LookResult`].
+    RobotLook(LookParams),
     RobotStop,
     RobotEnable(EnableParams),
     /// Power the joints and ramp to the home pose. No policy needed.
@@ -581,6 +591,7 @@ impl Call {
             Call::RobotRemoteSessionActive => method::ROBOT_SESSION_ACTIVE,
             Call::RobotMove(_) => method::ROBOT_MOVE,
             Call::RobotHead(_) => method::ROBOT_HEAD,
+            Call::RobotLook(_) => method::ROBOT_LOOK,
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
             Call::RobotInit => method::ROBOT_INIT,
@@ -673,6 +684,7 @@ impl Call {
             Call::Log(p) => encode(p),
             Call::RobotMove(p) => encode(p),
             Call::RobotHead(p) => encode(p),
+            Call::RobotLook(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
             Call::RobotDo(p) => encode(p),
             Call::RobotPose(p) => encode(p),
@@ -738,6 +750,7 @@ impl Call {
             method::ROBOT_SESSION_ACTIVE => Call::RobotRemoteSessionActive,
             method::ROBOT_MOVE => Call::RobotMove(decode(params)?),
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
+            method::ROBOT_LOOK => Call::RobotLook(decode(params)?),
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             method::ROBOT_INIT => Call::RobotInit,
@@ -1074,6 +1087,33 @@ pub struct HeadParams {
     pub head_pitch: f64,
     pub head_yaw: f64,
     pub head_roll: f64,
+}
+
+/// A point to look at, trunk frame, metres — see [`method::ROBOT_LOOK`]. The gaze form
+/// [`HeadParams`]' doc promised: the daemon solves the IK against its own MJCF model, so a
+/// client never has to know which way a positive head_yaw turns.
+///
+/// `neck_pitch` is posture, not aim — the IK holds it and aims around it. Defaults to 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LookParams {
+    /// Forward of the trunk origin.
+    pub x: f64,
+    /// Left of it.
+    pub y: f64,
+    /// Above it. NOTE: trunk frame, not floor — the floor is about 0.12 m below.
+    pub z: f64,
+    pub neck_pitch: f64,
+}
+
+/// Answer to [`Call::RobotLook`]: the joints the head was sent to.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LookResult {
+    /// What was handed to the same path `robot.head` feeds — resend these to hold the gaze.
+    pub head: HeadParams,
+    /// The point is beyond the head's reach (travel limits, or the gimbal geometry near
+    /// ±90° yaw); the joints are the closest gaze, not a lock.
+    pub clamped: bool,
 }
 
 /// A voice-bank tag — what kind of sound, not which file: the robot picks a random
@@ -2837,6 +2877,12 @@ mod tests {
                 head_yaw: 0.2,
                 head_roll: 0.0,
             }),
+            Call::RobotLook(LookParams {
+                x: 1.0,
+                y: 0.25,
+                z: -0.1,
+                neck_pitch: 0.2,
+            }),
             Call::RobotStop,
             Call::RobotEnable(EnableParams {
                 on: true,
@@ -2903,7 +2949,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            43,
+            44,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

@@ -343,6 +343,26 @@ enum RobotCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Point the camera at a trunk-frame point: X forward, Y left, Z up, metres.
+    ///
+    /// The daemon runs the gaze IK against its own robot model and moves the head — no sign
+    /// conventions to remember. `robotctl robot look 1 0 0` looks straight ahead;
+    /// `1 0.5 -0.1` looks ahead-left and slightly down. A point beyond the head's reach gets
+    /// the closest gaze the joints allow, and says so.
+    // `allow_negative_numbers`, or `look 0.3 0 -0.3` reads `-0.3` as a flag —
+    // and looking down is the single most common thing to ask a duck.
+    #[command(allow_negative_numbers = true)]
+    Look {
+        x: f64,
+        y: f64,
+        z: f64,
+        /// Neck posture to aim around, radians. The IK holds it rather than solving it.
+        #[arg(long, default_value_t = 0.0)]
+        neck_pitch: f64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `robotctl quack` — the loudest way to tell ducks apart. SSH into one, quack it, and the
@@ -1804,6 +1824,21 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             *json,
         ),
         RobotCommand::Mode { json } => (proto::Call::RobotMode, *json),
+        RobotCommand::Look {
+            x,
+            y,
+            z,
+            neck_pitch,
+            json,
+        } => (
+            proto::Call::RobotLook(proto::LookParams {
+                x: *x,
+                y: *y,
+                z: *z,
+                neck_pitch: *neck_pitch,
+            }),
+            *json,
+        ),
     };
 
     let result = result_of(client.call(&call)?)?;
@@ -1816,6 +1851,24 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     if let RobotCommand::Mode { .. } = command {
         let mode: proto::ModeResult = decode(&result)?;
         println!("{}", mode.mode);
+        return Ok(());
+    }
+
+    // `look` answers with the joints it chose, not an intent result.
+    if let RobotCommand::Look { .. } = command {
+        let look: proto::LookResult = decode(&result)?;
+        println!(
+            "head → neck_pitch {:+.2}  head_pitch {:+.2}  head_yaw {:+.2}  head_roll {:+.2} rad{}",
+            look.head.neck_pitch,
+            look.head.head_pitch,
+            look.head.head_yaw,
+            look.head.head_roll,
+            if look.clamped {
+                "\nout of reach — this is the closest the head can look"
+            } else {
+                ""
+            }
+        );
         return Ok(());
     }
 
@@ -1832,7 +1885,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
         RobotCommand::Relax { .. } => println!("torque off"),
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
-        RobotCommand::Mode { .. } => unreachable!("answered above"),
+        RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())
 }

@@ -150,7 +150,7 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // retransmitted (§5.2). A 20-byte notification budget and a link that does not exist for
         // the first ~73s of a boot is not a control transport. The skills, the body pose and
         // the mouth are motor control like the rest.
-        RobotMove(_) | RobotHead(_) | RobotEnable(_) | RobotDo(_) | RobotPose(_)
+        RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotEnable(_) | RobotDo(_) | RobotPose(_)
         | RobotMouth(_) => None,
 
         // Harmless and rather charming from a phone — but it rides the same refusal as the

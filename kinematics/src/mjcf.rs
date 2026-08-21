@@ -48,6 +48,8 @@ pub(crate) struct Joint {
     pub name: String,
     /// Unit rotation axis in the body frame. MJCF's default is +z.
     pub axis: [f64; 3],
+    /// `[lo, hi]` travel limits, radians. `None` when the MJCF declares none.
+    pub range: Option<(f64, f64)>,
 }
 
 pub(crate) struct Site {
@@ -60,6 +62,10 @@ pub(crate) struct Tree {
     /// In tree order: a body's parent always precedes it.
     pub bodies: Vec<Body>,
     pub sites: Vec<Site>,
+    /// Where the scene drops `trunk_base` into the world. FK ignores it (the
+    /// trunk frame is the root), but its Z is the trunk's standing height above
+    /// the floor — which a floor filter wants, from the asset, not a constant.
+    pub trunk_pos: [f64; 3],
 }
 
 pub(crate) fn parse(xml: &str) -> Result<Tree, ParseError> {
@@ -82,6 +88,7 @@ pub(crate) fn parse(xml: &str) -> Result<Tree, ParseError> {
     let mut tree = Tree {
         bodies: Vec::new(),
         sites: Vec::new(),
+        trunk_pos: parse_vec3(trunk, "pos")?.unwrap_or([0.0; 3]),
     };
 
     // The root is anchored at identity — its MJCF `pos` is where MuJoCo drops
@@ -116,6 +123,7 @@ fn walk_body(node: roxmltree::Node, parent: usize, tree: &mut Tree) -> Result<()
             Ok(Joint {
                 name: j.attribute("name").unwrap_or("").to_owned(),
                 axis: normalize(parse_vec3(j, "axis")?.unwrap_or([0.0, 0.0, 1.0])),
+                range: parse_floats_attr(j, "range", 2)?.map(|v| (v[0], v[1])),
             })
         })
         .transpose()?;
