@@ -9,11 +9,15 @@
 //! [`session::run`] is transport-agnostic on purpose: it takes lines and gives lines, so it is
 //! testable without a WebRTC peer and would serve a WebSocket surface (§11) unchanged.
 //!
-//! There is no binary yet, and no GStreamer. Both arrive together, because the moment this crate
-//! links GStreamer, CI's `board` job needs `scripts/cross-sysroot.sh` rather than the multiarch
-//! libudev in `ci-cross-deps.sh` — which is its own change and belongs beside the code that needs
-//! it.
+//! [`pipeline`] is the rest, and the only part that is not portable: `webrtcsink` with the
+//! signalling server in this process, `mpph264enc` in front of it, and a `control` datachannel per
+//! peer wired to [`session::run`].
 
 pub mod route;
 pub mod session;
 pub mod upstream;
+
+/// The GStreamer pipeline and the datachannel. Linux only — see the crate manifest for why the
+/// gate is by target rather than by feature.
+#[cfg(target_os = "linux")]
+pub mod pipeline;

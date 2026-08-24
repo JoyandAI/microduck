@@ -5,20 +5,39 @@ edition.workspace = true
 license.workspace = true
 description = "Camera, mic, WebRTC — and the remote gateway"
 
-# A library and no binary yet, deliberately. What exists is the transport policy: which calls a
-# WebRTC peer may make, which is the decision `docs/design/remote-webrtc.md` §5 says constrains
-# everything after it. A daemon that starts and serves nothing would have to be packaged, unit-ed
-# and enabled to be tested, and none of that would be testing anything.
+# GStreamer is Linux-only here, the way `padd`'s evdev tap is. The daemon runs on the robot; the
+# route table, the session pipe and the upstream pool are portable and their tests run on a laptop.
+# Gating by target rather than by feature keeps `cargo test` honest on both — a feature that is off
+# by default is a module nobody compiles.
 #
-# It links no GStreamer yet either, and that is not an oversight: `mediad` will, and the moment it
-# does, CI's `board` job needs `scripts/cross-sysroot.sh` rather than the multiarch libudev in
-# `ci-cross-deps.sh`. That is its own change and belongs beside the code that needs it.
+# This is the second C dependency to reach the board, after libudev for `gilrs` in `padd`, and it is
+# much larger: `scripts/cross-sysroot.sh` exists for it. `ci-cross-deps.sh` says of the first that
+# it "is the cost of that one exception, and it is worth reading before adding another" — this is
+# that other, and the cost is a sysroot the whole workspace now builds against.
 
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+anyhow = "1"
+clap = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# The pipeline, and the only part of this crate that is not portable.
+#
+# `gstreamer-webrtc` is here for the data channel: a `GstWebRTCDataChannel` is what
+# `create-data-channel` returns, and reaching for untyped `glib::Object` calls to avoid one
+# dependency would be a poor trade.
+[target.'cfg(target_os = "linux")'.dependencies]
+# `v1_22` on both, which is not a guess: it is the floor `gst-plugins-rs`'s own webrtc crate
+# declares, and it is what gates `WebRTCDataChannel` into existence (that type needs `v1_18`).
+# The board runs 1.26.2, so this is comfortably satisfied — and pinning the floor at what the
+# plugin requires rather than at what the board happens to have means a build failure here would
+# name a real incompatibility rather than an accident of one robot's package versions.
+gstreamer = { version = "0.24", features = ["v1_22"] }
+gstreamer-webrtc = { version = "0.24", features = ["v1_22"] }
+glib = "0.21"
 
 [dev-dependencies]
 # `every_call()`, so this crate's exhaustive-match tests use the same list every other
