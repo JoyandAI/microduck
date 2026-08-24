@@ -570,6 +570,55 @@ pub enum Call {
     TofStream,
 }
 
+/// The service that owns the answer to a call.
+///
+/// One socket per service, connected directly — there is no broker (`architecture.md` §2.2). A
+/// transport adapter holds connections to the services whose calls it carries, and to no others:
+/// `btd` holds three, and `padd` being absent from them is deliberate rather than incidental —
+/// `padd` is the unprivileged client whose whole value is having no special access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Service {
+    /// `updaterd`, at [`DEFAULT_SOCKET`].
+    Updater,
+    /// `robotd` — the control loop.
+    Robot,
+    /// `configd` — wifi, identity, the pairing PIN, gamepad bonding.
+    Config,
+    /// `padd` — the raw gamepad input stream.
+    Pad,
+    /// `tofd` — the depth stream.
+    Tof,
+}
+
+/// How long answering a call holds a connection, and therefore which connection carries it.
+///
+/// **Every service here serves one connection one request at a time.** So a single connection per
+/// service would put every call on one queue behind the slowest thing on it, and two orderings a
+/// client reaches for first are broken by that:
+///
+/// - `update.apply` then `update.status` — the status line waits in a socket `updaterd` will not
+///   read for minutes, so the client times out having heard nothing while the robot is fine.
+/// - `update.subscribe` then `update.apply` — worse. The subscription owns its connection until
+///   the peer goes away and never reads another request, so the apply is written into a socket
+///   nobody reads: it never runs, never replies and never errors. An update the owner asked for
+///   that the robot silently did not perform.
+///
+/// Grouping by *how long a call holds a connection* and giving each group its own is what fixes
+/// both. It is at most four sockets per service per session, which costs nothing and is bounded
+/// without bookkeeping — the alternative, a connection per call, needs the adapter to know when a
+/// call ended, which needs it to parse replies. It deliberately never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// Answers as fast as the daemon can look something up.
+    Prompt,
+    /// Seconds: a read that goes to the network or sweeps a radio.
+    Slow,
+    /// As long as it takes, and it changes the robot: an update, joining a network, bonding a pad.
+    Operation,
+    /// Never answers. The service writes notifications until the peer goes away.
+    Stream,
+}
+
 impl Call {
     /// The wire method name.
     pub fn method(&self) -> &'static str {
@@ -649,6 +698,105 @@ impl Call {
                 | Call::PadPair(_)
                 | Call::PadForget(_)
         )
+    }
+
+    /// The service that owns the answer to this call, and how long answering it holds a
+    /// connection. `None` for a call no service answers.
+    ///
+    /// **This is a property of the call, not of a transport.** Who owns `net.connect` does not
+    /// change depending on whether a phone asked over Bluetooth or a browser asked over a
+    /// datachannel, and neither does the fact that `configd` will sit on the connection for the
+    /// better part of a minute while it waits for NetworkManager. Whether a given transport may
+    /// *make* the call is the separate question, and it stays with the transport — see
+    /// `btd::route` for the one that exists, and `docs/design/remote-webrtc.md` §5 for why the two
+    /// were split.
+    ///
+    /// It lives here, beside [`Call::mutates`], because it is the same kind of fact: something
+    /// every adapter needs and none should decide for itself.
+    pub fn destination(&self) -> Option<(Service, Lane)> {
+        use Lane::*;
+        use Service::*;
+        Some(match self {
+            // The version handshake. `updaterd` answers it because it is the service on the
+            // recovery path — the one that must reply when the rest of the robot does not.
+            Call::Hello(_) => (Updater, Prompt),
+
+            // ── updaterd ────────────────────────────────────────────────────
+            //
+            // `Apply`, `Rollback` and `ResetToGolden` all move `current`, and `updaterd`
+            // single-flights mutations behind a file lock and answers `BUSY` for a second one —
+            // so sharing one lane is the behaviour to have rather than a compromise.
+            Call::Apply(_) | Call::Rollback(_) | Call::Select(_) | Call::ResetToGolden(_) => {
+                (Updater, Operation)
+            }
+            // Reaches the network to ask a mirror what exists, so seconds. Deliberately off
+            // `Operation`: "is there an update?" asked during one has an immediate answer
+            // (`BUSY`), and queueing it behind the update would turn that into a spinner that
+            // resolves minutes later.
+            Call::Check(_) => (Updater, Slow),
+            // `update.status` falls back to a cached snapshot rather than waiting for the engine,
+            // so it answers during an apply — which is wasted if the request is queued behind one.
+            Call::Status => (Updater, Prompt),
+            Call::Pin(_) | Call::Log(_) | Call::ListInstalled(_) => (Updater, Prompt),
+            // Owns its connection until the peer goes away and never reads another request.
+            Call::Subscribe => (Updater, Stream),
+
+            // ── robotd ──────────────────────────────────────────────────────
+            Call::RobotSafeToRestart
+            | Call::RobotHealth
+            | Call::RobotModelApi
+            | Call::RobotRemoteSessionActive
+            | Call::RobotMode => (Robot, Prompt),
+            // Intents and one-shot skills. All fast: they store a value the control loop reads on
+            // its next tick, and none of them waits for the robot to finish anything.
+            Call::RobotMove(_)
+            | Call::RobotHead(_)
+            | Call::RobotLook(_)
+            | Call::RobotStop
+            | Call::RobotEnable(_)
+            | Call::RobotInit
+            | Call::RobotRelax
+            | Call::RobotDo(_)
+            | Call::RobotPose(_)
+            | Call::RobotMouth(_)
+            | Call::RobotSound(_)
+            | Call::RobotShutdown => (Robot, Prompt),
+            Call::RobotSubscribe(_) => (Robot, Stream),
+
+            // ── configd ─────────────────────────────────────────────────────
+            Call::NetStatus
+            | Call::NetForget(_)
+            | Call::SystemInfo
+            | Call::SystemServices
+            | Call::SystemSetName(_)
+            | Call::SystemReboot
+            | Call::SystemPairingPin
+            | Call::SystemSetPairingPin(_)
+            | Call::PadStatus
+            | Call::PadForget(_) => (Config, Prompt),
+            // Re-sweeps the radio rather than returning the last scan.
+            Call::NetScan => (Config, Slow),
+            // `configd` polls NetworkManager for up to 45 seconds before calling a join failed,
+            // and `pad.pair` waits on a gamepad for its whole timeout. Both hold the connection
+            // for that long, which is what `Operation` is for — and why `net.status` must not be
+            // queued behind them.
+            Call::NetConnect(_) | Call::PadPair(_) => (Config, Operation),
+
+            // ── padd and tofd ───────────────────────────────────────────────
+            //
+            // Both are streams, and both are named here even though the only transport that
+            // exists today reaches neither: what a call *is* does not depend on who may ask it.
+            Call::PadInput => (Pad, Stream),
+            Call::TofStream => (Tof, Stream),
+
+            // ── answered by no service ──────────────────────────────────────
+            //
+            // The PIN check belongs to the transport, which is the whole point of it: BLE cannot
+            // express a fixed passkey printed on a robot, so the check moved up a layer to where
+            // we define the rules (`docs/design/app-path-design.md` §5). A transport that does not
+            // gate anything simply never sees this call.
+            Call::SystemAuthenticate(_) => return None,
+        })
     }
 
     /// The component this call is about, where it names one.
@@ -2945,6 +3093,51 @@ mod tests {
     /// someone remembers to add it. Pin the count: adding a `Call` without extending the
     /// list fails here, which is the only thing standing between a new method and it never
     /// being round-tripped at all.
+    /// `destination` answers for every call but the one the transport answers itself.
+    ///
+    /// The `None` arm is a single deliberate case — `system.authenticate`, whose check belongs to
+    /// the transport rather than to any service. A second `None` appearing here would mean a call
+    /// no service owns, which is a call nobody can serve.
+    #[test]
+    fn only_authenticate_has_no_service() {
+        for call in every_call() {
+            let has = call.destination().is_some();
+            let expected = !matches!(call, Call::SystemAuthenticate(_));
+            assert_eq!(
+                has,
+                expected,
+                "{} destination() = {:?}",
+                call.method(),
+                call.destination()
+            );
+        }
+    }
+
+    /// A stream holds its connection forever, so it must never share a lane with a call that
+    /// expects an answer.
+    ///
+    /// Pinned because the failure is silent and specific: `update.subscribe` owns its connection
+    /// and never reads another request, so anything queued behind it is written into a socket
+    /// nobody reads — it never runs, never replies and never errors.
+    #[test]
+    fn subscriptions_are_the_only_thing_on_the_stream_lane() {
+        for call in every_call() {
+            if let Some((_, Lane::Stream)) = call.destination() {
+                assert!(
+                    matches!(
+                        call,
+                        Call::Subscribe
+                            | Call::RobotSubscribe(_)
+                            | Call::PadInput
+                            | Call::TofStream
+                    ),
+                    "{} is on the Stream lane but is not a subscription",
+                    call.method()
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_call_covers_every_variant() {
         assert_eq!(
