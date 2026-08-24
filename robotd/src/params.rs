@@ -322,6 +322,42 @@ pub struct SafetyParams {
     /// (6.6 V — `duck_control::model::BATTERY_EMPTY_V`). The EMA moves over ~10 s, so a
     /// load sag cannot trip it.
     pub battery_empty_shutdown: bool,
+
+    /// Go limp *while falling*, to land soft instead of fighting the floor all the way
+    /// down. Off by default: it is a new behaviour, and one whose failure mode is causing
+    /// the fall it predicted.
+    ///
+    /// Independent of `fall_limp`/`fall_recover` — those act on a robot that is already
+    /// down. This acts in the second before it gets there: drop to `gain_limp`, let the
+    /// robot collapse, then pose it back to standing and hand it to the standing policy,
+    /// which stands up far more cleanly from a still robot than from one that has been
+    /// thrashing since the fall began.
+    pub limp_fall: bool,
+    /// Projected-gravity z the robot must already be past before a fall prediction counts
+    /// — about 26° of tilt, which ordinary walking does not reach.
+    pub limp_fall_tilt_z: f64,
+    /// Where the extrapolation must reach to count as falling. Same sense as
+    /// `fall_gravity_z`, and by default the same number.
+    pub limp_fall_predict_z: f64,
+    /// How far ahead the tilt rate is extrapolated.
+    pub limp_fall_lookahead_ms: u64,
+    /// How long the fall verdict must hold before the gains drop. Three ticks at 50 Hz —
+    /// longer than a footfall impulse, short enough to leave most of the fall to limp
+    /// through.
+    pub limp_fall_debounce_ms: u64,
+    /// Angular-rate magnitude below which the robot counts as having landed, rad/s.
+    pub limp_fall_still_rate: f64,
+    /// How long it has to stay that still before the limp ends.
+    pub limp_fall_still_ms: u64,
+    /// Hard cap on the limp, however the landing reads. A robot that never goes still —
+    /// held in someone's hands, or resting against something that keeps nudging it —
+    /// must not stay limp forever.
+    pub limp_fall_max_ms: u64,
+    /// How long the ramp back to the standing pose takes, once the robot has landed.
+    pub limp_fall_pose_ms: u64,
+    /// Gain for that ramp. The joints have to actually travel across the floor, so it is
+    /// not the limp gain; it is the softened standing gain rather than the walking one.
+    pub limp_fall_pose_gain: u16,
 }
 
 impl Default for PolicyParams {
@@ -366,6 +402,16 @@ impl Default for SafetyParams {
             fall_limp: false,
             fall_recover: false,
             battery_empty_shutdown: true,
+            limp_fall: false,
+            limp_fall_tilt_z: -0.90,
+            limp_fall_predict_z: -0.5,
+            limp_fall_lookahead_ms: 300,
+            limp_fall_debounce_ms: 60,
+            limp_fall_still_rate: 1.0,
+            limp_fall_still_ms: 200,
+            limp_fall_max_ms: 1500,
+            limp_fall_pose_ms: 1000,
+            limp_fall_pose_gain: 160,
         }
     }
 }

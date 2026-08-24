@@ -191,6 +191,60 @@ mode = "walk"
 # `--fall-detect` flag.
 # fall_recover = false
 
+# Land soft, then stand up from a still robot instead of a thrashing one.
+#
+# The standing policy is a good stand-up-er and a bad faller: from a still robot, face down
+# or face up, it gets back on its feet cleanly; out of a dynamic fall it tries and fails and
+# tries again, at walking gain, against the floor, and the motors pay for every attempt.
+#
+# With this on, a fall is taken away from the policy entirely. The moment the robot is seen
+# to be going down — before it lands — the gains drop to `gain_limp` and the joints follow
+# wherever they are pushed, so the robot arrives limp. Once it has stopped moving it is
+# ramped back to the standing pose over `limp_fall_pose_ms`, and only then handed back: what
+# the standing policy sees is a still robot in a known posture, which is the case it is good
+# at. (With `fall_recover` also on, the landed robot goes straight to the recovery rise —
+# its own 0.3 s settle is exactly what just happened, at length.)
+#
+# Independent of `fall_limp`/`fall_recover`, which act on a robot that is already down.
+# This one acts in the second before it gets there. Off by default: it is new, and its
+# failure mode is causing the fall it predicted.
+# limp_fall = false
+
+# When a fall counts as started. This is the whole feature, and both ways of getting it
+# wrong are real: too early and the robot limps out of leans it would have walked off —
+# every false positive is a fall the robot *caused*, strictly worse than a stiff landing —
+# and too late and it lands stiff anyway and the mode bought nothing.
+#
+# The test is not a position, because by the time gravity reaches the `fall_gravity_z`
+# above, the robot is on the floor. It is a projection: projected gravity rotates with the
+# trunk, so its rate is exactly `-(w x g)` from the gyro in the same 12-byte IMU block, and
+# extrapolating that says where gravity will be `limp_fall_lookahead_ms` from now. Trigger
+# when the robot is *already* tilted past `limp_fall_tilt_z` (about 26° — ordinary walking
+# does not reach it, which is what keeps footfalls and shoves out), is still tipping over
+# rather than recovering, and the extrapolation lands past `limp_fall_predict_z`.
+#
+# The debounce is three ticks at 50 Hz: longer than a footfall impulse, short enough to
+# leave most of the fall to limp through. `robotctl monitor` shows gravity live, and the
+# state stream's `safety.limp` and the `limp_fall` / `limp_pose` policy labels are what
+# tuning is read from.
+# limp_fall_tilt_z = -0.90
+# limp_fall_predict_z = -0.5
+# limp_fall_lookahead_ms = 300
+# limp_fall_debounce_ms = 60
+
+# The landing, and what happens after it. The limp ends when the robot has gone still —
+# read from the gyro rather than timed, because a stumble and a fall off a table take very
+# different times to finish — or at `limp_fall_max_ms` whatever the gyro says, so a robot
+# held in someone's hands does not stay limp forever.
+#
+# The pose ramp then travels the joints back to standing. Its gain is not the limp gain:
+# they have to actually move across the floor. 160 is the softened standing gain.
+# limp_fall_still_rate = 1.0
+# limp_fall_still_ms = 200
+# limp_fall_max_ms = 1500
+# limp_fall_pose_ms = 1000
+# limp_fall_pose_gain = 160
+
 # Sit down gracefully and power the machine off when the battery EMA reaches the empty
 # floor (6.6 V — the same value the battery percentage maps to 0%). The EMA moves over
 # ~10 s, so a load sag cannot trip it; reaching 6.6 requires a genuinely spent pack.

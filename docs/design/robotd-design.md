@@ -363,6 +363,33 @@ still*, because standing is the safe state for a biped. Losing balance makes it 
 events, two responses, written down rather than inferred from whichever got implemented
 first.
 
+#### 5.4.1 Falling is a third event
+
+The fall verdict above answers "is the robot down". That is the right question for
+refusing to enable a robot lying on its side, and the wrong one for softening a landing:
+gravity past `fall_gravity_z` held for 200 ms *is* the robot on the floor, and the window
+worth acting in has closed by then.
+
+So `limp_fall` (off by default) runs a second, separate detector — `duck_control::fall` —
+on the rate rather than the position. Projected gravity rotates with the trunk, so
+`ġ = −ω × g` is exact and comes straight from the gyro in the same 12-byte IMU block;
+extrapolating it over ~0.3 s says where gravity is heading. It fires when the robot is
+already tilted (≈26°), still tipping over rather than recovering, and predicted past the
+fall threshold — debounced three ticks. Differentiating the SFLP quaternion instead would
+add the filter's lag to the one number whose whole value is being early.
+
+What it buys is not the landing itself but the stand-up after it. The standing policy gets
+a still robot in a known posture up cleanly and a thrashing one up only after several
+attempts at walking gain against the floor, which is where the load on the motors comes
+from. So the sequence takes the fall away from the policy: limp at `gain_limp` following
+the joints down, wait for the gyro to go quiet, ramp back to the standing pose over ~1 s,
+hand over. With `fall_recover` also on, that hands straight to its rise — its 0.3 s settle
+is what just happened, at length.
+
+The tuning is the feature, and it is asymmetric: a false positive is a fall the robot
+*caused*, which is worse than the stiff landing it was trying to avoid. The defaults sit
+deliberately on the late side.
+
 ### 5.5 Intents
 
 Two vocabularies — intents in, state out — and JSON-RPC's two message families map onto

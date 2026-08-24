@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
 use clap::{Parser, Subcommand};
+use duck_control::fall::{FallPredictor, FallPredictorConfig};
 use duck_control::io::RobotIo;
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
 use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyPaths};
@@ -139,6 +140,82 @@ enum Recovery {
     Rising {
         upright_for: Duration,
     },
+}
+
+/// Where the limp-fall sequence is (`[safety] limp_fall`).
+///
+/// A different animal from [`Recovery`], and the two must not be confused. `Recovery` runs
+/// *after* the fall, on the `fallen` verdict, and its 300 ms limp is a settle. This runs
+/// *during* the fall, on [`duck_control::fall::FallPredictor`], and its limp is the point:
+/// the robot has to be soft before it lands, not after.
+///
+/// They compose. With both on, this sequence owns the fall and hands a landed, posed robot
+/// straight to `Recovery::Rising` — skipping the settle it has already done at length,
+/// rather than dropping the robot again the moment it was put back into shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LimpFall {
+    Idle,
+    /// Gains at `gain_limp`, joints commanded to wherever they already are — the softest
+    /// thing the servos can do short of cutting torque, which would drop the head on the
+    /// floor and lose the pose the next phase ramps from.
+    Limp {
+        since: Instant,
+        landing: Landing,
+    },
+    /// Ramping from where the robot landed back to the standing pose, so the standing
+    /// policy starts from the still, known posture it stands up from cleanly.
+    Posing {
+        from: [f64; NUM_JOINTS],
+        since: Instant,
+    },
+}
+
+/// Watching a limping robot for the moment it stops moving.
+///
+/// The end of the limp is read from the gyro rather than timed, because the falls are not
+/// all the same length: a stumble is over in a few hundred milliseconds and a topple off a
+/// table takes most of a second, and ending the limp early is landing stiff after all.
+/// Debounced, because a tumbling robot passes through instants of near-zero rate on its
+/// way over — one quiet sample is not a landing.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Landing {
+    still_for: Duration,
+}
+
+impl Landing {
+    /// One tick. `rate` is the gyro magnitude in rad/s, or `None` for a tick with no fresh
+    /// sample — which resets rather than accumulates: a robot nobody can read is not a
+    /// robot anybody has seen go still.
+    fn observe(&mut self, rate: Option<f64>, period: Duration, below: f64, held: Duration) -> bool {
+        self.still_for = match rate {
+            Some(rate) if rate < below => self.still_for.saturating_add(period),
+            _ => Duration::ZERO,
+        };
+        self.still_for >= held
+    }
+}
+
+impl LimpFall {
+    /// The interpolated pose target for this tick, or `None` once the ramp is done.
+    ///
+    /// The same linear shape as [`Bringup::homing_target`], and separate from it on
+    /// purpose: that ramp is bring-up from limp at the policy gain over a fixed two
+    /// seconds, this one is a landed robot being put back into shape, and both its
+    /// duration and its gain are tunable because both depend on how the robot lands.
+    fn pose_target(&self, now: Instant, over: Duration) -> Option<[f64; NUM_JOINTS]> {
+        let LimpFall::Posing { from, since } = self else {
+            return None;
+        };
+        let t = now.duration_since(*since).as_secs_f64() / over.as_secs_f64();
+        if t >= 1.0 {
+            return None;
+        }
+        let mut target = [0.0; NUM_JOINTS];
+        for (i, slot) in target.iter_mut().enumerate() {
+            *slot = from[i] + (DEFAULT_POSITION[i] - from[i]) * t;
+        }
+        Some(target)
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -1098,6 +1175,22 @@ async fn control_loop<T: RobotIo>(
     let mut recovery = Recovery::Idle;
     let mut warned_imu_warming = false;
 
+    // Limp-fall (`[safety] limp_fall`): the predictor that sees a fall start, and where the
+    // sequence it drives has got to. Built whether or not the mode is on — it costs a
+    // multiply-subtract per tick, and having the numbers computed on every robot is what
+    // makes the thresholds tunable against a recording from a robot that was not running
+    // the mode.
+    let mut falling = FallPredictor::new(FallPredictorConfig {
+        tilt_z: params.safety.limp_fall_tilt_z,
+        predicted_z: params.safety.limp_fall_predict_z,
+        lookahead: Duration::from_millis(params.safety.limp_fall_lookahead_ms),
+        debounce: Duration::from_millis(params.safety.limp_fall_debounce_ms),
+    });
+    let limp_fall_still = Duration::from_millis(params.safety.limp_fall_still_ms);
+    let limp_fall_max = Duration::from_millis(params.safety.limp_fall_max_ms);
+    let limp_fall_pose = Duration::from_millis(params.safety.limp_fall_pose_ms);
+    let mut limp_fall = LimpFall::Idle;
+
     // The voice, and the ear. Both optional equipment: a robot without a codec or a bank
     // walks identically — the player degrades to a debug line, and the mic worker is only
     // spawned when configured, with its own retry loop when arecord flaps.
@@ -1386,12 +1479,142 @@ async fn control_loop<T: RobotIo>(
             poweroff();
         }
 
+        // Limp-fall (`[safety] limp_fall`): catch the fall on the way down.
+        //
+        // The standing policy is a good stand-up-er and a bad faller. It stands a still
+        // robot up cleanly from face-down or face-up; asked to do it out of a dynamic fall
+        // it tries, fails, tries again — at walking gain, against the floor — and the
+        // motors pay for every attempt. So take the fall away from it: go soft before the
+        // landing, let the robot arrive limp, put it back into the standing pose, and only
+        // then hand it over. What the policy then sees is the case it is good at.
+        //
+        // Everything here is off the policy's path by construction: `driving` is false for
+        // the whole sequence, so the controller is not stepped and the targets below come
+        // from this block. Recovery is marked in `safety` throughout, because the landing
+        // will latch `fallen` mid-sequence and the armed fall gate would otherwise hold the
+        // robot at limp gain and refuse to let the pose ramp move it.
+        if params.safety.limp_fall {
+            // Abandoned mid-sequence: someone cut the torque, disabled the policy, or the
+            // shutdown sit started. Whatever took over owns the robot now — drop out rather
+            // than finishing a pose ramp nobody asked for, and hold where the robot is
+            // rather than snapping back to a pose it collapsed out of a second ago.
+            if limp_fall != LimpFall::Idle
+                && !(snapshot.enabled
+                    && bringup == Bringup::Ready
+                    && shutdown_sit.is_none()
+                    && !powered_off)
+            {
+                tracing::warn!("limp-fall abandoned — something else took the robot");
+                limp_fall = LimpFall::Idle;
+                falling.reset();
+                safety.set_recovery(false);
+                hold = coast.known_positions(hold);
+            }
+            match limp_fall {
+                LimpFall::Idle => {
+                    // Only on a fresh sample: a coasted one is the same reading twice, and
+                    // feeding it to a debounce would let one bad tick count three times.
+                    let eligible = was_driving
+                        && !safety.fallen()
+                        && shutdown_sit.is_none()
+                        && !powered_off
+                        // A roulade tips the robot over on purpose, a ground pick pitches it
+                        // forward, and a sit is not a fall. Limping through any of them would
+                        // break a move that was working.
+                        && controller
+                            .as_ref()
+                            .is_some_and(|c| !c.busy() && !c.is_sitting());
+                    match fresh.as_ref() {
+                        Some(fresh) if eligible && safety.imu_ready() => {
+                            if falling.observe(&fresh.imu, period) {
+                                tracing::warn!(
+                                    gravity_z = format!("{:.2}", fresh.imu.gravity[2]),
+                                    rate =
+                                        format!("{:.2}", FallPredictor::gravity_z_rate(&fresh.imu)),
+                                    gain = params.safety.gain_limp,
+                                    "falling — going limp to land soft"
+                                );
+                                safety.set_recovery(true);
+                                limp_fall = LimpFall::Limp {
+                                    since: tick_start,
+                                    landing: Landing::default(),
+                                };
+                            }
+                        }
+                        // Not eligible, or blind for this tick. Drop any debounce in
+                        // progress rather than resuming it later against a robot that has
+                        // moved on.
+                        _ => falling.reset(),
+                    }
+                }
+                LimpFall::Limp { since, mut landing } => {
+                    let rate = fresh
+                        .as_ref()
+                        .map(|s| s.imu.gyro.iter().map(|w| w * w).sum::<f64>().sqrt());
+                    let landed = landing.observe(
+                        rate,
+                        period,
+                        params.safety.limp_fall_still_rate,
+                        limp_fall_still,
+                    );
+                    // Whatever the gyro says: a robot held in someone's hands, or resting
+                    // against something that keeps nudging it, must not stay limp forever.
+                    let timed_out = tick_start.duration_since(since) >= limp_fall_max;
+                    if landed || timed_out {
+                        // From where the robot actually is. `hold` is where it was when
+                        // driving stopped, which is a pose it has since collapsed out of —
+                        // ramping from that would start with a jump.
+                        let from = coast.known_positions(hold);
+                        tracing::warn!(
+                            limp_ms = tick_start.duration_since(since).as_millis(),
+                            timed_out,
+                            pose_ms = limp_fall_pose.as_millis(),
+                            "landed — posing back to standing"
+                        );
+                        limp_fall = LimpFall::Posing {
+                            from,
+                            since: tick_start,
+                        };
+                    } else {
+                        limp_fall = LimpFall::Limp { since, landing };
+                    }
+                }
+                LimpFall::Posing { since, .. } => {
+                    if tick_start.duration_since(since) >= limp_fall_pose {
+                        tracing::warn!("posed — handing back to the standing policy");
+                        limp_fall = LimpFall::Idle;
+                        falling.reset();
+                        hold = DEFAULT_POSITION;
+                        // Hand a landed, posed robot straight to the recovery rise. Its own
+                        // limp settle is exactly what just happened, at length; running it
+                        // again would drop the robot back out of the pose this phase spent
+                        // a second building.
+                        if params.safety.fall_recover && safety.fallen() {
+                            if let Some(controller) = controller.as_mut() {
+                                controller.force_standing = true;
+                                controller.reset();
+                            }
+                            recovery = Recovery::Rising {
+                                upright_for: Duration::ZERO,
+                            };
+                        } else {
+                            safety.set_recovery(false);
+                            if let Some(controller) = controller.as_mut() {
+                                controller.reset();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let in_limp_fall = limp_fall != LimpFall::Idle;
+
         // Fall recovery (`[safety] fall_recover`): limp so the robot settles, then the
         // standing network gets it up, then back to whatever was driving. The prototype's
         // `--fall-detect`, minus its scripted-move opt-outs — a fall during a kick here
         // waits for the kick window to lapse (they are half a second) rather than being
         // ignored outright.
-        if params.safety.fall_recover && controller.is_some() && !powered_off {
+        if params.safety.fall_recover && controller.is_some() && !powered_off && !in_limp_fall {
             match recovery {
                 Recovery::Idle => {
                     if safety.fallen()
@@ -1451,8 +1674,12 @@ async fn control_loop<T: RobotIo>(
         // Smooth the command. The recovery sequence holds the twist at zero outright — the
         // prototype does the same — and leaving body-pose mode snaps the body back to
         // nominal rather than gliding, which is its B-button exit.
-        let twist_target = if in_recovery { [0.0; 3] } else { gated.twist };
-        if in_recovery {
+        let twist_target = if in_recovery || in_limp_fall {
+            [0.0; 3]
+        } else {
+            gated.twist
+        };
+        if in_recovery || in_limp_fall {
             twist_ema = [0.0; 3];
         }
         for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
@@ -1564,6 +1791,9 @@ async fn control_loop<T: RobotIo>(
             && controller.is_some()
             && (!(fall_gate && safety.fallen()) || safety.recovering())
             && !matches!(recovery, Recovery::Limp { .. })
+            // The limp-fall sequence owns the robot for its duration: the whole point is
+            // that the policy is *not* driving while the robot falls, lands and is posed.
+            && !in_limp_fall
             && sensors.is_some()
             && imu_warm
             && !powered_off;
@@ -1614,6 +1844,38 @@ async fn control_loop<T: RobotIo>(
         };
 
         let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+            // The limp-fall sequence, before anything else — `driving` is false throughout,
+            // so without this it would fall through to the hold branch and the robot would
+            // be commanded its pre-fall pose at walking gain, which is precisely the thing
+            // the mode exists to stop.
+            //
+            // `moving` stays true for the whole sequence: the joints are travelling (down,
+            // then back to the pose), and `safeToRestart` must not say yes in the middle of
+            // a fall.
+            _ if in_limp_fall => match limp_fall {
+                // Command the joints where they already are, at limp gain. Following the
+                // measurement rather than holding a fixed pose is what makes it soft: a
+                // fixed target grows an error as the robot collapses, and an error at any
+                // gain is a motor pushing back against the floor.
+                LimpFall::Limp { .. } => (
+                    coast.known_positions(hold),
+                    params.safety.gain_limp,
+                    true,
+                    "limp_fall",
+                ),
+                LimpFall::Posing { .. } => (
+                    // Past the end of the ramp the target is the pose itself — the state
+                    // machine above clears `Posing` on the same tick, so this is the one
+                    // frame where the two can disagree.
+                    limp_fall
+                        .pose_target(tick_start, limp_fall_pose)
+                        .unwrap_or(DEFAULT_POSITION),
+                    params.safety.limp_fall_pose_gain,
+                    true,
+                    "limp_pose",
+                ),
+                LimpFall::Idle => unreachable!("in_limp_fall excludes Idle"),
+            },
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
@@ -1674,9 +1936,11 @@ async fn control_loop<T: RobotIo>(
                 policy: policy_label.to_owned(),
                 safety: proto::SafetyState {
                     fallen: safety.fallen(),
-                    // Limp means "safety is actually holding it at limp gain", which needs
-                    // the fall gate armed — a bare fall verdict is a report, not a state.
-                    limp: fall_gate && safety.fallen() && !safety.recovering(),
+                    // Limp means "the robot is actually at limp gain": the armed fall gate
+                    // holding a fallen robot, or the limp-fall sequence riding one down. A
+                    // bare fall verdict is a report, not a state.
+                    limp: (fall_gate && safety.fallen() && !safety.recovering())
+                        || matches!(limp_fall, LimpFall::Limp { .. }),
                     gravity: sensors.imu.gravity,
                     gain: safety.gain(),
                 },
@@ -2353,6 +2617,110 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The limp-fall pose ramp: starts where the robot landed, ends at the standing pose,
+    /// and reports itself finished rather than pinning at the end — the state machine reads
+    /// `None` as "hand back to the policy".
+    #[test]
+    fn the_limp_fall_pose_ramp_ends_at_the_standing_pose() {
+        let landed = [0.7; NUM_JOINTS];
+        let over = Duration::from_secs(1);
+        let since = Instant::now();
+        let posing = LimpFall::Posing {
+            from: landed,
+            since,
+        };
+
+        let start = posing.pose_target(since, over).expect("t = 0");
+        assert_eq!(start, landed, "the ramp starts from where the robot landed");
+
+        let half = posing
+            .pose_target(since + over / 2, over)
+            .expect("mid-ramp");
+        for (i, value) in half.iter().enumerate() {
+            let expected = landed[i] + (DEFAULT_POSITION[i] - landed[i]) * 0.5;
+            assert!((value - expected).abs() < 1e-9);
+        }
+
+        assert!(
+            posing.pose_target(since + over, over).is_none(),
+            "a finished ramp is None, not the endpoint held forever"
+        );
+    }
+
+    /// Only the posing phase has a ramp. Asking the limp phase for one must not hand back
+    /// a target — that phase follows the joints down, it does not drive them anywhere.
+    #[test]
+    fn only_the_posing_phase_ramps() {
+        let over = Duration::from_secs(1);
+        let now = Instant::now();
+        assert!(LimpFall::Idle.pose_target(now, over).is_none());
+        assert!(
+            LimpFall::Limp {
+                since: now,
+                landing: Landing::default(),
+            }
+            .pose_target(now, over)
+            .is_none()
+        );
+    }
+
+    /// The landing detector. The limp ends when the robot has been still for the full hold,
+    /// not on the first quiet sample — a robot tumbling over passes through instants of
+    /// near-zero rate on the way, and ending the limp on one of those is landing stiff
+    /// after all.
+    #[test]
+    fn the_landing_needs_the_robot_to_stay_still() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let mut landing = Landing::default();
+
+        // Still, but not for long enough yet.
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        // One tumbling sample restarts the count from zero.
+        assert!(!landing.observe(Some(4.0), period, 1.0, held));
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(
+            landing.observe(Some(0.1), period, 1.0, held),
+            "three ticks still"
+        );
+    }
+
+    /// A tick with no fresh sample is not evidence of stillness. A robot nobody can read is
+    /// not a robot anybody has seen stop moving, and a bad bus must not end the limp.
+    #[test]
+    fn a_blind_tick_is_not_a_landing() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let mut landing = Landing::default();
+
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(!landing.observe(Some(0.1), period, 1.0, held));
+        assert!(
+            !landing.observe(None, period, 1.0, held),
+            "blind, not still"
+        );
+        assert!(
+            !landing.observe(Some(0.1), period, 1.0, held),
+            "counting again"
+        );
+    }
+
+    /// Limp-fall ships off, and it is independent of the fall gate: turning it on must not
+    /// silently arm `fall_limp`, which would leave a fallen robot refusing `robot.enable`.
+    #[test]
+    fn limp_fall_ships_off_and_arms_nothing_else() {
+        let mut params = Params::default();
+        assert!(!params.safety.limp_fall);
+        params.safety.limp_fall = true;
+        let s = RobotState::new(&params, false, false);
+        assert!(
+            !s.fall_gate,
+            "limp_fall is about the fall, not about what happens once the robot is down"
+        );
+    }
 
     fn state() -> RobotState {
         RobotState::new(&Params::default(), false, false)
