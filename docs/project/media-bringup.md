@@ -202,6 +202,18 @@ Two traps it guards, both found by reading the trees rather than by failing:
 `librockchip-mpp-dev` makes meson **skip the plugin and succeed**; and `dpkg -i` resolves nothing
 for direct `.deb` downloads, so the Radxa closure is installed in one call.
 
+**`mediad.service` must set `GST_PLUGIN_PATH`.** The plugins install to
+`/usr/local/lib/gstreamer-1.0`, which GStreamer does **not** search by default — its built-in
+path is the distro's `/usr/lib/aarch64-linux-gnu/gstreamer-1.0`, and that directory is
+deliberately avoided so an `apt` operation cannot replace or remove them. So the unit needs
+
+```
+Environment=GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
+```
+
+alongside the `SupplementaryGroups=video` the VPU node needs. Both are easy to forget and both
+present the same way at runtime: the encoder simply does not exist, with nothing saying why.
+
 `scripts/setup-gstreamer.sh` consumes it at a **pinned** version — never "latest". Two
 provisioning runs a day apart producing different plugins, with nothing recording which, is an
 unreproducible media bug waiting to happen. The pin lives in
