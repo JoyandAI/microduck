@@ -73,6 +73,10 @@ PLUGINS_VERSION="${PLUGINS_VERSION:-v1}"
 # has no VPU node and a board on the wrong kernel, and those are exactly the states you least
 # want to discover the check is wrong in. As variables they can be pointed at a fixture.
 MPP_SERVICE="${MPP_SERVICE:-/dev/mpp_service}"
+# Rockchip's 2D accelerator, which `mppenc` uses for format and stride conversion. Same story as
+# the VPU node and found the same way: non-root, `RkRgaInit` fails and the encoder logs
+# `Try to use uninit rgaCtx=(nil)` followed by pages of `rga call blit fail`.
+RGA_DEV="${RGA_DEV:-/dev/rga}"
 VIDEO_GLOB="${VIDEO_GLOB:-/dev/video*}"
 KERNEL="${KERNEL:-$(uname -r)}"
 # Where the VPU udev rule goes. A variable for the same fixture reason as the three above, and
@@ -530,7 +534,15 @@ install_plugins() {
 # script already probes and reports on the node — one place owning one mechanism. A board that
 # skips GStreamer has no use for the rule.
 configure_vpu_access() {
-    [ -e "$MPP_SERVICE" ] || return 0
+    # Both nodes, in one rule. `/dev/rga` was missed the first time round and cost a debugging
+    # round exactly like the VPU node did — a non-root encoder that finds its element, starts,
+    # and then fails inside RGA. Whichever nodes exist get the group; a kernel without one is not
+    # an error here.
+    nodes=""
+    for n in "$MPP_SERVICE" "$RGA_DEV"; do
+        [ -e "$n" ] && nodes="$nodes $n"
+    done
+    [ -n "$nodes" ] || return 0
 
     if [ ! -d "$UDEV_RULE_DIR" ]; then
         warn "no ${UDEV_RULE_DIR}; cannot give /dev/mpp_service a group.
@@ -541,28 +553,32 @@ configure_vpu_access() {
     rule="${UDEV_RULE_DIR}/99-robot-mpp.rules"
     # Matched on the kernel name alone. The node's subsystem is not something to depend on: it is
     # a Rockchip BSP driver, and a match that is wrong about it silently does nothing.
-    content='KERNEL=="mpp_service", GROUP="video", MODE="0660"'
+    content='KERNEL=="mpp_service", GROUP="video", MODE="0660"
+KERNEL=="rga", GROUP="video", MODE="0660"'
 
     if [ -f "$rule" ] && [ "$(cat "$rule")" = "$content" ]; then
-        say "VPU: /dev/mpp_service rule already in place"
+        say "VPU: udev rule already in place"
     else
-        say "VPU: installing the /dev/mpp_service udev rule (group video, 0660)"
+        say "VPU: installing the udev rule for mpp_service and rga (group video, 0660)"
         printf '%s\n' "$content" > "$rule"
         chmod 644 "$rule"
     fi
 
     # Applied now as well as at the next boot — `udevadm` failing is not worth stopping over.
     udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --action=change --name-match=mpp_service 2>/dev/null || true
+    for n in $nodes; do
+        udevadm trigger --action=change --name-match="$(basename "$n")" 2>/dev/null || true
+    done
 
     # Verified rather than assumed. `--name-match` is not in every udev, and a rule that did not
     # take is the state this whole function exists to prevent — so if the node is still root-only,
     # set it directly and say so.
-    if [ "$(stat -c '%G' "$MPP_SERVICE" 2>/dev/null || true)" = root ]; then
-        chgrp video "$MPP_SERVICE" 2>/dev/null || true
-        chmod 0660 "$MPP_SERVICE" 2>/dev/null || true
-        say "VPU: applied the mode directly; the rule takes over at the next boot"
-    fi
+    for n in $nodes; do
+        [ "$(stat -c '%G' "$n" 2>/dev/null || true)" = root ] || continue
+        chgrp video "$n" 2>/dev/null || true
+        chmod 0660 "$n" 2>/dev/null || true
+        say "VPU: applied the mode on ${n} directly; the rule takes over at the next boot"
+    done
 }
 
 report_webrtc() {
