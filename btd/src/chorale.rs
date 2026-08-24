@@ -92,7 +92,7 @@ pub fn beacon_in(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<ChoraleBea
 }
 
 #[cfg(target_os = "linux")]
-pub use radio::{Sighting, broadcast, watch};
+pub use radio::{Sighting, broadcast, run, watch};
 
 #[cfg(target_os = "linux")]
 mod radio {
@@ -110,7 +110,7 @@ mod radio {
     const AD_TYPE_MANUFACTURER_DATA: u8 = 0xFF;
 
     /// One beacon heard from another duck.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Sighting {
         pub beacon: ChoraleBeacon,
         /// Which duck. Only an identity for de-duplicating — a beacon says nothing about who is
@@ -145,6 +145,105 @@ mod radio {
                 ..Default::default()
             })
             .await
+    }
+
+    /// Serve the chorale for as long as the adapter lives.
+    ///
+    /// One connection to `robotd`, carrying both directions: a `chorale.subscribe` stream down
+    /// saying what to advertise, and `chorale.heard` notifications up saying what arrived. `robotd`
+    /// decides everything; this only holds the radio.
+    ///
+    /// Returns when the connection or the adapter goes away, so the caller restarts it the same way
+    /// [`crate::bluez::serve`] restarts on losing an adapter. A `robotd` that is not there yet — the
+    /// ordinary case at boot — is a retry, not a failure.
+    pub async fn run(
+        adapter: &bluer::Adapter,
+        robot_socket: &std::path::Path,
+    ) -> std::io::Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let stream = tokio::net::UnixStream::connect(robot_socket).await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+
+        let request = duck_ipc_proto::Request::call(
+            duck_ipc_proto::Id::Number(1),
+            &duck_ipc_proto::Call::ChoraleSubscribe,
+        );
+        let mut line = serde_json::to_string(&request).map_err(std::io::Error::other)?;
+        line.push('\n');
+        write_half.write_all(line.as_bytes()).await?;
+
+        // Held for as long as `robotd` wants them, and dropped the moment it does not: a second
+        // advertising instance halves the first one's rate, and a monitor costs the controller.
+        // Held only to be dropped: an `AdvertisementHandle` stops advertising when it goes, which
+        // is exactly how the instance is released the moment `robotd` says to stop.
+        let mut _advertisement: Option<bluer::adv::AdvertisementHandle> = None;
+        let mut listening: Option<tokio::task::JoinHandle<()>> = None;
+        let (heard_tx, mut heard_rx) = mpsc::channel::<Sighting>(64);
+
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Some(line) = line? else { return Ok(()) };
+                    let Ok(request) = serde_json::from_str::<duck_ipc_proto::Request>(&line) else {
+                        continue;
+                    };
+                    let Ok(duck_ipc_proto::Call::ChoraleBeaconSet(want)) = request.as_call() else {
+                        continue;
+                    };
+                    // Advertise what was asked for, and nothing when nothing was.
+                    _advertisement = match &want.beacon {
+                        Some(beacon) => match broadcast(adapter, beacon).await {
+                            Ok(handle) => Some(handle),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "chorale: cannot advertise the beacon");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    // And scan only while asked to. Restarting the monitor on every beat would be
+                    // absurd, so the task is started once and kept until listening stops.
+                    match (want.listening, listening.is_some()) {
+                        (true, false) => {
+                            let adapter = adapter.clone();
+                            let tx = heard_tx.clone();
+                            listening = Some(tokio::spawn(async move {
+                                if let Err(e) = watch(&adapter, tx).await {
+                                    tracing::warn!(error = %e, "chorale: the scan stopped");
+                                }
+                            }));
+                        }
+                        (false, true) => {
+                            if let Some(task) = listening.take() {
+                                task.abort();
+                            }
+                            tracing::warn!("chorale: no longer listening");
+                        }
+                        _ => {}
+                    }
+                }
+                Some(sighting) = heard_rx.recv() => {
+                    // An *age*, not a timestamp: the two daemons share a machine but not an epoch,
+                    // and an age survives the trip down a socket in a way another process's clock
+                    // reading does not.
+                    let heard = duck_ipc_proto::ChoraleHeard {
+                        beacon: sighting.beacon,
+                        from: sighting.from.to_string(),
+                        age_us: sighting.at.elapsed().as_micros() as u64,
+                    };
+                    let notify = duck_ipc_proto::Request::notify(
+                        &duck_ipc_proto::Call::ChoraleHeard(heard),
+                    );
+                    let mut line = serde_json::to_string(&notify).map_err(std::io::Error::other)?;
+                    line.push('\n');
+                    if write_half.write_all(line.as_bytes()).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
 
     /// Watch for other ducks' beacons, forever, sending each sighting to `tx`.
@@ -242,6 +341,7 @@ mod tests {
             beat: 91,
             register: 56,
             id: 0x3D,
+            roster: vec![(56, 0x3D), (180, 0x11)],
         }
     }
 
@@ -272,7 +372,7 @@ mod tests {
         assert_eq!(crate::adv::address_in(&as_advertised), None);
         assert!(
             !crate::adv::has_address_field(&as_advertised),
-            "five bytes is not an address field"
+            "a beacon is not four bytes, so it is not an address field"
         );
     }
 

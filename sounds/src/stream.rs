@@ -273,6 +273,14 @@ impl Stream {
         self.formant_shift_target = harmonics.clamp(-FORMANT_RANGE, FORMANT_RANGE);
     }
 
+    /// Silence the voice without moving its pitch — a note ending, rather than a note falling over.
+    ///
+    /// The pitch is left where it was because a fade at the note you were singing is a release, and
+    /// a fade on the way somewhere else is a slide out of a chord.
+    pub fn set_level(&mut self, level: f64) {
+        self.level_target = level.clamp(0.0, 1.0);
+    }
+
     /// Set the targets the stream glides toward.
     ///
     /// - `hz`: carrier frequency. Clamped to something a voice can actually sing.

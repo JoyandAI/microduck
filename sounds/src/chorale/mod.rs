@@ -574,27 +574,7 @@ pub fn cast(personalities: &[Personality]) -> Vec<Singer> {
 /// lines, and the doubling duck takes the part nearest its own register.
 pub fn seat(existing: &[Singer], newcomer: &Personality) -> Singer {
     let held: Vec<Part> = existing.iter().map(|s| s.part).collect();
-    let wanted = Part::ensemble(existing.len() + 1);
-    let free: Vec<Part> = wanted
-        .iter()
-        .copied()
-        .filter(|part| !held.contains(part))
-        .collect();
-    // Where this duck's voice sits, as a MIDI number, so "nearest part" means something.
-    let register = 69.0 + 12.0 * (newcomer.pitch_center_hz / A4_HZ).log2();
-    let choices = if free.is_empty() { &wanted } else { &free };
-    let part = choices
-        .iter()
-        .copied()
-        .min_by(|a, b| {
-            (a.register() - register)
-                .abs()
-                .partial_cmp(&(b.register() - register).abs())
-                .expect("registers are finite")
-                .then(a.cmp(b))
-        })
-        .unwrap_or(Part::Soprano);
-
+    let part = seat_by_register(&held, newcomer.pitch_center_hz);
     // The seat number is what varies the detune and the onset, and it has to be stable for this
     // duck — so it is how many were already singing, not a re-roll of the whole group.
     let mut rng = newcomer.variant_rng("chorale-seat", existing.len() as u32);
@@ -604,6 +584,67 @@ pub fn seat(existing: &[Singer], newcomer: &Personality) -> Singer {
         onset_offset_s: rng.uniform(-0.015, 0.015),
         personality: *newcomer,
     }
+}
+
+/// The part a duck of this register takes, given the parts already held.
+///
+/// The register-only form of [`seat`], and the one the radio uses: a beacon carries a quantised
+/// pitch centre and not a seed, because that is all seating consumes.
+pub fn seat_by_register(held: &[Part], pitch_center_hz: f64) -> Part {
+    let wanted = Part::ensemble(held.len() + 1);
+    let free: Vec<Part> = wanted
+        .iter()
+        .copied()
+        .filter(|part| !held.contains(part))
+        .collect();
+    // Where this duck's voice sits, as a MIDI number, so "nearest part" means something.
+    let register = 69.0 + 12.0 * (pitch_center_hz / A4_HZ).log2();
+    let choices = if free.is_empty() { &wanted } else { &free };
+    choices
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (a.register() - register)
+                .abs()
+                .partial_cmp(&(b.register() - register).abs())
+                .expect("registers are finite")
+                .then(a.cmp(b))
+        })
+        .unwrap_or(Part::Soprano)
+}
+
+/// The spread one duck brings to an ensemble: a few cents and a few milliseconds.
+///
+/// Split out from [`seat`] because a duck singing on real hardware learns its *part* from the
+/// conductor's roster rather than by seating itself, and still needs its own detune and onset — the
+/// two things that make four voices a choir rather than one thick organ stop. Derived from the seed
+/// and the part, so a given duck always brings the same spread to the same line.
+pub fn seat_for(personality: &Personality, part: Part) -> Singer {
+    let mut rng = personality.variant_rng("chorale-seat", part as u32);
+    Singer {
+        part,
+        detune_cents: rng.uniform(-5.0, 5.0),
+        onset_offset_s: rng.uniform(-0.015, 0.015),
+        personality: *personality,
+    }
+}
+
+/// Every duck's part, from an ordered roster of registers.
+///
+/// **This is what stops two ducks singing each other's line.** Seating depends on join order, so a
+/// duck that seats itself from whatever it happens to have heard will disagree with a duck that
+/// heard a different subset — and the two would then both sing alto. So the *conductor* keeps the
+/// roster, broadcasts it in order, and everyone replays this function over it: one source of truth,
+/// which is what a conductor is for.
+///
+/// A pure fold of [`seat_by_register`], so a duck joining changes nobody's part — the same
+/// invariant, now agreed across the room rather than only locally.
+pub fn seat_all(registers: &[f64]) -> Vec<Part> {
+    let mut held: Vec<Part> = Vec::new();
+    for register in registers {
+        held.push(seat_by_register(&held, *register));
+    }
+    held
 }
 
 /// Equal-temperament frequency of a MIDI note, from [`A4_HZ`].

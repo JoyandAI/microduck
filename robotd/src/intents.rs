@@ -133,6 +133,15 @@ pub struct Intents {
     power: AtomicU8,
     /// A pending pick-up or put-down for the ToF theremin. See [`THEREMIN_NONE`].
     theremin: AtomicU8,
+    /// The same, for the chorale.
+    chorale: AtomicU8,
+    /// Beacons `btd` has heard, waiting for the loop.
+    ///
+    /// A queue behind a mutex rather than an `ArcSwap` slot, unlike every other intent here, and
+    /// for a specific reason: the other intents are *levels*, where a value missed is a value
+    /// superseded. A beacon is an *event* carrying an arrival time, and a beat dropped by
+    /// last-writer-wins is a beat the phase lock never gets to average.
+    chorale_heard: std::sync::Mutex<Vec<duck_ipc_proto::ChoraleHeard>>,
     /// Pending skill requests, a bitmask taken (swapped to zero) once per tick. A mask
     /// rather than one slot so two different buttons in the same tick both arrive.
     skills: std::sync::atomic::AtomicU32,
@@ -196,6 +205,8 @@ impl Intents {
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
             theremin: AtomicU8::new(THEREMIN_NONE),
+            chorale: AtomicU8::new(THEREMIN_NONE),
+            chorale_heard: std::sync::Mutex::new(Vec::new()),
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
             sounds: std::sync::atomic::AtomicU32::new(0),
@@ -351,6 +362,40 @@ impl Intents {
     /// Called once per tick by the loop. A later request replaces an unread earlier one, which is
     /// the right resolution: if someone asked to stand up and then to relax within 20 ms, the
     /// second is what they meant.
+    /// Ask for the chorale to start listening (`true`) or stop (`false`).
+    pub fn request_chorale(&self, active: bool) {
+        self.chorale.store(
+            if active { THEREMIN_UP } else { THEREMIN_DOWN },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The pending chorale request, cleared by the read.
+    pub fn take_chorale_request(&self) -> Option<bool> {
+        match self.chorale.swap(THEREMIN_NONE, Ordering::Relaxed) {
+            THEREMIN_UP => Some(true),
+            THEREMIN_DOWN => Some(false),
+            _ => None,
+        }
+    }
+
+    /// A beacon `btd` heard. Queued rather than latched: two ducks' beacons in one tick are two
+    /// observations, and a beat lost to last-writer-wins is a beat the phase lock never sees.
+    pub fn heard_chorale(&self, heard: duck_ipc_proto::ChoraleHeard) {
+        let mut queue = self.chorale_heard.lock().expect("not poisoned");
+        // Bounded: the control loop drains this every tick, so a backlog means the loop is not
+        // running — in which case the newest beacons are the only ones worth having.
+        if queue.len() >= 64 {
+            queue.remove(0);
+        }
+        queue.push(heard);
+    }
+
+    /// Everything heard since the last tick.
+    pub fn take_chorale_heard(&self) -> Vec<duck_ipc_proto::ChoraleHeard> {
+        std::mem::take(&mut *self.chorale_heard.lock().expect("not poisoned"))
+    }
+
     /// Ask for the theremin to be picked up (`true`) or put down (`false`).
     pub fn request_theremin(&self, active: bool) {
         self.theremin.store(

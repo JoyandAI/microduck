@@ -28,6 +28,22 @@ pub struct Params {
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
+    pub chorale: ChoraleParams,
+}
+
+/// `[chorale]` — several ducks singing one piece.
+///
+/// `accept` is **false by default, and that is the whole section.** A chorale is not only a sound:
+/// it moves the mouth and it moves the head. A robot that began animating because another robot
+/// walked into the room would be doing motion nobody asked for, in someone's living room, and two
+/// people's ducks in a café have no business pairing up. Off also means *invisible* rather than
+/// visibly declining — a duck that has not opted in puts nothing on the air at all.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ChoraleParams {
+    /// Whether this robot may sing with others at all. `false` — and it is derived rather than
+    /// written out, so that the default cannot be changed by editing one word.
+    pub accept: bool,
 }
 
 /// `[theremin]` — the ToF theremin: what counts as a hand, and where the depth frames come

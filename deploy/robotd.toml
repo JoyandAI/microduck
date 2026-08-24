@@ -305,3 +305,17 @@ mode = "walk"
 # flickering between usable and not from chopping a note into gravel. Too long and a hand you
 # withdrew keeps sounding.
 # hold_ms = 250
+
+[chorale]
+# Several ducks singing one piece in four parts, found over Bluetooth with no shared clock: the
+# conducting duck's beat counter is the timebase, and the parts are worked out from each duck's own
+# vocal register. `robotctl chorale` starts it looking for company.
+#
+# **Off by default, and this is the whole section.** A chorale is not only a sound — it moves the
+# mouth and it moves the head. A robot that started animating because another robot walked into the
+# room would be doing motion nobody asked for, in someone's living room, and two people's ducks in a
+# café have no business pairing up. Off also means *invisible* rather than politely declining: a
+# duck that has not opted in puts nothing on the air at all.
+#
+# Needs [audio] on, since a duck with no voice has nothing to sing with.
+# accept = false

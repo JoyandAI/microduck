@@ -19,6 +19,7 @@
 //! publishes and never calls into the loop — a wedged loop reports itself unhealthy rather
 //! than hanging the caller.
 
+mod chorale;
 mod control;
 mod intents;
 mod params;
@@ -313,6 +314,13 @@ struct RobotState {
     shutdown: AtomicBool,
     /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
     state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
+    /// What `btd` should be advertising, published when it changes.
+    ///
+    /// A broadcast channel like the state stream, and for the same reason: `btd` subscribes, and a
+    /// `robotd` with nobody subscribed must not be blocked by that. Small buffer — a subscriber
+    /// that has fallen behind on beacons wants the newest one, not a backlog of beats that have
+    /// already passed.
+    chorale_tx: tokio::sync::broadcast::Sender<proto::ChoraleAdvertise>,
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
@@ -346,6 +354,9 @@ struct RobotState {
     /// drops off the I²C bus — and an accepted theremin on a duck with no depth is a
     /// feature that silently does nothing.
     theremin_ready: AtomicBool,
+    /// Whether this robot's config allows it to sing with others. Read once at startup, like the
+    /// policies: `[chorale] accept`, false by default.
+    chorale_accepted: bool,
     /// `walk` or `roller` — constant for the life of the process; `robot.mode` reports it.
     mode: &'static str,
     /// Published by the loop so the IPC side can answer without consulting it.
@@ -387,6 +398,7 @@ impl RobotState {
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
+            chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
             policy_walk: {
                 let policy = params.policy.resolved();
@@ -400,6 +412,7 @@ impl RobotState {
             policy_roulade: named_policy(params, |p| p.roulade.clone()),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             theremin_ready: AtomicBool::new(false),
+            chorale_accepted: params.chorale.accept,
             mode: params.policy.mode.as_str(),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
@@ -1211,6 +1224,22 @@ async fn control_loop<T: RobotIo>(
     // the note at its own pitch instead of gliding to the bottom of the range on its way out.
     let mut theremin_hz = 0.0f64;
 
+    // The chorale. Off unless the config opted in — see `[chorale] accept`, and note that off
+    // means putting nothing on the air rather than declining politely.
+    let mut chorale = (params.chorale.accept && params.audio.enabled)
+        .then(|| {
+            let personality = voice.as_mut().and_then(|v| v.personality())?;
+            Some(chorale::Chorale::new(
+                personality.pitch_center_hz,
+                personality.seed,
+                sounds::chorale::Score::wistful(),
+            ))
+        })
+        .flatten();
+    if chorale.is_some() {
+        tracing::warn!("chorale: this robot will sing with others");
+    }
+
     // Say hello in this robot's own voice as the control loop comes up, as the prototype
     // does — the greet is also the audible "robotd is running" on a headless board.
     if let Some(voice) = voice.as_mut() {
@@ -1873,10 +1902,59 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
+        // The chorale: where in the piece the ensemble is, and this duck's line of it. Before the
+        // mouth, like the theremin, because while a duck is singing its beak is doing that.
+        let mut chorale_state = None;
+        if let Some(ensemble) = chorale.as_mut() {
+            if let Some(active) = intents.take_chorale_request() {
+                ensemble.set_active(active, tick_start);
+            }
+            for heard in intents.take_chorale_heard() {
+                ensemble.heard(&heard, tick_start);
+            }
+            let tick = ensemble.tick(tick_start);
+            if let Some(advertise) = tick.advertise {
+                // Handed to whatever `btd` connection is subscribed. Only when it changes, which
+                // is about once a beat rather than fifty times a second.
+                let _ = state.chorale_tx.send(advertise);
+            }
+            match tick.singing {
+                Some((part, beats)) => {
+                    if let Some(voice) = voice.as_mut()
+                        && voice.sing_start(ensemble.score(), part)
+                    {
+                        voice.sing_at(beats, true);
+                    }
+                    // Singing opens the beak, and the head lifts with the line — a duck that sang
+                    // with a still head would read as a speaker rather than a singer.
+                    if snapshot.enabled && bringup == Bringup::Ready {
+                        let open = ensemble
+                            .score()
+                            .line(part)
+                            .find(|note| beats >= note.start_beat && beats < note.end_beat())
+                            .map_or(0.0, |note| note.vowel.open());
+                        targets[duck_control::model::MOUTH_INDEX] =
+                            duck_control::model::mouth_target(open);
+                    }
+                }
+                None => {
+                    if let Some(voice) = voice.as_mut() {
+                        voice.sing_stop();
+                    }
+                }
+            }
+            chorale_state = Some(proto::ChoraleState {
+                listening: ensemble.active(),
+                part: tick.singing.map(|(part, _)| part.as_str().to_owned()),
+                beats: tick.singing.map(|(_, beats)| beats),
+                voices: tick.voices as u32,
+            });
+        }
+
         // The mouth is not part of any policy; the intent is the only thing that moves it.
         // Only while driving — a held or homing robot keeps whatever its hold pose says, so
         // a restart cannot snap a mouth.
-        if driving && theremin_state.is_none() {
+        if driving && theremin_state.is_none() && chorale_state.is_none() {
             targets[duck_control::model::MOUTH_INDEX] =
                 duck_control::model::mouth_target(snapshot.mouth);
         }
@@ -1921,6 +1999,7 @@ async fn control_loop<T: RobotIo>(
                     yaw: odometry.yaw(),
                 },
                 theremin: theremin_state.clone(),
+                chorale: chorale_state.clone(),
             });
         }
 
@@ -2186,15 +2265,67 @@ async fn handle(
     // `None` until the client subscribes. Once set, the connection is both a request
     // channel and a state stream, so the loop below waits on whichever speaks first.
     let mut states: Option<tokio::sync::broadcast::Receiver<proto::RobotState>> = None;
+    // What to advertise, once `btd` has subscribed. A second stream on the same connection, which
+    // is why the read loop selects over a pair of options rather than one receiver.
+    let mut beacons: Option<tokio::sync::broadcast::Receiver<proto::ChoraleAdvertise>> = None;
     let mut decimate = Duration::ZERO;
     let mut last_sent: Option<Instant> = None;
 
     loop {
-        let line = match states.as_mut() {
-            None => lines.next_line().await?,
-            Some(rx) => {
+        // Three things can happen: a request arrives, a state frame is due for a subscriber, or a
+        // beacon is due for `btd`. Written as nested selects rather than one, because the two
+        // streams are independent options and a client normally has neither.
+        let line = match (states.as_mut(), beacons.as_mut()) {
+            (None, None) => lines.next_line().await?,
+            (None, Some(rx)) => {
                 tokio::select! {
                     line = lines.next_line() => line?,
+                    received = rx.recv() => {
+                        match received {
+                            Ok(advertise) => {
+                                write_line(
+                                    &mut write_half,
+                                    &proto::Request::notify(&proto::Call::ChoraleBeaconSet(advertise)),
+                                )
+                                .await?;
+                            }
+                            // Lagged: `btd` fell behind on beats. The newest beacon is the only
+                            // one worth having — an old beat is a beat that has already passed.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::debug!(dropped = n, "chorale subscriber fell behind");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                        }
+                        continue;
+                    }
+                }
+            }
+            (Some(rx), beacon_rx) => {
+                let mut pending = beacon_rx;
+                tokio::select! {
+                    line = lines.next_line() => line?,
+                    received = async {
+                        match pending.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            // Never resolves, so the select falls to the other arms.
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match received {
+                            Ok(advertise) => {
+                                write_line(
+                                    &mut write_half,
+                                    &proto::Request::notify(&proto::Call::ChoraleBeaconSet(advertise)),
+                                )
+                                .await?;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::debug!(dropped = n, "chorale subscriber fell behind");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                        }
+                        continue;
+                    }
                     received = rx.recv() => {
                         match received {
                             Ok(state) => {
@@ -2260,6 +2391,12 @@ async fn handle(
             continue;
         };
 
+        if let Ok(proto::Call::ChoraleSubscribe) = &call {
+            // `btd` asking what to put on the air. One connection carries both directions: this
+            // stream down, and `chorale.heard` notifications up.
+            beacons = Some(state.chorale_tx.subscribe());
+        }
+
         if let Ok(proto::Call::RobotSubscribe(params)) = &call {
             decimate = params
                 .hz
@@ -2305,6 +2442,12 @@ fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
         }
         proto::Call::RobotMouth(p) => {
             intents.set_mouth(p.open);
+            true
+        }
+        // A beacon `btd` heard. A notification because it is one-way and frequent, and because
+        // there is nothing to say back about a beat.
+        proto::Call::ChoraleHeard(p) => {
+            intents.heard_chorale(p.clone());
             true
         }
         // A skill as a notification: how a client spells "the button is held" — `padd`
@@ -2463,6 +2606,46 @@ fn dispatch(
         // The acknowledgement carries the policy identity: it is constant for the life of the
         // process, so sending it once here costs nothing, where putting it on every frame
         // would allocate two strings per tick on the control thread.
+        // Start or stop looking for other ducks. Refused for what this side can know: no voice to
+        // sing with, and — the one that matters — a robot whose config has not opted in. A chorale
+        // moves the mouth and the head, so an un-opted-in robot does not merely decline, it never
+        // goes on the air at all.
+        proto::Call::RobotChorale(p) => {
+            let result = if !state.chorale_accepted {
+                proto::ChoraleResult {
+                    accepted: false,
+                    reason: Some(
+                        "this robot has not opted in to singing with others (`[chorale] accept` \
+                         in robotd.toml)"
+                            .to_owned(),
+                    ),
+                }
+            } else if !state.has_voice {
+                proto::ChoraleResult {
+                    accepted: false,
+                    reason: Some("this robot has no voice to sing with".to_owned()),
+                }
+            } else {
+                intents.request_chorale(p.active);
+                proto::ChoraleResult {
+                    accepted: true,
+                    reason: None,
+                }
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // `btd` subscribing to what to advertise. The stream itself is set up by the caller; this
+        // only acknowledges, and is deliberately not refused for a robot that has not opted in —
+        // `btd` may subscribe at boot and the answer can change without it reconnecting.
+        proto::Call::ChoraleSubscribe => proto::Response::ok(
+            Some(id),
+            &proto::ChoraleResult {
+                accepted: true,
+                reason: None,
+            },
+        ),
+
         proto::Call::RobotSubscribe(_) => proto::Response::ok(
             Some(id),
             &proto::SubscribeResult {

@@ -620,6 +620,10 @@ impl Server {
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotTheremin(_)
+            | Call::RobotChorale(_)
+            | Call::ChoraleSubscribe
+            | Call::ChoraleBeaconSet(_)
+            | Call::ChoraleHeard(_)
             | Call::RobotShutdown
             | Call::RobotMode
             | Call::RobotSubscribe(_) => Response::err(

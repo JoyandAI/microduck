@@ -129,13 +129,21 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Gaze as a point instead of joint angles: `robot.head`'s doc always promised both forms,
 /// and this is the second one — the daemon runs the IK and answers with the joints it chose.
 ///
+/// # v14 — `robot.chorale`, `chorale.*`
+///
+/// Several ducks singing one piece in four parts, synchronised over BLE advertisements with no
+/// shared clock. `robot.chorale` is the switch; the `chorale.*` namespace is how `btd` — which owns
+/// the radio — and `robotd` — which owns the behaviour and the voice — divide the work. Additive:
+/// a client that never asks is unaffected, and `chorale.*` is between daemons rather than for
+/// clients at all.
+///
 /// # v13 — `robot.theremin`
 ///
 /// The head ToF becomes an instrument: a hand's distance is the pitch, and the mouth opens
 /// with it. Additive, same rule as every method before it — plus an optional `theremin`
 /// block in `robot.state`, absent while the instrument is down, so a client from v12 sees
 /// exactly the frame it saw before.
-pub const API_VERSION: u32 = 13;
+pub const API_VERSION: u32 = 14;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -342,6 +350,18 @@ pub mod method {
     /// what the sensor said about the frame — which is the field diagnostic for this whole
     /// feature.
     pub const ROBOT_THEREMIN: &str = "robot.theremin";
+    /// Start or stop looking for other ducks to sing with. Discrete; the answer is
+    /// [`super::ChoraleResult`].
+    ///
+    /// What it starts is *listening*, not singing: the robot begins broadcasting a beacon saying
+    /// it is willing, and watching for others. Two willing ducks in radio range then start a piece
+    /// between themselves with nobody in charge — the lower id conducts — and a third joins what it
+    /// finds already under way.
+    ///
+    /// Refused outright by a robot whose config has not opted in (`[chorale] accept`), which is
+    /// false by default: a chorale moves the mouth and the head, and a robot that began animating
+    /// because another robot walked into the room would be doing unrequested motion.
+    pub const ROBOT_CHORALE: &str = "robot.chorale";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
     /// Which drive mode this `robotd` was configured with: `walk` or `roller`.
@@ -441,6 +461,20 @@ pub mod method {
     /// The answer describes the sensor (or says why there is none); frames then
     /// arrive as [`TOF_FRAME`] notifications until the connection closes.
     pub const TOF_STREAM: &str = "tof.stream";
+
+    /// `btd` → `robotd`: subscribe to what to put on the air. Answered, then `robotd` streams
+    /// [`CHORALE_BEACON`] notifications for as long as the connection lasts.
+    ///
+    /// The radio is `btd`'s and the behaviour is `robotd`'s, so neither can do this alone. This is
+    /// the direction that needs a subscription rather than a call: `robotd` decides *when* the
+    /// beacon changes, and it changes on the beat.
+    pub const CHORALE_SUBSCRIBE: &str = "chorale.subscribe";
+    /// `robotd` → `btd`: advertise this, or stop. A notification on a [`CHORALE_SUBSCRIBE`]
+    /// stream; the params are [`super::ChoraleAdvertise`].
+    pub const CHORALE_BEACON: &str = "chorale.beacon";
+    /// `btd` → `robotd`: another duck's beacon was heard. A notification — the params are
+    /// [`super::ChoraleHeard`].
+    pub const CHORALE_HEARD: &str = "chorale.heard";
 
     /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
     pub const TOF_FRAME: &str = "tof.frame";
@@ -551,6 +585,16 @@ pub enum Call {
     RobotSound(SoundParams),
     /// Pick the ToF theremin up or put it down. Discrete; the answer is [`ThereminResult`].
     RobotTheremin(ThereminParams),
+    /// Start or stop looking for other ducks to sing with. Discrete; the answer is
+    /// [`ChoraleResult`].
+    RobotChorale(ChoraleParams),
+    /// `btd` subscribing to what it should advertise. Answered, then a stream of
+    /// [`method::CHORALE_BEACON`] notifications.
+    ChoraleSubscribe,
+    /// `robotd` telling `btd` what to advertise. A notification.
+    ChoraleBeaconSet(ChoraleAdvertise),
+    /// `btd` telling `robotd` what it heard. A notification.
+    ChoraleHeard(ChoraleHeard),
     /// Sit down, then power the machine off.
     RobotShutdown,
     /// Which drive mode this robotd runs: walk or roller.
@@ -624,6 +668,10 @@ impl Call {
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
+            Call::RobotChorale(_) => method::ROBOT_CHORALE,
+            Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
+            Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
+            Call::ChoraleHeard(_) => method::CHORALE_HEARD,
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
@@ -715,6 +763,9 @@ impl Call {
             Call::RobotMouth(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
+            Call::RobotChorale(p) => encode(p),
+            Call::ChoraleBeaconSet(p) => encode(p),
+            Call::ChoraleHeard(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
@@ -742,7 +793,8 @@ impl Call {
             | Call::SystemPairingPin
             | Call::PadStatus
             | Call::PadInput
-            | Call::TofStream => Value::Object(serde_json::Map::new()),
+            | Call::TofStream
+            | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -785,6 +837,10 @@ impl Call {
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
+            method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
+            method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
+            method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
+            method::CHORALE_HEARD => Call::ChoraleHeard(decode(params)?),
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
@@ -2031,6 +2087,27 @@ pub struct RobotState {
     /// instrument is down — see [`ThereminState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theremin: Option<ThereminState>,
+    /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
+    /// state of a duck — see [`ChoraleState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chorale: Option<ChoraleState>,
+}
+
+/// What the duck chorale is doing, in [`RobotState`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChoraleState {
+    /// Looking for other ducks — on the air and scanning.
+    pub listening: bool,
+    /// Which part this duck is singing: `bass`, `tenor`, `alto`, `soprano`. `None` while it is
+    /// listening, alone, or waiting to be seated by a conductor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<String>,
+    /// How far into the piece, in beats. `None` when not singing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beats: Option<f64>,
+    /// How many ducks are singing, this one included.
+    pub voices: u32,
 }
 
 /// The contact-odometry estimate: trunk pose in the world frame the IMU chose
@@ -2646,6 +2723,65 @@ pub struct TofFrame {
     pub status: Vec<u8>,
 }
 
+/// See [`method::ROBOT_CHORALE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoraleParams {
+    /// True starts listening for other ducks, false stops and falls silent. Idempotent both ways.
+    pub active: bool,
+}
+
+/// Answer to [`Call::RobotChorale`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChoraleResult {
+    pub accepted: bool,
+    /// Why not — no voice, no radio, or the robot has not opted in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for ChoraleResult {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+}
+
+/// What `robotd` wants on the air — a [`method::CHORALE_BEACON`] notification.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChoraleAdvertise {
+    /// The beacon to broadcast, or `None` to take the advertisement down.
+    ///
+    /// Down matters as much as up: a second advertising instance halves the rate of the first, and
+    /// `btd`'s front-door interval was tuned against measurements — so the beacon exists only while
+    /// a chorale does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beacon: Option<ChoraleBeacon>,
+    /// Whether to be listening for other ducks' beacons at all. Separate from `beacon` because a
+    /// duck that has been asked to stop should stop scanning too, and a duck that is only listening
+    /// still scans while advertising an idle beacon.
+    pub listening: bool,
+}
+
+/// A beacon `btd` heard — a [`method::CHORALE_HEARD`] notification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoraleHeard {
+    pub beacon: ChoraleBeacon,
+    /// Which radio it came from, as `btd` renders an address. An identity for de-duplication only.
+    pub from: String,
+    /// How long ago `btd` saw it, in microseconds.
+    ///
+    /// An age rather than a timestamp, and that is the whole reason this is usable for
+    /// synchronisation: the two daemons share a machine but not an epoch, and an age survives the
+    /// trip down a socket in a way a timestamp from another process's clock does not. `robotd`
+    /// subtracts it from its own clock on arrival.
+    pub age_us: u64,
+}
+
 /// The duck chorale's beacon: what one duck puts on the air so others can sing with it.
 ///
 /// **A wire contract, and the only one that is not JSON.** Every other message in this crate rides
@@ -2665,7 +2801,7 @@ pub struct TofFrame {
 /// Also absent is the robot's voice seed. Casting consumes a duck's pitch centre and nothing else
 /// (`sounds::chorale::cast`), so that is what goes out — quantised to a byte — and the seed, which
 /// is the robot's identity, stays at home.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChoraleBeacon {
     /// Which piece is being sung, so a duck arriving late knows what to join. Zero means "willing,
     /// but nothing is being sung" — which is what a duck with `accept_chorale` on advertises while
@@ -2679,6 +2815,18 @@ pub struct ChoraleBeacon {
     /// Tie-break, so two ducks rolled to the same register still order deterministically. Derived
     /// from the seed rather than being it: one byte of a hash identifies nothing.
     pub id: u8,
+    /// Who is singing, in seating order — `(register, id)` per duck. Empty from a duck that is only
+    /// listening.
+    ///
+    /// **This is what stops two ducks singing each other's part.** Seating depends on join order
+    /// (`sounds::chorale::seat`), so a duck that seats itself from whatever it happened to hear
+    /// disagrees with one that heard a different subset — and both then sing alto. The conductor
+    /// keeps the roster and broadcasts it; everyone else replays `seat_all` over it. One source of
+    /// truth, which is what a conductor is for.
+    ///
+    /// There is room: the controller reports a 251-byte advertising budget and a full quartet's
+    /// roster is eight bytes.
+    pub roster: Vec<(u8, u8)>,
 }
 
 impl ChoraleBeacon {
@@ -2721,26 +2869,72 @@ impl ChoraleBeacon {
         self.piece != Self::IDLE
     }
 
-    /// The manufacturer-data payload, tag first.
+    /// The most ducks a roster carries. Four parts, so a fifth doubles one — and a beacon is not
+    /// the place to describe a choir.
+    pub const MAX_ROSTER: usize = 4;
+
+    /// The manufacturer-data payload: tag, the fixed fields, then the roster length and its pairs.
     pub fn to_bytes(&self) -> Vec<u8> {
-        vec![Self::TAG, self.piece, self.beat, self.register, self.id]
+        let roster = &self.roster[..self.roster.len().min(Self::MAX_ROSTER)];
+        let mut bytes = vec![
+            Self::TAG,
+            self.piece,
+            self.beat,
+            self.register,
+            self.id,
+            roster.len() as u8,
+        ];
+        for (register, id) in roster {
+            bytes.push(*register);
+            bytes.push(*id);
+        }
+        bytes
     }
 
     /// Read a beacon out of a manufacturer-data payload.
     ///
-    /// `None` for anything that is not exactly this layout. The company id these ride under is
-    /// `0xFFFF`, the SIG's testing id that anyone may use, so a payload of the wrong shape is
-    /// somebody else's advertisement and not a malformed one of ours.
+    /// `None` for anything that is not exactly this layout, length included. The company id these
+    /// ride under is `0xFFFF`, the SIG's testing id that anyone may use, so a payload of the wrong
+    /// shape is somebody else's advertisement and not a malformed one of ours — which is also why
+    /// a *longer* payload is rejected rather than read leniently: a future beacon with more in it
+    /// is not this one.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        match bytes {
-            [Self::TAG, piece, beat, register, id] => Some(Self {
-                piece: *piece,
-                beat: *beat,
-                register: *register,
-                id: *id,
-            }),
-            _ => None,
+        let [Self::TAG, piece, beat, register, id, count, rest @ ..] = bytes else {
+            return None;
+        };
+        let count = usize::from(*count);
+        if count > Self::MAX_ROSTER || rest.len() != count * 2 {
+            return None;
         }
+        Some(Self {
+            piece: *piece,
+            beat: *beat,
+            register: *register,
+            id: *id,
+            roster: rest
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| (pair[0], pair[1]))
+                .collect(),
+        })
+    }
+
+    /// This duck's index in the roster, if it is in there — which is how it learns its part.
+    pub fn seat_of(&self, register: u8, id: u8) -> Option<usize> {
+        self.roster
+            .iter()
+            .position(|(r, i)| *r == register && *i == id)
+    }
+
+    /// The roster's registers as pitch centres, for `sounds::chorale::seat_all`.
+    pub fn roster_registers(&self) -> Vec<f64> {
+        self.roster
+            .iter()
+            .map(|(register, _)| {
+                Self::REGISTER_LOW_HZ + f64::from(*register) * Self::REGISTER_STEP_HZ
+            })
+            .collect()
     }
 }
 
@@ -3562,16 +3756,20 @@ mod tests {
             beat: 217,
             register: 56,
             id: 0x9F,
+            roster: vec![(56, 0x9F), (140, 0x02), (200, 0x71)],
         };
         let bytes = beacon.to_bytes();
-        assert_eq!(bytes.len(), 5, "tag plus four fields: {bytes:?}");
-        assert_eq!(ChoraleBeacon::from_bytes(&bytes), Some(beacon));
+        assert_eq!(ChoraleBeacon::from_bytes(&bytes), Some(beacon.clone()));
         assert!(beacon.singing());
+        // A trio's beacon is a dozen bytes — nowhere near even a legacy advertisement's budget.
+        assert!(bytes.len() <= 20, "{} bytes: {bytes:?}", bytes.len());
 
-        // Idle: willing, but nothing under way. What a duck waiting for company advertises.
+        // Idle: willing, but nothing under way, and nobody seated. What a duck waiting for company
+        // advertises.
         let idle = ChoraleBeacon {
             piece: ChoraleBeacon::IDLE,
-            ..beacon
+            roster: Vec::new(),
+            ..beacon.clone()
         };
         assert!(!idle.singing());
         assert_eq!(
@@ -3579,6 +3777,50 @@ mod tests {
             Some(idle),
             "an idle beacon still round-trips"
         );
+
+        // A duck finds its own seat in the roster, which is how it learns its part.
+        assert_eq!(beacon.seat_of(56, 0x9F), Some(0));
+        assert_eq!(beacon.seat_of(200, 0x71), Some(2));
+        assert_eq!(
+            beacon.seat_of(56, 0x00),
+            None,
+            "same register, different duck"
+        );
+        // And the registers come back as pitch centres for the seating fold.
+        let registers = beacon.roster_registers();
+        assert_eq!(registers.len(), 3);
+        assert!(registers[0] < registers[1] && registers[1] < registers[2]);
+    }
+
+    /// The roster's length is part of the layout, so a truncated or overlong payload is not a
+    /// beacon — a lenient read would seat a quartet from three ducks' worth of bytes.
+    #[test]
+    fn a_roster_of_the_wrong_length_is_not_a_beacon() {
+        let good = ChoraleBeacon {
+            piece: 1,
+            beat: 0,
+            register: 56,
+            id: 1,
+            roster: vec![(56, 1), (140, 2)],
+        };
+        let bytes = good.to_bytes();
+        assert!(ChoraleBeacon::from_bytes(&bytes).is_some());
+        // One byte short, one byte long, and a count that disagrees with what follows.
+        assert_eq!(ChoraleBeacon::from_bytes(&bytes[..bytes.len() - 1]), None);
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(ChoraleBeacon::from_bytes(&long), None);
+        let mut lying = bytes.clone();
+        lying[5] = 4;
+        assert_eq!(ChoraleBeacon::from_bytes(&lying), None);
+        // More ducks than there are parts is not a chorale.
+        let crowd = ChoraleBeacon {
+            roster: vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)],
+            ..good
+        };
+        let bytes = crowd.to_bytes();
+        let back = ChoraleBeacon::from_bytes(&bytes).expect("truncated to four, not refused");
+        assert_eq!(back.roster.len(), ChoraleBeacon::MAX_ROSTER);
     }
 
     /// The tag is what stops a scanner reading the *other* advertising instance's IPv4 address as a
@@ -3595,7 +3837,7 @@ mod tests {
                 "{length} bytes"
             );
         }
-        assert_eq!(ChoraleBeacon::from_bytes(&[0x00, 1, 2, 3, 4]), None);
+        assert_eq!(ChoraleBeacon::from_bytes(&[0x00, 1, 2, 3, 4, 0]), None);
     }
 
     /// The register byte has to be fine enough to cast from and wide enough for every duck, or two
@@ -3608,6 +3850,7 @@ mod tests {
                 beat: 0,
                 register: ChoraleBeacon::quantise_register(hz),
                 id: 0,
+                roster: Vec::new(),
             }
             .pitch_center_hz()
         };
@@ -3660,6 +3903,7 @@ mod tests {
             targets: vec![0.0; 15],
             odom: OdomState::default(),
             theremin: None,
+            chorale: None,
         };
         let down = serde_json::to_string(&state).unwrap();
         assert!(!down.contains("theremin"), "{down}");
@@ -3716,6 +3960,7 @@ mod tests {
             targets: vec![0.0; 15],
             odom: OdomState::default(),
             theremin: None,
+            chorale: None,
         };
 
         let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();

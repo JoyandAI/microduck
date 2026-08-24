@@ -243,7 +243,12 @@ pub fn destination_for(call: &proto::Call) -> Option<(Upstream, Lane)> {
         // The theremin sits here rather than with motor control even though it moves the
         // mouth, because what it is is a sound: the mouth is following the note. Same
         // refusal either way, and the same reason to lift it — an app that can play the duck.
-        RobotSound(_) | RobotTheremin(_) => None,
+        RobotSound(_) | RobotTheremin(_) | RobotChorale(_) => None,
+
+        // The chorale's own namespace is between `btd` and `robotd` — it is how this daemon is told
+        // what to advertise and how it reports what it heard. Not a client surface at all, so a
+        // phone asking for it is asking for something that does not exist for it.
+        ChoraleSubscribe | ChoraleBeaconSet(_) | ChoraleHeard(_) => None,
 
         // Powering the machine off from a phone in the room is `system.reboot` without the
         // coming back. The sit-then-power-off flow wants whoever asked to be watching the
