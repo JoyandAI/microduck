@@ -271,7 +271,11 @@ report_encoders() {
             printf '  %-16s %s\n' "$dev" "${card:-?}"
         fi
     done
-    [ "$found_dev" = 1 ] || printf '  none\n'
+    if [ "$found_dev" != 1 ]; then
+        printf '  none\n'
+        printf '  (an unattached camera looks exactly like this — the rkisp capture nodes\n'
+        printf '   appear only once a sensor is probed, so this is not itself a fault)\n'
+    fi
 
     printf '\n'
     say "verdict"
@@ -288,12 +292,34 @@ report_encoders() {
   and neither Rockchip MPP nor an apt repo for it is needed.
 EOF
     elif [ -e "$MPP_SERVICE" ]; then
-        cat <<EOF
-  No v4l2h264enc, but /dev/mpp_service is present — so the VPU is there and reachable only
-  through Rockchip's MPP. That means librockchip-mpp (not in Debian; Radxa publish debs, and
-  microduck_runtime already installs Radxa debs for rkaiq on this board) plus the
-  gstreamer-rockchip plugin built from source, which has historically tracked GStreamer 1.22
-  APIs against the 1.26 here.
+        cat <<'EOF'
+  No v4l2h264enc, but /dev/mpp_service is present. On a Rockchip BSP kernel that is the
+  expected shape rather than a fault: the VPU is exposed through Rockchip's MPP, not as a V4L2
+  M2M encoder, so the absent v4l2h264enc above is not a missing package.
+
+  Prove the VPU encodes before building any GStreamer plugin. Two debs from Radxa's pool — the
+  same plain-.deb-download route microduck_runtime already uses for rkaiq — plus MPP's own test
+  binary, which needs no GStreamer at all:
+
+    P=https://radxa-repo.github.io/bullseye/pool/main/m/mpp
+    curl -sL -O $P/librockchip-mpp1_1.5.0-1_arm64.deb
+    curl -sL -O $P/rockchip-mpp-demos_1.5.0-1_arm64.deb
+    sudo dpkg -i librockchip-mpp1_1.5.0-1_arm64.deb rockchip-mpp-demos_1.5.0-1_arm64.deb
+    mpi_enc_test -w 1280 -h 720 -t 7 -n 60 -o /tmp/out.h264
+
+  `-t` is MPP's coding enum, 7 being H.264; `mpi_enc_test -h` lists them. A bitstream in
+  /tmp/out.h264 means the hardware encodes and only the GStreamer binding is missing.
+
+  Then try the plugin from that same pool *before* building one:
+
+    G=https://radxa-repo.github.io/bullseye/pool/main/g/gstreamer1.0-rockchip
+    curl -sL -O $G/gstreamer1.0-rockchip1_1.14-4_arm64.deb
+    sudo dpkg -i gstreamer1.0-rockchip1_1.14-4_arm64.deb
+    gst-inspect-1.0 mpph264enc
+
+  It was built against bullseye's GStreamer and this board runs 1.26.2. GStreamer keeps plugin
+  ABI stable across 1.x, so it may simply load — and if it does, the encoder needs no source
+  build at all. Building gstreamer-rockchip against 1.26 is the fallback, not the first move.
 EOF
     else
         cat <<EOF

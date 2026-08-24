@@ -115,19 +115,18 @@ WEIRD_BLE="$ENV_WEIRD_BLE"
 
 # Install the GStreamer stack for `mediad`? Passed to `setup-gstreamer.sh`.
 #
-# Off by default, and that default is about timing rather than taste: nothing here has run on
-# real hardware yet. The board this targets has no GStreamer at all, so the first real run of
-# `setup-gstreamer.sh` *is* its test — apt behaviour and the encoder probe were exercised against
-# fixtures, not a driver.
+# **On** by default, since it installed cleanly and reported correctly on a Radxa Zero 3W
+# (GStreamer 1.26.2 from plain Debian trixie, `webrtcbin` registered, `/dev/mpp_service` found).
+# That was the agreed trigger, and it is deliberately earlier than "when `mediad` ships": waiting
+# for that would leave every board provisioned in between needing a bring-up step someone has to
+# remember, which is the failure this wiring exists to avoid.
 #
-# **Flip this to on the moment it installs cleanly and reports correctly on a board.** Not when
-# `mediad` ships: waiting for that would leave every board provisioned in between needing a
-# bring-up step someone has to remember, which is the failure this wiring exists to avoid. The
-# ~100 MB it costs before `mediad` uses any of it is the cheaper side of that trade.
+# `DUCK_GSTREAMER=0` turns it off — `--no-gstreamer` on `provision-board.sh`. Empty is *not* off,
+# because empty is what an unset environment looks like and the default has to survive that.
 #
-# Unlike `WEIRD_BLE` this is not a per-board quirk — every robot will eventually want it, which is
-# exactly why it should not be a flag anybody has to know about for long.
-GSTREAMER="$ENV_GSTREAMER"
+# Unlike `WEIRD_BLE` this is not a per-board quirk: every robot wants it, which is why it is a
+# default rather than a flag anybody has to know about.
+GSTREAMER="${ENV_GSTREAMER:-1}"
 
 # The branch the operator asked for, or empty. Kept apart from `REF` because they answer different
 # questions: `REF` is always set — it defaults to `main` — and says where the *scripts* come from,
@@ -284,7 +283,7 @@ load_state() {
     DEV_KEY="${ENV_DEV_KEY:-${DUCK_DEV_KEY:-}}"
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
     WEIRD_BLE="${ENV_WEIRD_BLE:-${DUCK_WEIRD_BLE:-}}"
-    GSTREAMER="${ENV_GSTREAMER:-${DUCK_GSTREAMER:-}}"
+    GSTREAMER="${ENV_GSTREAMER:-${DUCK_GSTREAMER:-1}}"
     ASKED_REF="${ENV_REF:-${DUCK_ASKED_REF:-}}"
     # No `ENV_` mirror for the name, unlike its neighbours. Theirs exist because sourcing this file
     # sets the very `DUCK_*` variables the operator's environment did, so the typed value has to be
@@ -527,12 +526,12 @@ phase_two() {
         DUCK_WEIRD_BLE="$WEIRD_BLE" sh "$tmp"
     fi
 
-    # GStreamer, only when asked for — see `GSTREAMER` above for why the default is off.
+    # GStreamer, unless turned off — see `GSTREAMER` above.
     #
     # Here rather than in phase 1 because it changes no boot config and needs no reboot: it is
     # apt packages and a report. Phase 1 exists for the two things that cannot swap under a
     # running kernel, and this is neither.
-    if [ -n "$GSTREAMER" ]; then
+    if [ -n "$GSTREAMER" ] && [ "$GSTREAMER" != 0 ]; then
         if [ -x "$GST_SELF" ]; then
             "$GST_SELF"
         else

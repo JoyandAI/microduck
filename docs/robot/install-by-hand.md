@@ -120,9 +120,9 @@ robotctl system set-name duck-01
 
 ## GStreamer, for a board that will stream
 
-Not part of provisioning by default yet — it becomes the default once it has run on real
-hardware. Until then, ask for it with `--gstreamer` on `provision-board.sh` (`DUCK_GSTREAMER=1`
-here), or run it by hand at any time. No reboot.
+Provisioning does this by default — `--no-gstreamer` on `provision-board.sh`
+(`DUCK_GSTREAMER=0` here) skips it. No reboot either way, so it can be run by hand at any time
+on a board that skipped it.
 
 ```bash
 scp scripts/setup-gstreamer.sh pierre@192.168.1.42:~/
@@ -133,8 +133,11 @@ sudo sh ~/setup-gstreamer.sh
 ```
 
 It prints what this board can encode — which `webrtc*` elements are registered, which H.264
-encoder is reachable, and whether the VPU is exposed by the running kernel. Re-run it after any
-kernel change; that is the event that changes the answer:
+encoder is reachable, and whether the VPU is exposed by the running kernel. On a Zero 3W it
+reports `/dev/mpp_service` and no `v4l2h264enc`, which is the expected shape for a Rockchip BSP
+kernel: the VPU is reached through MPP rather than V4L2, and the report names the two Radxa debs
+that prove it encodes. Re-run it after any kernel change; that is the event that changes the
+answer:
 
 ```bash
 sudo /usr/local/sbin/robot-setup-gstreamer
