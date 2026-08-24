@@ -120,9 +120,9 @@ robotctl system set-name duck-01
 
 ## GStreamer, for a board that will stream
 
-Not part of provisioning yet — `mediad` does not exist, so nothing on the board uses it. Add it
-with `--gstreamer` on `provision-board.sh` (`DUCK_GSTREAMER=1` here), or by hand at any time. No
-reboot.
+Not part of provisioning by default yet — it becomes the default once it has run on real
+hardware. Until then, ask for it with `--gstreamer` on `provision-board.sh` (`DUCK_GSTREAMER=1`
+here), or run it by hand at any time. No reboot.
 
 ```bash
 scp scripts/setup-gstreamer.sh pierre@192.168.1.42:~/

@@ -115,12 +115,18 @@ WEIRD_BLE="$ENV_WEIRD_BLE"
 
 # Install the GStreamer stack for `mediad`? Passed to `setup-gstreamer.sh`.
 #
-# Off by default, and that default is about timing rather than taste: it is around 100 MB of
-# media stack, and until `mediad` exists nothing on a board uses a byte of it. The wiring is
-# what is worth having early — flip this default when `mediad` ships and provisioning gains a
-# camera-capable board with a one-word change, instead of a bring-up step someone has to
-# remember. Unlike `WEIRD_BLE` this is not a per-board quirk: every robot will eventually want
-# it, which is exactly why it should not be a flag anybody has to know about for long.
+# Off by default, and that default is about timing rather than taste: nothing here has run on
+# real hardware yet. The board this targets has no GStreamer at all, so the first real run of
+# `setup-gstreamer.sh` *is* its test — apt behaviour and the encoder probe were exercised against
+# fixtures, not a driver.
+#
+# **Flip this to on the moment it installs cleanly and reports correctly on a board.** Not when
+# `mediad` ships: waiting for that would leave every board provisioned in between needing a
+# bring-up step someone has to remember, which is the failure this wiring exists to avoid. The
+# ~100 MB it costs before `mediad` uses any of it is the cheaper side of that trade.
+#
+# Unlike `WEIRD_BLE` this is not a per-board quirk — every robot will eventually want it, which is
+# exactly why it should not be a flag anybody has to know about for long.
 GSTREAMER="$ENV_GSTREAMER"
 
 # The branch the operator asked for, or empty. Kept apart from `REF` because they answer different

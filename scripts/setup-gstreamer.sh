@@ -88,6 +88,14 @@ KERNEL="${KERNEL:-$(uname -r)}"
 #                               enumerates nothing here. Installing it buys an element that
 #                               finds no camera (`microduck_runtime/radxa_setup/setup.md`).
 #   gstreamer1.0-plugins-rs     does not exist in Debian. See GST_EXTRA_PLUGIN_DIR above.
+#
+# **This list is meant to shrink.** It was assembled from what the pipeline in
+# `microduck_runtime/src/camera.rs` uses plus what `webrtcbin` needs to negotiate, which is a
+# reasoned guess and not a measurement — `mediad` does not exist yet to be profiled against it.
+# Re-read it whenever `mediad`'s pipeline changes shape and drop what nothing loads: every
+# package here is disk on a robot, an apt dependency during provisioning, and a security update
+# somebody has to care about. `gst-inspect-1.0 --plugin` names what a plugin actually provides,
+# which is the check to run before defending an entry.
 RUNTIME_PKGS="gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
 gstreamer1.0-plugins-bad gstreamer1.0-nice libnice10 gstreamer1.0-plugins-ugly v4l-utils"
 

@@ -45,9 +45,10 @@
 #                     `PIN or Key Missing`: that is `Privacy = device` on a board that needed only
 #                     the pause. Try this before `--weird-ble`.
 #   --gstreamer       also install the GStreamer stack `mediad` needs, and print what this board
-#                     can encode. Off by default only because `mediad` does not exist yet — see
-#                     `GSTREAMER` in provision.sh. Needs no reboot, so it is safe to add to a
-#                     board that is already provisioned:  sudo robot-setup-gstreamer
+#                     can encode. Off by default only until it has run on real hardware — see
+#                     `GSTREAMER` in provision.sh, which is where that default flips. Needs no
+#                     reboot, so it is safe to add to an already-provisioned board:
+#                     sudo /usr/local/sbin/robot-setup-gstreamer
 #   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all, even with
 #                     `btd` paused. Implies `--pause-btd-on-pair`, and additionally sets
 #                     `Privacy = device`.
