@@ -132,18 +132,31 @@ the *GStreamer binding*: a plugin that wraps `librockchip-mpp` as an element a p
 Runtime here — `libonnxruntime.so` is installed from a tarball with nothing compiled, and `ort` is
 the binding that makes it reachable.
 
-Prebuilt bindings were looked for and none is usable:
+Prebuilt bindings:
 
-| source | what it has | why not |
-|---|---|---|
-| Radxa `bullseye` pool | `gstreamer1.0-rockchip1_1.14-4` | installed and inspected: `mppvideodec` + `mppjpegdec` only |
-| Radxa `rk3588s2-bookworm` pool | the same `1.14-4` | identical build |
-| [`numbqq/gstreamer-rockchip-debs`](https://github.com/numbqq/gstreamer-rockchip-debs) | `1.14-8`, per-board | RK3588-family boards only, and shipped *beside forked* gstreamer core/base/good/bad debs — a build that expects a patched GStreamer is the wrong thing to drop onto stock 1.26.2 |
+| source | what it has |
+|---|---|
+| Radxa `bullseye` pool | `gstreamer1.0-rockchip1_1.14-4` — installed and inspected: `mppvideodec` + `mppjpegdec` only |
+| Radxa `rk3588s2-bookworm` pool | the same `1.14-4`, byte-identical |
+| [`numbqq/gstreamer-rockchip-debs`](https://github.com/numbqq/gstreamer-rockchip-debs) | `1.14-8` — **has every encoder** |
 
-It is worth two minutes to check whether the `1.14-8` build carries encoders before building, and
-that needs no install — `dpkg -x` it somewhere and point `gst-inspect-1.0` at the `.so` by path.
-Expect to build anyway: it is one small C plugin with meson and every dependency already on the
-board.
+The last one is worth trying before building anything. Its `bookworm/arm64/<board>/` entries are
+symlinks into `jammy/arm64/`, so it is an Ubuntu 22.04 build, from
+`rockchip-linux/gstreamer-rockchip` (now 404) with Jeffy Chen as maintainer — the same upstream
+Radxa built, at a revision with the encoders enabled. `mpph264enc`, `mpph265enc`, `mppjpegenc`
+and `mppvp8enc` are all present in the `.so`.
+
+Its `DT_NEEDED` is satisfied by what a board already has after the debs above:
+`librockchip_mpp.so.1`, `librga.so.2`, `libgstreamer-1.0.so.0`, `libgstvideo`,
+`libgstallocators`, `libgstpbutils`, `libdrm2`, `libglib2.0-0`, `libx11-6`, `libc6 >= 2.33`
+against glibc 2.41. Nothing in it is RK3588-specific — the SoC differences live inside MPP, not
+the plugin — and `Depends` bounds GStreamer only from below (`>= 1.14`).
+
+**Trying it is not the same as depending on it.** It is one person's per-board dump with no
+provenance we control, and it vanishes if that repository does. What it buys cheaply is the answer
+to the only real question about the build — whether this plugin works against *our* MPP and
+GStreamer versions — and if it does, building the same source ourselves is de-risked rather than
+unnecessary. A pinned build of our own is still where this should end up.
 
 **The build could be avoided entirely** by calling MPP's C API from `mediad` over Rust FFI, which
 `mpi_enc_test` proves works. That trades a meson build for hand-written and hand-maintained
