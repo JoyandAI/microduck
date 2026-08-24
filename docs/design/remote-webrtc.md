@@ -110,7 +110,8 @@ out:
 
 - **`system.pairingPin` and `system.setPairingPin`.** A PIN readable over the channel it authorises
   makes the authorisation theatre. Same reasoning as BLE, same answer.
-- **`update.*` mutations.** Not on security grounds — on honesty grounds. §8 explains.
+- **`update.*` mutations.** For now only, and for a different reason than the PIN: applying an
+  update restarts `mediad` and drops the session. Wanted later; §8 is what it will take.
 
 ### Replies are not correlated, deliberately
 
@@ -182,35 +183,57 @@ camelCase:
 Roles are `producer`, `listener`, `consumer`. The robot is a `producer`; `meta` is free-form JSON
 and is where a robot's identity goes.
 
-## 8. Updating the robot over WebRTC: refused, and say so
+## 8. Updating the robot over WebRTC: not yet, and what it will take
 
-`RobotRemoteSessionActive` already exists in `duck-ipc-proto`, and
-`updater/src/preflight.rs::check_no_remote_session` already refuses an update while a remote session
-is up. Nothing sets it true yet, because nothing creates remote sessions.
+Not in the first permitted subset, and **that is a deferral rather than a principle** — a phone
+updating a robot over WebRTC is wanted later, so this section is about what has to be true first
+rather than why it must not be.
 
-Once `mediad` reports honestly, **an update requested over WebRTC refuses itself.** That is not a
-bug to work around. Restarting `mediad` mid-session drops the session, so the client that asked
-would lose the connection it was watching progress on — and `update-over-ble.md` records what
-"start an update and watch it" failing silently already cost once.
+What makes it awkward today: applying an update restarts `mediad`, which drops the session the
+client is watching progress on. `update-over-ble.md` records what "start an update and watch it"
+failing silently already cost once, and a session that vanishes mid-update is the same shape of
+problem. So the first subset leaves `update.*` mutations out and BLE stays the transport that
+survives the restart. Read-only `update.*` calls are in from the start — seeing version and history
+over a remote session is useful and costs nothing.
 
-So: `update.*` mutations are not in WebRTC's permitted subset, and the refusal names the reason and
-points at BLE, which is the transport that survives the restart. Read-only `update.*` calls stay
-available, because seeing the version and history over a remote session is useful and harmless.
+Two things have to change for the mutations, and both are small and specific:
 
-## 9. Authority: the thing this feature breaks
+- **The client has to survive the restart.** The protocol already supports it: progress is pushed
+  as a JSON-RPC *notification*, which `duck-ipc-proto` documents precisely so a client that
+  reconnects mid-update can resubscribe and keep receiving them. So the work is a client that
+  reconnects and re-subscribes, not a change to the wire format.
+- **`RobotRemoteSessionActive` has to get more specific.**
+  `updater/src/preflight.rs::check_no_remote_session` refuses an update while a remote session is
+  up, which is right when the session is a *bystander* — someone is on a telepresence call and
+  should not have the robot restarted under them. It is wrong when the session is the *requester*.
+  Nothing sets that flag true yet, so the distinction can be designed in rather than retrofitted:
+  the check needs to know whether this update was asked for over the session it is about to drop.
+
+Worth writing down now precisely because nothing sets the flag yet. The moment `mediad` reports
+honestly, an update requested over WebRTC would refuse itself, and that would look like a bug in
+the update path rather than a missing distinction here.
+
+## 9. Authority: the premise this feature breaks, noted and not acted on
 
 `intents.rs` says its slots are "single-writer in practice, so last-writer-wins means what it
-says". That premise is true with one gamepad. **It is false the moment a pad and a remote peer both
+says". That is true with one gamepad. **It stops being true the moment a pad and a remote peer both
 drive**, and the failure is not a contest — it is two writers at 50 Hz interleaving into one slot,
 producing a robot that obeys neither.
 
-`architecture.md` §6 already calls for defined priority and handoff rather than last-writer-wins,
-with local physical able to preempt remote, and the roadmap defers it to M6. **WebRTC is what makes
-it due**, so it lands with this rather than after it: an intent carries its source, the loop
-resolves by priority, and a remote peer cannot quietly take the robot from someone holding a pad.
+**Deliberately not solved here.** It is recorded so that a confusing robot has an explanation
+waiting, and because the flag that eventually resolves it is cheaper to design before there are two
+transports than after. `architecture.md` §6 owns the requirement — defined priority and handoff,
+local physical able to preempt remote — and the roadmap has it in M6.
 
-This is the one part of this document that changes a file `robotd` owns, and it is the part most
-worth arguing about before it is written.
+When it is time, the cheap answer is a **single-writer token**: one peer holds the right to write
+intents, others are observers, and handing it over is explicit. That is much less than §6's full
+arbitration and it removes the interleaving, which is the part that produces nonsense rather than
+merely the wrong winner. Priority ordering — physical preempting remote without asking — can come
+after, on top of the same token.
+
+What this section is *for* until then: knowing that two simultaneous drivers is a known gap rather
+than a mystery, and that the first symptom is a robot ignoring both inputs rather than obeying the
+wrong one.
 
 ## 10. Deferred, with reasons
 
