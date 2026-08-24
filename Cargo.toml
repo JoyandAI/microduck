@@ -17,6 +17,18 @@ members = ["btd", "configd", "duck-control", "duck-ipc-proto", "kinematics", "od
 floor  = "1.23"
 target = "1.28.0"
 
+# The prebuilt GStreamer plugins `mediad` needs, built in CI from pinned upstream sources at
+# https://github.com/pollen-robotics/microduck-gst-plugins — `mpph264enc` (hardware H.264 through
+# Rockchip MPP) and `webrtcsink`/`webrtcsrc`, neither of which exists in any Debian suite.
+#
+# One source of truth, for the same reason `[workspace.metadata.onnxruntime]` above is one:
+# `scripts/setup-gstreamer.sh` is fetched standalone with curl and cannot read this file, so it
+# carries a literal, and a test asserts the two agree. Two copies of a version drifting apart is
+# how a board ended up with an ONNX Runtime its `ort` panics on.
+[workspace.metadata.gst-plugins]
+repo    = "pollen-robotics/microduck-gst-plugins"
+version = "v1"
+
 [workspace.package]
 version = "0.9.1"
 edition = "2024"

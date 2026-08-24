@@ -49,6 +49,25 @@ WANT_DEV=0
 # lands. GStreamer does not scan it by default, hence the GST_PLUGIN_PATH advice in the report.
 GST_EXTRA_PLUGIN_DIR=/usr/local/lib/gstreamer-1.0
 
+# The prebuilt plugins, and the release they come from.
+#
+# `mpph264enc` (hardware H.264 through Rockchip MPP) and `webrtcsink`/`webrtcsrc` are in no Debian
+# suite, so they are built in CI — natively on an arm64 runner in a debian:trixie container, which
+# is the robot's own userland — and published at:
+#
+#   https://github.com/pollen-robotics/microduck-gst-plugins
+#
+# **A pinned version, never "latest".** Two provisioning runs a day apart that produce different
+# plugins, with nothing recording which, is an unreproducible media bug waiting to happen. This is
+# the same lesson `ONNX_VERSION` in `setup-board.sh` carries, and an xtask test asserts this
+# literal matches `[workspace.metadata.gst-plugins]` in Cargo.toml — this script is fetched
+# standalone with curl and cannot read the manifest itself.
+#
+# The repository is public on purpose: the download happens during provisioning and, later, from
+# the updater's preinstall hook, which runs with a cleared environment and no token.
+PLUGINS_REPO="${PLUGINS_REPO:-pollen-robotics/microduck-gst-plugins}"
+PLUGINS_VERSION="${PLUGINS_VERSION:-v1}"
+
 # What the encoder probe looks at. Variables rather than literals for the reason
 # `setup-board.sh` makes CMDLINE one: the interesting states of this check are a board that
 # has no VPU node and a board on the wrong kernel, and those are exactly the states you least
@@ -382,6 +401,66 @@ EOF
     fi
 }
 
+# Install the prebuilt plugins at the pinned version.
+#
+# Into GST_EXTRA_PLUGIN_DIR rather than the distro's plugin directory, so an `apt` operation can
+# never quietly replace or remove them, and so which copy registers is not left to chance when a
+# packaged `gstreamer1.0-rockchip1` is also present.
+#
+# A stamp file records the installed version. Re-running then costs nothing, which matters because
+# this script is also the thing you run to *re-check* the report after a kernel change.
+install_plugins() {
+    stamp="${GST_EXTRA_PLUGIN_DIR}/.version"
+    if [ "$(cat "$stamp" 2>/dev/null || true)" = "$PLUGINS_VERSION" ]; then
+        say "plugins already at ${PLUGINS_VERSION}"
+        return 0
+    fi
+
+    name="microduck-gst-plugins-${PLUGINS_VERSION}-aarch64"
+    base="https://github.com/${PLUGINS_REPO}/releases/download/${PLUGINS_VERSION}"
+    tmp="$(mktemp -d)"
+
+    say "fetching ${name}"
+    # Warn rather than die: the packages and the udev rule above are done and still valuable, and
+    # the report below will show the elements missing. A hard stop here would also make a network
+    # blip look like a broken script.
+    if ! curl -fsSL -o "${tmp}/${name}.tar.gz" "${base}/${name}.tar.gz" \
+        || ! curl -fsSL -o "${tmp}/${name}.tar.gz.sha256" "${base}/${name}.tar.gz.sha256"; then
+        rm -rf "$tmp"
+        warn "could not download ${name} from ${base}
+  Hardware encoding and webrtcsink will be unavailable; everything else here is done. Check the
+  network, or that ${PLUGINS_VERSION} is a released tag of ${PLUGINS_REPO}, and re-run."
+        return 0
+    fi
+
+    # Verified before anything is unpacked. `sha256sum -c` reads the bare filename out of the
+    # sums file, so it has to run from the directory holding the tarball.
+    if ! ( cd "$tmp" && sha256sum -c "${name}.tar.gz.sha256" >/dev/null 2>&1 ); then
+        rm -rf "$tmp"
+        warn "${name}.tar.gz does not match its published sha256 — not unpacking it."
+        return 0
+    fi
+
+    tar -xzf "${tmp}/${name}.tar.gz" -C "$tmp" || {
+        rm -rf "$tmp"
+        warn "could not unpack ${name}.tar.gz"
+        return 0
+    }
+
+    install -d "$GST_EXTRA_PLUGIN_DIR"
+    for so in "${tmp}/${name}"/*.so; do
+        [ -e "$so" ] || continue
+        install -m 0644 "$so" "${GST_EXTRA_PLUGIN_DIR}/$(basename "$so")"
+    done
+    # The manifest travels with them: it names the upstream repository and commit each plugin was
+    # built from, which is what makes a media bug on this board traceable to a specific build.
+    [ -f "${tmp}/${name}/MANIFEST" ] \
+        && install -m 0644 "${tmp}/${name}/MANIFEST" "${GST_EXTRA_PLUGIN_DIR}/MANIFEST"
+    printf '%s\n' "$PLUGINS_VERSION" > "$stamp"
+    rm -rf "$tmp"
+    say "installed ${name} into ${GST_EXTRA_PLUGIN_DIR}"
+}
+
 # Give the VPU node a group, so a non-root `mediad` can open it.
 #
 # `/dev/mpp_service` arrives as 0600 root:root, and the failure that causes is silent: a non-root
@@ -483,7 +562,8 @@ main() {
     # shellcheck disable=SC2086
     [ "$WANT_DEV" = 0 ] || install_missing $DEV_PKGS
     # After the packages, before the report: a udev problem must not be what stops GStreamer
-    # installing, and the report should show the node as this run leaves it.
+    # installing, and the report should show the board as this run leaves it.
+    install_plugins
     configure_vpu_access
     report
 }

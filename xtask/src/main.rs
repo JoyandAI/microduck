@@ -1210,6 +1210,31 @@ mod tests {
         );
     }
 
+    /// Same trap, same shape: `scripts/setup-gstreamer.sh` is fetched standalone with `curl`, so
+    /// it carries a literal plugin version and cannot read Cargo.toml. A drift here is a board
+    /// running plugins nobody can name — which is exactly what building them ourselves, from
+    /// pinned sources, was for.
+    #[test]
+    fn setup_gstreamer_pins_the_same_plugin_version() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let meta = &manifest["workspace"]["metadata"]["gst-plugins"];
+        let version = meta["version"].as_str().unwrap();
+        let repo = meta["repo"].as_str().unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-gstreamer.sh")).unwrap();
+        for expected in [
+            format!("PLUGINS_VERSION=\"${{PLUGINS_VERSION:-{version}}}\""),
+            format!("PLUGINS_REPO=\"${{PLUGINS_REPO:-{repo}}}\""),
+        ] {
+            assert!(
+                script.contains(&expected),
+                "setup-gstreamer.sh must carry the line {expected:?}"
+            );
+        }
+    }
+
     /// The shipped hook must be fully substituted. A placeholder reaching a board would be
     /// compared against a version number and silently fail every board the same way.
     #[test]

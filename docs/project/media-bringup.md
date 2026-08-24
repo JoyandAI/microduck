@@ -116,7 +116,13 @@ Two plugins, for two unrelated reasons. Neither substitutes for the other.
 | plugin | source | gives | why it cannot be installed |
 |---|---|---|---|
 | `gstreamer-rockchip` | [`JeffyCN/mirrors`](https://github.com/JeffyCN/mirrors) branch `gstreamer-rockchip`, meson | `mpph264enc` — the hardware encoder | Debian has no Rockchip encoder at all, and Radxa's build predates the encoders |
-| `gst-plugin-webrtc` | [`gst-plugins-rs`](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs), cargo-c | `webrtcsink`, `webrtcsrc` | `gst-plugins-rs` is packaged in **no** Debian suite |
+| `gst-plugin-webrtc` | [`gst-plugins-rs`](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs) at 0.15.3, cargo-c | `webrtcsink`, `webrtcsrc` | `gst-plugins-rs` is packaged in **no** Debian suite |
+
+0.15.3 rather than the 0.14.5 the `reachy_mini` SDK documents: 0.14.5 is the floor that matters —
+below it a `webrtcsink` deadlock fix between remote description and ICE handling is missing, which
+presents as a client spinning forever on "connecting" — and 0.15.3 is simply newer. Both series
+declare a GStreamer `v1_22` feature floor and the robot runs 1.26.2, so the newer one costs
+nothing.
 
 `webrtcbin` **is** installed, from `gstreamer1.0-plugins-bad`. So a WebRTC session is reachable
 today without the second build — at the cost of implementing the signalling protocol ourselves.
@@ -152,17 +158,38 @@ Its `DT_NEEDED` is satisfied by what a board already has after the debs above:
 against glibc 2.41. Nothing in it is RK3588-specific — the SoC differences live inside MPP, not
 the plugin — and `Depends` bounds GStreamer only from below (`>= 1.14`).
 
-`scripts/build-gst-rockchip.sh` builds ours: pinned to
-`JeffyCN/mirrors@dcbcd6454ef892e385b3a782600369eb6c0719db` (2026-05-21), natively on the board,
-with `rkximage` and `kmssrc` — the X11 and KMS sinks in the same tree — **disabled**. A headless
-robot has no use for either, and they are why the prebuilt deb depends on `libx11-6`. It installs
-to `/usr/local/lib/gstreamer-1.0` rather than the distro plugin directory, so `apt` can never
-quietly replace or remove it, and prints the commit and sha256 needed to pin the result.
+Ours are built in [`microduck-gst-plugins`](https://github.com/pollen-robotics/microduck-gst-plugins)
+— a repository of its own, deliberately:
 
-The build has one trap worth knowing: `gst/rockchipmpp/meson.build` ends in
-`if not mpp_dep.found() → subdir_done()`, so a missing `librockchip-mpp-dev` makes meson **skip
-the plugin and succeed**, producing nothing. The script checks `pkg-config` for `rockchip_mpp`
-and `librga` up front and refuses rather than discovering an empty build.
+- **Not on the board.** An RK3566 compiles the Rust half far too slowly to wait for.
+- **Not cross-compiled either.** The daemon cross-builds with `cargo-zigbuild`, and
+  `scripts/ci-cross-deps.sh` says outright that its one C dependency "is the cost of that one
+  exception, and it is worth reading before adding another". GStreamer would be a much larger
+  second one, and both routes — x86 multiarch, or a sysroot with a meson cross file — link against
+  an approximation of the target.
+- **Natively, on an arm64 runner in a `debian:trixie` container**, which is the robot's own
+  userland. Nothing is approximated. arm64 runners are free on public repositories.
+- **Public** for a second reason that matters more: the download happens during provisioning and
+  from the updater's `preinstall` hook, which runs with a cleared environment and **no token**. The
+  same arrangement the daemon already relies on for ONNX Runtime.
+
+It builds both plugins, pins upstream by commit or tag in one `pins.env`, disables `rkximage` and
+`kmssrc` (the X11 and KMS sinks in the same tree — a headless robot needs neither, and they are why
+the prebuilt Radxa deb depends on `libx11-6`), and publishes a tarball plus its sha256 with a
+`MANIFEST` naming the exact upstream ref per plugin. That manifest is the thing the third-party deb
+could not answer.
+
+Two traps it guards, both found by reading the trees rather than by failing:
+`gst/rockchipmpp/meson.build` ends in `if not mpp_dep.found() → subdir_done()`, so a missing
+`librockchip-mpp-dev` makes meson **skip the plugin and succeed**; and `dpkg -i` resolves nothing
+for direct `.deb` downloads, so the Radxa closure is installed in one call.
+
+`scripts/setup-gstreamer.sh` consumes it at a **pinned** version — never "latest". Two
+provisioning runs a day apart producing different plugins, with nothing recording which, is an
+unreproducible media bug waiting to happen. The pin lives in
+`[workspace.metadata.gst-plugins]` in `Cargo.toml`, the script carries the literal because it is
+fetched standalone with `curl`, and an `xtask` test asserts they agree — the same arrangement, and
+the same reason, as `ONNX_VERSION`.
 
 **Trying the third-party deb is not the same as depending on it.** It is one person's per-board dump with no
 provenance we control, and it vanishes if that repository does. What it buys cheaply is the answer
