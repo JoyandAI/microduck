@@ -312,73 +312,94 @@ report_encoders() {
         printf '   appear only once a sensor is probed, so this is not itself a fault)\n'
     fi
 
+
     printf '\n'
     say "verdict"
-    if have_element v4l2h264enc && [ "$found_encoder" = 1 ]; then
+
+    # Ordered by what is *true*, not by what is interesting. The first branch is the one a
+    # working board hits, and it stays short — a report that prints setup instructions to a board
+    # that has already done the setup is worse than one that prints nothing, because it reads as
+    # "something is still wrong here".
+    if have_element mpph264enc; then
+        # Which file is answering matters: the distro package and this script's plugin directory
+        # can both provide `rockchipmpp`, and which one the registry keeps is not defined.
+        provider="$(GST_PLUGIN_PATH="${GST_EXTRA_PLUGIN_DIR}${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}" \
+            gst-inspect-1.0 mpph264enc 2>/dev/null \
+            | sed -n 's/^  Filename *//p' | head -1)"
+        printf '  Hardware H.264 is available through mpph264enc.\n'
+        printf '  %-14s %s\n' provided-by "${provider:-?}"
+        if dpkg -s gstreamer1.0-rockchip1 >/dev/null 2>&1; then
+            warn "gstreamer1.0-rockchip1 is also installed and provides the same elements from
+  /usr/lib. Two copies on the search path is a coin flip apt can change under you:
+      sudo dpkg -r gstreamer1.0-rockchip1"
+        fi
         cat <<EOF
-  Hardware H.264 looks reachable through v4l2h264enc, with no out-of-tree anything. Confirm
-  it actually encodes before believing it — a registered element and a working one are
-  different claims:
 
-    gst-launch-1.0 -v videotestsrc num-buffers=60 ! video/x-raw,width=1280,height=720 \\
-      ! v4l2h264enc ! h264parse ! fakesink
+  Registering is not encoding. One command settles that:
 
-  If that runs at speed, mediad's pipeline is appsrc ! v4l2h264enc ! h264parse ! webrtcsink
-  and neither Rockchip MPP nor an apt repo for it is needed.
+    gst-launch-1.0 videotestsrc num-buffers=60 ! video/x-raw,width=1280,height=720 \\
+      ! mpph264enc ! h264parse ! filesink location=/tmp/gst.h264
+    gst-launch-1.0 filesrc location=/tmp/gst.h264 ! h264parse ! avdec_h264 ! fakesink
+
+  Four properties are decisions rather than defaults to inherit, all read off the element on a
+  board — \`gst-inspect-1.0 mpph264enc\` has the full list:
+
+    profile=baseline      defaults to high; WebRTC's interoperable floor is Constrained
+                          Baseline (profile-level-id 42e01f)
+    header-mode=each-idr  defaults to first-frame, which puts SPS/PPS in the first frame only,
+                          so a peer that joins late or drops it never decodes
+    rotation=180          on the alpha, whose camera is mounted upside down. The encoder does
+                          it in hardware; videoflip costs a CPU pass per frame
+    bps=<target>          rc-mode is already cbr, which is right for a lossy link, but the
+                          bitrate should not be left on "auto calculate"
+
+  There is no B-frame property, so the latency budget's no-B-frames requirement holds by
+  construction, and the sink pad takes NV12 — which is what the rkisp capture path emits, so
+  nothing converts between capture and encode.
 EOF
     elif [ -e "$MPP_SERVICE" ]; then
-        cat <<'EOF'
-  No v4l2h264enc, but /dev/mpp_service is present. On a Rockchip BSP kernel that is the
-  expected shape rather than a fault: the VPU is exposed through Rockchip's MPP, not as a V4L2
-  M2M encoder, so the absent v4l2h264enc above is not a missing package.
+        cat <<EOF
+  /dev/mpp_service is present but mpph264enc is not registered. On a Rockchip BSP kernel the
+  VPU is reached through MPP rather than as a V4L2 M2M encoder, so the absent v4l2h264enc above
+  is the expected shape and not the problem.
 
-  Prove the VPU encodes before building any GStreamer plugin. Two debs from Radxa's pool — the
-  same plain-.deb-download route microduck_runtime already uses for rkaiq — plus MPP's own test
-  binary, which needs no GStreamer at all:
+  **Suspect the node before the plugin.** An MPP plugin registers its decoders unconditionally
+  and *probes MPP* before registering its encoders, so at 0600 root:root the encoders are
+  silently omitted from a plugin that contains them — which is what made Radxa's own deb look
+  decode-only when it is not. Check the mode printed above; this script installs the udev rule
+  that fixes it, and a user needs to be in the \`video\` group:
+
+    sudo usermod -aG video "\$USER"      # then log in again, or: newgrp video
+
+  If the mode is right and it is still missing, the plugins are absent or MPP's userspace is.
+  librockchip-mpp1 and librga2 are not in Debian; this script installs the plugins, and MPP's
+  own test binary proves the hardware with no GStreamer involved at all:
 
     R=https://radxa-repo.github.io/bullseye/pool/main
-    curl -sL -O $R/m/mpp/librockchip-mpp1_1.5.0-1_arm64.deb
-    curl -sL -O $R/m/mpp/librockchip-vpu0_1.5.0-1_arm64.deb
-    curl -sL -O $R/m/mpp/rockchip-mpp-demos_1.5.0-1_arm64.deb
-    sudo dpkg -i librockchip-mpp1_1.5.0-1_arm64.deb librockchip-vpu0_1.5.0-1_arm64.deb \
+    curl -sL -O \$R/m/mpp/librockchip-mpp1_1.5.0-1_arm64.deb
+    curl -sL -O \$R/m/mpp/librockchip-vpu0_1.5.0-1_arm64.deb
+    curl -sL -O \$R/m/mpp/rockchip-mpp-demos_1.5.0-1_arm64.deb
+    sudo dpkg -i librockchip-mpp1_1.5.0-1_arm64.deb librockchip-vpu0_1.5.0-1_arm64.deb \\
       rockchip-mpp-demos_1.5.0-1_arm64.deb
     sudo mpi_enc_test -w 1280 -h 720 -t 7 -n 60 -o /tmp/out.h264
 
-  All three debs in one dpkg call: rockchip-mpp-demos depends on librockchip-vpu0 at exactly
-  1.5.0-1, so installing it alongside mpp1 alone leaves the demos package unconfigured.
+  All three in one dpkg call — these are direct downloads, so dpkg resolves nothing and
+  rockchip-mpp-demos needs librockchip-vpu0 at exactly that version. And check the file size,
+  not the exit code: against an unopenable node that test writes nothing and still exits 0.
+EOF
+    elif have_element v4l2h264enc && [ "$found_encoder" = 1 ]; then
+        cat <<EOF
+  Hardware H.264 looks reachable through v4l2h264enc, with no out-of-tree anything — which is
+  not the shape a Rockchip BSP kernel usually has, so confirm it encodes before believing it:
 
-  **sudo, and check the file size.** At 0600 root:root the test writes nothing and still exits
-  0 — no error, no log line — so `exit=0` is evidence of nothing. A non-empty /tmp/out.h264 is:
-  60 frames of 720p came out at ~428 KB on a Zero 3W.
-
-  `-t` is MPP's coding enum, 7 being H.264; `mpi_enc_test -h` lists them. A bitstream in
-  /tmp/out.h264 means the hardware encodes and only the GStreamer binding is missing.
-
-  If mpph264enc is missing above, suspect the node before the plugin. An MPP plugin registers
-  its decoders unconditionally and *probes MPP* before registering its encoders, so at 0600
-  root:root the encoders are silently omitted from a plugin that contains them. That is what
-  made Radxa's own deb look decode-only when it is not.
-
-  Three notes, one settled and two not.
-
-  **The bitstream is sound.** Upstream reports poor or invalid H.264 from mpph264enc on 6.1
-  kernels and suggests mpph265enc instead. That does not reproduce here: what mpi_enc_test
-  produced decodes clean through avdec_h264 — High profile, level 4, 4:2:0 8-bit, 1280x720 at
-  30 fps, no errors, 60 frames in 0.29 s. H.264 stays; H.265 would be the worse codec for
-  browser reach anyway.
-
-  **The profile is not settled.** WebRTC's interoperable floor is Constrained Baseline
-  (`profile-level-id 42e01f`) and the VPU emits High by default. Current browsers negotiate
-  High, older peers will not, so `mediad` should set the profile deliberately rather than
-  inherit whatever the encoder defaults to.
-
-  **/dev/mpp_service needs a udev rule** before a non-root `mediad` can open it at all — see
-  the mode printed above.
+    gst-launch-1.0 -v videotestsrc num-buffers=60 ! video/x-raw,width=1280,height=720 \\
+      ! v4l2h264enc ! h264parse ! fakesink
 EOF
     else
         cat <<EOF
-  No hardware H.264 path found: no v4l2h264enc, no /dev/mpp_service, no M2M node. Either this
-  is not the vendor kernel (see above), or the VPU is not exposed by this build.
+  No hardware H.264 path found: no mpph264enc, no v4l2h264enc, no /dev/mpp_service, no M2M
+  node. Either this is not the vendor kernel (see above), or the VPU is not exposed by this
+  build.
 
   x264enc is installed and will work, at a cost worth stating: software H.264 on four A55s
   shares the CPU with robotd's control loop, and jpegenc already cannot hold 30 fps at VGA on
