@@ -176,7 +176,8 @@ mode = "walk"
 # How long the robot goes without a velocity intent before it stops.
 #
 # Stop, not limp: losing contact with a client should leave a biped standing, because
-# standing is its safe state. Losing balance is the other event, and it goes limp instead.
+# standing is its safe state. Losing balance is the other event, and limp_fall below is
+# what answers it — this one only ever zeroes the velocity.
 # deadman_ms = 500
 
 # The gain limp-fall yields at — low enough to give way rather than fight the floor.
