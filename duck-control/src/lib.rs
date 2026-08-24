@@ -8,6 +8,7 @@
 //! seam. Observations, the policy runner and the safety layer arrive with slice 2.
 
 pub mod bus;
+pub mod fall;
 pub mod imu;
 pub mod io;
 pub mod model;
