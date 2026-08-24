@@ -68,6 +68,12 @@ const MAX_LINE: usize = 64 * 1024;
 /// journal size cap it is what *evicts* the logs support needs.
 const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How fast the beak follows the vowel being sung, as a time constant.
+///
+/// A vowel is a step — `ah` opens the mouth to 0.90 and `mm` to 0.02 — and a servo asked to jump
+/// between them on a 20 ms tick twitches rather than sings. This is roughly how fast a jaw moves.
+const CHORALE_MOUTH_TAU_S: f64 = 0.09;
+
 /// How far a subscriber may fall behind before it starts losing frames.
 ///
 /// Five seconds at 50 Hz. State is advisory: a client that cannot keep up gets a gap, never
@@ -1220,6 +1226,9 @@ async fn control_loop<T: RobotIo>(
     // opening for no reason.
     let mut theremin = (params.theremin.enabled && params.audio.enabled)
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
+    // How far the beak is open for the chorale, slewed across ticks — see where it is written.
+    let mut chorale_mouth = 0.0f64;
+
     // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
     // the note at its own pitch instead of gliding to the bottom of the range on its way out.
     let mut theremin_hz = 0.0f64;
@@ -1918,37 +1927,55 @@ async fn control_loop<T: RobotIo>(
                 // is about once a beat rather than fifty times a second.
                 let _ = state.chorale_tx.send(advertise);
             }
-            match tick.singing {
+            // The mouth: a target from the vowel being sung, written on every tick **while a
+            // chorale is up** — which is the bug this replaced. Writing it only while a note
+            // actually sounded left the target at whatever the hold pose had put there between
+            // notes, so a beak could simply stay open.
+            //
+            // "While a chorale is up" and not "while this robot may sing", which was the *second*
+            // bug: owning the mouth whenever `[chorale] accept` was true meant the trigger could
+            // not open it any more, on a robot that was not singing and might never sing. Opting in
+            // grants the chorale nothing until it is actually running.
+            let mouth_target = match tick.singing {
                 Some((part, beats)) => {
                     if let Some(voice) = voice.as_mut()
                         && voice.sing_start(ensemble.score(), part)
                     {
                         voice.sing_at(beats, true);
                     }
-                    // Singing opens the beak, and the head lifts with the line — a duck that sang
-                    // with a still head would read as a speaker rather than a singer.
-                    if snapshot.enabled && bringup == Bringup::Ready {
-                        let open = ensemble
-                            .score()
-                            .line(part)
-                            .find(|note| beats >= note.start_beat && beats < note.end_beat())
-                            .map_or(0.0, |note| note.vowel.open());
-                        targets[duck_control::model::MOUTH_INDEX] =
-                            duck_control::model::mouth_target(open);
-                    }
+                    ensemble
+                        .score()
+                        .line(part)
+                        .find(|note| beats >= note.start_beat && beats < note.end_beat())
+                        .map_or(0.0, |note| note.vowel.open())
                 }
                 None => {
                     if let Some(voice) = voice.as_mut() {
                         voice.sing_stop();
                     }
+                    0.0
                 }
+            };
+            if ensemble.active() {
+                // Slewed, not snapped. A vowel is a step — `ah` is 0.90 and `mm` is 0.02 — and a
+                // servo asked to jump between them on a 20 ms tick twitches rather than sings.
+                let alpha = (period.as_secs_f64() / CHORALE_MOUTH_TAU_S).clamp(0.0, 1.0);
+                chorale_mouth += (mouth_target - chorale_mouth) * alpha;
+                if snapshot.enabled && bringup == Bringup::Ready {
+                    targets[duck_control::model::MOUTH_INDEX] =
+                        duck_control::model::mouth_target(chorale_mouth);
+                }
+                chorale_state = Some(proto::ChoraleState {
+                    listening: true,
+                    part: tick.singing.map(|(part, _)| part.as_str().to_owned()),
+                    beats: tick.singing.map(|(_, beats)| beats),
+                    voices: tick.voices as u32,
+                });
+            } else {
+                // Nothing on the wire and nothing on the servo: the mouth belongs to whoever else
+                // wants it, which is the trigger.
+                chorale_mouth = 0.0;
             }
-            chorale_state = Some(proto::ChoraleState {
-                listening: ensemble.active(),
-                part: tick.singing.map(|(part, _)| part.as_str().to_owned()),
-                beats: tick.singing.map(|(_, beats)| beats),
-                voices: tick.voices as u32,
-            });
         }
 
         // The mouth is not part of any policy; the intent is the only thing that moves it.

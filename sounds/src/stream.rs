@@ -71,7 +71,11 @@ const FORMANT_RANGE: f64 = 3.0;
 const OPEN_TILT_LIFT: f64 = 0.8;
 
 /// Headroom under full scale for the static gain, before the soft clip.
-const PEAK: f32 = 0.75;
+///
+/// The worst case it bounds is every harmonic in phase, which is rare — so the *typical* peak sits
+/// well below this and there is real headroom for the AM and the breath that go on top. Deliberately
+/// under the bank's own −4 dBFS: a synthesized voice can be asked for a level a recorded one cannot.
+const PEAK: f32 = 0.62;
 
 /// How steeply a small speaker falls away below its useful range, in dB per octave.
 ///
@@ -87,7 +91,11 @@ const ROLLOFF_DB_PER_OCTAVE: f64 = 12.0;
 /// renormalising it would turn a note the speaker cannot make into a loud note the speaker cannot
 /// make. Clamped, so a bass note off the bottom of the instrument stays quiet instead of becoming
 /// distortion.
-const MAX_BASS_LIFT: f64 = 4.0;
+///
+/// Was 4×, which on the robot sounded saturated: a full redistribution piles the whole note onto
+/// harmonics two to four, and that much upper-harmonic energy through a small driver is harsh rather
+/// than loud. 2× recovers most of the audibility for a fraction of the harshness.
+const MAX_BASS_LIFT: f64 = 2.0;
 
 /// How often the harmonic weights are recomputed, in samples (~5 ms).
 ///

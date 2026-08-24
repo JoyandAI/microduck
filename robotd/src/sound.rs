@@ -52,6 +52,16 @@ const SYNTH_BLOCK: usize = sounds::SR as usize / 100;
 /// this number — see the module docs for why it is not the ride's 250 ms.
 const SYNTH_LEAD_S: f64 = 0.03;
 
+/// How loud one voice of an ensemble sings.
+///
+/// Under full scale, and not for headroom: **four ducks in a room sum acoustically.** The offline
+/// preview divides its mix by the square root of the voice count for exactly this reason; on real
+/// hardware nothing divides anything, so each duck has to arrive already knowing it is one of
+/// several. A single duck singing alone is therefore a little quiet, which is the right way round —
+/// the alternative was a quartet that saturated, which is what the first run on the robot sounded
+/// like.
+const CHORALE_LEVEL: f64 = 0.55;
+
 /// Where the duck's own speaker gives up, hertz.
 ///
 /// Measured by ear rather than from a datasheet: the chorale's 130 Hz bass line did not come
@@ -494,7 +504,7 @@ impl Sound {
                             voice.set(
                                 sounds::chorale::midi_hz(f64::from(note.midi)) * detune,
                                 if held {
-                                    note.level * note.vowel.level_scale()
+                                    note.level * note.vowel.level_scale() * CHORALE_LEVEL
                                 } else {
                                     0.0
                                 },

@@ -632,22 +632,42 @@ pub fn seat_for(personality: &Personality, part: Part) -> Singer {
     }
 }
 
-/// Every duck's part, from an ordered roster of registers.
+/// Every duck's part, from a roster of registers — the roster's own order in, parts out.
 ///
-/// **This is what stops two ducks singing each other's line.** Seating depends on join order, so a
-/// duck that seats itself from whatever it happens to have heard will disagree with a duck that
-/// heard a different subset — and the two would then both sing alto. So the *conductor* keeps the
-/// roster, broadcasts it in order, and everyone replays this function over it: one source of truth,
-/// which is what a conductor is for.
+/// **This is what stops two ducks singing each other's line.** A duck that seats itself from
+/// whatever it happens to have heard disagrees with a duck that heard a different subset, and the
+/// two then both sing alto. So the *conductor* keeps the roster, broadcasts it, and everyone
+/// replays this function over it: one source of truth, which is what a conductor is for.
 ///
-/// A pure fold of [`seat_by_register`], so a duck joining changes nobody's part — the same
-/// invariant, now agreed across the room rather than only locally.
+/// **By register, not by roster position.** This was a fold of [`seat_by_register`] down the roster
+/// in join order, which preserved a lovely invariant — a duck joining moved nobody — and got the
+/// parts wrong, which matters more. `Part::ensemble(1)` is `[Soprano]`, so the fold gave the *first*
+/// duck the soprano line whatever its voice was, and the second the bass: parts by arrival order,
+/// with the register ignored entirely. On two real ducks the low one sang soprano.
+///
+/// So the parts of `Part::ensemble(n)` are handed out in register order, lowest voice to lowest
+/// part. Because those sets are nested, a duck arriving at the register the ensemble was missing
+/// still moves nobody; a duck arriving *below* the current bass does shift one part, and that is the
+/// price of having everybody on the right line to begin with.
 pub fn seat_all(registers: &[f64]) -> Vec<Part> {
-    let mut held: Vec<Part> = Vec::new();
-    for register in registers {
-        held.push(seat_by_register(&held, *register));
+    let parts = Part::ensemble(registers.len());
+    // Roster positions, ordered by the voice at each — so the answer comes back in roster order
+    // while the *parts* are assigned by register.
+    let mut order: Vec<usize> = (0..registers.len()).collect();
+    order.sort_by(|a, b| {
+        registers[*a]
+            .partial_cmp(&registers[*b])
+            .expect("registers are finite")
+            // Two ducks on the same register keep roster order between them, so the answer does not
+            // depend on the sort's stability.
+            .then(a.cmp(b))
+    });
+    let mut seated = vec![Part::Soprano; registers.len()];
+    for (rank, position) in order.into_iter().enumerate() {
+        // More ducks than parts double the top line, which is what `Part::ensemble` runs out at.
+        seated[position] = parts.get(rank).copied().unwrap_or(Part::Soprano);
     }
-    held
+    seated
 }
 
 /// Equal-temperament frequency of a MIDI note, from [`A4_HZ`].
@@ -943,6 +963,53 @@ mod tests {
             assert_eq!(unique, parts.len(), "doubled up early: {parts:?}");
         }
         assert_eq!(ensemble.len(), 4);
+    }
+
+    /// Parts go by *voice*, not by who arrived first. The bug this replaced gave the first duck in
+    /// the roster the soprano line whatever its register was — on two real ducks, the low one sang
+    /// soprano — because `Part::ensemble(1)` is `[Soprano]` and the seating was a fold down the
+    /// roster.
+    #[test]
+    fn the_lowest_voice_in_the_roster_gets_the_lowest_part() {
+        // Roster order deliberately opposite to register order: the high duck arrived first.
+        let high_first = seat_all(&[520.0, 214.0]);
+        assert_eq!(
+            high_first,
+            vec![Part::Soprano, Part::Bass],
+            "{high_first:?}"
+        );
+        let low_first = seat_all(&[214.0, 520.0]);
+        assert_eq!(low_first, vec![Part::Bass, Part::Soprano], "{low_first:?}");
+
+        // Three and four, in a shuffled roster: the answer is in roster order, the parts are by
+        // register.
+        let parts = seat_all(&[490.0, 214.0, 519.0, 389.0]);
+        assert_eq!(
+            parts,
+            vec![Part::Alto, Part::Bass, Part::Soprano, Part::Tenor],
+            "{parts:?}"
+        );
+        // Every part used exactly once.
+        let mut sorted = parts.clone();
+        sorted.sort();
+        assert_eq!(sorted, Part::ALL.to_vec());
+    }
+
+    /// A duck arriving at the register the ensemble was missing moves nobody — the nested sets are
+    /// what make that true, and it is the common case. One arriving *below* the current bass does
+    /// shift a part, which is the price of everyone being on the right line to begin with.
+    #[test]
+    fn a_joiner_in_the_gap_moves_nobody() {
+        let duet = seat_all(&[214.0, 520.0]);
+        assert_eq!(duet, vec![Part::Bass, Part::Soprano]);
+        // A middle voice joins: it takes the alto and the other two keep their parts.
+        let trio = seat_all(&[214.0, 520.0, 390.0]);
+        assert_eq!(&trio[..2], &duet[..], "{trio:?}");
+        assert_eq!(trio[2], Part::Alto);
+        // A fourth in the remaining gap, likewise.
+        let quartet = seat_all(&[214.0, 520.0, 390.0, 300.0]);
+        assert_eq!(&quartet[..3], &trio[..], "{quartet:?}");
+        assert_eq!(quartet[3], Part::Tenor);
     }
 
     /// The nesting of `Part::ensemble` is what makes that possible — there is always exactly one

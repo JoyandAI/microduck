@@ -628,7 +628,9 @@ mod tests {
             .and_then(|a| a.beacon)
             .expect("still conducting");
         assert_eq!(beacon.roster.len(), 2, "the seat is kept: {beacon:?}");
-        assert_eq!(tick.singing.expect("still singing").0, Part::Soprano);
+        // This duck's register is the lower of the two, so it has the bass — and keeps it after the
+        // other one leaves rather than being reseated onto the line nobody is singing.
+        assert_eq!(tick.singing.expect("still singing").0, Part::Bass);
     }
 
     /// The beacon is resent only when it changes. The loop runs at 50 Hz and the beat turns over
