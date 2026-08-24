@@ -314,10 +314,10 @@ EOF
   same plain-.deb-download route microduck_runtime already uses for rkaiq — plus MPP's own test
   binary, which needs no GStreamer at all:
 
-    P=https://radxa-repo.github.io/bullseye/pool/main/m/mpp
-    curl -sL -O $P/librockchip-mpp1_1.5.0-1_arm64.deb
-    curl -sL -O $P/librockchip-vpu0_1.5.0-1_arm64.deb
-    curl -sL -O $P/rockchip-mpp-demos_1.5.0-1_arm64.deb
+    R=https://radxa-repo.github.io/bullseye/pool/main
+    curl -sL -O $R/m/mpp/librockchip-mpp1_1.5.0-1_arm64.deb
+    curl -sL -O $R/m/mpp/librockchip-vpu0_1.5.0-1_arm64.deb
+    curl -sL -O $R/m/mpp/rockchip-mpp-demos_1.5.0-1_arm64.deb
     sudo dpkg -i librockchip-mpp1_1.5.0-1_arm64.deb librockchip-vpu0_1.5.0-1_arm64.deb \
       rockchip-mpp-demos_1.5.0-1_arm64.deb
     sudo mpi_enc_test -w 1280 -h 720 -t 7 -n 60 -o /tmp/out.h264
@@ -332,22 +332,30 @@ EOF
   `-t` is MPP's coding enum, 7 being H.264; `mpi_enc_test -h` lists them. A bitstream in
   /tmp/out.h264 means the hardware encodes and only the GStreamer binding is missing.
 
-  Then try the plugin from that same pool *before* building one:
+  The encoder plugin has to be built. Radxa's prebuilt one is decode-only — measured, not
+  assumed: gstreamer1.0-rockchip1_1.14-4 (needs librga2 from libr/librga in the same pool)
+  installs and registers cleanly, and provides exactly `mppvideodec` and `mppjpegdec`. No
+  encoders; 1.14.4 predates them.
 
-    R=https://radxa-repo.github.io/bullseye/pool/main
-    curl -sL -O $R/libr/librga/librga2_2.2.0-1_arm64.deb
-    curl -sL -O $R/g/gstreamer1.0-rockchip/gstreamer1.0-rockchip1_1.14-4_arm64.deb
-    sudo dpkg -i librga2_2.2.0-1_arm64.deb gstreamer1.0-rockchip1_1.14-4_arm64.deb
+  Install it anyway if you want hardware *decode*, and for what it proves: a plugin built
+  against GStreamer 1.14 registers without complaint in 1.26.2, so plugin ABI is not the risk
+  in the build below. The encoders are in the current tree — gstmpph264enc.c, gstmpph265enc.c,
+  gstmppjpegenc.c, gstmppvp8enc.c — which is meson-built:
+
+    sudo /usr/local/sbin/robot-setup-gstreamer --dev
+    sudo apt-get install -y meson ninja-build
+    curl -sL -O $R/m/mpp/librockchip-mpp-dev_1.5.0-1_arm64.deb
+    curl -sL -O $R/libr/librga/librga-dev_2.2.0-1_arm64.deb
+    sudo dpkg -i librockchip-mpp-dev_1.5.0-1_arm64.deb librga-dev_2.2.0-1_arm64.deb
+    git clone -b gstreamer-rockchip --depth 1 https://github.com/JeffyCN/mirrors.git
+    cd mirrors && meson setup build && ninja -C build && sudo ninja -C build install
     gst-inspect-1.0 mpph264enc
 
-  librga2 is the plugin's other dependency (Rockchip's 2D accelerator, used for colour
-  conversion and scaling). Both deb sets here name their full closure because these packages
-  do not come from a configured apt source: `dpkg -i` resolves nothing on your behalf, so a
-  missing dependency is an unconfigured package rather than an install that fixes itself.
-
-  It was built against bullseye's GStreamer and this board runs 1.26.2. GStreamer keeps plugin
-  ABI stable across 1.x, so it may simply load — and if it does, the encoder needs no source
-  build at all. Building gstreamer-rockchip against 1.26 is the fallback, not the first move.
+  Two things to know before trusting the result. `mediad` runs as its own user, so
+  /dev/mpp_service needs a udev rule giving it a group — see the mode printed above. And
+  mpph264enc on 6.1 kernels has upstream reports of poor or invalid bitstreams, with
+  mpph265enc suggested instead; H.265 is the worse WebRTC codec for browser reach, so decode
+  what this encodes and look at it before building a pipeline on top of it.
 EOF
     else
         cat <<EOF
