@@ -93,6 +93,14 @@ scale, which is the interaction envelope.
   the chorale/theremin grew as explicit modes because there was no brain to hang them on;
   fold them in as states/inputs when it lands ("Petted" is to pet-detect what "Sing" is to
   a heard beacon).
+- **The chorale ends up as a spontaneous event, not a command.** `robotctl chorale` is
+  bench scaffolding: once ducks run autonomously, a group of them together should
+  *sometimes* break into song on their own — a low random chance gated on company being
+  present (and plausibly on mood/energy), the way Zoomies or Dance fire, not something a
+  user starts. Rare on purpose: a surprise duet is a delight, a jukebox is not. The
+  mechanism barely changes — an idle-beacon duck already knows who is nearby, so "decide to
+  sing" is one more transition; `[chorale] accept` stays as the consent gate for whether a
+  duck may ever join in.
 - The chorale's consent rule generalizes: **anything social is opt-in and off = invisible**
   (`[chorale] accept` today; probably one `[social]` switch tomorrow).
 - Recognition/greeting is the right *first* behavior: highest charm per line, no sync, and
