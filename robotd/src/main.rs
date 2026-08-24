@@ -2582,15 +2582,15 @@ mod tests {
         );
     }
 
-    /// Limp-fall ships off, and turning it on must not make a fallen robot refuse anything.
+    /// Limp-fall ships ON, and it must refuse a fallen robot nothing.
     ///
     /// This is the contract that answers "I booted it face-down and pressed Start": enable
-    /// and init are never refused for gravity, whatever the mode is set to.
+    /// and init are never refused for gravity, whatever the mode is set to. It matters more
+    /// now the mode is a default than it did when it was opt-in — every robot has it.
     #[test]
-    fn limp_fall_ships_off_and_refuses_nothing_when_on() {
-        let mut params = Params::default();
-        assert!(!params.safety.limp_fall);
-        params.safety.limp_fall = true;
+    fn limp_fall_ships_on_and_refuses_nothing() {
+        let params = Params::default();
+        assert!(params.safety.limp_fall, "on by default, fleet-wide");
 
         let s = RobotState::new(&params, false, false);
         let intents = Arc::new(Intents::new());

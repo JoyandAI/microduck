@@ -312,8 +312,9 @@ pub struct SafetyParams {
     pub battery_empty_shutdown: bool,
 
     /// Go limp *while falling*, to land soft instead of fighting the floor all the way
-    /// down. Off by default: it is a new behaviour, and one whose failure mode is causing
-    /// the fall it predicted.
+    /// down. **On by default** since it was validated on a robot — the whole point is that
+    /// the fleet lands soft, and a mode every board has to opt into individually is a mode
+    /// most boards do not have.
     ///
     /// The only thing the daemon does about a fall. Drop to `gain_limp`, let the robot
     /// collapse, pose it back to standing once it has landed, then hand it to the standing
@@ -342,6 +343,8 @@ pub struct SafetyParams {
     /// must not stay limp forever.
     pub limp_fall_max_ms: u64,
     /// How long the ramp back to the standing pose takes, once the robot has landed.
+    /// 0.3 s — measured on the robot, where a slower ramp was just dead time before the
+    /// stand-up: the joints are travelling across the floor unloaded, not lifting anything.
     pub limp_fall_pose_ms: u64,
     /// Gain for that ramp. The joints have to actually travel across the floor, so it is
     /// not the limp gain; it is the softened standing gain rather than the walking one.
@@ -388,7 +391,7 @@ impl Default for SafetyParams {
             deadman_ms: 500,
             gain_limp: 50,
             battery_empty_shutdown: true,
-            limp_fall: false,
+            limp_fall: true,
             limp_fall_tilt_z: -0.90,
             limp_fall_predict_z: -0.5,
             limp_fall_lookahead_ms: 300,
@@ -396,7 +399,7 @@ impl Default for SafetyParams {
             limp_fall_still_rate: 1.0,
             limp_fall_still_ms: 200,
             limp_fall_max_ms: 1500,
-            limp_fall_pose_ms: 1000,
+            limp_fall_pose_ms: 300,
             limp_fall_pose_gain: 160,
         }
     }

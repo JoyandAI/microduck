@@ -374,7 +374,8 @@ refusing to enable a robot lying on its side, and the wrong one for softening a 
 gravity past `fall_gravity_z` held for 200 ms *is* the robot on the floor, and the window
 worth acting in has closed by then.
 
-So `limp_fall` (off by default) runs a second, separate detector — `duck_control::fall` —
+So `limp_fall` (on by default since it was validated on a robot) runs a second, separate
+detector — `duck_control::fall` —
 on the rate rather than the position. Projected gravity rotates with the trunk, so
 `ġ = −ω × g` is exact and comes straight from the gyro in the same 12-byte IMU block;
 extrapolating it over ~0.3 s says where gravity is heading. It fires when the robot is

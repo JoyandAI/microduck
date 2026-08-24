@@ -199,9 +199,10 @@ mode = "walk"
 #
 # The only thing the daemon does about a fall. With it off, a fall changes nothing: the
 # policy keeps driving and the humans stay in charge, which is the prototype's behaviour
-# and the default here. Off by default: it is new, and its failure mode is causing the
-# fall it predicted.
-# limp_fall = false
+# and the default here. ON by default since it was validated on a robot: the whole point is
+# that the fleet lands soft, and a mode every board has to opt into individually is a mode
+# most boards do not have. Set it to false on a robot that needs the old behaviour.
+# limp_fall = true
 
 # When a fall counts as started. This is the whole feature, and both ways of getting it
 # wrong are real: too early and the robot limps out of leans it would have walked off —
@@ -231,11 +232,13 @@ mode = "walk"
 # held in someone's hands does not stay limp forever.
 #
 # The pose ramp then travels the joints back to standing. Its gain is not the limp gain:
-# they have to actually move across the floor. 160 is the softened standing gain.
+# they have to actually move across the floor. 160 is the softened standing gain. 0.3 s is
+# measured on the robot — anything slower is dead time before the stand-up, since the joints
+# are travelling unloaded rather than lifting the robot.
 # limp_fall_still_rate = 1.0
 # limp_fall_still_ms = 200
 # limp_fall_max_ms = 1500
-# limp_fall_pose_ms = 1000
+# limp_fall_pose_ms = 300
 # limp_fall_pose_gain = 160
 
 # Sit down gracefully and power the machine off when the battery EMA reaches the empty
