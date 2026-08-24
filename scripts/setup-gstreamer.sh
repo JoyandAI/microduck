@@ -363,7 +363,14 @@ EOF
   VPU is reached through MPP rather than as a V4L2 M2M encoder, so the absent v4l2h264enc above
   is the expected shape and not the problem.
 
-  **Suspect the node before the plugin.** An MPP plugin registers its decoders unconditionally
+  **First check the plugin's own libraries.** It links librockchip_mpp.so.1 and librga.so.2,
+  neither of which is in Debian, and a missing one means the plugin fails to load without a word:
+
+    ldd ${GST_EXTRA_PLUGIN_DIR}/libgstrockchipmpp.so | grep "not found"
+
+  Anything listed there is the answer, and re-running this script installs them.
+
+  **Otherwise, suspect the node before the plugin.** An MPP plugin registers its decoders unconditionally
   and *probes MPP* before registering its encoders, so at 0600 root:root the encoders are
   silently omitted from a plugin that contains them — which is what made Radxa's own deb look
   decode-only when it is not. Check the mode printed above; this script installs the udev rule
@@ -406,6 +413,46 @@ EOF
   this SoC. Treat it as the interim encoder for bring-up, not the shipping one.
 EOF
     fi
+}
+
+# Rockchip's MPP and RGA runtime libraries, from Radxa's pool.
+#
+# **The plugins do not work without these, and the failure is silent.**
+# `libgstrockchipmpp.so` links `librockchip_mpp.so.1` and `librga.so.2`; neither is in Debian, in
+# any suite. Missing, the plugin fails to dlopen, GStreamer skips it without a word, and
+# `mpph264enc` simply does not exist — which looks exactly like the permission trap and is not it.
+#
+# This was missed until a *clean* board ran the script: the board it was developed against had
+# these installed by hand during bring-up, so the gap was invisible there. Worth remembering as a
+# class of bug rather than a one-off.
+#
+# Direct .deb downloads, the same route `microduck_runtime/radxa_setup/setup_rkaiq.sh` uses for
+# rkaiq — so `dpkg -i` resolves nothing and both are named explicitly. Versions match what the
+# plugins in the release were *built* against; see the release MANIFEST.
+MPP_VERSION="${MPP_VERSION:-1.5.0-1}"
+RGA_VERSION="${RGA_VERSION:-2.2.0-1}"
+RADXA_POOL="${RADXA_POOL:-https://radxa-repo.github.io/bullseye/pool/main}"
+
+install_rockchip_userspace() {
+    dpkg -s librockchip-mpp1 >/dev/null 2>&1 \
+        && dpkg -s librga2 >/dev/null 2>&1 && return 0
+
+    tmp="$(mktemp -d)"
+    say "fetching Rockchip MPP ${MPP_VERSION} and RGA ${RGA_VERSION} (not in Debian)"
+    ok=1
+    for path in \
+        "m/mpp/librockchip-mpp1_${MPP_VERSION}_arm64.deb" \
+        "libr/librga/librga2_${RGA_VERSION}_arm64.deb"
+    do
+        curl -fsSL -o "${tmp}/$(basename "$path")" "${RADXA_POOL}/${path}" || ok=0
+    done
+    if [ "$ok" = 1 ]; then
+        dpkg -i "${tmp}"/*.deb >/dev/null 2>&1 || ok=0
+    fi
+    rm -rf "$tmp"
+    [ "$ok" = 1 ] || warn "could not install Rockchip MPP/RGA from ${RADXA_POOL}.
+  Without them mpph264enc cannot register — the plugin is there and fails to load. Everything
+  else here is still done; fix the network and re-run."
 }
 
 # Install the prebuilt plugins at the pinned version.
@@ -570,6 +617,9 @@ main() {
     [ "$WANT_DEV" = 0 ] || install_missing $DEV_PKGS
     # After the packages, before the report: a udev problem must not be what stops GStreamer
     # installing, and the report should show the board as this run leaves it.
+    # Before the plugins: they link against these, and a plugin whose libraries are absent is a
+    # plugin that silently does not register.
+    install_rockchip_userspace
     install_plugins
     configure_vpu_access
     report
