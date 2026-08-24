@@ -33,12 +33,12 @@ pub struct Params {
 /// `[theremin]` — the ToF theremin: what counts as a hand, and where the depth frames come
 /// from.
 ///
-/// Every field here is a *number the field will want to argue with*, which is why they are
-/// config and not constants: how near you have to get before it plays, how far away the note
-/// bottoms out, and how much nearer than the background a hand has to be before it counts.
-/// The defaults are `kinematics::hand::Config`'s, and the reason to move them is a room, not
-/// a robot — a duck on a desk has a background 20 cm away and wants a shorter band than one
-/// on a floor.
+/// The interesting field is `statuses`, and it is the reason this section exists at all. ST
+/// documents 5 and 9 as "range valid", and a build that believes only those stops seeing a
+/// hand at about 30 cm on this sensor — past that a moving hand comes back as 4 or 13,
+/// *consistency failed*, carrying a distance that is fine for a pitch. That took a bench
+/// session to find, so the set is configurable: a duck whose theremin has a short reach wants
+/// more codes in, and one that plays phantom notes at nothing wants fewer.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ThereminParams {
@@ -52,13 +52,14 @@ pub struct ThereminParams {
     pub near_m: f64,
     /// Farthest playable range, metres.
     pub far_m: f64,
-    /// How much nearer than the background a return must be to count as a hand, metres.
-    /// Raise it on a duck whose stand policy sways more than most.
-    pub margin_m: f64,
     /// Fewest zones that make a hand.
     pub min_zones: usize,
-    /// Seconds over which the background drifts toward a rearranged room.
-    pub background_tau_s: f64,
+    /// ST status bytes whose distance is believed. See the section docs — this is the one
+    /// that decides how far the instrument reaches.
+    pub statuses: Vec<u8>,
+    /// How long a note is held through a sensor dropout, milliseconds. This is what keeps a
+    /// flickering zone from chopping a note into gravel.
+    pub hold_ms: u64,
 }
 
 impl Default for ThereminParams {
@@ -69,34 +70,26 @@ impl Default for ThereminParams {
             socket: PathBuf::from(duck_ipc_proto::socket::TOF),
             near_m: hand.near_m,
             far_m: hand.far_m,
-            margin_m: hand.margin_m,
             min_zones: hand.min_zones,
-            background_tau_s: hand.background_tau_s,
+            statuses: hand.statuses,
+            hold_ms: hand.hold.as_millis() as u64,
         }
     }
 }
 
 impl ThereminParams {
     /// The hand-detection config these params describe.
-    ///
-    /// The fields not exposed above keep their library defaults on purpose: `max_fill` and
-    /// `wall_fill` are geometry (a wall fills the field of view, a hand does not), not taste,
-    /// and an operator who moved them would be describing a different sensor.
     pub fn hand(&self) -> kinematics::hand::Config {
         kinematics::hand::Config {
             near_m: self.near_m,
             far_m: self.far_m,
-            margin_m: self.margin_m,
             min_zones: self.min_zones,
-            background_tau_s: self.background_tau_s,
-            ..kinematics::hand::Config::default()
+            statuses: self.statuses.clone(),
+            hold: std::time::Duration::from_millis(self.hold_ms),
         }
     }
 }
 
-/// `[audio]` — the voice and the microphone. All optional equipment: a robot without a
-/// codec (or a bank) walks identically and stays quiet, so nothing here reaches a health
-/// verdict.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AudioParams {

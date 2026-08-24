@@ -1205,13 +1205,8 @@ async fn control_loop<T: RobotIo>(
     // frames — a second of silence that reads as a broken feature. Off entirely when the
     // params say so, or when audio is off, since a theremin with no voice is a mouth
     // opening for no reason.
-    let mut theremin = (params.theremin.enabled && params.audio.enabled).then(|| {
-        theremin::Theremin::spawn(
-            params.theremin.socket.clone(),
-            params.theremin.hand(),
-            kinematics::tof::Reprojector::alpha(),
-        )
-    });
+    let mut theremin = (params.theremin.enabled && params.audio.enabled)
+        .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
     // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
     // the note at its own pitch instead of gliding to the bottom of the range on its way out.
     let mut theremin_hz = 0.0f64;
@@ -1827,25 +1822,10 @@ async fn control_loop<T: RobotIo>(
             if let Some(active) = intents.take_theremin_request() {
                 instrument.set_active(active);
             }
-            // A background is a picture of what is in front of the duck, so a duck that has
-            // started moving is holding an instrument tuned to somewhere it no longer is.
-            // Dropped rather than silently re-armed: a zero that changes under the player is
-            // worse than an instrument that has to be picked up again.
-            if instrument.active() {
-                if safety.fallen() {
-                    instrument.invalidate("the robot is down");
-                } else if moving {
-                    instrument.invalidate("walking");
-                }
-            }
-            let note = instrument.tick(
-                command.head,
-                &kinematics::tof::Posture {
-                    gravity: sensors.as_ref().map_or([0.0, 0.0, -1.0], |s| s.imu.gravity),
-                    trunk_height_m: Some(odometry.position()[2]),
-                },
-                period.as_secs_f64(),
-            );
+            // Nothing takes the instrument away but asking. Walking used to drop it, because
+            // a captured background is a picture of one spot — with no background there is
+            // nothing to invalidate, and a duck that plays while it walks is a feature.
+            let note = instrument.tick(tick_start);
             match note {
                 Some(note) => {
                     let mut block = note.state;
@@ -1872,7 +1852,12 @@ async fn control_loop<T: RobotIo>(
                             voice.theremin_set(theremin_hz, level, note.mouth);
                         }
                     }
-                    if driving {
+                    // Whatever the policy is doing, unlike the mouth *intent* below. The
+                    // mouth is not part of any policy, and a duck playing a theremin while
+                    // sitting — which is how anyone will first try this — has to be able to
+                    // open its beak: gating on `driving` made the visible half of the whole
+                    // gesture silently absent on a sitting robot.
+                    if snapshot.enabled && bringup == Bringup::Ready {
                         targets[duck_control::model::MOUTH_INDEX] =
                             duck_control::model::mouth_target(note.mouth);
                     }

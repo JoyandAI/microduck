@@ -1,754 +1,356 @@
-//! Telling a hand from a wall in an 8×8 depth frame.
+//! The nearest thing in front of the beak, as an instrument wants it.
 //!
-//! The ToF theremin needs one number — how far away the hand is — and the whole difficulty
-//! is that the sensor does not report hands, it reports distances. A duck that walks up to
-//! a wall and stops sees a frame that is near, filled, and stable, which is also what a
-//! palm held in front of its beak looks like. Every cheap test for "is this a hand" fails
-//! on one of those two:
+//! This started out clever. It carried a background captured when the theremin armed, so
+//! that a duck facing a wall could still tell a hand from the wall; a plane fit to exempt
+//! walls from being mistaken for one enormous hand; a slow drift so the room could be
+//! rearranged. All of it worked in tests and none of it survived a duck, for one reason
+//! worth writing down: **the sensor's input is not stable enough to reason that hard
+//! about.** Which zones carry a usable status varies frame to frame, so a background
+//! captured over half a second was a different background every time, and the *same*
+//! gesture would arm one moment and be refused the next. Cleverness on top of a noisy input
+//! multiplies the noise; it does not filter it.
 //!
-//!   - **"The near return is small, with free space around it."** The field of view is only
-//!     `0.828 × d` wide, so at 25 cm it spans 20.7 cm and a hand really does leave the
-//!     border zones looking past it. Below ~15 cm it does not, and under
-//!     [`crate::tof::Reprojector::MIN_RANGE_M`] the returns are crosstalk anyway — so this
-//!     works, but only over part of the band we want to play.
-//!   - **"The duck is standing still, so anything that moves is a hand."** A standing duck
-//!     is never still: the policy sways, and a wall 30 cm away swings a few centimetres in
-//!     range with it. Worse, a theremin note should *hold* when the hand holds, so
-//!     requiring motion breaks the instrument.
+//! So this is the simple thing, and the theremin is an explicit mode instead. There is no
+//! background and no arming: while the instrument is up, the nearest return inside the
+//! playable band is the hand. Point the duck at open space and it is silent; point it at a
+//! wall 40 cm away and it plays a steady note, which is correct — you turned the mode on,
+//! and a mode turned on deliberately is allowed to do the obvious thing.
 //!
-//! So neither is the test. The test is a **background**, captured when the theremin arms:
-//! whatever is in front of the duck at that moment — wall, table, sofa, nothing — becomes
-//! the reference, per zone, and from then on only returns *nearer than the background by a
-//! margin* are a hand. The duck that stopped in front of a wall has the wall as its zero,
-//! at whatever distance it happens to be, and a hand between duck and wall is by
-//! definition nearer. The margin ([`Config::margin_m`]) is set above the trunk's sway,
-//! which is the real reason "the robot is not walking" is not the same as "the frame is not
-//! moving".
+//! What is left is the two pieces of robustness that are about the *sensor* rather than
+//! about the room:
 //!
-//! The one case a background cannot see is a hand that was already there when it was
-//! captured. So arming runs the hand test against its own candidate background, with
-//! nothing behind it: a background that already looks like a hand is refused
-//! ([`Refusal::SomethingInTheWay`]) instead of being frozen in as the zero. The arming
-//! check is the play check, which is why there is only one of them to be wrong.
+//!   - **Which status bytes count.** ST calls 5 and 9 "valid", and on this sensor at 15 Hz a
+//!     hand past ~30 cm routinely comes back as 4 or 13 — *consistency failed*, sigma too
+//!     high — carrying a distance perfectly good enough for a pitch. Accepting only 5 and 9
+//!     is why the first version died at 30 cm. The set is [`Config::statuses`], and it is
+//!     config rather than a constant because it is the one number a bench session needs to
+//!     move.
+//!   - **A hold.** A zone that flickers between usable and not, at 15 Hz, chops a note into
+//!     gravel. [`Config::hold`] keeps the last hand for a few frames, so a dropout is
+//!     inaudible while a hand actually leaving still stops the note promptly.
 //!
-//! Which leaves one thing the play check cannot get right on its own: a wall inside the
-//! playable band *is* one enormous near blob, and refusing to arm in front of a wall is
-//! refusing the exact case this module was written for. So the candidate is fitted to a
-//! plane, and a plane is believed as background when it is either beyond the band or
-//! covering nearly the whole frame — which every real wall does, the field of view being
-//! only `0.828 × d` across. A flat palm is planar too and fails both halves: it is near,
-//! and it is partial.
-//!
-//! The fit is cheap and exact rather than iterative. For a plane at distance `d` with unit
-//! normal `n`, every beam gives `1/r = beam · (n/d)`, which is *linear* in `n/d` — so a
-//! 3×3 least squares over inverse ranges recovers the plane, and its residual (carried back
-//! into metres) says how far off one the returns sit. That number is also the log line that
-//! settles a field report about a theremin that would not arm: "background: plane at
-//! 0.42 m, 0.9 cm rms", or "background: cluttered, 11 cm rms".
-//!
-//! This lives in `kinematics` for the reason [`crate::tof`] does: it is arithmetic over a
-//! frame, and its callers must not have to link the vendored ST driver to get at it.
+//! There is no floor filter and no reprojection here, on purpose. Both need the head's
+//! forward kinematics and the IMU, and both were another way for a note to disappear for a
+//! reason the player cannot see. An instrument that plays the raw beam is one you can
+//! predict.
 
-use crate::tof::{COLS, ROWS, Zone};
+use std::time::{Duration, Instant};
+
+use crate::tof::{COLS, ROWS};
 
 const N_ZONES: usize = ROWS * COLS;
 
 /// What counts as a hand.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// Nearest playable range, metres. Above the band where a hand fills the whole field of
-    /// view and the border test stops meaning anything (~15 cm), and well above the
-    /// crosstalk floor.
+    /// Nearest playable range, metres. Below ~10 cm the sensor's own cover-glass crosstalk
+    /// invents short returns, so this is a floor on believability rather than on taste.
     pub near_m: f64,
-    /// Farthest playable range, metres. The sensor's usable reach at 15 Hz is around a
-    /// metre; the top of the playable band is deliberately shorter than that, because the
-    /// returns near the limit are the noisy ones and they would be the *low* notes.
+    /// Farthest playable range, metres.
     pub far_m: f64,
-    /// How much nearer than the background a zone must read to count as foreground. Above
-    /// the trunk sway of a standing policy — the point of the whole margin.
-    pub margin_m: f64,
-    /// How many foreground zones make a hand. Two is noise; a hand at 60 cm is ~4 zones
-    /// across the diagonal even before the fingers.
+    /// How many zones in the band make a hand. Low: a hand at the far end of the band is a
+    /// handful of zones, and this sensor will only be giving usable status for some of them.
     pub min_zones: usize,
-    /// A foreground filling more than this fraction of the usable frame is not a hand — it
-    /// is a wall that arrived after arming, i.e. the duck walked into something.
-    pub max_fill: f64,
-    /// Time constant for the background's drift, seconds. Long: the room may be
-    /// rearranged, a hand may not become the floor.
-    pub background_tau_s: f64,
-    /// How many frames an arming window must hold before it can be reduced. At 15 Hz this
-    /// is a third of a second — long enough for the per-zone median to step over the
-    /// dropouts that are the reason it is a median.
-    pub min_arming_frames: usize,
-    /// Fraction of the frame a *plane* must cover to be believed as a wall rather than a
-    /// palm. A wall inside the playable band always fills the whole field of view — it is
-    /// only 0.828 × d across, smaller than any wall — so anything planar, near, and
-    /// partial is a hand however flat it is.
-    pub wall_fill: f64,
+    /// ST status bytes whose distance is believed. See the module docs — accepting only the
+    /// two ST calls "valid" is what made the first version stop working at 30 cm.
+    pub statuses: Vec<u8>,
+    /// How long the last hand is held through a dropout. Long enough to bridge the sensor's
+    /// flicker, short enough that a hand actually withdrawn stops the note.
+    pub hold: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            near_m: 0.15,
-            far_m: 0.60,
-            margin_m: 0.08,
-            min_zones: 3,
-            max_fill: 0.75,
-            background_tau_s: 120.0,
-            min_arming_frames: 5,
-            wall_fill: 0.9,
+            near_m: 0.10,
+            far_m: 0.70,
+            min_zones: 2,
+            // 5 and 9 are ST's "valid" and "valid, large pulse". 6 is a first range whose
+            // wrap-around check was not performed, 10 a valid range where the previous one
+            // saw nothing, 12 a target blurred by a sharp edge — which is what the edge of a
+            // hand *is*. 4 and 13 are the consistency failures a moving hand produces past
+            // 30 cm, and they are in because a pitch does not need a millimetre.
+            statuses: vec![4, 5, 6, 9, 10, 12, 13],
+            hold: Duration::from_millis(250),
         }
+    }
+}
+
+impl Config {
+    /// Whether this status byte's distance is worth believing.
+    pub fn believes(&self, status: u8) -> bool {
+        self.statuses.contains(&status)
     }
 }
 
 /// A hand, as the theremin needs it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hand {
-    /// Robust distance to it, metres — a low percentile of the foreground rather than the
-    /// single nearest zone, which on this sensor is regularly a flier.
+    /// Robust distance to it, metres — a low percentile of what is in the band rather than
+    /// the single nearest zone, which on this sensor is regularly a flier.
     pub range_m: f64,
     /// Where that sits in the playable band: 0 at [`Config::far_m`], 1 at
     /// [`Config::near_m`]. Closer is *higher*, which is the direction the pitch and the
     /// mouth both move.
     pub closeness: f64,
-    /// How many zones the hand covers. The instrument's dynamics: a flat palm is louder
-    /// than a fingertip.
+    /// How many zones it covers. Reported because it is the number that says whether a
+    /// dropout was the hand leaving or the sensor blinking.
     pub zones: usize,
-    /// Its centroid in the trunk frame, metres — for a gaze that follows the hand, and for
-    /// nothing the theremin itself needs.
-    pub centroid: [f64; 3],
+    /// True when this hand is the held memory of an earlier frame rather than one measured
+    /// now — so a readout can show a bridged dropout instead of pretending it saw something.
+    pub held: bool,
 }
 
-/// Why a background was not accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    /// The sensor produced almost nothing over the whole arming window: no background, and
-    /// nothing to play against either.
-    NoReturns,
-    /// The candidate background already looks like a hand. Almost always literally that —
-    /// arming happened with a hand in front of the beak — and freezing it in would make
-    /// that hand the silent zero.
-    SomethingInTheWay,
-}
-
-impl Refusal {
-    /// What to tell whoever asked for the theremin.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Refusal::NoReturns => "the depth sensor is not seeing anything to play against",
-            Refusal::SomethingInTheWay => {
-                "something is right in front of the beak — move it away and arm again"
-            }
-        }
-    }
-}
-
-/// The reference frame the hand test measures against, and what it turned out to be.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Background {
-    /// Per-zone reference range, metres. `None` where the sensor saw nothing — which for
-    /// the hand test means "infinitely far", so anything appearing there is foreground.
-    pub range_m: [Option<f64>; N_ZONES],
-    /// What the background is, geometrically: the wall exemption in [`Arming::finish`]
-    /// turns on it, and it is the log line when a theremin refuses to arm.
-    pub shape: Shape,
-}
-
-/// A background's geometry, as the plane fit reads it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Shape {
-    /// Too few returns to fit anything — mostly open space.
-    Open { zones: usize },
-    /// A plane: a wall, a table, a door. `rms_m` is how far the returns sit off it.
-    Plane { distance_m: f64, rms_m: f64 },
-    /// Returns, but not on one plane: furniture, clutter, a corner.
-    Cluttered { rms_m: f64 },
-}
-
-impl Shape {
-    /// Departure from a plane at which a background stops being called one. Generous: this
-    /// only picks the word in a log line, and a real wall seen through this sensor's noise
-    /// sits around a centimetre.
-    const PLANE_RMS_M: f64 = 0.03;
-    /// Fewest returns worth fitting three parameters to.
-    const MIN_FIT_ZONES: usize = 12;
-}
-
-/// Accumulates arming frames into a [`Background`].
+/// Finds the hand, and remembers it briefly.
 ///
-/// Several frames rather than one, reduced per zone by median: at 15 Hz a zone drops out
-/// often enough that a single frame would freeze holes into the reference, and a median is
-/// the reduction that ignores a dropout instead of averaging it in.
-#[derive(Debug, Default)]
-pub struct Arming {
-    samples: Vec<[Option<f64>; N_ZONES]>,
+/// Stateful only for the hold: everything else about a frame's verdict depends on that frame
+/// alone, which is what makes the instrument predictable.
+#[derive(Debug)]
+pub struct Tracker {
+    config: Config,
+    last: Option<(Hand, Instant)>,
 }
 
-impl Arming {
-    pub fn new() -> Self {
-        Self::default()
+impl Tracker {
+    pub fn new(config: Config) -> Self {
+        Self { config, last: None }
     }
 
-    /// Take one frame's slant ranges into the window.
-    pub fn observe(&mut self, ranges_m: &[Option<f64>; N_ZONES]) {
-        self.samples.push(*ranges_m);
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
-    pub fn frames(&self) -> usize {
-        self.samples.len()
-    }
-
-    /// Enough frames to reduce.
-    pub fn ready(&self, config: &Config) -> bool {
-        self.samples.len() >= config.min_arming_frames
-    }
-
-    /// Reduce the window to a background, or say why it is not one.
+    /// The hand in this frame, or the one from a frame just gone.
     ///
-    /// The refusal path is the whole reason arming is a step and not a flag: a theremin
-    /// that silently took a hand as its zero would present as "the duck ignores my hand",
-    /// which is indistinguishable from a broken sensor from the outside.
-    pub fn finish(
-        &self,
-        config: &Config,
-        beams: &[[f64; 3]; N_ZONES],
-    ) -> Result<Background, Refusal> {
-        let mut range_m: [Option<f64>; N_ZONES] = [None; N_ZONES];
-        for (zone, slot) in range_m.iter_mut().enumerate() {
-            let mut seen: Vec<f64> = self
-                .samples
-                .iter()
-                .filter_map(|frame| frame[zone])
-                .collect();
-            // A zone must have been seen in most of the window to be part of the reference;
-            // one sighting in ten frames is a flier, and as a background it would mask a
-            // real hand appearing there.
-            if seen.len() * 2 <= self.samples.len() {
+    /// `distance_mm` and `status` are the wire's own arrays — raw, parallel, row-major, and
+    /// possibly shorter than the grid if the peer is from another release. Taken raw rather
+    /// than pre-interpreted on purpose: which statuses count is this module's decision, and
+    /// it is the decision that matters most.
+    pub fn track(&mut self, distance_mm: &[i16], status: &[u8], now: Instant) -> Option<Hand> {
+        let mut in_band: Vec<f64> = Vec::new();
+        for zone in 0..N_ZONES {
+            let (Some(&mm), Some(&code)) = (distance_mm.get(zone), status.get(zone)) else {
                 continue;
-            }
-            seen.sort_by(|a, b| a.partial_cmp(b).expect("ranges are finite"));
-            *slot = Some(seen[seen.len() / 2]);
-        }
-
-        if self.samples.is_empty() {
-            return Err(Refusal::NoReturns);
-        }
-        let shape = fit_shape(&range_m, beams);
-        let seen = range_m.iter().filter(|r| r.is_some()).count();
-        if seen == 0 {
-            return Err(Refusal::NoReturns);
-        }
-
-        // The arming check *is* the play check: run the hand test on this candidate with
-        // nothing behind it, and refuse a background that already answers "hand".
-        let nothing = Background {
-            range_m: [None; N_ZONES],
-            shape,
-        };
-        let hand_shaped = nothing
-            .detect(&range_m, &[Zone::Empty; N_ZONES], config)
-            .is_some();
-
-        // Except when the candidate is a wall, which the play check cannot help reading as
-        // one enormous hand. A wall inside the playable band fills the frame — the field of
-        // view is 0.828 × d across, narrower than any wall — so a plane is believed as
-        // background when it is either beyond the band or covering nearly all of it. A flat
-        // palm is planar too, and fails both halves: it is near, and it is partial.
-        let is_wall = match shape {
-            Shape::Plane { distance_m, .. } => {
-                distance_m > config.far_m || seen as f64 >= config.wall_fill * N_ZONES as f64
-            }
-            Shape::Open { .. } | Shape::Cluttered { .. } => false,
-        };
-        if hand_shaped && !is_wall {
-            return Err(Refusal::SomethingInTheWay);
-        }
-        Ok(Background { range_m, shape })
-    }
-}
-
-impl Background {
-    /// Find the hand in one frame, if there is one.
-    ///
-    /// `ranges_m` is the frame's 64 slant ranges, `None` where the sensor reported nothing
-    /// usable — the same array [`crate::tof::Reprojector::project`] takes, and the depth
-    /// comparison is done on these rather than on reprojected points because a slant range
-    /// is what the sensor measured: putting it through forward kinematics first would fold
-    /// head-pose error into a number whose whole job is to be compared against itself one
-    /// frame later.
-    ///
-    /// `zones` is that reprojection, used only as a validity mask: a beam the reprojector
-    /// calls [`Zone::Floor`] hit the ground, and a duck looking slightly down must play the
-    /// hand and not the carpet.
-    pub fn detect(
-        &self,
-        ranges_m: &[Option<f64>; N_ZONES],
-        zones: &[Zone; N_ZONES],
-        config: &Config,
-    ) -> Option<Hand> {
-        let mut usable = 0usize;
-        let mut foreground: Vec<(usize, f64)> = Vec::new();
-        for (i, range) in ranges_m.iter().enumerate() {
-            // The floor is not an instrument, and a return the reprojector distrusts is not
-            // a measurement. Both are excluded before anything is counted.
-            if matches!(zones[i], Zone::Floor { .. } | Zone::TooClose) {
-                continue;
-            }
-            usable += 1;
-            let Some(r) = *range else { continue };
-            if !(config.near_m..=config.far_m).contains(&r) {
-                continue;
-            }
-            // No background in this zone means nothing was ever there: any return is new.
-            let reference = self.range_m[i].unwrap_or(f64::INFINITY);
-            if r < reference - config.margin_m {
-                foreground.push((i, r));
-            }
-        }
-
-        if foreground.len() < config.min_zones {
-            return None;
-        }
-        // A foreground that fills the frame is not a hand — the duck walked into something,
-        // or the room changed behind the reference. Either way the background is stale and
-        // playing it would be a held note nobody asked for.
-        if usable > 0 && foreground.len() as f64 > config.max_fill * usable as f64 {
-            return None;
-        }
-
-        let mut ranges: Vec<f64> = foreground.iter().map(|(_, r)| *r).collect();
-        ranges.sort_by(|a, b| a.partial_cmp(b).expect("ranges are finite"));
-        // A low percentile, not the minimum: single-zone fliers a few centimetres short of
-        // the truth are routine on this sensor, and as the pitch input one would be a chirp.
-        let range_m = ranges[ranges.len() / 5];
-
-        let mut centroid = [0.0f64; 3];
-        let mut counted = 0usize;
-        for (i, _) in &foreground {
-            if let Zone::Hit { point, .. } = zones[*i] {
-                for (c, p) in centroid.iter_mut().zip(point) {
-                    *c += p;
-                }
-                counted += 1;
-            }
-        }
-        if counted > 0 {
-            for c in &mut centroid {
-                *c /= counted as f64;
-            }
-        }
-
-        let span = (config.far_m - config.near_m).max(1e-6);
-        Some(Hand {
-            range_m,
-            closeness: ((config.far_m - range_m) / span).clamp(0.0, 1.0),
-            zones: foreground.len(),
-            centroid,
-        })
-    }
-
-    /// Let the reference drift toward what the sensor sees, everywhere the hand is not.
-    ///
-    /// Slow, so the room can be rearranged without re-arming while a hand held still for a
-    /// minute never becomes the new zero. Zones the hand is currently in are left alone —
-    /// updating those is exactly how a background model eats its own signal.
-    pub fn relax(
-        &mut self,
-        ranges_m: &[Option<f64>; N_ZONES],
-        hand: Option<&Hand>,
-        config: &Config,
-        dt_s: f64,
-    ) {
-        let alpha = (dt_s / config.background_tau_s.max(1e-3)).clamp(0.0, 1.0);
-        for (i, measured) in ranges_m.iter().enumerate() {
-            let Some(r) = *measured else { continue };
-            // Anything inside the playable band while a hand is out there might *be* the
-            // hand; leave the whole band alone rather than trying to name its zones.
-            if hand.is_some() && r <= config.far_m {
-                continue;
-            }
-            match &mut self.range_m[i] {
-                Some(reference) => *reference += (r - *reference) * alpha,
-                // A zone that was empty and now reads something adopts it at once: there is
-                // no old value to drift away from, and the alternative is a permanent hole.
-                slot @ None => *slot = Some(r),
-            }
-        }
-    }
-}
-
-/// Least squares plane over inverse ranges — see the module docs for why that is linear.
-fn fit_shape(range_m: &[Option<f64>; N_ZONES], beams: &[[f64; 3]; N_ZONES]) -> Shape {
-    let points: Vec<([f64; 3], f64)> = range_m
-        .iter()
-        .zip(beams)
-        .filter_map(|(r, beam)| r.map(|r| (*beam, r)))
-        .filter(|(_, r)| *r > 1e-3)
-        .collect();
-    if points.len() < Shape::MIN_FIT_ZONES {
-        return Shape::Open {
-            zones: points.len(),
-        };
-    }
-
-    // Normal equations for `beam · v = 1/r`, v = n/d.
-    let mut ata = [[0.0f64; 3]; 3];
-    let mut atb = [0.0f64; 3];
-    for (beam, r) in &points {
-        let inv = 1.0 / r;
-        for (row, (a_row, b)) in ata.iter_mut().zip(atb.iter_mut()).enumerate() {
-            for (col, a) in a_row.iter_mut().enumerate() {
-                *a += beam[row] * beam[col];
-            }
-            *b += beam[row] * inv;
-        }
-    }
-    let Some(v) = solve3(ata, atb) else {
-        return Shape::Cluttered { rms_m: f64::NAN };
-    };
-    let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if norm < 1e-9 {
-        return Shape::Cluttered { rms_m: f64::NAN };
-    }
-    let distance_m = 1.0 / norm;
-
-    // Residuals back in metres: the inverse-range error at each zone, scaled by that
-    // zone's own range squared, which is the derivative of `r` with respect to `1/r`.
-    let mut sum_sq = 0.0;
-    for (beam, r) in &points {
-        let predicted = beam[0] * v[0] + beam[1] * v[1] + beam[2] * v[2];
-        let error_m = (1.0 / r - predicted) * r * r;
-        sum_sq += error_m * error_m;
-    }
-    let rms_m = (sum_sq / points.len() as f64).sqrt();
-    if rms_m <= Shape::PLANE_RMS_M {
-        Shape::Plane { distance_m, rms_m }
-    } else {
-        Shape::Cluttered { rms_m }
-    }
-}
-
-/// Gaussian elimination on a 3×3 symmetric system. `None` if it is singular — fewer than
-/// three independent beam directions, which the zone-count guard makes unreachable in
-/// practice but which must not be a divide by zero if it happens.
-fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
-    for col in 0..3 {
-        let (pivot_row, pivot) = (col..3)
-            .map(|r| (r, a[r][col].abs()))
-            .max_by(|x, y| x.1.partial_cmp(&y.1).expect("finite"))?;
-        if pivot < 1e-12 {
-            return None;
-        }
-        a.swap(col, pivot_row);
-        b.swap(col, pivot_row);
-        for row in (col + 1)..3 {
-            let factor = a[row][col] / a[col][col];
-            let (pivot_row, target) = {
-                let (head, tail) = a.split_at_mut(row);
-                (head[col], &mut tail[0])
             };
-            for (cell, pivot) in target.iter_mut().zip(pivot_row).skip(col) {
-                *cell -= factor * pivot;
+            // A negative distance comes back on a failed convergence whatever the status
+            // says, and is not a measurement.
+            if mm <= 0 || !self.config.believes(code) {
+                continue;
             }
-            b[row] -= factor * b[col];
+            let range = f64::from(mm) / 1000.0;
+            if (self.config.near_m..=self.config.far_m).contains(&range) {
+                in_band.push(range);
+            }
+        }
+
+        if in_band.len() < self.config.min_zones {
+            // Hold the last hand briefly. This is the whole anti-chop mechanism: the note
+            // rides over a dropout, and stops when one lasts.
+            return match self.last {
+                Some((hand, at)) if now.duration_since(at) < self.config.hold => {
+                    Some(Hand { held: true, ..hand })
+                }
+                _ => {
+                    self.last = None;
+                    None
+                }
+            };
+        }
+
+        in_band.sort_by(|a, b| a.partial_cmp(b).expect("ranges are finite"));
+        // A low percentile, not the minimum: single-zone fliers a few centimetres short of
+        // the truth are routine here, and as the pitch input one would be a chirp.
+        let range_m = in_band[in_band.len() / 5];
+        let span = (self.config.far_m - self.config.near_m).max(1e-6);
+        let hand = Hand {
+            range_m,
+            closeness: ((self.config.far_m - range_m) / span).clamp(0.0, 1.0),
+            zones: in_band.len(),
+            held: false,
+        };
+        self.last = Some((hand, now));
+        Some(hand)
+    }
+
+    /// Forget the held hand — for putting the instrument down, so picking it back up does
+    /// not open with a note from before.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+/// How many zones came back with each status byte, most common first.
+///
+/// Purely diagnostic, and the diagnostic that matters: "it stops working past 30 cm" and
+/// "status 4 covers 31 zones of the frame" are the same sentence, but only the second tells
+/// you what to change. Rendered into the live readout so a bench session never has to guess
+/// what the sensor is actually saying.
+pub fn status_histogram(status: &[u8]) -> Vec<(u8, usize)> {
+    let mut counts: Vec<(u8, usize)> = Vec::new();
+    for &code in status.iter().take(N_ZONES) {
+        match counts.iter_mut().find(|(c, _)| *c == code) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((code, 1)),
         }
     }
-    let mut x = [0.0f64; 3];
-    for row in (0..3).rev() {
-        let mut acc = b[row];
-        for col in (row + 1)..3 {
-            acc -= a[row][col] * x[col];
-        }
-        x[row] = acc / a[row][row];
-    }
-    Some(x)
+    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    counts
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tof::Reprojector;
 
-    /// The beam table the real thing uses, so the plane geometry under test is the
-    /// sensor's own and not an idealisation of it.
-    fn beams() -> [[f64; 3]; N_ZONES] {
-        *Reprojector::alpha().beams()
-    }
-
-    /// A wall perpendicular to the sensor axis at `distance`, as slant ranges: every beam
-    /// reaches it at `d / (beam · axis)`.
-    fn wall(distance: f64) -> [Option<f64>; N_ZONES] {
-        let beams = beams();
-        let mut out = [None; N_ZONES];
-        for (slot, beam) in out.iter_mut().zip(&beams) {
-            *slot = Some(distance / beam[0]);
+    /// A frame with `zones` zones at `distance_m`, all carrying `status_code`.
+    fn frame(distance_m: f64, status_code: u8, zones: usize) -> (Vec<i16>, Vec<u8>) {
+        let mm = (distance_m * 1000.0) as i16;
+        let mut distance = vec![0i16; N_ZONES];
+        let mut status = vec![255u8; N_ZONES];
+        for zone in 0..zones.min(N_ZONES) {
+            distance[zone] = mm;
+            status[zone] = status_code;
         }
-        out
+        (distance, status)
     }
 
-    /// A blob of `size`×`size` zones at `distance`, centred, over `behind`.
-    fn blob(behind: &[Option<f64>; N_ZONES], distance: f64, size: usize) -> [Option<f64>; N_ZONES] {
-        let mut out = *behind;
-        let start = (ROWS - size) / 2;
-        for row in start..start + size {
-            for col in start..start + size {
-                out[row * COLS + col] = Some(distance);
-            }
-        }
-        out
-    }
-
-    fn all_hits() -> [Zone; N_ZONES] {
-        [Zone::Hit {
-            point: [0.3, 0.0, 0.0],
-            range: 0.3,
-        }; N_ZONES]
-    }
-
-    fn armed(frames: &[[Option<f64>; N_ZONES]]) -> Result<Background, Refusal> {
-        let config = Config::default();
-        let mut arming = Arming::new();
-        for frame in frames {
-            arming.observe(frame);
-        }
-        arming.finish(&config, &beams())
-    }
-
-    /// The scenario the whole module exists for: the duck walks up to a wall and stops, so
-    /// its background *is* the wall — and a hand in front of that wall still reads as a
-    /// hand, because it is nearer than the reference wherever the reference happens to be.
+    /// The bug that killed the first version, pinned: a hand past 30 cm arrives with a
+    /// consistency-failure status, and it must still play. If someone narrows
+    /// `Config::statuses` back to ST's two "valid" codes, this is the test that says why not.
     #[test]
-    fn a_hand_in_front_of_a_wall_the_duck_is_facing() {
-        let config = Config::default();
-        for wall_m in [0.30, 0.40, 0.55, 0.80] {
-            let background = armed(&[wall(wall_m); 8]).expect("a wall is a background");
+    fn the_statuses_a_real_hand_arrives_with_are_believed() {
+        let mut tracker = Tracker::new(Config::default());
+        for code in Config::default().statuses {
+            let (distance, status) = frame(0.40, code, 8);
+            let hand = tracker
+                .track(&distance, &status, Instant::now())
+                .unwrap_or_else(|| panic!("status {code} must play"));
             assert!(
-                background
-                    .detect(&wall(wall_m), &all_hits(), &config)
-                    .is_none(),
-                "the wall itself must be silent at {wall_m} m"
+                (hand.range_m - 0.40).abs() < 0.01,
+                "status {code}: {hand:?}"
             );
-            // Somewhere in the playable band, in front of wherever the wall is.
-            let hand_m = (wall_m - 0.15).clamp(config.near_m, config.far_m);
-            let hand = background
-                .detect(&blob(&wall(wall_m), hand_m, 3), &all_hits(), &config)
-                .unwrap_or_else(|| panic!("a hand at {hand_m} m in front of a {wall_m} m wall"));
-            assert!((hand.range_m - hand_m).abs() < 0.02, "{:?}", hand);
-            assert!((0.0..=1.0).contains(&hand.closeness), "{:?}", hand);
+            tracker.reset();
         }
+        // 255 is the sensor saying it looked and found nothing. That is silence, not a note.
+        let (distance, status) = frame(0.40, 255, 8);
+        assert_eq!(tracker.track(&distance, &status, Instant::now()), None);
+        // And a status nobody believes stays unbelieved.
+        let (distance, status) = frame(0.40, 1, 8);
+        assert_eq!(tracker.track(&distance, &status, Instant::now()), None);
     }
 
-    /// A wall is a plane, and the fit says so with the distance it is actually at — the log
-    /// line that settles "why would it not arm".
-    #[test]
-    fn a_wall_reads_as_a_plane_at_its_distance() {
-        for wall_m in [0.25, 0.5, 0.9] {
-            let background = armed(&[wall(wall_m); 8]).expect("armed");
-            match background.shape {
-                Shape::Plane { distance_m, rms_m } => {
-                    assert!(
-                        (distance_m - wall_m).abs() < 0.01,
-                        "{distance_m} vs {wall_m}"
-                    );
-                    assert!(rms_m < 0.005, "a synthetic wall is flat, rms {rms_m}");
-                }
-                other => panic!("a wall must fit a plane, got {other:?}"),
-            }
-        }
-    }
-
-    /// Arming with a hand already in front of the beak is refused rather than frozen in:
-    /// that background would make the hand the silent zero, which from outside looks
-    /// exactly like a duck ignoring you.
-    #[test]
-    fn arming_refuses_a_hand_it_would_have_taken_as_the_zero() {
-        assert_eq!(
-            armed(&[blob(&wall(0.6), 0.25, 3); 8]),
-            Err(Refusal::SomethingInTheWay)
-        );
-        // The same hand-shaped blob against open space, too — there is no wall to hide it.
-        assert_eq!(
-            armed(&[blob(&[None; N_ZONES], 0.25, 3); 8]),
-            Err(Refusal::SomethingInTheWay)
-        );
-    }
-
-    /// Open space arms fine: the background is "nothing anywhere", so every return that
-    /// arrives later is foreground. Only a sensor producing nothing at all is refused.
-    #[test]
-    fn open_space_arms_and_an_empty_sensor_does_not() {
-        let config = Config::default();
-        let far = {
-            let mut frame = wall(2.0);
-            // Beyond the playable band the reprojector would call these hits; what matters
-            // is that they are farther than anything the theremin plays.
-            frame[0] = None;
-            frame
-        };
-        let background = armed(&[far; 8]).expect("a far wall is open space to a theremin");
-        let hand = background
-            .detect(&blob(&far, 0.3, 3), &all_hits(), &config)
-            .expect("a hand against a far background");
-        assert!((hand.range_m - 0.3).abs() < 0.02);
-
-        assert_eq!(armed(&[[None; N_ZONES]; 8]), Err(Refusal::NoReturns));
-        assert_eq!(armed(&[]), Err(Refusal::NoReturns));
-    }
-
-    /// Closer is higher — the direction the pitch and the mouth both move — and the ends
-    /// of the band are 0 and 1 exactly.
+    /// Closer is higher — the direction the pitch and the mouth both move — and the ends of
+    /// the band are 0 and 1 exactly.
     #[test]
     fn closeness_rises_as_the_hand_approaches() {
         let config = Config::default();
-        let background = armed(&[wall(2.0); 8]).expect("armed");
-        let closeness = |d: f64| {
-            background
-                .detect(&blob(&wall(2.0), d, 3), &all_hits(), &config)
-                .map(|h| h.closeness)
+        let mut tracker = Tracker::new(config.clone());
+        let at = |tracker: &mut Tracker, distance: f64| {
+            let (d, s) = frame(distance, 5, 8);
+            tracker.track(&d, &s, Instant::now()).map(|h| h.closeness)
         };
-        let near = closeness(config.near_m).expect("the near end plays");
-        let far = closeness(config.far_m).expect("the far end plays");
-        let middle = closeness(0.5 * (config.near_m + config.far_m)).expect("the middle plays");
-        assert!((near - 1.0).abs() < 1e-9, "{near}");
-        assert!(far.abs() < 1e-9, "{far}");
-        assert!(far < middle && middle < near);
-        // Outside the band there is no note at all, rather than a clamped one.
-        assert_eq!(closeness(config.far_m + 0.1), None);
-        assert_eq!(closeness(config.near_m - 0.04), None);
+        assert_eq!(at(&mut tracker, config.near_m), Some(1.0));
+        assert_eq!(at(&mut tracker, config.far_m), Some(0.0));
+        let middle = at(&mut tracker, 0.5 * (config.near_m + config.far_m)).expect("plays");
+        assert!((0.0..1.0).contains(&middle));
+
+        // Outside the band there is no note, rather than a clamped one.
+        tracker.reset();
+        let (d, s) = frame(config.far_m + 0.2, 5, 8);
+        assert_eq!(tracker.track(&d, &s, Instant::now()), None);
     }
 
-    /// Walking into a wall after arming must not play a held note: a foreground that fills
-    /// the frame is a stale background, not a hand.
+    /// The anti-chop mechanism, which is the whole reason this is stateful: a frame the
+    /// sensor fumbles must not cut the note, and a hand actually withdrawn must stop it.
     #[test]
-    fn a_wall_that_arrives_after_arming_is_not_a_hand() {
+    fn a_dropped_frame_holds_the_note_and_a_withdrawn_hand_ends_it() {
         let config = Config::default();
-        let background = armed(&[wall(2.0); 8]).expect("armed");
+        let mut tracker = Tracker::new(config.clone());
+        let start = Instant::now();
+        let (good, good_status) = frame(0.30, 5, 8);
+        let (empty, empty_status) = frame(0.30, 255, 8);
+
+        let hand = tracker.track(&good, &good_status, start).expect("plays");
+        assert!(!hand.held);
+
+        // Dropouts inside the hold keep the note, and say they are held.
+        for frames in 1..=3 {
+            let at = start + Duration::from_millis(66 * frames);
+            let held = tracker
+                .track(&empty, &empty_status, at)
+                .unwrap_or_else(|| panic!("frame {frames} must ride the dropout"));
+            assert!(held.held);
+            assert_eq!(held.range_m, hand.range_m);
+        }
+        // Past the hold, silence.
+        let after = start + config.hold + Duration::from_millis(1);
+        assert_eq!(tracker.track(&empty, &empty_status, after), None);
+        // And the hold does not resurrect: still silent a frame later.
         assert_eq!(
-            background.detect(&wall(0.3), &all_hits(), &config),
-            None,
-            "a whole frame gone near is the duck moving, not a hand"
-        );
-        // And the same wall with only part of the frame on it *is* playable — that is a
-        // hand-sized thing, whatever it is made of.
-        assert!(
-            background
-                .detect(&blob(&wall(2.0), 0.3, 4), &all_hits(), &config)
-                .is_some()
+            tracker.track(&empty, &empty_status, after + Duration::from_millis(66)),
+            None
         );
     }
 
-    /// The floor is not an instrument. A duck looking down sees the ground in the lower
-    /// rows; those zones must not reach the pitch, however near they read.
+    /// The hold is measured from the last *seen* hand, not from the first dropout — a
+    /// gesture held for a minute must not expire mid-note.
     #[test]
-    fn floor_returns_are_never_the_hand() {
+    fn a_hand_that_keeps_being_seen_never_expires() {
+        let mut tracker = Tracker::new(Config::default());
+        let start = Instant::now();
+        let (good, status) = frame(0.30, 5, 8);
+        for frame_index in 0..(15 * 60) {
+            let at = start + Duration::from_millis(66 * frame_index);
+            let hand = tracker
+                .track(&good, &status, at)
+                .expect("a held hand plays");
+            assert!(!hand.held, "a seen hand is not a held one");
+        }
+    }
+
+    /// Too few zones is not a hand: one stray zone at 20 cm is the sensor, not a gesture.
+    #[test]
+    fn one_stray_zone_is_not_a_hand() {
         let config = Config::default();
-        let background = armed(&[wall(2.0); 8]).expect("armed");
-        let mut zones = all_hits();
-        let mut frame = wall(2.0);
-        // The bottom three rows are floor at a range that would otherwise dominate.
-        for row in 5..ROWS {
-            for col in 0..COLS {
-                zones[row * COLS + col] = Zone::Floor {
-                    point: [0.2, 0.0, -0.1],
-                };
-                frame[row * COLS + col] = Some(0.20);
-            }
-        }
-        assert_eq!(background.detect(&frame, &zones, &config), None);
+        let mut tracker = Tracker::new(config.clone());
+        let (distance, status) = frame(0.25, 5, 1);
+        assert_eq!(tracker.track(&distance, &status, Instant::now()), None);
+        let (distance, status) = frame(0.25, 5, config.min_zones);
+        assert!(tracker.track(&distance, &status, Instant::now()).is_some());
     }
 
-    /// Sway must not play: a background dropping by less than the margin is the trunk
-    /// breathing, and crossing it is a hand.
+    /// A negative distance under a believed status is a failed convergence, and a frame
+    /// shorter than the grid must not panic or read past its end — the wire carries vectors,
+    /// and a peer from another release can send fewer.
     #[test]
-    fn the_margin_absorbs_the_trunks_sway() {
-        let config = Config::default();
-        let background = armed(&[wall(0.45); 8]).expect("armed");
-        for sway in [0.0, 0.02, 0.05, config.margin_m - 0.005] {
-            let swayed: [Option<f64>; N_ZONES] =
-                std::array::from_fn(|i| background.range_m[i].map(|r| r - sway));
-            assert_eq!(
-                background.detect(&swayed, &all_hits(), &config),
-                None,
-                "sway of {sway} m must be silent"
-            );
-        }
-        let hand = blob(&wall(0.45), 0.45 - config.margin_m - 0.03, 3);
-        assert!(background.detect(&hand, &all_hits(), &config).is_some());
-    }
-
-    /// A zone the sensor drops in most arming frames must not enter the reference: as a
-    /// background it would mask a real hand appearing in exactly that zone.
-    #[test]
-    fn a_flickering_zone_stays_out_of_the_reference() {
-        let solid = wall(0.5);
-        let mut frames = vec![solid; 8];
-        // Zone 0 is seen once in eight; zone 1 in seven.
-        for (i, frame) in frames.iter_mut().enumerate() {
-            if i > 0 {
-                frame[0] = None;
-            }
-            if i == 0 {
-                frame[1] = None;
-            }
-        }
-        let background = armed(&frames).expect("armed");
-        assert_eq!(
-            background.range_m[0], None,
-            "a one-in-eight zone is a flier"
-        );
-        assert!(background.range_m[1].is_some(), "seven in eight is real");
-    }
-
-    /// The background drifts toward a rearranged room, and never toward the hand — a hand
-    /// held still for a minute must not become the new zero.
-    #[test]
-    fn the_reference_drifts_to_the_room_but_not_to_the_hand() {
-        let config = Config::default();
-        let mut background = armed(&[wall(0.8); 8]).expect("armed");
-        let held = blob(&wall(0.8), 0.30, 3);
-        let centre = (ROWS / 2) * COLS + COLS / 2;
-        let before = background.range_m[centre].expect("the wall is in every zone");
-
-        // Two minutes of a hand held perfectly still, at the frame rate.
-        for _ in 0..(15 * 120) {
-            let hand = background.detect(&held, &all_hits(), &config);
-            assert!(hand.is_some(), "a held hand must keep playing");
-            background.relax(&held, hand.as_ref(), &config, 1.0 / 15.0);
-        }
+    fn a_bad_frame_is_not_a_note() {
+        let mut tracker = Tracker::new(Config::default());
+        let now = Instant::now();
+        assert_eq!(tracker.track(&[-3; N_ZONES], &[5; N_ZONES], now), None);
+        assert_eq!(tracker.track(&[], &[], now), None);
+        // Three distances, two statuses: only zones with both count, so this is one usable
+        // zone and not a hand.
+        assert_eq!(tracker.track(&[300, 300, 300], &[5, 255], now), None);
         assert!(
-            (background.range_m[centre].expect("still there") - before).abs() < 0.01,
-            "the hand must not have become the background"
+            tracker.track(&[300, 300, 300], &[5, 5], now).is_some(),
+            "two usable zones is the minimum, and it is met"
         );
-
-        // The wall itself moving back (someone opened a door) is adopted.
-        let moved = wall(1.2);
-        for _ in 0..(15 * 600) {
-            background.relax(&moved, None, &config, 1.0 / 15.0);
-        }
-        let after = background.range_m[centre].expect("still there");
-        let expected = moved[centre].expect("the wall is in every zone");
-        assert!((after - expected).abs() < 0.05, "{after} vs {expected}");
     }
 
-    /// Clutter is called clutter, not a plane — the other half of the diagnostic line.
+    /// The histogram is the diagnostic that ends an argument about what the sensor is
+    /// saying, so it has to be ordered by how much of the frame each status covers.
     #[test]
-    fn clutter_does_not_fit_a_plane() {
-        // Beyond the playable band, so the theremin has no opinion about it and only the
-        // description is under test.
-        let mut frame = wall(1.4);
-        for (i, slot) in frame.iter_mut().enumerate() {
-            if let Some(r) = slot.as_mut()
-                && i % 3 == 0
-            {
-                *r -= 0.25;
-            }
-        }
-        let background = armed(&[frame; 8]).expect("clutter is still a background");
-        assert!(
-            matches!(background.shape, Shape::Cluttered { .. }),
-            "{:?}",
-            background.shape
-        );
+    fn the_histogram_leads_with_what_dominates_the_frame() {
+        let mut status = vec![4u8; 40];
+        status.extend(vec![255u8; 20]);
+        status.extend(vec![5u8; 4]);
+        let histogram = status_histogram(&status);
+        assert_eq!(histogram[0], (4, 40));
+        assert_eq!(histogram[1], (255, 20));
+        assert_eq!(histogram[2], (5, 4));
+
+        // Never reads past the grid, however long the wire's array is.
+        let long = vec![7u8; N_ZONES * 3];
+        assert_eq!(status_histogram(&long), vec![(7, N_ZONES)]);
+        assert!(status_histogram(&[]).is_empty());
     }
 }

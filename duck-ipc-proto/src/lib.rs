@@ -332,13 +332,15 @@ pub mod method {
     /// instrument, and the distance of a hand in front of the beak is the pitch — and the
     /// mouth opening, which rises with it, so the note is visible as well as audible.
     ///
-    /// Discrete; send as a request. The answer only says whether the robot *took* the
-    /// instrument — has a voice, has depth frames, is not face-down. Arming itself takes
-    /// about half a second of frames, because the theremin's zero is whatever is in front
-    /// of the duck at that moment (a wall, a table, an empty room) and one frame is not a
-    /// background. What that came out as, and whether it was refused because a hand was
-    /// already in the way, arrives in [`ROBOT_STATE`]'s `theremin` block — which is also
-    /// where the live pitch is, so a client can show the note being played.
+    /// Discrete; send as a request, and idempotent both ways. The answer says whether the
+    /// robot took the instrument — it has a voice, and depth frames are arriving. From then
+    /// on the nearest return inside the playable band is the hand: an explicit mode with
+    /// nothing clever inside it, because the clever version could not be relied on to mean
+    /// the same thing twice on real frames.
+    ///
+    /// [`ROBOT_STATE`]'s `theremin` block carries the live pitch, the mouth, and a line of
+    /// what the sensor said about the frame — which is the field diagnostic for this whole
+    /// feature.
     pub const ROBOT_THEREMIN: &str = "robot.theremin";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
@@ -1199,11 +1201,10 @@ pub struct ThereminParams {
 
 /// Answer to [`Call::RobotTheremin`].
 ///
-/// `accepted` is about the *instrument*, not about the arming: a robot with a voice, depth
-/// frames and its feet under it accepts, and then spends half a second working out what its
-/// background is. Watch [`RobotState::theremin`] for how that turned out — including the one
-/// refusal a client will actually hit, which is arming with a hand already in front of the
-/// beak.
+/// Refused only for what the robot can know at the door: no voice, no depth frames, the
+/// feature switched off. Once accepted it plays immediately — there is no arming step — and
+/// [`RobotState::theremin`] carries what it is doing, including what the sensor is saying
+/// about each frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThereminResult {
@@ -1230,19 +1231,8 @@ impl Default for ThereminResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThereminState {
-    /// The background has been captured and the instrument is playable. False while the
-    /// arming window is still filling, or after it was refused.
-    pub armed: bool,
-    /// Why arming was refused — a hand in the way, or a sensor seeing nothing. Set instead
-    /// of `armed`, and cleared by asking again.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refused: Option<String>,
-    /// What the background turned out to be, e.g. `plane at 0.42 m (0.9 cm rms)`. The one
-    /// line that explains a theremin behaving oddly in a particular spot.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub background: Option<String>,
-    /// Distance to the hand being played, metres. `None` when no hand is in the band —
-    /// which is silence, not an error.
+    /// Distance to the hand being played, metres. `None` when nothing is in the playable
+    /// band — which is silence, not an error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hand_range_m: Option<f64>,
     /// The note being sounded, hertz. `None` when silent.
@@ -1250,6 +1240,24 @@ pub struct ThereminState {
     pub note_hz: Option<f64>,
     /// How far open the mouth is being driven, 0..1 — the same number the pitch came from.
     pub mouth: f64,
+    /// How many zones the hand covers. Zero while silent. The number that says whether a
+    /// dropout was the hand leaving or the sensor blinking.
+    pub zones: u32,
+    /// This note is the held memory of a frame just gone, bridging a sensor dropout, rather
+    /// than something measured now. Reported so a readout can show that rather than implying
+    /// it still sees a hand.
+    #[serde(default, skip_serializing_if = "not")]
+    pub held: bool,
+    /// What the sensor said about this frame, as a line: how many zones carry a status the
+    /// robot believes, then the count per status code with a `*` on the believed ones — e.g.
+    /// `12 usable · 255:40 4*:12 5*:8 1:4`.
+    ///
+    /// Diagnostic, and the one worth carrying on the wire: a theremin that stops working past
+    /// 30 cm and a frame where status 4 covers half the grid are the same fact, but only the
+    /// second says what to change. The first version of this feature accepted only ST's two
+    /// "valid" codes and died at exactly that distance, invisibly, for want of this line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor: Option<String>,
 }
 
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
@@ -3481,22 +3489,19 @@ mod tests {
         assert!(!down.contains("theremin"), "{down}");
 
         state.theremin = Some(ThereminState {
-            armed: true,
-            refused: None,
-            background: Some("plane at 0.42 m (0.9 cm rms)".into()),
             hand_range_m: Some(0.31),
             note_hz: Some(412.0),
             mouth: 0.64,
+            zones: 9,
+            held: false,
+            sensor: Some("12 usable · 255:40 4*:12 5*:8 1:4".into()),
         });
         let up = serde_json::to_string(&state).unwrap();
-        assert!(up.contains(r#""theremin":{"armed":true"#), "{up}");
+        assert!(up.contains(r#""theremin":{"hand_range_m":0.31"#), "{up}");
         assert!(up.contains(r#""note_hz":412.0"#), "{up}");
-        // A silent armed theremin omits the note rather than sending a zero, which would
-        // read as "playing 0 Hz".
-        state.theremin = Some(ThereminState {
-            armed: true,
-            ..Default::default()
-        });
+        // A silent theremin omits the note rather than sending a zero, which would read as
+        // "playing 0 Hz".
+        state.theremin = Some(ThereminState::default());
         let silent = serde_json::to_string(&state).unwrap();
         assert!(!silent.contains("note_hz"), "{silent}");
         assert!(!silent.contains("hand_range_m"), "{silent}");

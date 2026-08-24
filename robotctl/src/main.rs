@@ -139,11 +139,13 @@ enum Namespace {
     /// beak is the pitch — closer is higher, and the mouth opens with the note.
     ///
     /// Runs until Ctrl-C, printing what the instrument is doing, and puts it down on the way
-    /// out. What the first half-second is doing is *arming*: whatever is in front of the duck
-    /// right then — a wall, a table, an empty room — becomes the silent zero, and only things
-    /// nearer than that play. So a duck facing a wall is fine; a duck arming with your hand
-    /// already in front of it refuses and says so, because that hand would have become the
-    /// zero.
+    /// out. An explicit mode with nothing clever inside it: while it is up, the nearest thing
+    /// in the playable band is the hand. Point the duck at open space and it is silent; point
+    /// it at a wall 40 cm away and it plays a steady note.
+    ///
+    /// The readout's last column is what the *sensor* said about the frame — how many zones
+    /// carry a status the robot believes, then the count per status code. That line is the
+    /// answer to every "why did it stop playing".
     Theremin {
         /// Put the instrument down instead of picking it up. For a theremin left up by a
         /// client that went away.
@@ -402,7 +404,6 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-
 /// Set by the `SIGINT` handler so the theremin is put down on the way out rather than left
 /// sounding. A bare `AtomicBool` store is the only thing a signal handler may safely do.
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -413,19 +414,19 @@ extern "C" fn note_interrupt(_signal: libc::c_int) {
 
 /// `robotctl theremin` — pick the ToF theremin up, watch it, put it down.
 ///
-/// A live view rather than a one-shot, because every question anyone has about this feature
-/// is a question about what it is doing *now*: has it armed, what did it decide its
-/// background was, is it seeing my hand, what note is that. All four are in
-/// `robot.state`'s theremin block, so this is a subscription with a one-line renderer over
-/// it.
+/// A live view rather than a one-shot, because every question anyone has about this feature is
+/// a question about what it is doing *now*: is it seeing my hand, what note is that, and —
+/// the one that matters when it is not working — what is the sensor actually reporting. All
+/// three are in `robot.state`'s theremin block, so this is a subscription with a one-line
+/// renderer over it.
 fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
     let mut client = Client::connect_to("robotd", socket)?;
     client.hello()?;
 
     let ask = |client: &mut Client, active: bool| -> Result<proto::ThereminResult, Failure> {
-        let result = result_of(client.call(&proto::Call::RobotTheremin(proto::ThereminParams {
-            active,
-        }))?)?;
+        let result = result_of(client.call(&proto::Call::RobotTheremin(
+            proto::ThereminParams { active },
+        ))?)?;
         decode(&result)
     };
 
@@ -457,7 +458,7 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
         );
     }
 
-    println!("arming — hold still, whatever is in front of the beak becomes the zero");
+    println!("playing — a hand in front of the beak, closer is higher · Ctrl-C to stop");
     // A second connection for the state stream: the first one is kept to put the instrument
     // down with, and a subscription is a stream of notifications rather than a call/response,
     // so sharing one would mean untangling the two.
@@ -468,7 +469,6 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
         &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(15) }),
     ))?;
 
-    let mut armed = false;
     let mut line = String::new();
     while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
         line.clear();
@@ -490,32 +490,22 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
             continue;
         };
         // The block is absent while the instrument is down, which after a successful pick-up
-        // means the robot put it down itself — it started walking, or went over.
+        // means the robot put it down itself.
         let Some(theremin) = state.theremin else {
-            println!("\rthe robot put the theremin down          ");
+            println!("\rthe robot put the theremin down                                     ");
             return Ok(());
         };
-        if let Some(refused) = theremin.refused {
-            println!("\r                                                                  ");
-            return Err(Failure::new(exit::REFUSED, refused));
-        }
-        if theremin.armed && !armed {
-            armed = true;
-            let background = theremin.background.as_deref().unwrap_or("unknown");
-            println!("armed against {background} — play it, Ctrl-C to stop");
-        }
-        if !armed {
-            continue;
-        }
         // One rewritten line: this is a live readout, and a scrolling one would be unreadable
         // at 15 Hz.
+        let sensor = theremin.sensor.as_deref().unwrap_or("");
         match (theremin.hand_range_m, theremin.note_hz) {
             (Some(range), Some(hz)) => print!(
-                "\r  {range:.2} m   {hz:6.1} Hz   mouth {:>3.0}%   {:<20}",
+                "\r  {range:.2} m {:1} {hz:6.1} Hz  {:>3.0}% {:<10}  {sensor:<34}",
+                if theremin.held { "~" } else { " " },
                 theremin.mouth * 100.0,
                 bar(theremin.mouth),
             ),
-            _ => print!("\r  {:<58}", "— no hand —"),
+            _ => print!("\r  {:<32}{sensor:<34}", "— no hand —"),
         }
         let _ = std::io::stdout().flush();
     }
@@ -528,10 +518,10 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A twenty-cell meter for the mouth opening — the one part of the readout you can watch
+/// A ten-cell meter for the mouth opening — the one part of the readout you can watch
 /// without reading it.
 fn bar(fraction: f64) -> String {
-    let filled = (fraction.clamp(0.0, 1.0) * 20.0).round() as usize;
+    let filled = (fraction.clamp(0.0, 1.0) * 10.0).round() as usize;
     "█".repeat(filled)
 }
 

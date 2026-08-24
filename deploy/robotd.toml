@@ -280,22 +280,28 @@ mode = "walk"
 # tofd's depth stream.
 # socket = "/run/tofd/tof.sock"
 
-# The playable band, metres. Closer than near_m the field of view is narrower than a hand
-# (it is only 0.828 x distance across) and the sensor's own crosstalk starts inventing short
-# returns; past far_m the returns are the noisy ones, and they would be the low notes.
-# Shorten the band for a duck on a desk, where the background is 20 cm away.
-# near_m = 0.15
-# far_m = 0.60
+# The playable band, metres. Below near_m the sensor's own cover-glass crosstalk invents
+# short returns; past far_m the returns are the noisy ones, and they would be the low notes.
+# near_m = 0.10
+# far_m = 0.70
 
-# How much nearer than the background a return has to be to count as a hand. The theremin's
-# zero is whatever was in front of the duck when it armed — that is what lets it work facing
-# a wall — and this margin is what keeps the *trunk's own sway* from crossing it. Raise it on
-# a duck whose stand policy sways more than most; lower it for a lighter touch.
-# margin_m = 0.08
+# Fewest zones that make a hand. Two, because at the far end of the band a hand is a handful
+# of zones and only some of them will carry a usable status.
+# min_zones = 2
 
-# Fewest zones that make a hand. Two is noise.
-# min_zones = 3
+# **The field that decides how far the instrument reaches.** ST documents 5 and 9 as "range
+# valid", and a build believing only those stops seeing a hand at about 30 cm: past that a
+# moving hand comes back as 4 or 13 — consistency failed, sigma too high — carrying a
+# distance that is perfectly good for a pitch. 6, 10 and 12 are the other usable-in-practice
+# codes (12 is "blurred by a sharp edge", which is what the edge of a hand is). 255 is the
+# sensor saying it looked and found nothing, and is never in this list.
+#
+# Add codes if the reach is short; remove them if it plays phantom notes at empty air.
+# `robotctl theremin`'s last column is the per-code count for the live frame, with a * on the
+# ones this list believes — that is how you tune it.
+# statuses = [4, 5, 6, 9, 10, 12, 13]
 
-# Seconds over which the zero drifts toward a rearranged room. Long on purpose: a hand held
-# still for a minute must not become the new background.
-# background_tau_s = 120.0
+# How long a note is held through a sensor dropout, milliseconds. This is what keeps a zone
+# flickering between usable and not from chopping a note into gravel. Too long and a hand you
+# withdrew keeps sounding.
+# hold_ms = 250
