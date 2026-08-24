@@ -105,6 +105,10 @@ enum Cmd {
         /// preview is harsher than the hardware will actually sound.
         #[arg(long, default_value_t = 0.25)]
         room: f64,
+        /// Where the playback speaker stops reproducing, hertz. Defaults to the duck's own
+        /// driver, which is the target; `--rolloff 0` renders for a full-range system instead.
+        #[arg(long, default_value_t = 300.0)]
+        rolloff: f64,
         /// ALSA device; the robot's codec by default.
         #[arg(long, default_value = "plughw:aic3104")]
         device: String,
@@ -328,6 +332,7 @@ fn main() -> Result<()> {
             bpm,
             transpose,
             room,
+            rolloff,
             device,
         } => {
             // A spread of seeds that casts to four clearly different registers, so the default
@@ -394,6 +399,7 @@ fn main() -> Result<()> {
             let options = chorale::Options {
                 transpose: shift,
                 room,
+                speaker_rolloff_hz: Some(rolloff).filter(|hz| *hz > 0.0),
                 ..chorale::Options::default()
             };
             let mix = chorale::render(&score, &singers, &options);

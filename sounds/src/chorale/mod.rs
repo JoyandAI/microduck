@@ -636,6 +636,13 @@ pub struct Options {
     pub room: f64,
     /// Peak of the finished mix, dBFS.
     pub peak_dbfs: f64,
+    /// Where the playback speaker stops reproducing, hertz — or `None` for a full-range one.
+    ///
+    /// Defaults to the duck's own driver, because the duck is the target. A coin-sized speaker
+    /// produces almost nothing below a few hundred hertz, so the bass line's fundamental is not
+    /// quiet but *absent*, and `Stream::set_speaker_rolloff` moves the note into harmonics the
+    /// driver can actually make. Set `None` to hear the arrangement on a full-range system.
+    pub speaker_rolloff_hz: Option<f64>,
 }
 
 impl Default for Options {
@@ -644,6 +651,9 @@ impl Default for Options {
             transpose: 0,
             room: 0.25,
             peak_dbfs: -3.0,
+            // Measured by ear on the duck rather than from a datasheet: the shipped score's
+            // 130 Hz bass line did not come through, and this is where it starts to.
+            speaker_rolloff_hz: Some(300.0),
         }
     }
 }
@@ -661,7 +671,10 @@ pub fn render(score: &Score, singers: &[Singer], options: &Options) -> Vec<f32> 
     let mut mix = vec![0.0f32; total];
 
     for singer in singers {
-        for (sample, value) in sing(score, singer, shift, total).iter().enumerate() {
+        for (sample, value) in sing(score, singer, shift, total, options)
+            .iter()
+            .enumerate()
+        {
             mix[sample] += value;
         }
     }
@@ -680,12 +693,13 @@ pub fn render(score: &Score, singers: &[Singer], options: &Options) -> Vec<f32> 
 }
 
 /// One duck's part, as it would come out of that duck's speaker.
-fn sing(score: &Score, singer: &Singer, shift: i32, total: usize) -> Vec<f32> {
+fn sing(score: &Score, singer: &Singer, shift: i32, total: usize, options: &Options) -> Vec<f32> {
     /// Control-rate block. Short enough that a note change lands within a couple of
     /// milliseconds; the stream's own slews do the shaping from there.
     const BLOCK: usize = 128;
 
     let mut stream = Stream::choral(&singer.personality, singer.part as u32);
+    stream.set_speaker_rolloff(options.speaker_rolloff_hz);
     let detune = 2.0f64.powf(singer.detune_cents / 1200.0);
     let beat_s = score.beat_s();
 

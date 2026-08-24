@@ -73,6 +73,22 @@ const OPEN_TILT_LIFT: f64 = 0.8;
 /// Headroom under full scale for the static gain, before the soft clip.
 const PEAK: f32 = 0.75;
 
+/// How steeply a small speaker falls away below its useful range, in dB per octave.
+///
+/// A sealed driver the size of a coin rolls off at about this, and the exact figure matters less
+/// than the shape: the point is that amplitude spent below it is not merely quiet, it is *gone*,
+/// and spending it there is worse than not spending it.
+const ROLLOFF_DB_PER_OCTAVE: f64 = 12.0;
+
+/// The most [`Stream::set_speaker_rolloff`] may amplify what is left after it has given up on the
+/// low harmonics.
+///
+/// A note whose *whole* series sits below the rolloff has nothing to redistribute to, and
+/// renormalising it would turn a note the speaker cannot make into a loud note the speaker cannot
+/// make. Clamped, so a bass note off the bottom of the instrument stays quiet instead of becoming
+/// distortion.
+const MAX_BASS_LIFT: f64 = 4.0;
+
 /// How often the harmonic weights are recomputed, in samples (~5 ms).
 ///
 /// Not once per block, which is the obvious place for it and is wrong: the block size is
@@ -113,12 +129,18 @@ pub struct Stream {
     /// Formant offset in harmonics, from the vowel being sung. See [`FORMANT_RANGE`].
     formant_shift: f64,
     formant_shift_target: f64,
+    /// Where the speaker stops reproducing, if the caller has said. See
+    /// [`Stream::set_speaker_rolloff`].
+    speaker_rolloff_hz: Option<f64>,
     /// Harmonic weights for the current `open`, and the `open` they were computed at — 7
     /// `powf`s are not worth spending while the mouth has not moved.
     weights: Vec<f64>,
     weights_open: f64,
     /// The formant offset the weights were computed at, for the same reason.
     weights_formant: f64,
+    /// And the frequency, which matters once a speaker rolloff is in play: the weights then depend
+    /// on where the harmonics *land*, not only on their relative sizes.
+    weights_freq: f64,
     /// Samples until the next weight refresh. See [`REFRESH_SAMPLES`].
     refresh_in: u32,
     /// Static gain, from the weights' worst-case sum.
@@ -159,10 +181,12 @@ impl Stream {
             open_target: 0.0,
             formant_shift: 0.0,
             formant_shift_target: 0.0,
+            speaker_rolloff_hz: None,
             weights: Vec::new(),
             // Not any reachable `open`, so the first sample computes the weights.
             weights_open: f64::NAN,
             weights_formant: f64::NAN,
+            weights_freq: f64::NAN,
             refresh_in: 0,
             gain: 1.0,
             vibrato_depth: p.vibrato_depth,
@@ -218,6 +242,27 @@ impl Stream {
         hz_at(&self.p, position)
     }
 
+    /// Tell the voice what the speaker can actually reproduce, in hertz — or `None` for a
+    /// full-range one.
+    ///
+    /// **This makes low notes louder by making the fundamental quieter**, which sounds backwards
+    /// and is the whole trick. A duck's speaker is a coin-sized driver that produces very little
+    /// below a few hundred hertz, so a bass line's fundamental is not quiet — it is absent, and
+    /// the amplitude allocated to it is spent on nothing while eating the headroom the rest of the
+    /// note needs. Worse, pushing harder at it is how a small driver is made to distort.
+    ///
+    /// So the weight is taken *off* the harmonics the driver cannot produce and given to the ones
+    /// it can. The pitch survives because pitch does not live in the fundamental: a series spaced
+    /// 130 Hz apart is heard as a 130 Hz note whether or not there is anything at 130 Hz — the
+    /// residue pitch every small speaker has always relied on.
+    ///
+    /// Off by default: on a laptop the fundamental is real and there is nothing to work around.
+    pub fn set_speaker_rolloff(&mut self, hz: Option<f64>) {
+        self.speaker_rolloff_hz = hz.filter(|hz| *hz > 0.0);
+        // The weights depend on it, and it is set rarely enough that recomputing now is free.
+        self.refresh_weights();
+    }
+
     /// Set the vowel being sung: which harmonic the formant boosts, relative to this duck's
     /// own [`Personality::formant_n`].
     ///
@@ -267,8 +312,11 @@ impl Stream {
         for sample in out.iter_mut() {
             // Timbre, on its own cadence — see `REFRESH_SAMPLES` for why not per block.
             if self.refresh_in == 0 {
+                let moved_a_lot = |from: f64, to: f64| (to - from).abs() > from.abs() * 0.01;
                 if (self.open - self.weights_open).abs() > 0.005
                     || (self.formant_shift - self.weights_formant).abs() > 0.02
+                    || (self.speaker_rolloff_hz.is_some()
+                        && moved_a_lot(self.weights_freq, self.freq))
                 {
                     self.refresh_weights();
                 }
@@ -342,6 +390,30 @@ impl Stream {
         self.weights = p.harmonics();
         self.weights_open = self.open;
         self.weights_formant = self.formant_shift;
+        self.weights_freq = self.freq;
+
+        if let Some(rolloff) = self.speaker_rolloff_hz {
+            // What the driver does to each harmonic, as a plain amplitude factor. Above the
+            // rolloff it does nothing; below, the response falls at `ROLLOFF_DB_PER_OCTAVE`.
+            let exponent = ROLLOFF_DB_PER_OCTAVE / 6.0206;
+            let before: f64 = self.weights.iter().sum();
+            for (n, weight) in self.weights.iter_mut().enumerate() {
+                let harmonic_hz = self.freq * (n + 1) as f64;
+                let response = (harmonic_hz / rolloff).min(1.0).powf(exponent);
+                *weight *= response;
+            }
+            // Give back what was taken, to whatever is left — so the note keeps its loudness and
+            // only its *balance* changes. Clamped: a note whose whole series is under the rolloff
+            // has nothing to give it to, and must stay quiet rather than become distortion.
+            let after: f64 = self.weights.iter().sum();
+            if after > 1e-9 {
+                let lift = (before / after).min(MAX_BASS_LIFT);
+                for weight in &mut self.weights {
+                    *weight *= lift;
+                }
+            }
+        }
+
         let sum: f64 = self.weights.iter().sum();
         self.gain = PEAK / (sum.max(1e-6) as f32);
     }
@@ -495,6 +567,94 @@ mod tests {
             open > closed * 1.1,
             "an open mouth must be brighter: upper/f0 {closed} -> {open}"
         );
+    }
+
+    /// The bass fix, and it has to be checked the way the ear works rather than the way a level
+    /// meter does: the compensation must move energy *above* the speaker's rolloff while leaving
+    /// the harmonic spacing — and so the perceived pitch — exactly where it was.
+    #[test]
+    fn a_speaker_rolloff_moves_the_bass_into_the_harmonics() {
+        const F0: f64 = 130.81; // C3, the shipped score's bass
+        const ROLLOFF: f64 = 300.0;
+        let p = Personality::from_seed(100);
+
+        // Energy at n * F0, and the total below the rolloff, for a settled note.
+        let measure = |rolloff: Option<f64>| {
+            let mut s = Stream::choral(&p, 0);
+            s.set_speaker_rolloff(rolloff);
+            s.set(F0, 1.0, 0.6);
+            let mut block = vec![0.0f32; 48_000];
+            s.block(&mut block);
+            s.block(&mut block);
+            let magnitude = |hz: f64| {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, &v) in block.iter().enumerate() {
+                    let ph = std::f64::consts::TAU * hz * i as f64 / f64::from(SR);
+                    re += f64::from(v) * ph.cos();
+                    im += f64::from(v) * ph.sin();
+                }
+                (re * re + im * im).sqrt() / block.len() as f64
+            };
+            let harmonics: Vec<f64> = (1..=6).map(|n| magnitude(F0 * n as f64)).collect();
+            let below: f64 = harmonics
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| (F0 * (n + 1) as f64) < ROLLOFF)
+                .map(|(_, m)| m)
+                .sum();
+            let above: f64 = harmonics
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| (F0 * (n + 1) as f64) >= ROLLOFF)
+                .map(|(_, m)| m)
+                .sum();
+            (harmonics, below, above)
+        };
+
+        let (plain, plain_below, plain_above) = measure(None);
+        let (lifted, lifted_below, lifted_above) = measure(Some(ROLLOFF));
+
+        // Less under the rolloff, more over it — the trade the whole thing is.
+        assert!(
+            lifted_below < plain_below * 0.8,
+            "energy below {ROLLOFF} Hz barely moved: {plain_below} -> {lifted_below}"
+        );
+        assert!(
+            lifted_above > plain_above * 1.2,
+            "energy above {ROLLOFF} Hz barely moved: {plain_above} -> {lifted_above}"
+        );
+        // The pitch is unchanged, because it never lived in the fundamental: the series is still
+        // spaced F0 apart, with every harmonic still present.
+        for (n, magnitude) in lifted.iter().enumerate() {
+            assert!(
+                *magnitude > 0.0,
+                "harmonic {} vanished, which would change the perceived pitch",
+                n + 1
+            );
+        }
+        // And it is a rebalance, not a volume knob: the note is not wildly louder overall.
+        let plain_total: f64 = plain.iter().sum();
+        let lifted_total: f64 = lifted.iter().sum();
+        assert!(
+            (lifted_total / plain_total) < 2.0,
+            "the note got {:.1}x louder, which is a gain and not a rebalance",
+            lifted_total / plain_total
+        );
+    }
+
+    /// A note the driver cannot make at all must stay quiet rather than become distortion: there is
+    /// nothing to redistribute to, so the lift is clamped.
+    #[test]
+    fn a_note_below_everything_is_not_amplified_into_distortion() {
+        let p = Personality::from_seed(100);
+        let mut s = Stream::choral(&p, 0);
+        // A rolloff above the whole seven-harmonic series of a 40 Hz note.
+        s.set_speaker_rolloff(Some(2000.0));
+        s.set(40.0, 1.0, 0.5);
+        let mut block = vec![0.0f32; 24_000];
+        s.block(&mut block);
+        s.block(&mut block);
+        assert!(block.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
     }
 
     /// The pitch map must be geometric and anchored on the duck: the same interval for the
