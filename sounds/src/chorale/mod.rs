@@ -34,6 +34,7 @@
 //! is what has to be exact, and that needs no synchronisation at all — only a shared reference
 //! pitch, which is a constant.
 
+pub mod beat;
 pub mod midi;
 pub mod text;
 
@@ -66,12 +67,28 @@ impl Part {
         }
     }
 
+    /// Roughly where this part sits, as a MIDI number — the middle of the range the shipped
+    /// voicings keep it inside. Used to seat a duck in the part nearest its own register.
+    pub fn register(&self) -> f64 {
+        match self {
+            Part::Bass => 51.0,
+            Part::Tenor => 58.0,
+            Part::Alto => 63.0,
+            Part::Soprano => 68.0,
+        }
+    }
+
     /// Which parts an ensemble of `n` ducks sings.
     ///
     /// Not simply the lowest `n`: a chord needs its outer voices most, so a duet is bass and
     /// soprano — melody over a bass line — rather than bass and tenor, which would be two
     /// ducks muttering in the same octave. A trio drops the tenor, the voice whose notes are
     /// most often doubled elsewhere in the chord.
+    ///
+    /// **These sets are nested**, and that is load-bearing rather than incidental:
+    /// `{S} ⊂ {B,S} ⊂ {B,A,S} ⊂ {B,T,A,S}`. It is what makes a duck able to join a group that
+    /// is already singing without anyone changing part — there is always exactly one free
+    /// part to take. See [`seat`].
     pub fn ensemble(n: usize) -> Vec<Part> {
         match n {
             0 => Vec::new(),
@@ -542,6 +559,53 @@ pub fn cast(personalities: &[Personality]) -> Vec<Singer> {
     singers.into_iter().flatten().collect()
 }
 
+/// Seat one more duck alongside a group that is already singing.
+///
+/// **Nobody already singing changes part.** That is the whole point, and the alternative is
+/// audibly bad: [`cast`] sorts by register, so a low duck arriving at a duet would take the
+/// bass and shove the current bass up to alto — a part change in the middle of a piece. So a
+/// joiner takes what is free, and because [`Part::ensemble`]'s sets are nested there is always
+/// exactly one free part until the fourth duck has arrived.
+///
+/// Still decided by every duck independently, with nothing negotiated: the join order is what
+/// each duck observed, and they all observed the same beacon.
+///
+/// Past four, the parts double up — which is what a real choir does with more singers than
+/// lines, and the doubling duck takes the part nearest its own register.
+pub fn seat(existing: &[Singer], newcomer: &Personality) -> Singer {
+    let held: Vec<Part> = existing.iter().map(|s| s.part).collect();
+    let wanted = Part::ensemble(existing.len() + 1);
+    let free: Vec<Part> = wanted
+        .iter()
+        .copied()
+        .filter(|part| !held.contains(part))
+        .collect();
+    // Where this duck's voice sits, as a MIDI number, so "nearest part" means something.
+    let register = 69.0 + 12.0 * (newcomer.pitch_center_hz / A4_HZ).log2();
+    let choices = if free.is_empty() { &wanted } else { &free };
+    let part = choices
+        .iter()
+        .copied()
+        .min_by(|a, b| {
+            (a.register() - register)
+                .abs()
+                .partial_cmp(&(b.register() - register).abs())
+                .expect("registers are finite")
+                .then(a.cmp(b))
+        })
+        .unwrap_or(Part::Soprano);
+
+    // The seat number is what varies the detune and the onset, and it has to be stable for this
+    // duck — so it is how many were already singing, not a re-roll of the whole group.
+    let mut rng = newcomer.variant_rng("chorale-seat", existing.len() as u32);
+    Singer {
+        part,
+        detune_cents: rng.uniform(-5.0, 5.0),
+        onset_offset_s: rng.uniform(-0.015, 0.015),
+        personality: *newcomer,
+    }
+}
+
 /// Equal-temperament frequency of a MIDI note, from [`A4_HZ`].
 pub fn midi_hz(midi: f64) -> f64 {
     A4_HZ * 2.0f64.powf((midi - 69.0) / 12.0)
@@ -777,6 +841,109 @@ mod tests {
             assert_eq!(singer.part, same.part, "seed {}", singer.personality.seed);
             assert_eq!(singer.detune_cents, same.detune_cents);
         }
+    }
+
+    /// Joining a group that is already singing must not move anyone who is: the whole reason
+    /// `seat` exists alongside `cast`. With `cast` alone, a low duck arriving at a duet would take
+    /// the bass and shove the current bass up to alto — a part change mid-piece.
+    #[test]
+    fn a_duck_joining_does_not_move_anyone_already_singing() {
+        let personalities: Vec<Personality> = [100u32, 7, 313, 42]
+            .iter()
+            .copied()
+            .map(Personality::from_seed)
+            .collect();
+        // Two ducks start together, then two more arrive one at a time.
+        let mut ensemble = cast(&personalities[..2]);
+        let opening: Vec<(u32, Part)> = ensemble
+            .iter()
+            .map(|s| (s.personality.seed, s.part))
+            .collect();
+
+        for newcomer in &personalities[2..] {
+            let joined = seat(&ensemble, newcomer);
+            ensemble.push(joined);
+            // Everyone who was singing is still singing the same part.
+            for (seed, part) in &opening {
+                let now = ensemble
+                    .iter()
+                    .find(|s| s.personality.seed == *seed)
+                    .expect("still here");
+                assert_eq!(
+                    now.part, *part,
+                    "seed {seed} changed part when someone joined"
+                );
+            }
+            // And no two ducks are doubling while a part is still free.
+            let mut parts: Vec<Part> = ensemble.iter().map(|s| s.part).collect();
+            parts.sort();
+            let unique = {
+                let mut p = parts.clone();
+                p.dedup();
+                p.len()
+            };
+            assert_eq!(unique, parts.len(), "doubled up early: {parts:?}");
+        }
+        assert_eq!(ensemble.len(), 4);
+    }
+
+    /// The nesting of `Part::ensemble` is what makes that possible — there is always exactly one
+    /// free part for a joiner until the fourth duck has arrived. If someone reorders those sets,
+    /// this is what notices.
+    #[test]
+    fn the_ensemble_sets_are_nested() {
+        for n in 1..4 {
+            let smaller = Part::ensemble(n);
+            let larger = Part::ensemble(n + 1);
+            for part in &smaller {
+                assert!(
+                    larger.contains(part),
+                    "ensemble({n}) is not inside ensemble({}) — {smaller:?} vs {larger:?}",
+                    n + 1
+                );
+            }
+            assert_eq!(larger.len(), smaller.len() + 1, "exactly one part opens up");
+        }
+    }
+
+    /// Past four ducks the parts double, which is what a real choir does with more singers than
+    /// lines — and the doubling duck takes the part nearest its own register rather than an
+    /// arbitrary one.
+    #[test]
+    fn a_fifth_duck_doubles_the_part_nearest_its_voice() {
+        let quartet = cast(
+            &[100u32, 7, 313, 42]
+                .iter()
+                .copied()
+                .map(Personality::from_seed)
+                .collect::<Vec<_>>(),
+        );
+        // A very low duck: seed chosen by searching for one at the bottom of the population.
+        let low = (0u32..2000)
+            .map(Personality::from_seed)
+            .min_by(|a, b| {
+                a.pitch_center_hz
+                    .partial_cmp(&b.pitch_center_hz)
+                    .expect("finite")
+            })
+            .expect("some duck");
+        let fifth = seat(&quartet, &low);
+        assert_eq!(
+            fifth.part,
+            Part::Bass,
+            "a {} Hz duck doubles the bass",
+            low.pitch_center_hz
+        );
+
+        let high = (0u32..2000)
+            .map(Personality::from_seed)
+            .max_by(|a, b| {
+                a.pitch_center_hz
+                    .partial_cmp(&b.pitch_center_hz)
+                    .expect("finite")
+            })
+            .expect("some duck");
+        assert_eq!(seat(&quartet, &high).part, Part::Soprano);
     }
 
     /// A duet takes the outer voices. Two ducks muttering a bass and a tenor in the same octave
