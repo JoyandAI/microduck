@@ -304,9 +304,38 @@ plugin loading in 1.26.2 with two decode elements.
    the user joins `video`, `gst-inspect` answers as that user. Which is the case `mediad` is in,
    and every check before this one had been under `sudo`.
 
-**Not measured.** No camera has been attached, so the capture half — rkisp, rkaiq, the
-`v4l2-ctl`-into-`appsrc` question — is untested here; what is known comes from
-`microduck_runtime` on the same hardware. `webrtcsink` registers but has never negotiated with a
+**The overlay works; the sensor has not been reached.** With
+`radxa-zero3-rpi-camera-v2` mirrored and enabled, a board comes up with `csi2-dphy0` probed,
+`rkisp` running, and ten `/dev/videoN` nodes — `rkisp_mainpath` on `platform:rkisp-vir0` and
+`rkisp-statistics`. So the overlay half is proven.
+
+The sensor is not:
+
+```
+imx219 2-0010: Reading register 100 from 10 failed
+imx219 2-0010: Error -5 setting default controls
+imx219: probe of 2-0010 failed with error -5
+```
+
+`i2cdetect -y 2` on the camera's own bus is completely empty — no address, and no `UU` either,
+while other buses show `UU` where drivers hold devices. Nothing is answering electrically. Two
+things to know when picking this up:
+
+- **A format list capping at 800x600 is the ISP's fallback with no sensor.** A live IMX219 offers
+  up to 3280x2464, so that cap is a symptom rather than a limit.
+- **An empty `i2cdetect` after a failed probe proves less than it looks.** The driver releases the
+  sensor's clock and regulators when probe fails, so the bus reads empty either way. The probe
+  line in `dmesg` at boot is the signal; the scan is not.
+
+Most likely physical: the Zero 3W's CSI connector is a **22-pin 0.5 mm FPC**, like a Pi Zero, not
+the 15-pin one on a full-size Pi — a standard Pi Camera ribbon does not mate with it. Reversed
+orientation is the other common cause. If the module turns out to be a Pi Cam v1.3 (OV5647,
+address `0x36`) rather than a v2, `DUCK_CAMERA_OVERLAY=radxa-zero3-rpi-camera-v1.3` is the
+overlay — a path nothing here has tested.
+
+**Not measured beyond that.** rkaiq, image quality, and the `v4l2src`-versus-own-mmap-loop
+question are all untouched; what is known about them comes from `microduck_runtime` on the same
+hardware. `webrtcsink` registers but has never negotiated with a
 peer. And `mediad` does not exist, so nothing has been assembled into a pipeline that runs as a
 service.
 
