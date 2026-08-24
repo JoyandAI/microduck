@@ -46,6 +46,25 @@ installs that kernel — for the audio codec's I²S tree, not for video — so t
 met before anyone asked for it. A stray `apt upgrade` that pulls the `current` kernel and
 repoints `/boot` takes both away.
 
+## The camera needs an overlay, mirrored under a prefix
+
+A plugged-in CSI camera produces **no `/dev/video*` and nothing in dmesg** until its device-tree
+overlay is enabled — which reads exactly like a camera that is not connected.
+
+Enabling it has a trap worth stating on its own. Armbian ships the overlay as
+`radxa-zero3-rpi-camera-v2.dtbo` with **no `rk3568-` prefix**, while the board runs
+`overlay_prefix=rk3568`. So an `overlays=` word resolves to
+`rk3568-radxa-zero3-rpi-camera-v2.dtbo`, the loader finds nothing, and the board boots happily
+with no camera — the same silent failure `configure_overlay` exists to prevent for `uart2-m0`.
+The file has to be **mirrored under the prefixed name first**, and only then named in `overlays=`.
+`microduck_runtime/install.sh` hit this and does the same thing.
+
+`configure_camera` in `setup-board.sh` does both, into the *vendor* kernel's overlay directory —
+the MIPI-CSI capture driver exists only on that branch, which is the second reason the vendor
+kernel is not optional. `DUCK_CAMERA_OVERLAY` picks another module; Armbian ships one per sensor,
+and for this board that is `radxa-zero3-rpi-camera-v2` (Pi Cam v2 / IMX219) or
+`radxa-zero3-rpi-camera-v1.3` (Pi Cam v1.3 / OV5647). Only the first has ever been used here.
+
 ## The encoder is MPP, not V4L2
 
 `v4l2h264enc` is absent and `/dev/video*` is empty. Neither is a fault:
