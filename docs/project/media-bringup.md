@@ -152,7 +152,19 @@ Its `DT_NEEDED` is satisfied by what a board already has after the debs above:
 against glibc 2.41. Nothing in it is RK3588-specific — the SoC differences live inside MPP, not
 the plugin — and `Depends` bounds GStreamer only from below (`>= 1.14`).
 
-**Trying it is not the same as depending on it.** It is one person's per-board dump with no
+`scripts/build-gst-rockchip.sh` builds ours: pinned to
+`JeffyCN/mirrors@dcbcd6454ef892e385b3a782600369eb6c0719db` (2026-05-21), natively on the board,
+with `rkximage` and `kmssrc` — the X11 and KMS sinks in the same tree — **disabled**. A headless
+robot has no use for either, and they are why the prebuilt deb depends on `libx11-6`. It installs
+to `/usr/local/lib/gstreamer-1.0` rather than the distro plugin directory, so `apt` can never
+quietly replace or remove it, and prints the commit and sha256 needed to pin the result.
+
+The build has one trap worth knowing: `gst/rockchipmpp/meson.build` ends in
+`if not mpp_dep.found() → subdir_done()`, so a missing `librockchip-mpp-dev` makes meson **skip
+the plugin and succeed**, producing nothing. The script checks `pkg-config` for `rockchip_mpp`
+and `librga` up front and refuses rather than discovering an empty build.
+
+**Trying the third-party deb is not the same as depending on it.** It is one person's per-board dump with no
 provenance we control, and it vanishes if that repository does. What it buys cheaply is the answer
 to the only real question about the build — whether this plugin works against *our* MPP and
 GStreamer versions — and if it does, building the same source ourselves is de-risked rather than
