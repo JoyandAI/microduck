@@ -27,6 +27,71 @@ pub struct Params {
     pub policy: PolicyParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
+    pub theremin: ThereminParams,
+}
+
+/// `[theremin]` — the ToF theremin: what counts as a hand, and where the depth frames come
+/// from.
+///
+/// Every field here is a *number the field will want to argue with*, which is why they are
+/// config and not constants: how near you have to get before it plays, how far away the note
+/// bottoms out, and how much nearer than the background a hand has to be before it counts.
+/// The defaults are `kinematics::hand::Config`'s, and the reason to move them is a room, not
+/// a robot — a duck on a desk has a background 20 cm away and wants a shorter band than one
+/// on a floor.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ThereminParams {
+    /// Master switch. On by default: the instrument still has to be picked up with
+    /// `robot.theremin`, so what this turns off is the *ability* to, on a duck where the
+    /// feature is unwanted or the sensor is known bad.
+    pub enabled: bool,
+    /// `tofd`'s depth stream.
+    pub socket: PathBuf,
+    /// Nearest playable range, metres.
+    pub near_m: f64,
+    /// Farthest playable range, metres.
+    pub far_m: f64,
+    /// How much nearer than the background a return must be to count as a hand, metres.
+    /// Raise it on a duck whose stand policy sways more than most.
+    pub margin_m: f64,
+    /// Fewest zones that make a hand.
+    pub min_zones: usize,
+    /// Seconds over which the background drifts toward a rearranged room.
+    pub background_tau_s: f64,
+}
+
+impl Default for ThereminParams {
+    fn default() -> Self {
+        let hand = kinematics::hand::Config::default();
+        Self {
+            enabled: true,
+            socket: PathBuf::from(duck_ipc_proto::socket::TOF),
+            near_m: hand.near_m,
+            far_m: hand.far_m,
+            margin_m: hand.margin_m,
+            min_zones: hand.min_zones,
+            background_tau_s: hand.background_tau_s,
+        }
+    }
+}
+
+impl ThereminParams {
+    /// The hand-detection config these params describe.
+    ///
+    /// The fields not exposed above keep their library defaults on purpose: `max_fill` and
+    /// `wall_fill` are geometry (a wall fills the field of view, a hand does not), not taste,
+    /// and an operator who moved them would be describing a different sensor.
+    pub fn hand(&self) -> kinematics::hand::Config {
+        kinematics::hand::Config {
+            near_m: self.near_m,
+            far_m: self.far_m,
+            margin_m: self.margin_m,
+            min_zones: self.min_zones,
+            background_tau_s: self.background_tau_s,
+            ..kinematics::hand::Config::default()
+        }
+    }
 }
 
 /// `[audio]` — the voice and the microphone. All optional equipment: a robot without a

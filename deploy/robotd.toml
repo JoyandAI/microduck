@@ -269,3 +269,33 @@ mode = "walk"
 # pet_model = ".../current/models/pet_detect.onnx"
 # pet_enter_threshold = 0.95
 # pet_exit_threshold = 0.85
+
+[theremin]
+# The ToF theremin: a hand's distance in front of the beak becomes a note, and the mouth
+# opens with the pitch. Picked up with `robotctl theremin` (or `robot.theremin`) — this
+# switch is only whether it *can* be, so a duck with a known-bad ToF can refuse outright.
+# Needs [audio] on: a theremin with no voice is a mouth opening for no reason.
+# enabled = true
+
+# tofd's depth stream.
+# socket = "/run/tofd/tof.sock"
+
+# The playable band, metres. Closer than near_m the field of view is narrower than a hand
+# (it is only 0.828 x distance across) and the sensor's own crosstalk starts inventing short
+# returns; past far_m the returns are the noisy ones, and they would be the low notes.
+# Shorten the band for a duck on a desk, where the background is 20 cm away.
+# near_m = 0.15
+# far_m = 0.60
+
+# How much nearer than the background a return has to be to count as a hand. The theremin's
+# zero is whatever was in front of the duck when it armed — that is what lets it work facing
+# a wall — and this margin is what keeps the *trunk's own sway* from crossing it. Raise it on
+# a duck whose stand policy sways more than most; lower it for a lighter touch.
+# margin_m = 0.08
+
+# Fewest zones that make a hand. Two is noise.
+# min_zones = 3
+
+# Seconds over which the zero drifts toward a rearranged room. Long on purpose: a hand held
+# still for a minute must not become the new background.
+# background_tau_s = 120.0

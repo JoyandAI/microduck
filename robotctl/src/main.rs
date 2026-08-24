@@ -135,6 +135,22 @@ enum Namespace {
     /// its own — is the one you're SSH'd into.
     Quack,
 
+    /// Play the duck: the head's depth sensor becomes a theremin, and a hand in front of the
+    /// beak is the pitch — closer is higher, and the mouth opens with the note.
+    ///
+    /// Runs until Ctrl-C, printing what the instrument is doing, and puts it down on the way
+    /// out. What the first half-second is doing is *arming*: whatever is in front of the duck
+    /// right then — a wall, a table, an empty room — becomes the silent zero, and only things
+    /// nearer than that play. So a duck facing a wall is fine; a duck arming with your hand
+    /// already in front of it refuses and says so, because that hand would have become the
+    /// zero.
+    Theremin {
+        /// Put the instrument down instead of picking it up. For a theremin left up by a
+        /// client that went away.
+        #[arg(long)]
+        off: bool,
+    },
+
     /// The gamepad. Pair one, see what is paired, forget one.
     ///
     /// Driving is not a command here: `padd.service` runs on its own and picks up whatever pad is
@@ -384,6 +400,139 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
     }
     println!("🦆");
     Ok(())
+}
+
+
+/// Set by the `SIGINT` handler so the theremin is put down on the way out rather than left
+/// sounding. A bare `AtomicBool` store is the only thing a signal handler may safely do.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn note_interrupt(_signal: libc::c_int) {
+    INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `robotctl theremin` — pick the ToF theremin up, watch it, put it down.
+///
+/// A live view rather than a one-shot, because every question anyone has about this feature
+/// is a question about what it is doing *now*: has it armed, what did it decide its
+/// background was, is it seeing my hand, what note is that. All four are in
+/// `robot.state`'s theremin block, so this is a subscription with a one-line renderer over
+/// it.
+fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+
+    let ask = |client: &mut Client, active: bool| -> Result<proto::ThereminResult, Failure> {
+        let result = result_of(client.call(&proto::Call::RobotTheremin(proto::ThereminParams {
+            active,
+        }))?)?;
+        decode(&result)
+    };
+
+    if off {
+        let outcome = ask(&mut client, false)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        println!("theremin put down");
+        return Ok(());
+    }
+
+    let outcome = ask(&mut client, true)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused the theremin".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
+
+    // SAFETY: installing a handler whose whole body is one relaxed atomic store. Done after
+    // the instrument is up, so an interrupt before this point simply kills the process — and
+    // the theremin was not up yet to be left behind.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+
+    println!("arming — hold still, whatever is in front of the beak becomes the zero");
+    // A second connection for the state stream: the first one is kept to put the instrument
+    // down with, and a subscription is a stream of notifications rather than a call/response,
+    // so sharing one would mean untangling the two.
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(15) }),
+    ))?;
+
+    let mut armed = false;
+    let mut line = String::new();
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                let _ = ask(&mut client, false);
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        // The block is absent while the instrument is down, which after a successful pick-up
+        // means the robot put it down itself — it started walking, or went over.
+        let Some(theremin) = state.theremin else {
+            println!("\rthe robot put the theremin down          ");
+            return Ok(());
+        };
+        if let Some(refused) = theremin.refused {
+            println!("\r                                                                  ");
+            return Err(Failure::new(exit::REFUSED, refused));
+        }
+        if theremin.armed && !armed {
+            armed = true;
+            let background = theremin.background.as_deref().unwrap_or("unknown");
+            println!("armed against {background} — play it, Ctrl-C to stop");
+        }
+        if !armed {
+            continue;
+        }
+        // One rewritten line: this is a live readout, and a scrolling one would be unreadable
+        // at 15 Hz.
+        match (theremin.hand_range_m, theremin.note_hz) {
+            (Some(range), Some(hz)) => print!(
+                "\r  {range:.2} m   {hz:6.1} Hz   mouth {:>3.0}%   {:<20}",
+                theremin.mouth * 100.0,
+                bar(theremin.mouth),
+            ),
+            _ => print!("\r  {:<58}", "— no hand —"),
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    println!();
+    let outcome = ask(&mut client, false)?;
+    if outcome.accepted {
+        println!("theremin put down");
+    }
+    Ok(())
+}
+
+/// A twenty-cell meter for the mouth opening — the one part of the readout you can watch
+/// without reading it.
+fn bar(fraction: f64) -> String {
+    let filled = (fraction.clamp(0.0, 1.0) * 20.0).round() as usize;
+    "█".repeat(filled)
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -2483,6 +2632,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
+        }
+        Namespace::Theremin { off } => {
+            return run_theremin(&cli.robot_socket, off);
         }
         Namespace::Update { command } => command,
     };

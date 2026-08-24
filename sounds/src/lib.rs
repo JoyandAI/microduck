@@ -24,6 +24,7 @@
 
 pub mod personality;
 pub mod rng;
+pub mod stream;
 pub mod synth;
 pub mod voices;
 
@@ -32,6 +33,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 pub use personality::Personality;
+pub use stream::Stream;
 pub use synth::SR;
 
 /// Bump when the synth changes enough that existing banks should re-render on the next

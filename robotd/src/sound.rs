@@ -14,6 +14,15 @@
 //!    its loop and writes the end segment into a pipe that is still open. Only the second
 //!    one ever plays `wheee_end_*`, which is why [`Ride`] is a state and not a bool.
 //!
+//!  - **The theremin is synthesized, not played.** Every other sound here is a wav the
+//!    bank rendered in advance, which works because their shape is known in advance. A
+//!    theremin's pitch is a hand's distance — 15 new values a second, none of them known
+//!    until they arrive — so there is no file to pick. Its writer thread pulls blocks from
+//!    a live [`sounds::Stream`] instead, reading the parameters the control loop last
+//!    stored, and stays much closer behind playback than the ride does: a ride's 250 ms
+//!    lead only delays its release, while the same lead on an instrument is the gap between
+//!    moving your hand and hearing it.
+//!
 //! Playing is spawning: nothing here blocks the 50 Hz tick except the deliberately blocking
 //! goodbye peck right before power-off, when there is no tick left to miss — and that one is
 //! bounded, because a wedged PCM must not be able to hold up the power-off.
@@ -21,8 +30,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use sounds::{Personality, Stream};
 
 use crate::intents::WheeeHold;
 
@@ -30,8 +41,20 @@ use crate::intents::WheeeHold;
 /// well under a second; this is a ceiling on a wedged PCM, not a playback budget.
 const BLOCKING_PLAY_MAX: Duration = Duration::from_millis(1500);
 
-/// What the wheee ride is doing. `Landing` exists because the end segment takes real time
-/// to play and the trigger keeps asking during it.
+/// Audio block the theremin writer renders at a time: 10 ms.
+///
+/// Short, because it bounds how stale the parameters can be by the time they are heard, and
+/// the stream is deliberately indifferent to block size (`sounds::stream`) so this is a
+/// latency choice and nothing else.
+const THEREMIN_BLOCK: usize = sounds::SR as usize / 100;
+
+/// How far ahead of playback the theremin writer stays. An instrument's whole quality is
+/// this number — see the module docs for why it is not the ride's 250 ms.
+const THEREMIN_LEAD_S: f64 = 0.03;
+
+/// What owns the single-client PCM. Not a bool and not two: "free", "a ride is looping",
+/// "a ride is finishing", and "an instrument is being played" are four states that a
+/// one-shot, a trigger press and a power-off each have to tell apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ride {
     /// No ride. The PCM is free for one-shots.
@@ -41,6 +64,52 @@ enum Ride {
     /// The writer is on the end segment, or `aplay` is draining it. Reaped when the child
     /// exits; a fresh press supersedes it.
     Landing,
+    /// The theremin holds the PCM: a writer thread is synthesizing from live parameters,
+    /// and will keep doing so until the loop takes the instrument away.
+    Theremin,
+}
+
+/// The theremin's parameters, as the control loop hands them to the writer thread.
+///
+/// Atomics rather than a channel: the loop must never block on audio, the writer must never
+/// block the loop, and a parameter is a *level* — a writer that missed one update wants the
+/// newest value, not a queue of every value it slept through.
+#[derive(Debug)]
+struct Live {
+    /// Carrier frequency, hertz, as `f64` bits.
+    hz: AtomicU64,
+    /// 0 silent, 1 full, as `f64` bits. The note's key.
+    level: AtomicU64,
+    /// Mouth opening, 0..1, as `f64` bits — the same value the servo is being sent, so
+    /// what is heard and what is seen are one gesture.
+    open: AtomicU64,
+    /// Cleared to tell the writer to fade out and let go of the pipe.
+    playing: AtomicBool,
+}
+
+impl Live {
+    fn new() -> Self {
+        Self {
+            hz: AtomicU64::new(0.0f64.to_bits()),
+            level: AtomicU64::new(0.0f64.to_bits()),
+            open: AtomicU64::new(0.0f64.to_bits()),
+            playing: AtomicBool::new(true),
+        }
+    }
+
+    fn set(&self, hz: f64, level: f64, open: f64) {
+        self.hz.store(hz.to_bits(), Ordering::Relaxed);
+        self.level.store(level.to_bits(), Ordering::Relaxed);
+        self.open.store(open.to_bits(), Ordering::Relaxed);
+    }
+
+    fn read(&self) -> (f64, f64, f64) {
+        (
+            f64::from_bits(self.hz.load(Ordering::Relaxed)),
+            f64::from_bits(self.level.load(Ordering::Relaxed)),
+            f64::from_bits(self.open.load(Ordering::Relaxed)),
+        )
+    }
 }
 
 /// The player. Constructed once by the control loop; `None`-like when the bank is missing —
@@ -59,6 +128,12 @@ pub struct Sound {
     ride: Ride,
     /// Bank missing is logged once, not per press.
     warned_missing: bool,
+    /// The live parameters of the theremin currently being played, if one is.
+    live: Option<Arc<Live>>,
+    /// This robot's voice, read once from the bank's own seed marker so the synthesized
+    /// theremin and the rendered wavs are the same duck. `None` until first asked for;
+    /// `Some(None)` once it has been asked for and there is no seed to be had.
+    personality: Option<Option<Personality>>,
 }
 
 impl Sound {
@@ -70,6 +145,8 @@ impl Sound {
             wheee_held: Arc::new(AtomicBool::new(false)),
             ride: Ride::Off,
             warned_missing: false,
+            live: None,
+            personality: None,
         }
     }
 
@@ -97,6 +174,12 @@ impl Sound {
     /// does to its predecessor.
     fn stop_child(&mut self) {
         self.wheee_held.store(false, Ordering::Relaxed);
+        // A theremin writer blocked in `write_all` on a pipe whose reader is about to die
+        // needs telling as well: clearing this is what gets it out of its loop, and the
+        // `EPIPE` its next write returns is what gets it out if it was already inside one.
+        if let Some(live) = self.live.take() {
+            live.playing.store(false, Ordering::Relaxed);
+        }
         self.ride = Ride::Off;
         if let Some(mut child) = self.child.take()
             && let Ok(None) = child.try_wait()
@@ -171,10 +254,204 @@ impl Sound {
         }
     }
 
+    /// Take the PCM for a live theremin, if this robot has a voice to play it in.
+    ///
+    /// Idempotent: called on the rising edge, and safe to call again — an instrument already
+    /// in hand is left playing rather than restarted, because restarting it would drop the
+    /// note the player is in the middle of.
+    pub fn theremin_start(&mut self) -> bool {
+        if self.ride == Ride::Theremin && self.live.is_some() {
+            return true;
+        }
+        let Some(personality) = self.voice() else {
+            if !self.warned_missing {
+                self.warned_missing = true;
+                tracing::warn!(
+                    bank = %self.bank.display(),
+                    "no voice seed — the theremin has no voice to play in \
+                     (run `sounds ensure-bank`)"
+                );
+            }
+            return false;
+        };
+        self.stop_child();
+
+        // A short ALSA buffer for the same reason as the short lead: this is an instrument,
+        // and every millisecond queued here is a millisecond between the hand and the note.
+        let child = Command::new("aplay")
+            .args([
+                "-q",
+                "-D",
+                &self.device,
+                "-t",
+                "raw",
+                "-f",
+                "S16_LE",
+                "-c",
+                "1",
+            ])
+            .args(["-r", &sounds::SR.to_string()])
+            .args(["--buffer-time=40000", "--period-time=10000"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            tracing::debug!("aplay failed; no theremin");
+            return false;
+        };
+        let Some(mut stdin) = child.stdin.take() else {
+            return false;
+        };
+        self.child = Some(child);
+        self.ride = Ride::Theremin;
+
+        let live = Arc::new(Live::new());
+        self.live = Some(live.clone());
+        // The variant is fixed rather than picked per performance: an instrument that
+        // re-rolled its own wobble rate every time it was picked up would be a different
+        // instrument every time, which is the one kind of variety a duck does not want.
+        let mut stream = Stream::wheee(&personality, 0);
+
+        let spawned = std::thread::Builder::new()
+            .name("theremin".into())
+            .spawn(move || {
+                use std::io::Write;
+                // Same reason as the wheee writer: robotd restores SIGPIPE's default at
+                // startup, so a write into a dead `aplay` would kill the daemon rather than
+                // return `EPIPE`. Block it here and every write is just a failed write.
+                unsafe {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGPIPE);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                }
+                let bytes_per_sec = f64::from(sounds::SR) * 2.0;
+                let t0 = Instant::now();
+                let mut sent = 0usize;
+                let mut block = vec![0.0f32; THEREMIN_BLOCK];
+                let mut bytes = Vec::with_capacity(THEREMIN_BLOCK * 2);
+
+                loop {
+                    let playing = live.playing.load(Ordering::Relaxed);
+                    let (hz, level, open) = live.read();
+                    // Letting go is a fade, not a cut: the level target goes to zero and the
+                    // stream is rendered until it has actually reached silence, which is the
+                    // difference between an instrument being put down and one being unplugged.
+                    stream.set(hz, if playing { level } else { 0.0 }, open);
+                    if !playing && stream.is_silent() {
+                        return;
+                    }
+
+                    stream.block(&mut block);
+                    bytes.clear();
+                    for sample in &block {
+                        let scaled = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                        bytes.extend_from_slice(&scaled.to_le_bytes());
+                    }
+
+                    // Stay just behind playback. Without this the pipe would take every
+                    // block the moment it is rendered and the instrument would run at the
+                    // speed of the CPU rather than of the sound card.
+                    let ahead = sent as f64 / bytes_per_sec - t0.elapsed().as_secs_f64();
+                    if ahead > THEREMIN_LEAD_S {
+                        std::thread::sleep(Duration::from_secs_f64(ahead - THEREMIN_LEAD_S));
+                    }
+                    sent += bytes.len();
+                    if stdin.write_all(&bytes).is_err() {
+                        return; // `aplay` is gone; so is the instrument
+                    }
+                }
+            });
+        if spawned.is_err() {
+            tracing::warn!("cannot spawn the theremin writer");
+            self.stop_child();
+            return false;
+        }
+        tracing::warn!(
+            seed = personality.seed,
+            "theremin: the PCM is an instrument"
+        );
+        true
+    }
+
+    /// The note a 0..1 closeness plays in this robot's voice, hertz.
+    ///
+    /// The mapping lives with the voice (`sounds::stream::hz_at`) rather than in the
+    /// theremin, because it is a fact about *this duck's register*: a low duck plays low,
+    /// and the playable span is the one its own joy-ride recipe uses.
+    pub fn theremin_hz_at(&mut self, closeness: f64) -> Option<f64> {
+        let personality = self.voice()?;
+        Some(sounds::stream::hz_at(&personality, closeness))
+    }
+
+    /// Hand the writer the parameters it should be rendering. Cheap enough for every tick.
+    ///
+    /// Silently ignored when no instrument is in hand, so the loop can call it
+    /// unconditionally rather than mirroring this module's state.
+    pub fn theremin_set(&self, hz: f64, level: f64, open: f64) {
+        if let Some(live) = self.live.as_ref() {
+            live.set(hz, level, open);
+        }
+    }
+
+    /// Put the instrument down: fade the note out, then let the PCM go.
+    ///
+    /// The writer owns the fade, so this returns at once and the child is reaped on a later
+    /// tick by [`Self::theremin_settle`] — the loop has no time to wait for audio.
+    ///
+    pub fn theremin_stop(&mut self) {
+        if self.ride != Ride::Theremin {
+            return;
+        }
+        if let Some(live) = self.live.take() {
+            live.playing.store(false, Ordering::Relaxed);
+        }
+        self.ride = Ride::Landing;
+    }
+
+    /// Reap a faded-out instrument, freeing the PCM for one-shots again.
+    ///
+    /// Called once per tick, which is the only cadence available: the fade happens in the
+    /// writer thread and the loop cannot wait for it. Until this reaps, the PCM is still
+    /// held — which is correct, and is why a quack right after letting go is dropped rather
+    /// than talking over the tail of the note.
+    pub fn theremin_settle(&mut self) {
+        if self.ride == Ride::Landing && self.live.is_none() {
+            self.reap_landing();
+        }
+    }
+
+    /// This robot's voice, from the seed its own bank was rendered with.
+    ///
+    /// The bank's marker rather than the hardware id, and deliberately: the marker is the
+    /// seed the wavs on this disk were made from, so a robot whose bank predates a re-seed
+    /// still has a theremin that matches the quacks it is sitting next to. Falling back to
+    /// the hardware id covers a robot that has a codec but no bank yet.
+    fn voice(&mut self) -> Option<Personality> {
+        if let Some(cached) = self.personality {
+            return cached;
+        }
+        let seed = std::fs::read_to_string(self.bank.join(".seed"))
+            .ok()
+            .and_then(|marker| marker.trim().split(':').next()?.parse::<u32>().ok())
+            .or_else(|| sounds::hardware_seed().ok());
+        let personality = seed.map(Personality::from_seed);
+        self.personality = Some(personality);
+        personality
+    }
+
     /// The ride, level-driven: the loop calls this every tick with what the wheee hold
     /// currently says. The rising edge starts it; the two ways of stopping are different
     /// sounds, which is the whole point of [`WheeeHold`] carrying three states.
     pub fn wheee(&mut self, hold: WheeeHold) {
+        // The theremin is played *with* the trigger held in practice (the same hand is on
+        // the pad), and a ride restarting under a theremin would be an instrument that
+        // stops whenever the player touches anything. The instrument keeps the PCM until
+        // the loop takes it away; the trigger is simply inaudible while it does.
+        if self.ride == Ride::Theremin {
+            return;
+        }
         match hold {
             // A press during a landing ride supersedes it — `start_wheee` takes the PCM.
             WheeeHold::Held if self.ride != Ride::Riding => self.start_wheee(),

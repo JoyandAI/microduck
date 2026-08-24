@@ -18,6 +18,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 /// Encodings for [`Intents::power`]. An `AtomicU8` rather than two bools, so "init" and "relax"
 /// cannot both be pending — they are alternatives, and the last one asked for wins.
 const POWER_NONE: u8 = 0;
+
+/// Encodings for [`Intents::theremin`]. An edge rather than a level, and for a concrete
+/// reason: the loop puts the instrument down by itself when the robot starts walking, and a
+/// level slot still reading "up" would pick it straight back up with a background of
+/// somewhere the duck no longer is.
+const THEREMIN_NONE: u8 = 0;
+const THEREMIN_UP: u8 = 1;
+const THEREMIN_DOWN: u8 = 2;
 const POWER_INIT: u8 = 1;
 const POWER_RELAX: u8 = 2;
 use std::time::{Duration, Instant};
@@ -123,6 +131,8 @@ pub struct Intents {
     /// It lives with the intents because this is where the loop reads what clients asked for, and
     /// because the loop is the only thing that may touch the bus — the IPC task cannot do it itself.
     power: AtomicU8,
+    /// A pending pick-up or put-down for the ToF theremin. See [`THEREMIN_NONE`].
+    theremin: AtomicU8,
     /// Pending skill requests, a bitmask taken (swapped to zero) once per tick. A mask
     /// rather than one slot so two different buttons in the same tick both arrive.
     skills: std::sync::atomic::AtomicU32,
@@ -185,6 +195,7 @@ impl Intents {
             mouth: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
+            theremin: AtomicU8::new(THEREMIN_NONE),
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
             sounds: std::sync::atomic::AtomicU32::new(0),
@@ -340,6 +351,23 @@ impl Intents {
     /// Called once per tick by the loop. A later request replaces an unread earlier one, which is
     /// the right resolution: if someone asked to stand up and then to relax within 20 ms, the
     /// second is what they meant.
+    /// Ask for the theremin to be picked up (`true`) or put down (`false`).
+    pub fn request_theremin(&self, active: bool) {
+        self.theremin.store(
+            if active { THEREMIN_UP } else { THEREMIN_DOWN },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The pending theremin request, cleared by the read.
+    pub fn take_theremin_request(&self) -> Option<bool> {
+        match self.theremin.swap(THEREMIN_NONE, Ordering::Relaxed) {
+            THEREMIN_UP => Some(true),
+            THEREMIN_DOWN => Some(false),
+            _ => None,
+        }
+    }
+
     pub fn take_power_request(&self) -> Option<PowerRequest> {
         match self.power.swap(POWER_NONE, Ordering::Relaxed) {
             POWER_INIT => Some(PowerRequest::Init),

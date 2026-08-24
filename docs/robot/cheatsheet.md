@@ -220,6 +220,34 @@ To audition a voice or regenerate the bank by hand, the release carries the gene
 sudo /opt/robot/daemon/current/bin/sounds ensure-bank --force
 ```
 
+`sounds theremin` auditions the *live* synth — the voice the theremin plays in, driven by a
+scripted hand sweep at the ToF's own frame rate. `--out sweep.wav` writes it instead of
+playing it, which is how you hear a voice change without a robot in front of you.
+
+### Play the duck (the ToF theremin)
+
+```
+robotctl theremin
+```
+
+The head's depth sensor becomes an instrument: a hand in front of the beak is the pitch —
+closer is higher — and the mouth opens with the note, wide at the top of the range. Runs
+until Ctrl-C and puts the instrument down on the way out. `--off` puts down one that a
+client left up.
+
+The first half-second is **arming**, and it is the thing worth understanding: whatever is in
+front of the duck right then becomes the silent zero, and only returns nearer than that
+play. That is what lets it work with the duck facing a wall 30 cm away — the wall *is* the
+zero. It also means arming with your hand already in front of the beak is refused, and says
+so, because that hand would have become the zero. `robotctl theremin` prints what the zero
+turned out to be (`plane at 0.42 m`, `open space`, `cluttered`), which is the line that
+explains a theremin behaving differently in two corners of one room.
+
+Walking or going over puts the instrument down rather than quietly re-zeroing it: a
+background is a picture of where the duck was standing. Needs `tofd` delivering frames and
+`[audio]` on — it refuses with a reason otherwise, rather than accepting into silence. The
+playable band and the sway margin are `[theremin]` in `robotd.toml`.
+
 ### The ToF sensor (`tofd`)
 
 An 8×8 depth matrix from the head sensor. `robotctl monitor`, then **`t`**:

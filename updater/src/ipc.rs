@@ -619,6 +619,7 @@ impl Server {
             | Call::RobotSound(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
+            | Call::RobotTheremin(_)
             | Call::RobotShutdown
             | Call::RobotMode
             | Call::RobotSubscribe(_) => Response::err(

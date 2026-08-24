@@ -24,6 +24,7 @@ mod intents;
 mod params;
 mod soc;
 mod sound;
+mod theremin;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -339,6 +340,12 @@ struct RobotState {
     /// accepting it into silence. Read once at startup, like the policies: the postinstall
     /// renders the bank and restarts robotd, so a bank cannot appear under a running one.
     has_voice: bool,
+    /// Whether a theremin can be picked up: the params allow one, and the depth stream is
+    /// actually delivering frames. Published by the loop rather than read once at startup,
+    /// because unlike a voice bank the sensor comes and goes — `tofd` restarts, the ToF
+    /// drops off the I²C bus — and an accepted theremin on a duck with no depth is a
+    /// feature that silently does nothing.
+    theremin_ready: AtomicBool,
     /// `walk` or `roller` — constant for the life of the process; `robot.mode` reports it.
     mode: &'static str,
     /// Published by the loop so the IPC side can answer without consulting it.
@@ -392,6 +399,7 @@ impl RobotState {
             policy_kick_right: named_policy(params, |p| p.kick_right.clone()),
             policy_roulade: named_policy(params, |p| p.roulade.clone()),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
+            theremin_ready: AtomicBool::new(false),
             mode: params.policy.mode.as_str(),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
@@ -1191,6 +1199,23 @@ async fn control_loop<T: RobotIo>(
         None
     };
 
+    // The theremin. Its depth reader starts now and parks on `tofd`'s socket whether or not
+    // anyone ever asks for an instrument: one blocked read costs nothing, and connecting
+    // lazily would make the first arming window wait for a connection as well as for
+    // frames — a second of silence that reads as a broken feature. Off entirely when the
+    // params say so, or when audio is off, since a theremin with no voice is a mouth
+    // opening for no reason.
+    let mut theremin = (params.theremin.enabled && params.audio.enabled).then(|| {
+        theremin::Theremin::spawn(
+            params.theremin.socket.clone(),
+            params.theremin.hand(),
+            kinematics::tof::Reprojector::alpha(),
+        )
+    });
+    // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
+    // the note at its own pitch instead of gliding to the bottom of the range on its way out.
+    let mut theremin_hz = 0.0f64;
+
     // Say hello in this robot's own voice as the control loop comes up, as the prototype
     // does — the greet is also the audible "robotd is running" on a headless board.
     if let Some(voice) = voice.as_mut() {
@@ -1357,6 +1382,7 @@ async fn control_loop<T: RobotIo>(
             } else {
                 intents.wheee_hold()
             };
+            voice.theremin_settle();
             voice.wheee(hold);
             for tag in intents.take_sounds() {
                 voice.play(tag.as_str(), false);
@@ -1786,10 +1812,86 @@ async fn control_loop<T: RobotIo>(
         };
         state.moving.store(moving, Ordering::Relaxed);
 
+        // The theremin: a hand's distance in front of the beak, turned into a note and a
+        // mouth opening. Before the mouth is written, because while an instrument is up it
+        // *is* what the mouth is doing — the intent from a client is not competing with it.
+        let mut theremin_state = None;
+        if let Some(instrument) = theremin.as_mut() {
+            // Whether an instrument could be picked up right now, for the IPC side to
+            // refuse on. Republished every tick because the sensor can go away under a
+            // running daemon.
+            state.theremin_ready.store(
+                instrument.has_frames() && voice.is_some(),
+                Ordering::Relaxed,
+            );
+            if let Some(active) = intents.take_theremin_request() {
+                instrument.set_active(active);
+            }
+            // A background is a picture of what is in front of the duck, so a duck that has
+            // started moving is holding an instrument tuned to somewhere it no longer is.
+            // Dropped rather than silently re-armed: a zero that changes under the player is
+            // worse than an instrument that has to be picked up again.
+            if instrument.active() {
+                if safety.fallen() {
+                    instrument.invalidate("the robot is down");
+                } else if moving {
+                    instrument.invalidate("walking");
+                }
+            }
+            let note = instrument.tick(
+                command.head,
+                &kinematics::tof::Posture {
+                    gravity: sensors.as_ref().map_or([0.0, 0.0, -1.0], |s| s.imu.gravity),
+                    trunk_height_m: Some(odometry.position()[2]),
+                },
+                period.as_secs_f64(),
+            );
+            match note {
+                Some(note) => {
+                    let mut block = note.state;
+                    // Silence keeps the last pitch rather than gliding to the bottom of the
+                    // range: a fade at the note you were playing is a note ending, and a fade
+                    // on the way down is a note falling over.
+                    let level = match note.closeness {
+                        Some(closeness) => {
+                            if let Some(voice) = voice.as_mut()
+                                && let Some(hz) = voice.theremin_hz_at(closeness)
+                            {
+                                theremin_hz = hz;
+                            }
+                            block.note_hz = Some(theremin_hz);
+                            1.0
+                        }
+                        None => 0.0,
+                    };
+                    if let Some(voice) = voice.as_mut() {
+                        // Idempotent, so this is also what picks the instrument up on the
+                        // first tick after the request — there is no separate start edge to
+                        // get wrong.
+                        if voice.theremin_start() {
+                            voice.theremin_set(theremin_hz, level, note.mouth);
+                        }
+                    }
+                    if driving {
+                        targets[duck_control::model::MOUTH_INDEX] =
+                            duck_control::model::mouth_target(note.mouth);
+                    }
+                    theremin_state = Some(block);
+                }
+                // The instrument is down. Putting the voice down too is idempotent, so this
+                // covers both "it was just dropped" and "there has never been one".
+                None => {
+                    if let Some(voice) = voice.as_mut() {
+                        voice.theremin_stop();
+                    }
+                }
+            }
+        }
+
         // The mouth is not part of any policy; the intent is the only thing that moves it.
         // Only while driving — a held or homing robot keeps whatever its hold pose says, so
         // a restart cannot snap a mouth.
-        if driving {
+        if driving && theremin_state.is_none() {
             targets[duck_control::model::MOUTH_INDEX] =
                 duck_control::model::mouth_target(snapshot.mouth);
         }
@@ -1833,6 +1935,7 @@ async fn control_loop<T: RobotIo>(
                     position: odometry.position(),
                     yaw: odometry.yaw(),
                 },
+                theremin: theremin_state.clone(),
             });
         }
 
@@ -2296,6 +2399,40 @@ fn dispatch(
             } else {
                 intents.request_skill(p.skill);
                 proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // Picking the theremin up, or putting it down. Refused here for what this side can
+        // already know — no voice, no depth frames, the feature switched off — and *not* for
+        // circumstance: the loop puts the instrument down by itself when the robot starts
+        // walking or goes over, which is a thing that happens after the answer.
+        //
+        // Note what the answer does not promise: arming. That takes about half a second of
+        // depth frames, because the theremin's zero is whatever is in front of the duck at
+        // that moment, and one frame is not a background. Whether it took, and the one
+        // refusal a player will actually hit — a hand already in front of the beak — arrive
+        // in `robot.state`'s theremin block.
+        proto::Call::RobotTheremin(p) => {
+            let result = if !state.has_voice {
+                proto::ThereminResult {
+                    accepted: false,
+                    reason: Some("this robot has no voice to play a theremin in".to_owned()),
+                }
+            } else if p.active && !state.theremin_ready.load(Ordering::Relaxed) {
+                proto::ThereminResult {
+                    accepted: false,
+                    reason: Some(
+                        "no depth frames — the ToF sensor is not delivering (is tofd running?)"
+                            .to_owned(),
+                    ),
+                }
+            } else {
+                intents.request_theremin(p.active);
+                proto::ThereminResult {
+                    accepted: true,
+                    reason: None,
+                }
             };
             proto::Response::ok(Some(id), &result)
         }

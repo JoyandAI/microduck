@@ -128,7 +128,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// Gaze as a point instead of joint angles: `robot.head`'s doc always promised both forms,
 /// and this is the second one — the daemon runs the IK and answers with the joints it chose.
-pub const API_VERSION: u32 = 12;
+///
+/// # v13 — `robot.theremin`
+///
+/// The head ToF becomes an instrument: a hand's distance is the pitch, and the mouth opens
+/// with it. Additive, same rule as every method before it — plus an optional `theremin`
+/// block in `robot.state`, absent while the instrument is down, so a client from v12 sees
+/// exactly the frame it saw before.
+pub const API_VERSION: u32 = 13;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -321,6 +328,18 @@ pub mod method {
     /// is diagnostics, not danger), but "accepted" from a robot that cannot make a sound
     /// would make `robotctl quack` lie about which duck answered.
     pub const ROBOT_SOUND: &str = "robot.sound";
+    /// Pick the ToF theremin up, or put it down: the head's depth sensor becomes an
+    /// instrument, and the distance of a hand in front of the beak is the pitch — and the
+    /// mouth opening, which rises with it, so the note is visible as well as audible.
+    ///
+    /// Discrete; send as a request. The answer only says whether the robot *took* the
+    /// instrument — has a voice, has depth frames, is not face-down. Arming itself takes
+    /// about half a second of frames, because the theremin's zero is whatever is in front
+    /// of the duck at that moment (a wall, a table, an empty room) and one frame is not a
+    /// background. What that came out as, and whether it was refused because a hand was
+    /// already in the way, arrives in [`ROBOT_STATE`]'s `theremin` block — which is also
+    /// where the live pitch is, so a client can show the note being played.
+    pub const ROBOT_THEREMIN: &str = "robot.theremin";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
     /// Which drive mode this `robotd` was configured with: `walk` or `roller`.
@@ -528,6 +547,8 @@ pub enum Call {
     RobotMouth(MouthParams),
     /// Play a voice-bank sound.
     RobotSound(SoundParams),
+    /// Pick the ToF theremin up or put it down. Discrete; the answer is [`ThereminResult`].
+    RobotTheremin(ThereminParams),
     /// Sit down, then power the machine off.
     RobotShutdown,
     /// Which drive mode this robotd runs: walk or roller.
@@ -600,6 +621,7 @@ impl Call {
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
             Call::RobotSound(_) => method::ROBOT_SOUND,
+            Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
@@ -690,6 +712,7 @@ impl Call {
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
             Call::RobotSound(p) => encode(p),
+            Call::RobotTheremin(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
@@ -759,6 +782,7 @@ impl Call {
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
+            method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
@@ -1162,6 +1186,70 @@ pub struct SoundParams {
     /// so a client that dies mid-ride does not leave the robot going "wheee" forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold: Option<bool>,
+}
+
+/// See [`method::ROBOT_THEREMIN`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThereminParams {
+    /// True picks the instrument up, false puts it down. Idempotent both ways: a client
+    /// that cannot remember whether it already asked may simply ask again.
+    pub active: bool,
+}
+
+/// Answer to [`Call::RobotTheremin`].
+///
+/// `accepted` is about the *instrument*, not about the arming: a robot with a voice, depth
+/// frames and its feet under it accepts, and then spends half a second working out what its
+/// background is. Watch [`RobotState::theremin`] for how that turned out — including the one
+/// refusal a client will actually hit, which is arming with a hand already in front of the
+/// beak.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThereminResult {
+    pub accepted: bool,
+    /// Why not, when `accepted` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for ThereminResult {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+}
+
+/// What the theremin is doing, in [`RobotState`].
+///
+/// Absent from the frame entirely while the instrument is down, which is the ordinary state
+/// of a duck — so a client that never asks for a theremin never pays for one in its state
+/// stream, and one built before this simply does not see the field.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThereminState {
+    /// The background has been captured and the instrument is playable. False while the
+    /// arming window is still filling, or after it was refused.
+    pub armed: bool,
+    /// Why arming was refused — a hand in the way, or a sensor seeing nothing. Set instead
+    /// of `armed`, and cleared by asking again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+    /// What the background turned out to be, e.g. `plane at 0.42 m (0.9 cm rms)`. The one
+    /// line that explains a theremin behaving oddly in a particular spot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    /// Distance to the hand being played, metres. `None` when no hand is in the band —
+    /// which is silence, not an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_range_m: Option<f64>,
+    /// The note being sounded, hertz. `None` when silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_hz: Option<f64>,
+    /// How far open the mouth is being driven, 0..1 — the same number the pitch came from.
+    pub mouth: f64,
 }
 
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
@@ -1931,6 +2019,10 @@ pub struct RobotState {
     /// that has not moved.
     #[serde(default)]
     pub odom: OdomState,
+    /// What the ToF theremin is doing, when one is being played. Absent while the
+    /// instrument is down — see [`ThereminState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theremin: Option<ThereminState>,
 }
 
 /// The contact-odometry estimate: trunk pose in the world frame the IMU chose
@@ -3356,6 +3448,66 @@ mod tests {
         );
     }
 
+    /// The theremin block is absent while the instrument is down, and named when it is up:
+    /// a v12 client must see byte-for-byte the frame it saw before, and a v13 one must find
+    /// the field where the docs say it is.
+    #[test]
+    fn the_theremin_block_is_absent_until_there_is_a_theremin() {
+        let mut state = RobotState {
+            t: 1.5,
+            movement: MoveState {
+                requested: [0.0; 3],
+                applied: [0.0; 3],
+                limited_by: Vec::new(),
+            },
+            head: [0.0; 4],
+            policy: "stand".into(),
+            safety: SafetyState {
+                fallen: false,
+                limp: false,
+                gravity: [0.0, 0.0, -1.0],
+                gain: Some(200),
+            },
+            control_loop: LoopState {
+                hz: 50.0,
+                missed: 0,
+            },
+            joints: vec![0.0; 15],
+            targets: vec![0.0; 15],
+            odom: OdomState::default(),
+            theremin: None,
+        };
+        let down = serde_json::to_string(&state).unwrap();
+        assert!(!down.contains("theremin"), "{down}");
+
+        state.theremin = Some(ThereminState {
+            armed: true,
+            refused: None,
+            background: Some("plane at 0.42 m (0.9 cm rms)".into()),
+            hand_range_m: Some(0.31),
+            note_hz: Some(412.0),
+            mouth: 0.64,
+        });
+        let up = serde_json::to_string(&state).unwrap();
+        assert!(up.contains(r#""theremin":{"armed":true"#), "{up}");
+        assert!(up.contains(r#""note_hz":412.0"#), "{up}");
+        // A silent armed theremin omits the note rather than sending a zero, which would
+        // read as "playing 0 Hz".
+        state.theremin = Some(ThereminState {
+            armed: true,
+            ..Default::default()
+        });
+        let silent = serde_json::to_string(&state).unwrap();
+        assert!(!silent.contains("note_hz"), "{silent}");
+        assert!(!silent.contains("hand_range_m"), "{silent}");
+
+        // And it round-trips: a client reads back what the daemon sent.
+        let back: RobotState = serde_json::from_str(&up).unwrap();
+        assert_eq!(back.theremin.expect("present").note_hz, Some(412.0));
+        let back: RobotState = serde_json::from_str(&down).unwrap();
+        assert_eq!(back.theremin, None);
+    }
+
     /// `move` and `loop` are Rust keywords, so the fields are renamed on the wire. A typo
     /// in either rename is invisible in Rust and breaks every consumer, so pin the JSON.
     #[test]
@@ -3382,6 +3534,7 @@ mod tests {
             joints: vec![0.0; 15],
             targets: vec![0.0; 15],
             odom: OdomState::default(),
+            theremin: None,
         };
 
         let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();

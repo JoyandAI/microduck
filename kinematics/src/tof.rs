@@ -128,6 +128,14 @@ impl Reprojector {
         Self::new(Model::alpha())
     }
 
+    /// The unit beam directions, in the sensor's own frame, row-major like the wire's
+    /// zones. Exposed for geometry that reasons about the beams themselves rather than
+    /// about where they landed — [`crate::hand`]'s plane fit, which needs the direction a
+    /// slant range was measured along.
+    pub fn beams(&self) -> &[[f64; 3]; N_ZONES] {
+        &self.beams
+    }
+
     /// The sensor's pose in the trunk frame at these head joints — for a
     /// consumer that wants the raw geometry (a point-cloud view, a map).
     pub fn sensor_in_trunk(&self, head_joints: [f64; 4]) -> Pose {
