@@ -258,8 +258,9 @@ present at 0600 root:root; `mpi_enc_test` silently writing nothing as non-root a
 root; that bitstream decoding clean as High/4.0; the Radxa debs' dependency closure; the rockchip
 plugin loading in 1.26.2 with two decode elements.
 
-**Not measured.** Nobody has built either plugin yet, so `mpph264enc` has never run here — only
-MPP's own test binary has. There is no camera attached, so the whole capture path is untested on
+**Not measured.** `mpph264enc` **registers** — confirmed as root on the board, which is what
+finally proved the permission story — but no frame has been encoded through a GStreamer pipeline
+yet; only MPP's own test binary has run. There is no camera attached, so the whole capture path is untested on
 this board; what is known about it comes from `microduck_runtime`, which drove an IMX219 on the
 same hardware. `mediad` does not exist, so no pipeline has been assembled end to end.
 
@@ -271,11 +272,31 @@ slowly, dropping every third frame — ~20 fps from a 30 fps sensor, with "lost 
 pipes raw frames into a `fdsrc` pipeline (`camera.rs:487`). `mediad` needs either that subprocess
 shape or its own V4L2 mmap loop feeding `appsrc`.
 
-**The H.264 profile has to be set deliberately.** The VPU emits **High** profile; WebRTC's
-interoperable floor is Constrained Baseline (`profile-level-id 42e01f`). Current browsers
-negotiate High and older peers do not. High also permits B-frames, which are latency poison
-against [`architecture.md`](../design/architecture.md) §5.5's <200 ms glass-to-glass target —
-Rockchip's encoders do not normally emit them, but that wants asserting rather than assuming.
+**Four `mpph264enc` properties are pipeline decisions, not defaults to inherit.** Read off the
+element on the board:
+
+| property | default | what `mediad` should set | why |
+|---|---|---|---|
+| `profile` | `high` | **`baseline`** | WebRTC's interoperable floor is Constrained Baseline (`profile-level-id 42e01f`). Current browsers negotiate High; older peers do not. The element offers `baseline`/`main`/`high`, so this is a one-word decision rather than the open question it looked like |
+| `header-mode` | `first-frame` | **`each-idr`** | SPS/PPS in the first frame *only* means a peer that joins later — or loses that packet — never decodes anything. `reachy_mini`'s Pi pipeline sets exactly this on `v4l2h264enc` via `repeat_sequence_header=1`; same requirement, different spelling |
+| `rotation` | `0` | **`180`** on the alpha | the IMX219 is mounted upside down. `microduck_runtime` fixes it with `videoflip method=rotate-180` — a full CPU pass over every frame, on the SoC `robotd` shares. The encoder does it in hardware for nothing |
+| `bps` | `0` (auto) | an explicit target | `rc-mode` already defaults to `cbr`, which is what a lossy link wants; the bitrate should not be left to "auto calculate" |
+
+Two things that turn out to need no decision:
+
+- **There is no B-frame knob at all**, so §5.5's "no B-frames" requirement is satisfied by
+  construction rather than by configuration.
+- **The sink pad accepts `NV12`**, which is exactly what the rkisp capture path emits. No
+  `videoconvert`, and no RGA colour conversion, between capture and encode.
+
+Keyframes should come from `min-force-key-unit-interval` rather than a periodic `gop`: WebRTC
+drives them from the peer's PLI, and `gop` defaults to one IDR per second whether anybody needed
+one or not.
+
+One thing to verify once there is a stream rather than assume: the enum value is `baseline` (66),
+while WebRTC negotiates *Constrained* Baseline. A Baseline stream that avoids FMO, ASO and
+redundant slices is what a constrained-baseline decoder expects, and MPP has no reason to emit
+those — but the SPS constraint flags are worth reading off a real capture.
 
 `webrtcsink` accepts pre-encoded H.264 on its sink pad, so the pipeline is
 `appsrc ! mpph264enc ! h264parse ! webrtcsink` and the encoder choice never reaches
