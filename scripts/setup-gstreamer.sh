@@ -56,6 +56,9 @@ GST_EXTRA_PLUGIN_DIR=/usr/local/lib/gstreamer-1.0
 MPP_SERVICE="${MPP_SERVICE:-/dev/mpp_service}"
 VIDEO_GLOB="${VIDEO_GLOB:-/dev/video*}"
 KERNEL="${KERNEL:-$(uname -r)}"
+# Where the VPU udev rule goes. A variable for the same fixture reason as the three above, and
+# because a write into it failing must not be how this script ends.
+UDEV_RULE_DIR="${UDEV_RULE_DIR:-/etc/udev/rules.d}"
 
 # Runtime packages, and why each one is here rather than "the usual set".
 #
@@ -379,6 +382,56 @@ EOF
     fi
 }
 
+# Give the VPU node a group, so a non-root `mediad` can open it.
+#
+# `/dev/mpp_service` arrives as 0600 root:root, and the failure that causes is silent: a non-root
+# `mpi_enc_test` against it writes an empty file and exits 0. Every daemon here rides into a
+# kernel resource on a supplementary group — `tofd` into `i2c`, `padd` into `input`, `btd` into
+# `bluetooth` — so the VPU gets the same treatment.
+#
+# `video` rather than `robot`: `robot` gates the IPC sockets *we* define, and a kernel device node
+# is not ours to redefine. `video` is the distro convention for this device class, so a developer
+# with `gst-launch` gets in exactly the way `mediad` does.
+#
+# Here rather than in `setup-board.sh`, which owns the other udev rule on this board, because this
+# script already probes and reports on the node — one place owning one mechanism. A board that
+# skips GStreamer has no use for the rule.
+configure_vpu_access() {
+    [ -e "$MPP_SERVICE" ] || return 0
+
+    if [ ! -d "$UDEV_RULE_DIR" ]; then
+        warn "no ${UDEV_RULE_DIR}; cannot give /dev/mpp_service a group.
+  A non-root mediad will not be able to open the VPU. Everything else here is still done."
+        return 0
+    fi
+
+    rule="${UDEV_RULE_DIR}/99-robot-mpp.rules"
+    # Matched on the kernel name alone. The node's subsystem is not something to depend on: it is
+    # a Rockchip BSP driver, and a match that is wrong about it silently does nothing.
+    content='KERNEL=="mpp_service", GROUP="video", MODE="0660"'
+
+    if [ -f "$rule" ] && [ "$(cat "$rule")" = "$content" ]; then
+        say "VPU: /dev/mpp_service rule already in place"
+    else
+        say "VPU: installing the /dev/mpp_service udev rule (group video, 0660)"
+        printf '%s\n' "$content" > "$rule"
+        chmod 644 "$rule"
+    fi
+
+    # Applied now as well as at the next boot — `udevadm` failing is not worth stopping over.
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --action=change --name-match=mpp_service 2>/dev/null || true
+
+    # Verified rather than assumed. `--name-match` is not in every udev, and a rule that did not
+    # take is the state this whole function exists to prevent — so if the node is still root-only,
+    # set it directly and say so.
+    if [ "$(stat -c '%G' "$MPP_SERVICE" 2>/dev/null || true)" = root ]; then
+        chgrp video "$MPP_SERVICE" 2>/dev/null || true
+        chmod 0660 "$MPP_SERVICE" 2>/dev/null || true
+        say "VPU: applied the mode directly; the rule takes over at the next boot"
+    fi
+}
+
 report_webrtc() {
     say "WebRTC elements"
     element_line webrtcbin
@@ -429,6 +482,9 @@ main() {
     install_missing $RUNTIME_PKGS
     # shellcheck disable=SC2086
     [ "$WANT_DEV" = 0 ] || install_missing $DEV_PKGS
+    # After the packages, before the report: a udev problem must not be what stops GStreamer
+    # installing, and the report should show the node as this run leaves it.
+    configure_vpu_access
     report
 }
 
