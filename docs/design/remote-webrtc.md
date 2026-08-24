@@ -54,7 +54,7 @@ started. A LAN client connects to the same server directly.
 at all and every session goes through a bridge, which defeats the point of a local mode. So it
 binds on all interfaces, and §4 is what that implies for who may drive.
 
-## 4. Authorisation: open on the LAN, and the bridge is where that stops
+## 4. Authorisation: none on the robot, and why that holds both locally and remotely
 
 **No gate in the first version.** A peer that reaches the signalling server can start a session,
 drive the robot, and see through its camera. That is a decision, not an oversight.
@@ -68,30 +68,46 @@ What it costs, stated plainly so nobody has to discover it: anyone on the same n
 robot and its camera. Fine on a bench and in an office. **Not fine in a home**, which is the thing
 to revisit before one ships to one.
 
-### The bridge is the line, not the LAN
+### Where authorisation actually lives: the bridge, and it is already there
 
-"On the LAN" is a boundary only while the LAN is the boundary. §7's bridge deletes it: a robot
-reachable through a rendezvous service is reachable by whoever can address it there, and "open to
-anyone who can connect" stops meaning "open to people in the building".
+The remote path does not need a gate on the robot either, because it is authenticated **before it
+reaches one** — on both sides:
 
-So the rule is: **LAN-only may be unauthenticated; bridged may not.** That is a cheaper commitment
-than it sounds, because the bridge has to solve identity anyway — something has to decide which
-robots a given user may see — and whatever answers that question is also what authorises the
-session. Deferring auth is therefore not deferring work; it is declining to invent a second answer
-before the first one exists.
+- **The client** authenticates to the rendezvous service with OAuth, and the service shows it only
+  the robots its account owns. Reaching the part of the bridge that routes to a given robot *is*
+  the proof.
+- **The robot** authenticates outward: its relay holds an account token and connects to the service
+  with it (§7). So the robot proves it belongs to the account too.
 
-### The hook, when it is wanted
+The service is therefore matching two already-authenticated parties, and a session arriving through
+it has been authorised twice over. A `system.authenticate` on top would be a second answer to a
+question already answered — and a worse one, since the shared `000000` PIN proves less than an
+account token does.
+
+**What this means is that the trust moved rather than vanished**, and it is worth naming where it
+went: the robot has no independent check, so the binding between a robot and an account is now the
+thing that must be right, and it lives in the service rather than here. That is an acceptable place
+for it — it is the only component that can know the answer — but it is a dependency, not an absence
+of one.
+
+The one arrangement none of this covers is a robot whose signalling port is exposed to the internet
+directly, by a port forward rather than through the bridge. Then there is no bridge to have
+authenticated anything, and §4's LAN reasoning does not apply either, because the population that
+can reach it is no longer the people in the building. That is a deployment mistake rather than a
+design decision, and worth saying out loud precisely because nothing in the robot would notice.
+
+### The hook, if it is ever wanted
 
 `system.authenticate` — the method BLE already uses, added in `API_VERSION` v4. A control channel
-would serve that one method and refuse the rest by name until it passes, exactly as a BLE session
-does, with the PIN read from `configd` over its unix socket rather than over the channel being
-authenticated.
+would serve that one method and refuse the rest by name until it passes, with the PIN read from
+`configd` over its unix socket rather than over the channel being authenticated.
 
-Cheap to add later precisely because §5's routing table already needs a notion of *which methods a
-transport may reach*. "Which methods before authentication" is the same table with a smaller
-subset, not a new mechanism. Using BLE's mechanism rather than inventing a second one is the point:
-two authorisation schemes for two transports is how one of them ends up weaker, and it is usually
-the newer one.
+It is named here so the answer exists, not because it is planned. The case for it is narrow: it
+adds nothing to the bridged path, which is better authenticated already, and on the LAN it costs a
+step per connection while proving only that the peer read a number printed on every robot. If it is
+ever wanted, it is cheap — §5's routing table already needs a notion of which methods a transport
+may reach, and "which methods before authentication" is the same table with a smaller subset rather
+than a new mechanism.
 
 ## 5. The control channel is a pipe to the existing API
 
@@ -180,10 +196,13 @@ Two properties follow, and both are the reason for this shape:
   a LAN client speaks. That is the concrete payoff for using `webrtcsink` rather than `webrtcbin`:
   the protocol already exists, so the bridge is a relay rather than a translator.
 
-**And the bridge is where §4's open door closes.** A LAN-only robot may be unauthenticated; a
-bridged one may not, because "whoever can reach it" stops meaning "whoever is in the building". The
-bridge already has to answer which robots a given user may see, and whatever answers that is what
-authorises the session — so this is not extra work, it is the same work not done twice.
+- **The bridge authenticates, so the robot does not have to.** The relay connects *outward* holding
+  an account token, and the service shows a client only the robots its account owns — so a bridged
+  session is authorised on both sides before it arrives. §4 covers where that leaves the trust.
+
+  A useful consequence: because the relay is a robot-side process connecting to loopback, the robot
+  *can* tell a bridged peer from a LAN one by source address, even though it does not currently act
+  on the difference. Nothing is foreclosed if that stops being true.
 
 `reachy_mini` runs exactly this arrangement against a Hugging Face Space, with the robot
 registering as a `producer` and the Space keeping a TTL lease refreshed by a heartbeat. Whether we
