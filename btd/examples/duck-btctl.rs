@@ -417,11 +417,13 @@ fn worth_connecting<T>(
     // entirely when a name is wanted, and a named device that is not advertising the service lands
     // in `named` before that tier is reached. Asking the same question of all three is one rule
     // instead of a rule plus the reason the third is exempt from it.
-    advertised
-        .iter()
-        .chain(named)
-        .chain(connected)
-        .any(|(_, name)| answers_to(name, wanted))
+    any_answers(advertised, wanted) || any_answers(named, wanted) || any_answers(connected, wanted)
+}
+
+/// Does any of these answer to `wanted`? The one question both the scan loop and the failure below
+/// ask, so that "keep listening" and "this is why it failed" cannot disagree about what a match is.
+fn any_answers<T>(candidates: &[(T, String)], wanted: &str) -> bool {
+    candidates.iter().any(|(_, name)| answers_to(name, wanted))
 }
 
 /// Devices as indented lines: what names each one, what it calls itself, where it is, what it is
@@ -582,15 +584,9 @@ async fn nothing_found(seen: &[Seen], target: &Target) -> String {
         Some(name) => format!(" and nothing was named {name:?}"),
         None => String::new(),
     };
-    // The count of unnamed devices is in the summary rather than left to be inferred from the list:
-    // named ones sort first, so truncation hides exactly the lines the robot could be hiding in, and
-    // "is it plausibly one of those" is the question this list is read to answer.
-    let anonymous = seen.iter().filter(|d| d.local_name.is_none()).count();
     let mut message = format!(
-        "no robot found. Nothing advertised the duck service{missed}. The Mac saw {} device(s) in \
-         {SCAN_TIME:?}, {anonymous} of them with no name:\n{}",
-        seen.len(),
-        device_list(seen.iter().collect(), target).await,
+        "no robot found. Nothing advertised the duck service{missed}. {}",
+        radio_saw(seen, target).await,
     );
     // Before the generic advice, because "why is it looking for that name" comes first for a reader
     // who did not type one.
@@ -599,6 +595,47 @@ async fn nothing_found(seen: &[Seen], target: &Target) -> String {
         "\nIf the robot is one of the unnamed lines, it was reported without the name and the \
          service UUID this matches on, and retrying usually finds it. If it is absent entirely, \
          `journalctl -u btd -b` on the robot says whether the GATT application is registered.",
+    );
+    message
+}
+
+/// Everything the radio reported, as evidence under a failure.
+///
+/// The count of unnamed devices is in the summary rather than left to be inferred from the list:
+/// named ones sort first, so truncation hides exactly the lines a robot could be hiding in, and "is
+/// it plausibly one of those" is the question this list is read to answer.
+async fn radio_saw(seen: &[Seen], target: &Target) -> String {
+    let anonymous = seen.iter().filter(|d| d.local_name.is_none()).count();
+    format!(
+        "The Mac saw {} device(s) in {SCAN_TIME:?}, {anonymous} of them with no name:\n{}",
+        seen.len(),
+        device_list(seen.iter().collect(), target).await,
+    )
+}
+
+/// What to add under `choose`'s "no robot named …" when nothing answered to the name.
+///
+/// `choose` is given names and nothing else — deliberately, since the rule it encodes is about
+/// names — so its failure can only list the robots that *did* answer. Alone, that reads as "your
+/// robot is not here" when the honest claim is narrower: nothing calling itself that was reported
+/// in eight seconds. The two ways that happens want opposite next moves, and the list separates
+/// them:
+///
+/// - **The robot is in the list, unnamed.** Its name travels in the scan response, a second
+///   exchange that can be missed on its own — [`nothing_found`] has the byte budget that forces
+///   that. Retrying finds it.
+/// - **The robot is not in the list at all.** Nothing this client did can explain that: `btd`
+///   advertises every 100–150ms, so eight seconds is fifty missed chances, and the robot was not
+///   advertising. That is a fact about the robot rather than about the search — and a phone looking
+///   for the same robot would find it just as absent.
+async fn missed_the_named_robot(seen: &[Seen], target: &Target) -> String {
+    let mut message = radio_saw(seen, target).await;
+    message.push_str(
+        "\n\nIf the robot is one of the unnamed lines, its name was in a scan response this scan \
+         missed, and retrying usually finds it. If it is absent from that list entirely, it was \
+         not advertising for the whole eight seconds — check `journalctl -u btd -b` on the robot, \
+         and note that a robot stops advertising while a central is connected to it, so a link \
+         left over from the previous command can be the reason.",
     );
     message
 }
@@ -968,7 +1005,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(nothing_found(&seen, &target).await.into());
     }
 
-    let (peripheral, name) = choose(found, &target)?;
+    // Whether the name matched nothing, as against matching too much: only the first wants the list
+    // of everything the radio saw under it. A collision is about two robots that are both right
+    // there, and fifty lines of earbuds under it would bury the two names that matter.
+    let missed = target
+        .wanted()
+        .is_some_and(|wanted| !any_answers(&found, wanted));
+
+    let (peripheral, name) = match choose(found, &target) {
+        Ok(chosen) => chosen,
+        Err(why) if missed => {
+            return Err(
+                format!("{why}\n\n{}", missed_the_named_robot(&seen, &target).await).into(),
+            );
+        }
+        Err(why) => return Err(why.into()),
+    };
     eprintln!("connecting to {name}…");
 
     step(
@@ -1620,6 +1672,22 @@ mod tests {
             none,
             &target,
         ));
+    }
+
+    /// The two ways a named search ends with no robot, told apart by the rule the search itself
+    /// uses. Nothing answered: the failure is a claim about eight seconds, and everything the radio
+    /// saw belongs under it as evidence. Two answered: the two names *are* the evidence, and fifty
+    /// lines of earbuds beneath them would bury the only thing worth reading.
+    #[test]
+    fn a_miss_and_a_collision_are_not_the_same_failure() {
+        assert!(
+            !any_answers(&candidates(&["graphite"]), "olducky"),
+            "a miss"
+        );
+        assert!(
+            any_answers(&candidates(&["radxa-zero3", "radxa-zero3"]), "radxa-zero3"),
+            "a collision"
+        );
     }
 
     /// Without a name the fast path is unchanged, and that matters as much as the fix: a bonded
