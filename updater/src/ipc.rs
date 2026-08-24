@@ -518,13 +518,22 @@ impl Server {
                 })
                 .await
                 .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
-            Call::Check(params) => {
-                let engine = self.engine.lock().await;
-                match engine.check(params.component.as_str()).await {
+            // `try_lock`, like every other read here, and for a reason the header states:
+            // a request that blocks on the engine mutex is answered whenever the update
+            // finishes, which is minutes for a daemon release. A client asking "is there an
+            // update?" during one has an immediate answer — there is one running — and getting
+            // `BUSY` back at once is what lets it say so. Blocking instead produced a spinner
+            // indistinguishable from a robot that had stopped answering.
+            Call::Check(params) => match self.engine.try_lock() {
+                Ok(engine) => match engine.check(params.component.as_str()).await {
                     Ok(result) => Response::ok(Some(id), &result),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
-                }
-            }
+                },
+                Err(_) => Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::BUSY, "an update is in progress; retry shortly"),
+                ),
+            },
 
             // ── mutating ─────────────────────────────────────────────────────
             Call::Apply(params) => {
@@ -569,13 +578,19 @@ impl Server {
                 })
                 .await
             }
-            Call::Pin(params) => {
-                let mut engine = self.engine.lock().await;
-                match engine.pin(params.component.as_str(), params.version).await {
+            // Also `try_lock`, and the same `BUSY` every other mutation answers with. Pinning
+            // during an update is a request about which version may be installed, made while one
+            // is being installed: waiting for the answer to become moot is worse than saying so.
+            Call::Pin(params) => match self.engine.try_lock() {
+                Ok(mut engine) => match engine.pin(params.component.as_str(), params.version).await {
                     Ok(()) => Response::ok(Some(id), &serde_json::json!({})),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
-                }
-            }
+                },
+                Err(_) => Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::BUSY, "another update is already in progress"),
+                ),
+            },
 
             // Owned by `handle_connection`, which hands the whole connection to
             // `stream_progress` instead of answering once.

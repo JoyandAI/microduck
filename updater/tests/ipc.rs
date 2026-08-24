@@ -551,6 +551,51 @@ async fn status_answers_while_an_update_is_running() {
     let _ = applier.await_response(&apply_id).await;
 }
 
+/// `check` must come straight back during an update, and say why.
+///
+/// It used to take the engine lock and wait, so "is there an update available?" asked while one
+/// was running answered whenever that update finished — minutes, for a daemon release. On a phone
+/// that is indistinguishable from a robot that has stopped answering, and it is the wrong answer
+/// besides: there is something to say, and it is that an update is in progress.
+#[tokio::test]
+async fn check_says_busy_rather_than_waiting_for_the_update_to_finish() {
+    let fx = Harness::new();
+    fx.publish("1.0.0", false);
+    let engine = fx.engine(
+        true,
+        Faults {
+            hang_health: true,
+            ..Faults::none()
+        },
+    );
+    let _server = fx.serve(engine).await;
+
+    let mut applier = Client::connect(&fx.socket).await;
+    applier.hello().await;
+    let apply_id = applier
+        .send(
+            method::APPLY,
+            serde_json::json!({ "component": "daemon", "target": "latest" }),
+        )
+        .await;
+
+    // Let it get into the gate, where it holds the engine.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut observer = Client::connect(&fx.socket).await;
+    observer.hello().await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        observer.call(method::CHECK, serde_json::json!({ "component": "daemon" })),
+    )
+    .await
+    .expect("check must not block on the in-flight update");
+
+    assert_eq!(response.error.expect("busy").code, proto::code::BUSY);
+
+    let _ = applier.await_response(&apply_id).await;
+}
+
 /// The robot pulls, so a client vanishing mid-update is normal and must not cancel
 /// it (`architecture.md` §1.1).
 #[tokio::test]

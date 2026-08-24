@@ -54,12 +54,25 @@ const SCAN_TIME: Duration = Duration::from_secs(8);
 /// finish in well under a second instead of always paying `SCAN_TIME`.
 const SCAN_POLL: Duration = Duration::from_millis(250);
 
-/// How long to wait for a reply once the request is written.
+/// How long to wait with **nothing at all arriving** before giving up on a request.
 ///
-/// Longer than any single call except `net.connect`, which polls NetworkManager for up to 45s
-/// and so gets its own budget below.
+/// Idle rather than total, and that distinction is what makes an update watchable. An apply takes
+/// as long as the robot needs — download, verify, extract, swap, hooks, the health gate — so a
+/// total budget either cuts off a working update or waits out a dead robot. But the useful signal
+/// is already arriving: every progress notification is proof the robot is alive and working, so
+/// each one starts the clock again. A stalled mirror still fails in seconds.
+///
+/// Longer than any single call except `net.connect`, which polls NetworkManager for up to 45s and
+/// so gets its own budget below.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const SLOW_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// An update's silences are longer than any other call's: a post-install hook may take two
+/// minutes, and the phase notification arrives before it rather than during it. So the budget is
+/// the longest gap an update can legitimately have, not the longest an update can take.
+const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// `update watch` follows progress until interrupted, so it has no deadline worth naming. A day
+/// is an arbitrary bound that keeps the reply loop one shape instead of two.
+const FOLLOW_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
 /// Every step before the first reply gets its own budget and its own message.
 ///
@@ -622,6 +635,15 @@ enum Command {
     Scan,
     /// Version handshake plus update status.
     Status,
+    /// What the robot is running: the API version, the release, and the revision it was built from.
+    ///
+    /// `status` above answers this too, buried in an update report. This is the narrower question,
+    /// and the first one to ask of a robot that is behaving unexpectedly — a `revision` of `null`
+    /// means the release was built on somebody's laptop rather than by CI.
+    Version,
+    /// Updates: what is available, installing it, and going back.
+    #[command(subcommand)]
+    Update(Update),
     /// Name, serial and uptime.
     Info,
     /// Is the control loop healthy?
@@ -643,6 +665,86 @@ enum Command {
         /// Parameters as JSON. Defaults to `{}`.
         params: Option<String>,
     },
+}
+
+/// The update commands, named as `robotctl update` names them.
+///
+/// Deliberately the same words in the same order, so what someone learns on the robot transfers to
+/// the radio and back. What differs is the component: `robotctl` takes it as a positional argument
+/// because an operator may be updating a model bundle, and here it is a flag with a default,
+/// because a phone has one component to care about and today a robot has exactly one.
+#[derive(Subcommand)]
+enum Update {
+    /// Is there a newer release? Changes nothing.
+    ///
+    /// Answers `BUSY` rather than waiting if an update is already running.
+    Check {
+        #[arg(long, default_value = "daemon")]
+        component: String,
+    },
+    /// Install a release, and report progress while it happens.
+    ///
+    /// Answers once, when it is finished. The connection then drops a few seconds later, because
+    /// installing a daemon release restarts `btd` — see what this prints after the reply.
+    Apply {
+        #[arg(long, default_value = "daemon")]
+        component: String,
+        /// Exact version to install. Omit for whatever the source calls latest.
+        #[arg(long, conflicts_with = "git_ref")]
+        version: Option<duck_ipc_proto::semver::Version>,
+        /// Install what a branch last built, e.g. `--ref my-branch`.
+        ///
+        /// A dev build, so a robot only accepts one if the team key is in its trusted set and
+        /// `allow_dev_keys` is on: a customer robot refuses it.
+        #[arg(long = "ref", value_name = "REF", conflicts_with = "version")]
+        git_ref: Option<String>,
+        /// Install the release candidate from the staging channel.
+        ///
+        /// Pair it with `--version` to name one candidate rather than the newest.
+        #[arg(long, conflicts_with = "git_ref")]
+        staging: bool,
+        /// Verify everything, then stop before the symlink swap.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Per-component state: the version installed, the phase, health, and the last attempt.
+    ///
+    /// The same call as the top-level `status`, which keeps working because it is in every set of
+    /// notes anybody has written down.
+    Status,
+    /// Which releases are on the board, and which one is active.
+    Versions {
+        #[arg(long, default_value = "daemon")]
+        component: String,
+    },
+    /// Recent update attempts and outcomes — the record that survives a wiped journal.
+    Log {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Go back to the release installed before this one.
+    ///
+    /// The undo, for a release that installed, passed its health gate and then behaved worse.
+    /// Discards nothing, and is gated and auto-reverted like any other transition.
+    Rollback {
+        #[arg(long, default_value = "daemon")]
+        component: String,
+    },
+    /// Activate a release already on the board, without downloading anything.
+    ///
+    /// `versions` above lists what there is to choose from. Gated like an apply, so a selection
+    /// that does not come up is reverted.
+    Select {
+        version: duck_ipc_proto::semver::Version,
+        #[arg(long, default_value = "daemon")]
+        component: String,
+    },
+    /// Follow progress until interrupted.
+    ///
+    /// Prints where any update in flight has got to — `updaterd` replays the latest progress to a
+    /// new subscriber — and then everything that follows. It never receives a reply, so it ends
+    /// with Ctrl-C.
+    Watch,
 }
 
 #[derive(Subcommand)]
@@ -947,46 +1049,73 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut reassembler = Reassembler::new();
-    let deadline = tokio::time::Instant::now() + timeout;
+    // The deadline is **idle**, not total: it is pushed back by every notification that arrives,
+    // because a robot sending progress is a robot that is working. See `REPLY_TIMEOUT`.
+    let mut deadline = tokio::time::Instant::now() + timeout;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(format!("no reply within {timeout:?}").into());
+            return Err(silence(timeout).into());
         }
 
         let Ok(Some(notification)) = tokio::time::timeout(remaining, notifications.next()).await
         else {
-            return Err(format!("no reply within {timeout:?}").into());
+            return Err(silence(timeout).into());
         };
+        deadline = tokio::time::Instant::now() + timeout;
 
         for line in reassembler.push(&notification.value)? {
             if cli.verbose {
                 eprintln!("← {line}");
             }
-            // Notifications with no `id` are a progress stream, not an answer; print them and
+            // Notifications with no `id` are a progress stream, not an answer; report them and
             // keep waiting for the response that closes the call.
             let value: serde_json::Value = serde_json::from_str(&line)?;
             let is_answer = value.get("id").is_some_and(|id| !id.is_null());
 
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            if is_answer {
-                let _ = peripheral.disconnect().await;
-                // A JSON-RPC error is the robot answering, not this tool failing — so it is
-                // printed above and reported through the exit status rather than as a panic.
-                return if value.get("error").is_some() {
-                    Err("the robot returned an error".into())
+            if !is_answer {
+                if value["method"] == "update.progress" {
+                    eprintln!("· {}", progress_line(&value["params"]));
                 } else {
-                    // After the reply, and only for one that succeeded: a rename that the robot
-                    // refused leaves nothing stale.
-                    if let Some(note) = target.stale_after_rename(&cli.command) {
-                        eprintln!("{note}");
-                    }
-                    Ok(())
-                };
+                    // Nothing else streams today. Printed whole rather than summarised, because a
+                    // notification this tool does not know about is worth seeing in full.
+                    eprintln!("· {}", serde_json::to_string(&value)?);
+                }
+                continue;
             }
+
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            let _ = peripheral.disconnect().await;
+            // A JSON-RPC error is the robot answering, not this tool failing — so it is
+            // printed above and reported through the exit status rather than as a panic.
+            return if value.get("error").is_some() {
+                Err("the robot returned an error".into())
+            } else {
+                // After the reply, and only for one that succeeded: a rename that the robot
+                // refused leaves nothing stale.
+                if let Some(note) = target.stale_after_rename(&cli.command) {
+                    eprintln!("{note}");
+                }
+                if let Some(note) = restart_note(&cli.command, &value) {
+                    eprintln!("{note}");
+                }
+                Ok(())
+            };
         }
     }
+}
+
+/// What to say when the robot stops talking, which depends on what was expected of it.
+///
+/// The budget is a silence rather than a total, so "no reply within 180s" would be a lie about an
+/// update that had been running for ten minutes and then stalled.
+fn silence(idle: Duration) -> String {
+    format!(
+        "nothing from the robot for {idle:?}, so it has stopped answering. Anything it had \
+             already started — an update in particular — carries on without this connection: \
+             reconnect and run `duck-btctl update status`."
+    )
 }
 
 /// Write one NDJSON line, chunked.
@@ -1100,6 +1229,12 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // request: there is no method to send, and connecting is the thing it exists not to do.
         Command::Scan => unreachable!("scan returns before anything connects"),
         Command::Status => ("update.status", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::Version => (
+            "hello",
+            serde_json::json!({ "api_version": duck_ipc_proto::API_VERSION }),
+            REPLY_TIMEOUT,
+        ),
+        Command::Update(update) => return update_request_line(update),
         Command::Info => ("system.info", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Health => ("robot.health", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Name { name } => (
@@ -1143,6 +1278,153 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         "params": params,
     });
     Ok((serde_json::to_string(&request)?, timeout))
+}
+
+/// The update commands, built from `duck_ipc_proto`'s own types rather than as hand-written JSON.
+///
+/// `update.apply`'s target is an externally tagged enum — `"latest"`, `{"exact":"0.5.1"}`,
+/// `{"ref":"my-branch"}` — and getting that shape wrong by hand is a `PARSE_ERROR` from the robot
+/// with no clue in it. Serialising the type the daemon deserialises cannot be wrong.
+fn update_request_line(update: &Update) -> Result<(String, Duration), Box<dyn std::error::Error>> {
+    use duck_ipc_proto as proto;
+
+    let component = |name: &str| proto::ComponentId::new(name.to_owned());
+    let (method, params, timeout) = match update {
+        Update::Check { component: c } => (
+            proto::method::CHECK,
+            serde_json::to_value(proto::ComponentParams {
+                component: component(c),
+            })?,
+            // Reaches the network. It answers BUSY at once during an update rather than waiting,
+            // so the budget is for a slow mirror, not for a busy robot.
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Update::Apply {
+            component: c,
+            version,
+            git_ref,
+            staging,
+            dry_run,
+        } => {
+            let target = match (version.clone(), git_ref, staging) {
+                (Some(version), _, true) => proto::Target::StagingExact(version),
+                (Some(version), _, false) => proto::Target::Exact(version),
+                (None, Some(git_ref), _) => proto::Target::Ref(git_ref.clone()),
+                (None, None, true) => proto::Target::Staging,
+                (None, None, false) => proto::Target::Latest,
+            };
+            (
+                proto::method::APPLY,
+                serde_json::to_value(proto::ApplyParams {
+                    component: component(c),
+                    target,
+                    options: proto::ApplyOptions {
+                        dry_run: *dry_run,
+                        ..Default::default()
+                    },
+                })?,
+                UPDATE_IDLE_TIMEOUT,
+            )
+        }
+        Update::Status => (proto::method::STATUS, serde_json::json!({}), REPLY_TIMEOUT),
+        Update::Versions { component: c } => (
+            proto::method::LIST_INSTALLED,
+            serde_json::to_value(proto::ComponentParams {
+                component: component(c),
+            })?,
+            REPLY_TIMEOUT,
+        ),
+        Update::Log { limit } => (
+            proto::method::LOG,
+            serde_json::to_value(proto::LogParams {
+                limit: *limit as usize,
+            })?,
+            REPLY_TIMEOUT,
+        ),
+        Update::Rollback { component: c } => (
+            proto::method::ROLLBACK,
+            serde_json::to_value(proto::ComponentParams {
+                component: component(c),
+            })?,
+            UPDATE_IDLE_TIMEOUT,
+        ),
+        Update::Select {
+            version,
+            component: c,
+        } => (
+            proto::method::SELECT,
+            serde_json::to_value(proto::SelectParams {
+                component: component(c),
+                version: version.clone(),
+            })?,
+            UPDATE_IDLE_TIMEOUT,
+        ),
+        Update::Watch => (
+            proto::method::SUBSCRIBE,
+            serde_json::json!({}),
+            FOLLOW_TIMEOUT,
+        ),
+    };
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    Ok((serde_json::to_string(&request)?, timeout))
+}
+
+/// One progress notification, as a line for a person.
+///
+/// Progress goes to stderr like everything that is not an answer, so `duck-btctl … > reply.json`
+/// keeps the two apart — and printing it as pretty JSON, which is what this used to do, put a
+/// dozen lines of punctuation on stdout for every percent of a download.
+fn progress_line(params: &serde_json::Value) -> String {
+    let phase = params["phase"].as_str().unwrap_or("?");
+    let component = params["component"].as_str().unwrap_or("?");
+    let percent = params["percent"]
+        .as_u64()
+        .map(|p| format!(" {p}%"))
+        .unwrap_or_default();
+    let detail = params["detail"]
+        .as_str()
+        .map(|d| format!(" — {d}"))
+        .unwrap_or_default();
+    format!("{component}: {phase}{percent}{detail}")
+}
+
+/// What to say after an update replies, because the connection is about to drop.
+///
+/// Not a failure, and it should not read as one: `updaterd` and `btd` are the two units an update
+/// never restarts mid-flight — `btd` may be the transport it arrived over — so both are restarted
+/// about five seconds *after* the reply goes out (`docs/design/restart-order.md` §1). Every client
+/// has to expect that, and a phone app should show it as a step rather than an error.
+fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
+    let component = match command {
+        Command::Update(
+            Update::Apply { component, .. }
+            | Update::Rollback { component }
+            | Update::Select { component, .. },
+        ) => component,
+        _ => return None,
+    };
+    // `btd` ships in the daemon release and in nothing else, so only that component's transition
+    // takes the connection down. A model bundle restarts `robotd` and leaves this link alone —
+    // there are no model components configured today, and a note that is wrong the first time one
+    // appears is worse than no note.
+    if component != "daemon" {
+        return None;
+    }
+    // Only when something actually moved. `already_current` and `dry_run_passed` restart nothing.
+    match reply["result"]["outcome"].as_str()? {
+        "applied" | "rolled_back" => Some(
+            "note: the robot restarts its daemons now, and `btd` about five seconds after this \
+             reply — so this connection drops. That is the update working. Reconnect and run \
+             `duck-btctl update status`: `last_attempt` carries the outcome of what just ran.",
+        ),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1488,5 +1770,181 @@ mod tests {
         assert!(answers_to("duck [1]", "duck [1]"));
         assert!(!answers_to("[duck-c51b]", "duck-c51b"));
         assert!(!answers_to("duck-c51b [", "duck-c51b"));
+    }
+
+    /// Every shape `update apply` can ask for, on the wire.
+    ///
+    /// `Target` is an externally tagged enum, so each of these is a *different JSON shape* rather
+    /// than a different value in one field, and a mistake is a parse error from the robot with
+    /// nothing in it to act on. Built from the daemon's own type for that reason, and pinned here
+    /// because the flags are what a person types.
+    #[test]
+    fn apply_asks_for_the_target_the_flags_named() {
+        let wire = |args: &[&str]| {
+            let mut argv = vec!["duck-btctl", "update", "apply"];
+            argv.extend_from_slice(args);
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        assert!(wire(&[]).contains(r#""target":"latest""#));
+        assert!(wire(&["--version", "0.5.1"]).contains(r#""target":{"exact":"0.5.1"}"#));
+        assert!(wire(&["--ref", "my-branch"]).contains(r#""target":{"ref":"my-branch"}"#));
+        assert!(wire(&["--staging"]).contains(r#""target":"staging""#));
+        assert!(
+            wire(&["--staging", "--version", "0.6.0"])
+                .contains(r#""target":{"staging_exact":"0.6.0"}"#),
+            "a named candidate, which is neither of the two flags on its own"
+        );
+
+        let plain = wire(&[]);
+        assert!(plain.contains(r#""method":"update.apply""#), "{plain}");
+        assert!(
+            plain.contains(r#""component":"daemon""#),
+            "the default component"
+        );
+        assert!(
+            plain.contains(r#""dry_run":false"#),
+            "the options travel spelled out, which is what the daemon parses: {plain}"
+        );
+        assert!(wire(&["--dry-run"]).contains(r#""dry_run":true"#));
+    }
+
+    /// A ref and a version are alternatives, not a precedence to resolve by guessing — the same
+    /// refusal `robotctl` makes, so a command copied between them fails the same way.
+    #[test]
+    fn a_ref_and_a_version_cannot_both_be_named() {
+        assert!(
+            Cli::try_parse_from([
+                "duck-btctl",
+                "update",
+                "apply",
+                "--ref",
+                "my-branch",
+                "--version",
+                "0.5.1",
+            ])
+            .is_err()
+        );
+    }
+
+    /// The read-only commands and going back, each reaching the method it is named after. A table,
+    /// because the value of these commands over `call` is that the method is not typed by hand.
+    #[test]
+    fn every_update_command_asks_for_its_own_method() {
+        for (args, method) in [
+            (vec!["check"], "update.check"),
+            (vec!["status"], "update.status"),
+            (vec!["versions"], "update.listInstalled"),
+            (vec!["log"], "update.log"),
+            (vec!["watch"], "update.subscribe"),
+            (vec!["rollback"], "update.rollback"),
+            (vec!["select", "0.5.1"], "update.select"),
+        ] {
+            let mut argv = vec!["duck-btctl", "update"];
+            argv.extend_from_slice(&args);
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            let (line, _) = request_line(&cli.command).expect("a request");
+            assert!(line.contains(&format!(r#""method":"{method}""#)), "{line}");
+        }
+    }
+
+    /// `select` sends the version as a version, and defaults the component like the rest.
+    #[test]
+    fn select_names_a_version_and_defaults_the_component() {
+        let cli = Cli::try_parse_from(["duck-btctl", "update", "select", "0.5.1"]).expect("parses");
+        let (line, _) = request_line(&cli.command).expect("a request");
+        assert!(line.contains(r#""version":"0.5.1""#), "{line}");
+        assert!(line.contains(r#""component":"daemon""#), "{line}");
+    }
+
+    /// An update waits on silence, not on a total, and it waits longer than anything else does.
+    /// A total budget would cut off a working update; this is the longest gap one can legitimately
+    /// have (a post-install hook) rather than the longest one can take.
+    #[test]
+    fn an_update_is_given_the_longest_silence() {
+        let budget = |args: &[&str]| {
+            let mut argv = vec!["duck-btctl"];
+            argv.extend_from_slice(args);
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            request_line(&cli.command).expect("a request").1
+        };
+
+        assert_eq!(budget(&["update", "apply"]), UPDATE_IDLE_TIMEOUT);
+        assert_eq!(budget(&["update", "rollback"]), UPDATE_IDLE_TIMEOUT);
+        assert_eq!(budget(&["update", "select", "0.5.1"]), UPDATE_IDLE_TIMEOUT);
+        assert!(budget(&["update", "apply"]) > budget(&["update", "status"]));
+        assert_eq!(
+            budget(&["update", "watch"]),
+            FOLLOW_TIMEOUT,
+            "watch ends with Ctrl-C, not with a deadline"
+        );
+    }
+
+    /// Progress reads as a line rather than as JSON, and survives a field it does not have.
+    ///
+    /// The phase is always there; the percent only during a download, and the detail rarely. A
+    /// `None` percent must not print as `null%`, which is what a naive format would do.
+    #[test]
+    fn progress_prints_as_a_line() {
+        let full = serde_json::json!({
+            "component": "daemon",
+            "phase": "downloading",
+            "percent": 42,
+            "detail": null,
+        });
+        assert_eq!(progress_line(&full), "daemon: downloading 42%");
+
+        let bare = serde_json::json!({ "component": "daemon", "phase": "health_gate" });
+        assert_eq!(progress_line(&bare), "daemon: health_gate");
+
+        let detailed = serde_json::json!({
+            "component": "daemon",
+            "phase": "verifying",
+            "detail": "0.6.0",
+        });
+        assert_eq!(progress_line(&detailed), "daemon: verifying — 0.6.0");
+    }
+
+    /// The disconnect that follows an update is announced, and only when something moved.
+    ///
+    /// `already_current` restarts nothing, so telling someone their connection is about to drop
+    /// would be a false alarm — and the note is what stops a *real* drop from reading as a failed
+    /// update, so it has to be trustworthy.
+    #[test]
+    fn a_restart_is_announced_only_when_the_release_changed() {
+        let apply = Cli::try_parse_from(["duck-btctl", "update", "apply"])
+            .expect("parses")
+            .command;
+
+        let applied = serde_json::json!({
+            "id": 1,
+            "result": { "outcome": "applied", "from": "0.5.1", "to": "0.6.0" },
+        });
+        assert!(restart_note(&apply, &applied).is_some());
+
+        let unchanged = serde_json::json!({
+            "id": 1,
+            "result": { "outcome": "already_current", "version": "0.6.0" },
+        });
+        assert!(restart_note(&apply, &unchanged).is_none());
+
+        let dry_run = serde_json::json!({
+            "id": 1,
+            "result": { "outcome": "dry_run_passed", "candidate": "0.6.0" },
+        });
+        assert!(restart_note(&apply, &dry_run).is_none());
+
+        // And nothing else announces one, however it answered.
+        let status = Cli::try_parse_from(["duck-btctl", "update", "status"])
+            .expect("parses")
+            .command;
+        assert!(restart_note(&status, &applied).is_none());
+
+        // Nor a component whose release does not ship `btd`.
+        let model = Cli::try_parse_from(["duck-btctl", "update", "apply", "--component", "model"])
+            .expect("parses")
+            .command;
+        assert!(restart_note(&model, &applied).is_none());
     }
 }

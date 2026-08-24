@@ -181,6 +181,100 @@ duck-btctl --name <robot-name> status
 
 The version handshake and the update status.
 
+## Which release is it running
+
+```bash
+duck-btctl --name <robot-name> version
+```
+
+The API version, the release, and the git revision it was built from. A `revision` of `null` means
+the release was built on somebody's laptop rather than by CI.
+
+## Updates
+
+Same words as `robotctl update`, so a command learned on the robot works here. Every one of them
+takes `--component <name>` and defaults to `daemon`, which is the only component a robot has today.
+
+```bash
+duck-btctl --name <robot-name> update check
+```
+
+```bash
+duck-btctl --name <robot-name> update status
+```
+
+```bash
+duck-btctl --name <robot-name> update versions
+```
+
+```bash
+duck-btctl --name <robot-name> update log --limit 20
+```
+
+Installing takes minutes and prints progress lines as it goes:
+
+```bash
+duck-btctl --name <robot-name> update apply
+```
+
+```
+· daemon: preflight
+· daemon: downloading 12%
+· daemon: downloading 47%
+· daemon: verifying
+· daemon: swapping
+· daemon: health_gate
+{
+  "outcome": "applied",
+  "from": "0.5.1",
+  "to": "0.6.0"
+}
+note: the robot restarts its daemons now, and `btd` about five seconds after this reply — so this
+connection drops. That is the update working. Reconnect and run `duck-btctl update status`:
+`last_attempt` carries the outcome of what just ran.
+```
+
+The connection dropping after an apply is the update working, not a failure. Reconnect and read
+`update status`.
+
+A branch build, an exact version, or the staging candidate:
+
+```bash
+duck-btctl --name <robot-name> update apply --ref my-branch
+```
+
+```bash
+duck-btctl --name <robot-name> update apply --version 0.5.1
+```
+
+```bash
+duck-btctl --name <robot-name> update apply --staging
+```
+
+`--dry-run` verifies everything and stops before the swap. `--ref` and `--version` are alternatives;
+asking for both is refused.
+
+Going back — the previous release, or one named from `update versions`:
+
+```bash
+duck-btctl --name <robot-name> update rollback
+```
+
+```bash
+duck-btctl --name <robot-name> update select 0.5.1
+```
+
+Both are gated like an apply, so one that does not come up is reverted. Neither discards anything.
+
+Progress for an update somebody else started, or one triggered by the robot itself:
+
+```bash
+duck-btctl --name <robot-name> update watch
+```
+
+It prints where the update in flight has got to and then everything that follows. It never receives
+a reply, so it ends with Ctrl-C.
+
 ## Anything else — `call`
 
 ```bash
@@ -192,24 +286,14 @@ written without the `duck-btctl --name <robot-name>` in front of them:
 
 | | |
 |---|---|
-| `call update.check '{"component":"daemon"}'` | Is there a newer release? |
-| `call update.apply '{"component":"daemon","target":"latest"}'` | Install the latest stable release. |
-| `call update.apply '{"component":"daemon","target":{"ref":"my-branch"}}'` | Install what a branch last built. |
-| `call update.apply '{"component":"daemon","target":{"exact":"0.5.1"}}'` | Install one exact version. |
-| `call update.listInstalled '{"component":"daemon"}'` | Which releases are on the board. |
-| `call update.log '{"limit":20}'` | The update record that survives a wiped journal. |
 | `call system.services` | Which daemons are up, and the release each runs. |
 | `call pad.status` | Is a gamepad bonded, and is it connected? |
 | `call pad.pair '{"timeout_seconds":30}'` | Bond a pad held in pairing mode. |
 | `call pad.forget '{"mac":"<address>"}'` | Drop a bond. |
 
-An apply answers once, when it is finished, and `call` waits 60 seconds for that answer. A daemon
-update can take longer — the robot carries on regardless, and `status` afterwards says how it
-went.
-
-`call update.subscribe` is the progress stream. It never sends an answer, so it prints progress
-until the same 60 seconds run out. Nothing else streams: an apply on its own connection is silent
-until it is done.
+`call` waits 60 seconds for an answer. The update commands above wait on *silence* instead — three
+minutes with nothing arriving at all — which is why they are the way to run an update rather than
+`call update.apply`.
 
 ## Global options
 
@@ -225,18 +309,24 @@ until it is done.
 
 Replies go to stdout as pretty JSON, and everything else — progress, diagnosis, what the radio
 saw — to stderr. So `duck-btctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
-from the robot still exits non-zero.
+from the robot still exits non-zero. Progress lines start with `·` and are one line each, so
+`update apply > outcome.json` leaves them on screen and keeps the outcome in the file.
 
 One command is one connection: it finds the robot, pairs if it has to, proves the PIN, asks, and
 disconnects.
 
+Every command gives up after a period of silence rather than after a fixed total, so a slow update
+is never cut off and a robot that stops answering is reported in seconds. An update in flight
+survives that: the robot pulls, so it carries on with nobody watching, and `update status` afterwards
+says how it went.
+
 ## What is refused
 
 Motor control (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`,
-`robot.relax`), high-rate telemetry (`robot.subscribe`), the operator decisions (`update.select`,
-`update.pin`, `update.rollback`, `update.resetToGolden`) and the pairing PIN
-(`system.pairingPin`, `system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
-They come back as error code 14, "not available over Bluetooth".
+`robot.relax`), high-rate telemetry (`robot.subscribe`), the two update commands a person has to
+mean (`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
+`system.setPairingPin`) are refused by `btd` itself and never reach a daemon. They come back as
+error code 14, "not available over Bluetooth".
 
 That is a security boundary rather than a missing feature, and each refusal has its reason next
 to it in `btd/src/route.rs` — [`app-path-design.md`](../design/app-path-design.md) §3.1 is the
