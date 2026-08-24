@@ -74,8 +74,9 @@ sudo robotctl configure
 An interactive editor over `/etc/robot/robotd.toml`: every key the daemon knows, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown…), current value against default, one line of doc. SPACE toggles, ENTER types a
-value, `u` reverts a key to its default. Values in yellow are overrides; everything else is
-running on the built-in default.
+value, `u` reverts a key to its default. Values in yellow (marked `•`) are the keys where
+this robot diverges from the defaults; everything else is the built-in default, and `unset`
+optionals show what they resolve to `(auto)`.
 
 Three properties worth trusting:
 

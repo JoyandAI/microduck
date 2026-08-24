@@ -654,9 +654,14 @@ fn draw(
                 } else {
                     row.entry.key.split_once('.').expect("section.key").1
                 };
+                // Two markers, both meaning what they look like: `*` you changed it this
+                // session and have not saved; `•` this robot diverges from the default. A
+                // key merely *written* in the file at its default value gets no mark — that
+                // distinction confused everyone it was shown to, starting with the author's
+                // own demo file.
                 let marker = if model.pending.contains_key(row.entry.key) {
                     "*"
-                } else if row.overridden() {
+                } else if row.differs() {
                     "•"
                 } else {
                     " "
