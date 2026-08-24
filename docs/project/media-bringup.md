@@ -291,9 +291,11 @@ plugin loading in 1.26.2 with two decode elements.
 peer. And `mediad` does not exist, so nothing has been assembled into a pipeline that runs as a
 service.
 
-One thing still worth reading off a real stream: whether the `baseline` profile above lands as
-**Constrained** Baseline. `h264parse` distinguishes them in its caps, so
-`gst-launch-1.0 -v filesrc location=… ! h264parse ! fakesink` names it. There is no camera attached, so the whole capture path is untested on
+And `profile=baseline` does land as **Constrained** Baseline, which is the one thing here that
+could not be reasoned about and had to be read off a stream: `h264parse` distinguishes the two in
+its caps, and it reports `profile=(string)constrained-baseline`. That is exactly what WebRTC
+negotiates as `profile-level-id 42e01f`, so browser interop is settled at the encoder rather than
+left to a compatibility argument. There is no camera attached, so the whole capture path is untested on
 this board; what is known about it comes from `microduck_runtime`, which drove an IMX219 on the
 same hardware. `mediad` does not exist, so no pipeline has been assembled end to end.
 
@@ -310,7 +312,7 @@ element on the board:
 
 | property | default | what `mediad` should set | why |
 |---|---|---|---|
-| `profile` | `high` | **`baseline`** | WebRTC's interoperable floor is Constrained Baseline (`profile-level-id 42e01f`). Current browsers negotiate High; older peers do not. The element offers `baseline`/`main`/`high`, so this is a one-word decision rather than the open question it looked like |
+| `profile` | `high` | **`baseline`** | WebRTC's interoperable floor is Constrained Baseline (`profile-level-id 42e01f`). Current browsers negotiate High; older peers do not. Setting `baseline` produces a stream `h264parse` reports as `constrained-baseline` — verified, not assumed, since the enum only says "baseline" |
 | `header-mode` | `first-frame` | **`each-idr`** | SPS/PPS in the first frame *only* means a peer that joins later — or loses that packet — never decodes anything. `reachy_mini`'s Pi pipeline sets exactly this on `v4l2h264enc` via `repeat_sequence_header=1`; same requirement, different spelling |
 | `rotation` | `0` | **`180`** on the alpha | the IMX219 is mounted upside down. `microduck_runtime` fixes it with `videoflip method=rotate-180` — a full CPU pass over every frame, on the SoC `robotd` shares. The encoder does it in hardware for nothing |
 | `bps` | `0` (auto) | an explicit target | `rc-mode` already defaults to `cbr`, which is what a lossy link wants; the bitrate should not be left to "auto calculate" |
