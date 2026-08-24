@@ -26,16 +26,32 @@
 //! halving it would spend that hard-won margin on a feature nobody has asked for yet. The beacon
 //! is therefore registered only while a chorale is wanted, and dropped when it is not.
 //!
-//! ## In: a hardware-offloaded passive scan
+//! ## In: two ways to listen, because the good one is not always there
 //!
-//! BlueZ's advertisement monitor ([`bluer::monitor`]) filters on a byte pattern in the controller,
-//! so the host is woken only for advertisements that are already chorale beacons. Passive: the
-//! duck transmits nothing to scan, which matters because one antenna carries this, the gamepad's
-//! link and wifi.
+//! The one to want is BlueZ's advertisement monitor ([`bluer::monitor`]): it filters on a byte
+//! pattern *in the controller*, so the host is woken only for advertisements that are already
+//! chorale beacons, and it is passive — the duck transmits nothing to listen, which matters when
+//! one antenna carries this, the gamepad's link and wifi.
 //!
-//! The pattern matches the manufacturer-data field on company id `0xFFFF` followed by
-//! [`ChoraleBeacon::TAG`]. That tag is why the *other* instance's four bytes of IPv4 address are
-//! not delivered here as a beat.
+//! **It is not on this board.** `AdvertisementMonitorManager1` is still behind `bluetoothd
+//! --experimental` in BlueZ 5.82, and the daemon here runs without it, so `RegisterMonitor` comes
+//! back `UnknownMethod` and two ducks sit in a room hearing nothing. Turning `--experimental` on
+//! globally would enable a set of other unfinished interfaces underneath the phone's only way in,
+//! which is a poor trade for a power saving.
+//!
+//! So [`watch`] tries the monitor and falls back to ordinary discovery, which has been in every
+//! BlueZ forever. The costs of the fallback are real and worth knowing:
+//!
+//!  - **It scans actively**, so the duck transmits. More airtime taken from the gamepad.
+//!  - **It needs `duplicate_data`.** BlueZ suppresses repeated advertisement data by default, and a
+//!    beacon's *payload* is the whole signal — without this every beat after the first is invisible
+//!    and a follower locks onto nothing.
+//!  - Filtering happens in the host rather than the controller, so the byte pattern is applied by
+//!    [`beacon_in`] after the fact instead of before the wakeup.
+//!
+//! Either way the discriminator is the same: manufacturer-data on company id `0xFFFF` beginning
+//! with [`ChoraleBeacon::TAG`]. That tag is why the *other* advertising instance's four bytes of
+//! IPv4 address are not delivered here as a beat.
 //!
 //! ## What the arrival time means
 //!
@@ -248,9 +264,27 @@ mod radio {
 
     /// Watch for other ducks' beacons, forever, sending each sighting to `tx`.
     ///
-    /// Returns when the channel closes or the adapter goes away, so the caller can restart it the
-    /// same way `bluez::serve` restarts on losing an adapter.
+    /// Prefers the controller-offloaded monitor and falls back to ordinary discovery when BlueZ has
+    /// no monitor to offer — see the module docs for why that is the common case here and what the
+    /// fallback costs.
     pub async fn watch(adapter: &bluer::Adapter, tx: mpsc::Sender<Sighting>) -> bluer::Result<()> {
+        match monitor(adapter, tx.clone()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Any failure to *register* falls back; a monitor that registered and then died is a
+                // different matter and is reported as itself.
+                tracing::warn!(
+                    error = %e,
+                    "chorale: no advertisement monitor (bluetoothd without --experimental?); \
+                     falling back to discovery, which scans actively"
+                );
+                discover(adapter, tx).await
+            }
+        }
+    }
+
+    /// The good path: the controller matches the pattern and only wakes us for beacons.
+    async fn monitor(adapter: &bluer::Adapter, tx: mpsc::Sender<Sighting>) -> bluer::Result<()> {
         let manager = adapter.monitor().await?;
         let mut monitor = manager
             .register(Monitor {
@@ -266,68 +300,96 @@ mod radio {
                 ..Default::default()
             })
             .await?;
-        tracing::warn!(
-            pattern = ?scan_pattern(),
-            "chorale: listening for other ducks"
-        );
+        tracing::warn!(pattern = ?scan_pattern(), "chorale: listening (monitor)");
 
         while let Some(event) = monitor.next().await {
             let MonitorEvent::DeviceFound(found) = event else {
                 continue;
             };
-            let Ok(device) = adapter.device(found.device) else {
+            if let Ok(device) = adapter.device(found.device) {
+                spawn_follow(device, tx.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The fallback: ordinary discovery, filtered in the host.
+    async fn discover(adapter: &bluer::Adapter, tx: mpsc::Sender<Sighting>) -> bluer::Result<()> {
+        adapter
+            .set_discovery_filter(bluer::DiscoveryFilter {
+                transport: bluer::DiscoveryTransport::Le,
+                // **Load-bearing.** Without it BlueZ reports a device's advertisement data once and
+                // suppresses the repeats — and a beacon's payload is the entire signal, so every
+                // beat after the first would be invisible.
+                duplicate_data: true,
+                ..Default::default()
+            })
+            .await?;
+        let mut events = adapter.discover_devices_with_changes().await?;
+        tracing::warn!("chorale: listening (discovery)");
+
+        while let Some(event) = events.next().await {
+            let bluer::AdapterEvent::DeviceAdded(address) = event else {
                 continue;
             };
-            let tx = tx.clone();
-            // One task per duck heard, watching its advertisement for changes. The monitor
-            // reports a device once; the *payload* arriving repeatedly is a property change on it.
-            tokio::spawn(async move {
-                let address = device.address();
-                // Whatever it was already advertising when the monitor first matched it — the
-                // first beat is otherwise missed while waiting for a change that already happened.
-                if let Ok(Some(data)) = device.manufacturer_data().await
-                    && let Some(beacon) = beacon_in(&data)
-                {
-                    let sighting = Sighting {
+            if let Ok(device) = adapter.device(address) {
+                spawn_follow(device, tx.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Watch one duck's advertisement for as long as it keeps changing.
+    ///
+    /// One task per duck heard: whichever way it was found, the *payload* arriving repeatedly is a
+    /// property change on the device, and that is what carries the beat.
+    fn spawn_follow(device: bluer::Device, tx: mpsc::Sender<Sighting>) {
+        tokio::spawn(async move {
+            let address = device.address();
+            // Whatever it was already advertising when it was found — the first beat is otherwise
+            // missed while waiting for a change that has already happened.
+            if let Ok(Some(data)) = device.manufacturer_data().await
+                && let Some(beacon) = beacon_in(&data)
+                && tx
+                    .send(Sighting {
                         beacon,
                         from: address,
                         at: Instant::now(),
-                    };
-                    if tx.send(sighting).await.is_err() {
-                        return;
-                    }
-                }
-                let Ok(mut events) = device.events().await else {
-                    return;
+                    })
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            let Ok(mut events) = device.events().await else {
+                return;
+            };
+            while let Some(event) = events.next().await {
+                let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(
+                    data,
+                )) = event
+                else {
+                    continue;
                 };
-                while let Some(event) = events.next().await {
-                    let bluer::DeviceEvent::PropertyChanged(
-                        bluer::DeviceProperty::ManufacturerData(data),
-                    ) = event
-                    else {
-                        continue;
-                    };
-                    // Stamped here, as early as this process can: everything after is jitter the
-                    // phase average has to absorb.
-                    let at = Instant::now();
-                    let Some(beacon) = beacon_in(&data) else {
-                        continue;
-                    };
-                    if tx
-                        .send(Sighting {
-                            beacon,
-                            from: address,
-                            at,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                // Stamped here, as early as this process can: everything after is jitter the phase
+                // average has to absorb.
+                let at = Instant::now();
+                let Some(beacon) = beacon_in(&data) else {
+                    continue;
+                };
+                if tx
+                    .send(Sighting {
+                        beacon,
+                        from: address,
+                        at,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-            });
-        }
-        Ok(())
+            }
+        });
     }
 }
 
