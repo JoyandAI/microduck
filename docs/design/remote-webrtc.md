@@ -52,30 +52,46 @@ started. A LAN client connects to the same server directly.
 
 **Bind address is a decision, not a default.** Loopback only would mean a LAN peer cannot reach it
 at all and every session goes through a bridge, which defeats the point of a local mode. So it
-binds on all interfaces — and that makes §4 load-bearing rather than optional.
+binds on all interfaces, and §4 is what that implies for who may drive.
 
-## 4. Authorisation, because the signalling port is open on the LAN
+## 4. Authorisation: open on the LAN, and the bridge is where that stops
 
-A peer that reaches the signalling server can start a session, and a session carries the control
-channel, which carries the robot API. So the question is not "who may signal" but "who may drive".
+**No gate in the first version.** A peer that reaches the signalling server can start a session,
+drive the robot, and see through its camera. That is a decision, not an oversight.
 
-**Reuse `system.authenticate`.** It already exists — `API_VERSION` v4 added it — and it already
-solves this problem once, for BLE: a client proves knowledge of the robot's pairing PIN before
-anything else is served. `app-path-design.md` §5 explains why the check lives at the protocol layer
-rather than the link layer, and that reasoning transfers unchanged: *we* define the rules here too.
+Usability outranks hardening at this stage, and here the trade is not even close. The robot's
+pairing PIN is a shared `000000` — a PIN that is the same on every robot authenticates nobody — so
+requiring it over WebRTC would add a step to every first connection and buy no safety at all. An
+awkward first connect is a real cost; this particular gate is a real cost with no benefit.
 
-So the control channel is **unauthorised until `system.authenticate` succeeds on it**, exactly as a
-BLE session is. Concretely:
+What it costs, stated plainly so nobody has to discover it: anyone on the same network has the
+robot and its camera. Fine on a bench and in an office. **Not fine in a home**, which is the thing
+to revisit before one ships to one.
 
-- A fresh `control` channel serves `system.authenticate` and nothing else. Every other method is
-  refused, by name, with the same error a BLE session gives.
-- Media tracks do not flow before that either. A camera in someone's home must not stream to
-  whoever found port 8443.
-- The PIN comes from `configd` over its unix socket, never over the channel being authenticated —
-  the same rule that makes `system.pairingPin` unroutable to BLE.
+### The bridge is the line, not the LAN
 
-This is deliberately the *same* mechanism rather than a second one. Two authorisation schemes for
-two transports is how one of them ends up weaker, and it is usually the newer one.
+"On the LAN" is a boundary only while the LAN is the boundary. §7's bridge deletes it: a robot
+reachable through a rendezvous service is reachable by whoever can address it there, and "open to
+anyone who can connect" stops meaning "open to people in the building".
+
+So the rule is: **LAN-only may be unauthenticated; bridged may not.** That is a cheaper commitment
+than it sounds, because the bridge has to solve identity anyway — something has to decide which
+robots a given user may see — and whatever answers that question is also what authorises the
+session. Deferring auth is therefore not deferring work; it is declining to invent a second answer
+before the first one exists.
+
+### The hook, when it is wanted
+
+`system.authenticate` — the method BLE already uses, added in `API_VERSION` v4. A control channel
+would serve that one method and refuse the rest by name until it passes, exactly as a BLE session
+does, with the PIN read from `configd` over its unix socket rather than over the channel being
+authenticated.
+
+Cheap to add later precisely because §5's routing table already needs a notion of *which methods a
+transport may reach*. "Which methods before authentication" is the same table with a smaller
+subset, not a new mechanism. Using BLE's mechanism rather than inventing a second one is the point:
+two authorisation schemes for two transports is how one of them ends up weaker, and it is usually
+the newer one.
 
 ## 5. The control channel is a pipe to the existing API
 
@@ -108,8 +124,10 @@ BLE's subset is narrow because the radio is slow and anyone within a few metres 
 Neither applies here, so WebRTC gets more — but "more" is not "everything", and two categories stay
 out:
 
-- **`system.pairingPin` and `system.setPairingPin`.** A PIN readable over the channel it authorises
-  makes the authorisation theatre. Same reasoning as BLE, same answer.
+- **`system.pairingPin` and `system.setPairingPin`.** Not because they would compromise *this*
+  transport — §4 leaves it open anyway — but because they authorise a **different** one. A LAN peer
+  that can rewrite the pairing PIN can lock a phone out of BLE, which is the recovery path. Keeping
+  the PIN off every network transport is the same rule that makes it unroutable to BLE itself.
 - **`update.*` mutations.** For now only, and for a different reason than the PIN: applying an
   update restarts `mediad` and drops the session. Wanted later; §8 is what it will take.
 
@@ -161,6 +179,11 @@ Two properties follow, and both are the reason for this shape:
 - **The bridge parses nothing.** It proxies the gst signalling protocol, which is the same protocol
   a LAN client speaks. That is the concrete payoff for using `webrtcsink` rather than `webrtcbin`:
   the protocol already exists, so the bridge is a relay rather than a translator.
+
+**And the bridge is where §4's open door closes.** A LAN-only robot may be unauthenticated; a
+bridged one may not, because "whoever can reach it" stops meaning "whoever is in the building". The
+bridge already has to answer which robots a given user may see, and whatever answers that is what
+authorises the session — so this is not extra work, it is the same work not done twice.
 
 `reachy_mini` runs exactly this arrangement against a Hugging Face Space, with the robot
 registering as a `producer` and the Space keeping a TTL lease refreshed by a heartbeat. Whether we
