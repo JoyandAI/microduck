@@ -123,6 +123,35 @@ today without the second build — at the cost of implementing the signalling pr
 `webrtcsink` is preferred because its signalling protocol is what a relay proxies, which is what
 makes a central signaling server reusable.
 
+### Why not a prebuilt one
+
+The hardware, the kernel driver and MPP's userspace library all work with **nothing compiled** —
+`mpi_enc_test` came out of a deb and encoded 720p H.264 on the first try. What is missing is only
+the *GStreamer binding*: a plugin that wraps `librockchip-mpp` as an element a pipeline can use.
+`mpi_enc_test` is a standalone program; GStreamer has no idea it exists. The same shape as ONNX
+Runtime here — `libonnxruntime.so` is installed from a tarball with nothing compiled, and `ort` is
+the binding that makes it reachable.
+
+Prebuilt bindings were looked for and none is usable:
+
+| source | what it has | why not |
+|---|---|---|
+| Radxa `bullseye` pool | `gstreamer1.0-rockchip1_1.14-4` | installed and inspected: `mppvideodec` + `mppjpegdec` only |
+| Radxa `rk3588s2-bookworm` pool | the same `1.14-4` | identical build |
+| [`numbqq/gstreamer-rockchip-debs`](https://github.com/numbqq/gstreamer-rockchip-debs) | `1.14-8`, per-board | RK3588-family boards only, and shipped *beside forked* gstreamer core/base/good/bad debs — a build that expects a patched GStreamer is the wrong thing to drop onto stock 1.26.2 |
+
+It is worth two minutes to check whether the `1.14-8` build carries encoders before building, and
+that needs no install — `dpkg -x` it somewhere and point `gst-inspect-1.0` at the `.so` by path.
+Expect to build anyway: it is one small C plugin with meson and every dependency already on the
+board.
+
+**The build could be avoided entirely** by calling MPP's C API from `mediad` over Rust FFI, which
+`mpi_enc_test` proves works. That trades a meson build for hand-written and hand-maintained
+bindings to a vendor library, which is the worse side of the trade — but it is a real option, not
+a dead end, if the plugin turns out to fight GStreamer 1.26.
+
+### The upstream
+
 `rockchip-linux/gstreamer-rockchip` is gone (404). `JeffyCN/mirrors@gstreamer-rockchip` is the
 live mirror — last commit 2026-05-21 — and `gst/rockchipmpp` holds `gstmpph264enc.c`,
 `gstmpph265enc.c`, `gstmppjpegenc.c`, `gstmppvp8enc.c`. Fork soup exists around it; whichever
