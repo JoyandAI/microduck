@@ -16,8 +16,14 @@ description = "Camera, mic, WebRTC — and the remote gateway"
 
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tracing.workspace = true
 
 [dev-dependencies]
 # `every_call()`, so this crate's exhaustive-match tests use the same list every other
 # transport's do rather than growing a third copy of it.
 duck-ipc-proto = { path = "../duck-ipc-proto", features = ["test-support"] }
+# Fake daemons on real unix sockets, which is how the pipe is tested without a WebRTC peer.
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

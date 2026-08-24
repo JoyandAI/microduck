@@ -2098,6 +2098,10 @@ name = "mediad"
 version = "0.9.1"
 dependencies = [
  "duck-ipc-proto",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
