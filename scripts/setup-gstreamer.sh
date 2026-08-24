@@ -351,11 +351,21 @@ EOF
     cd mirrors && meson setup build && ninja -C build && sudo ninja -C build install
     gst-inspect-1.0 mpph264enc
 
-  Two things to know before trusting the result. `mediad` runs as its own user, so
-  /dev/mpp_service needs a udev rule giving it a group — see the mode printed above. And
-  mpph264enc on 6.1 kernels has upstream reports of poor or invalid bitstreams, with
-  mpph265enc suggested instead; H.265 is the worse WebRTC codec for browser reach, so decode
-  what this encodes and look at it before building a pipeline on top of it.
+  Three notes, one settled and two not.
+
+  **The bitstream is sound.** Upstream reports poor or invalid H.264 from mpph264enc on 6.1
+  kernels and suggests mpph265enc instead. That does not reproduce here: what mpi_enc_test
+  produced decodes clean through avdec_h264 — High profile, level 4, 4:2:0 8-bit, 1280x720 at
+  30 fps, no errors, 60 frames in 0.29 s. H.264 stays; H.265 would be the worse codec for
+  browser reach anyway.
+
+  **The profile is not settled.** WebRTC's interoperable floor is Constrained Baseline
+  (`profile-level-id 42e01f`) and the VPU emits High by default. Current browsers negotiate
+  High, older peers will not, so `mediad` should set the profile deliberately rather than
+  inherit whatever the encoder defaults to.
+
+  **/dev/mpp_service needs a udev rule** before a non-root `mediad` can open it at all — see
+  the mode printed above.
 EOF
     else
         cat <<EOF
