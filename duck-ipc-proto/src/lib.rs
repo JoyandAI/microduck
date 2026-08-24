@@ -2646,6 +2646,104 @@ pub struct TofFrame {
     pub status: Vec<u8>,
 }
 
+/// The duck chorale's beacon: what one duck puts on the air so others can sing with it.
+///
+/// **A wire contract, and the only one that is not JSON.** Every other message in this crate rides
+/// a socket; this one rides a BLE advertisement, because a chorale has to work between two robots
+/// with no network between them and no clock in common. It lives here for the reason
+/// `btd::adv`'s address layout lives in `btd` — one implementation of the layout, so the half that
+/// broadcasts and the half that scans cannot disagree about it.
+///
+/// ## Why these four bytes and no more
+///
+/// The controller reports a 251-byte advertising budget, so this is small by choice rather than by
+/// necessity: **every field is something several ducks have to agree about**, and the fewer of
+/// those there are the fewer ways they can disagree. Notably absent is any kind of timestamp —
+/// the arrival of a new [`ChoraleBeacon::beat`] *is* the downbeat, which is what lets a chorale
+/// work with no shared clock at all.
+///
+/// Also absent is the robot's voice seed. Casting consumes a duck's pitch centre and nothing else
+/// (`sounds::chorale::cast`), so that is what goes out — quantised to a byte — and the seed, which
+/// is the robot's identity, stays at home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoraleBeacon {
+    /// Which piece is being sung, so a duck arriving late knows what to join. Zero means "willing,
+    /// but nothing is being sung" — which is what a duck with `accept_chorale` on advertises while
+    /// it waits for company.
+    pub piece: u8,
+    /// The beat the conductor is on, wrapping. A byte is about four minutes at a chorale tempo;
+    /// the follower unwraps it (`sounds::chorale::beat::Follower`).
+    pub beat: u8,
+    /// The advertiser's own register — its pitch centre, quantised. All casting needs.
+    pub register: u8,
+    /// Tie-break, so two ducks rolled to the same register still order deterministically. Derived
+    /// from the seed rather than being it: one byte of a hash identifies nothing.
+    pub id: u8,
+}
+
+impl ChoraleBeacon {
+    /// Bottom and top of the range [`ChoraleBeacon::register`] covers.
+    ///
+    /// Brackets the whole duck population — `sounds::Personality` clamps a pitch centre to
+    /// 110–620 Hz — with margin at both ends, so neither the lowest nor the highest duck sits on a
+    /// clamp. A byte over that span is ~2 Hz a step, a fortieth of a semitone at the bottom, far
+    /// finer than casting looks at.
+    pub const REGISTER_LOW_HZ: f64 = 100.0;
+    pub const REGISTER_HIGH_HZ: f64 = 625.0;
+
+    /// Hertz per step of [`ChoraleBeacon::register`].
+    pub const REGISTER_STEP_HZ: f64 = (Self::REGISTER_HIGH_HZ - Self::REGISTER_LOW_HZ) / 255.0;
+
+    /// The piece number that means "willing, but not singing".
+    pub const IDLE: u8 = 0;
+
+    /// Marks the payload as a chorale beacon rather than some other four bytes.
+    ///
+    /// The advertisement's service UUID already says "this is a duck", so this only has to separate
+    /// *this* payload from the address field the other advertising instance carries — a scanner
+    /// reading four bytes of IPv4 as a beacon would hear a beat in `192.168.1.42`.
+    pub const TAG: u8 = 0xC0;
+
+    /// Quantise a pitch centre into [`ChoraleBeacon::register`].
+    pub fn quantise_register(pitch_center_hz: f64) -> u8 {
+        ((pitch_center_hz - Self::REGISTER_LOW_HZ) / Self::REGISTER_STEP_HZ)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    }
+
+    /// The pitch centre this register stands for.
+    pub fn pitch_center_hz(&self) -> f64 {
+        Self::REGISTER_LOW_HZ + f64::from(self.register) * Self::REGISTER_STEP_HZ
+    }
+
+    /// Whether this beacon says a piece is under way.
+    pub fn singing(&self) -> bool {
+        self.piece != Self::IDLE
+    }
+
+    /// The manufacturer-data payload, tag first.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        vec![Self::TAG, self.piece, self.beat, self.register, self.id]
+    }
+
+    /// Read a beacon out of a manufacturer-data payload.
+    ///
+    /// `None` for anything that is not exactly this layout. The company id these ride under is
+    /// `0xFFFF`, the SIG's testing id that anyone may use, so a payload of the wrong shape is
+    /// somebody else's advertisement and not a malformed one of ours.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match bytes {
+            [Self::TAG, piece, beat, register, id] => Some(Self {
+                piece: *piece,
+                beat: *beat,
+                register: *register,
+                id: *id,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// `skip_serializing_if` for a `bool` that is false by default.
 fn not(b: &bool) -> bool {
     !*b
@@ -3454,6 +3552,84 @@ mod tests {
             }
             .over_bluetooth()
         );
+    }
+
+    /// The beacon's round trip, which the broadcasting half and the scanning half both depend on.
+    #[test]
+    fn a_beacon_survives_the_advertisement() {
+        let beacon = ChoraleBeacon {
+            piece: 3,
+            beat: 217,
+            register: 56,
+            id: 0x9F,
+        };
+        let bytes = beacon.to_bytes();
+        assert_eq!(bytes.len(), 5, "tag plus four fields: {bytes:?}");
+        assert_eq!(ChoraleBeacon::from_bytes(&bytes), Some(beacon));
+        assert!(beacon.singing());
+
+        // Idle: willing, but nothing under way. What a duck waiting for company advertises.
+        let idle = ChoraleBeacon {
+            piece: ChoraleBeacon::IDLE,
+            ..beacon
+        };
+        assert!(!idle.singing());
+        assert_eq!(
+            ChoraleBeacon::from_bytes(&idle.to_bytes()),
+            Some(idle),
+            "an idle beacon still round-trips"
+        );
+    }
+
+    /// The tag is what stops a scanner reading the *other* advertising instance's IPv4 address as a
+    /// beat. Four bytes of address are a plausible beacon without it.
+    #[test]
+    fn an_address_payload_is_not_mistaken_for_a_beacon() {
+        // 192.168.1.42, as `btd::adv` would broadcast it.
+        assert_eq!(ChoraleBeacon::from_bytes(&[192, 168, 1, 42]), None);
+        // Nor is anything else of the wrong length, or the right length with the wrong tag.
+        for length in [0usize, 1, 4, 6, 16] {
+            assert_eq!(
+                ChoraleBeacon::from_bytes(&vec![ChoraleBeacon::TAG; length]),
+                None,
+                "{length} bytes"
+            );
+        }
+        assert_eq!(ChoraleBeacon::from_bytes(&[0x00, 1, 2, 3, 4]), None);
+    }
+
+    /// The register byte has to be fine enough to cast from and wide enough for every duck, or two
+    /// robots would seat the ensemble differently and sing each other's parts.
+    #[test]
+    fn a_quantised_register_is_good_enough_to_cast_from() {
+        let round_trip = |hz: f64| {
+            ChoraleBeacon {
+                piece: 1,
+                beat: 0,
+                register: ChoraleBeacon::quantise_register(hz),
+                id: 0,
+            }
+            .pitch_center_hz()
+        };
+        for hz in [110.0, 160.0, 214.4, 389.2, 491.5, 519.0, 620.0] {
+            let back = round_trip(hz);
+            assert!(
+                (back - hz).abs() <= ChoraleBeacon::REGISTER_STEP_HZ / 2.0 + 1e-9,
+                "{hz} Hz came back as {back}"
+            );
+        }
+        // Ordering survives, which is the only property casting actually asks of it.
+        assert!(ChoraleBeacon::quantise_register(214.4) < ChoraleBeacon::quantise_register(389.2));
+        // And the whole population fits without sitting on either clamp — a duck at the floor
+        // would be indistinguishable from every other duck at the floor.
+        assert!(ChoraleBeacon::quantise_register(110.0) > 0);
+        assert!(ChoraleBeacon::quantise_register(620.0) < 255);
+        assert_eq!(
+            ChoraleBeacon::quantise_register(50.0),
+            0,
+            "clamps, not wraps"
+        );
+        assert_eq!(ChoraleBeacon::quantise_register(10_000.0), 255);
     }
 
     /// The theremin block is absent while the instrument is down, and named when it is up:

@@ -61,55 +61,6 @@
 /// conductor against the whole ensemble, which is the one error that is *not* common-mode.
 pub const SLOT_MEAN_S: f64 = 0.125;
 
-/// What a conductor puts on the air, and what a follower reads off it.
-///
-/// Small on purpose. `btd`'s controller reports a 251-byte advertising budget, so this is not
-/// squeezed for space — it is squeezed because every field is something four ducks have to agree
-/// about, and the fewer of those there are the fewer ways they can disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Beacon {
-    /// Which piece. A joiner needs it to know what to sing.
-    pub piece: u8,
-    /// The beat the conductor is on. Wraps, and [`Follower`] unwraps it — a byte is ~4 minutes at
-    /// a chorale tempo, and the alternative is spending three more bytes on a number whose high
-    /// bits never differ between two ducks a room apart.
-    pub beat: u8,
-    /// The conductor's own register, quantised — all [`super::cast`] needs in order to seat
-    /// everyone identically without anyone being told their part.
-    pub register: u8,
-    /// Tie-break, so two ducks rolled to the same register still order deterministically.
-    pub id: u8,
-}
-
-impl Beacon {
-    /// Bottom and top of the range the register byte covers.
-    ///
-    /// Chosen to bracket the whole duck population (`Personality::from_seed` clamps a pitch centre
-    /// to 110–620 Hz) with margin at both ends. A byte over that span is ~2 Hz a step, which at
-    /// the bottom is a fortieth of a semitone — far finer than anything casting looks at.
-    pub const REGISTER_LOW_HZ: f64 = 100.0;
-    pub const REGISTER_HIGH_HZ: f64 = 625.0;
-
-    /// Hertz per step of [`Beacon::register`].
-    pub const REGISTER_STEP_HZ: f64 = (Self::REGISTER_HIGH_HZ - Self::REGISTER_LOW_HZ) / 255.0;
-
-    /// Quantise a pitch centre into [`Beacon::register`].
-    ///
-    /// The *seed* is deliberately not broadcast, even though there is a 251-byte advertisement to
-    /// put it in: casting consumes the pitch centre and nothing else, and a robot's seed is its
-    /// identity. Broadcasting the least that works is the cheaper habit.
-    pub fn quantise_register(pitch_center_hz: f64) -> u8 {
-        (((pitch_center_hz - Self::REGISTER_LOW_HZ) / Self::REGISTER_STEP_HZ)
-            .round()
-            .clamp(0.0, 255.0)) as u8
-    }
-
-    /// The pitch centre a quantised register stands for.
-    pub fn pitch_center_hz(&self) -> f64 {
-        Self::REGISTER_LOW_HZ + f64::from(self.register) * Self::REGISTER_STEP_HZ
-    }
-}
-
 /// The duck holding the beat.
 ///
 /// Deliberately dumb: it counts beats and says when to put each one on the air. It does not know
@@ -163,14 +114,17 @@ impl Conductor {
         (now - self.started_at - SLOT_MEAN_S) / self.beat_s
     }
 
-    /// What to advertise right now.
-    pub fn beacon(&self, piece: u8, register: u8, id: u8) -> Beacon {
-        Beacon {
-            piece,
-            beat: (self.emitted.unwrap_or(0) % 256) as u8,
-            register,
-            id,
-        }
+    /// The beat currently on the air, as the wire carries it — a byte, wrapping.
+    ///
+    /// The caller assembles the advertisement; this module knows nothing about radios. A byte is
+    /// ~4 minutes at a chorale tempo, and [`Follower`] unwraps it.
+    pub fn wire_beat(&self) -> u8 {
+        (self.emitted.unwrap_or(0) % 256) as u8
+    }
+
+    /// Beats handed to the radio so far, unwrapped. `None` before the first.
+    pub fn beat(&self) -> Option<u64> {
+        self.emitted
     }
 }
 
@@ -548,44 +502,5 @@ mod tests {
             assert_eq!(*beat, index as u64);
             assert!((at - index as f64).abs() < 0.02, "{bumps:?}");
         }
-    }
-
-    /// The register byte is the only thing about a duck that goes on the air, so it has to survive
-    /// the trip finely enough for casting to seat everyone the same way.
-    #[test]
-    fn a_quantised_register_is_good_enough_to_cast_from() {
-        for hz in [110.0, 160.0, 214.4, 389.2, 491.5, 519.0, 620.0] {
-            let byte = Beacon::quantise_register(hz);
-            let back = Beacon {
-                piece: 0,
-                beat: 0,
-                register: byte,
-                id: 0,
-            }
-            .pitch_center_hz();
-            // Within half a step, which at the bottom of the range is a fortieth of a semitone.
-            assert!(
-                (back - hz).abs() <= Beacon::REGISTER_STEP_HZ / 2.0 + 1e-9,
-                "{hz} -> {byte} -> {back}"
-            );
-        }
-        // Two ducks a hertz apart still order the same way round after quantisation, which is all
-        // casting asks of it.
-        assert!(
-            Beacon::quantise_register(214.4) < Beacon::quantise_register(389.2),
-            "ordering must survive"
-        );
-        // Out-of-range values clamp rather than wrap into the wrong octave.
-        assert_eq!(Beacon::quantise_register(50.0), 0);
-        assert_eq!(Beacon::quantise_register(10_000.0), 255);
-        // And the whole duck population fits inside the range without clipping at either end.
-        assert!(
-            Beacon::quantise_register(110.0) > 0,
-            "the lowest duck is not at the floor"
-        );
-        assert!(
-            Beacon::quantise_register(620.0) < 255,
-            "the highest is not at the ceiling"
-        );
     }
 }
