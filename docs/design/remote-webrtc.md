@@ -51,7 +51,9 @@ ship is a `.so` while `gst-webrtc-signalling-server` is a separate Rust binary f
 upstream crate. Not shipping it is a real simplification, not a shortcut.
 
 `webrtcsink`'s own signaller defaults to `ws://127.0.0.1:8443` and connects to the server it just
-started. A LAN client connects to the same server directly.
+started. A LAN client connects to the same server directly — `mediad/webclient/index.html` is one,
+in a single file with no build step, which speaks this protocol by hand rather than through
+`gst-plugins-rs`'s JS library so that trying it needs nothing installed.
 
 **Bind address is a decision, not a default.** Loopback only would mean a LAN peer cannot reach it
 at all and every session goes through a bridge, which defeats the point of a local mode. So it
