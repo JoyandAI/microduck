@@ -67,6 +67,7 @@ ENV_TOKEN="${DUCK_TOKEN:-}"
 ENV_DEV_KEY="${DUCK_DEV_KEY:-}"
 ENV_FORCE="${DUCK_FORCE_REINSTALL:-}"
 ENV_WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
+ENV_GSTREAMER="${DUCK_GSTREAMER:-}"
 
 REPO="${ENV_REPO:-pollen-robotics/microduck_daemon}"
 REF="${ENV_REF:-main}"
@@ -112,6 +113,16 @@ FORCE_REINSTALL="$ENV_FORCE"
 # `setup-board.sh` for the split this exists for.
 WEIRD_BLE="$ENV_WEIRD_BLE"
 
+# Install the GStreamer stack for `mediad`? Passed to `setup-gstreamer.sh`.
+#
+# Off by default, and that default is about timing rather than taste: it is around 100 MB of
+# media stack, and until `mediad` exists nothing on a board uses a byte of it. The wiring is
+# what is worth having early — flip this default when `mediad` ships and provisioning gains a
+# camera-capable board with a one-word change, instead of a bring-up step someone has to
+# remember. Unlike `WEIRD_BLE` this is not a per-board quirk: every robot will eventually want
+# it, which is exactly why it should not be a flag anybody has to know about for long.
+GSTREAMER="$ENV_GSTREAMER"
+
 # The branch the operator asked for, or empty. Kept apart from `REF` because they answer different
 # questions: `REF` is always set — it defaults to `main` — and says where the *scripts* come from,
 # while this says whether a *branch build of the daemon* was asked for. Provisioning plainly with no
@@ -149,6 +160,7 @@ DEV_KEY_KEPT="${STATE_DIR}/team.dev.pub"
 # they are on disk, and re-fetching would be a second chance for the network to fail.
 SETUP_SELF=/usr/local/sbin/robot-setup-board
 MIGRATE_SELF=/usr/local/sbin/robot-migrate-network
+GST_SELF=/usr/local/sbin/robot-setup-gstreamer
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -242,6 +254,7 @@ save_state() {
         kv DUCK_DEV_KEY "$1"
         kv DUCK_FORCE_REINSTALL "$FORCE_REINSTALL"
         kv DUCK_WEIRD_BLE "$WEIRD_BLE"
+        kv DUCK_GSTREAMER "$GSTREAMER"
         kv DUCK_ASKED_REF "$ASKED_REF"
         # `PROVISION_*` for the two that are not environment knobs, so sourcing this file cannot
         # set something an operator could also have exported.
@@ -265,6 +278,7 @@ load_state() {
     DEV_KEY="${ENV_DEV_KEY:-${DUCK_DEV_KEY:-}}"
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
     WEIRD_BLE="${ENV_WEIRD_BLE:-${DUCK_WEIRD_BLE:-}}"
+    GSTREAMER="${ENV_GSTREAMER:-${DUCK_GSTREAMER:-}}"
     ASKED_REF="${ENV_REF:-${DUCK_ASKED_REF:-}}"
     # No `ENV_` mirror for the name, unlike its neighbours. Theirs exist because sourcing this file
     # sets the very `DUCK_*` variables the operator's environment did, so the typed value has to be
@@ -505,6 +519,21 @@ phase_two() {
         tmp=/tmp/setup-board.sh
         fetch setup-board.sh "$tmp"
         DUCK_WEIRD_BLE="$WEIRD_BLE" sh "$tmp"
+    fi
+
+    # GStreamer, only when asked for — see `GSTREAMER` above for why the default is off.
+    #
+    # Here rather than in phase 1 because it changes no boot config and needs no reboot: it is
+    # apt packages and a report. Phase 1 exists for the two things that cannot swap under a
+    # running kernel, and this is neither.
+    if [ -n "$GSTREAMER" ]; then
+        if [ -x "$GST_SELF" ]; then
+            "$GST_SELF"
+        else
+            tmp=/tmp/setup-gstreamer.sh
+            fetch setup-gstreamer.sh "$tmp"
+            sh "$tmp"
+        fi
     fi
 
     # This run is what retires the wifi backstop. Left armed, any later boot where wifi is

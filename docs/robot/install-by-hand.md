@@ -118,6 +118,31 @@ Name it, if you want a name:
 robotctl system set-name duck-01
 ```
 
+## GStreamer, for a board that will stream
+
+Not part of provisioning yet — `mediad` does not exist, so nothing on the board uses it. Add it
+with `--gstreamer` on `provision-board.sh` (`DUCK_GSTREAMER=1` here), or by hand at any time. No
+reboot.
+
+```bash
+scp scripts/setup-gstreamer.sh pierre@192.168.1.42:~/
+```
+
+```bash
+sudo sh ~/setup-gstreamer.sh
+```
+
+It prints what this board can encode — which `webrtc*` elements are registered, which H.264
+encoder is reachable, and whether the VPU is exposed by the running kernel. Re-run it after any
+kernel change; that is the event that changes the answer:
+
+```bash
+sudo /usr/local/sbin/robot-setup-gstreamer
+```
+
+Add `--dev` to also install the headers, for building `gst-plugin-webrtc` on the board or an
+aarch64 sysroot to cross-build against.
+
 ## Check it
 
 ```bash

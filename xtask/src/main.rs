@@ -1292,6 +1292,7 @@ mod tests {
         for name in [
             "setup-board.sh",
             "migrate-network.sh",
+            "setup-gstreamer.sh",
             "install.sh",
             "provision.sh",
             "provision-board.sh",
