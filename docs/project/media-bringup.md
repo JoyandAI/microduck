@@ -270,14 +270,30 @@ present at 0600 root:root; `mpi_enc_test` silently writing nothing as non-root a
 root; that bitstream decoding clean as High/4.0; the Radxa debs' dependency closure; the rockchip
 plugin loading in 1.26.2 with two decode elements.
 
-**The plugin path works end to end**, on a board: `v1` fetched from the public release, sha256
-verified, installed to `/usr/local/lib/gstreamer-1.0`, and `gst-inspect-1.0 mpph264enc` answering
-with `provided-by /usr/local/lib/gstreamer-1.0/libgstrockchipmpp.so` — our build, not a
-third-party deb, which was removed first so the answer could be attributed.
+**The encode path is closed, on hardware, end to end.** In order:
 
-**Not measured.** No frame has been encoded through a GStreamer pipeline yet — `mpph264enc`
-registers, and only MPP's own test binary has actually encoded anything. Nor has any of it run as
-a non-root user: every check so far has been under `sudo`, and `mediad` will not be. There is no camera attached, so the whole capture path is untested on
+1. `v1` fetched from the public release, sha256 verified, installed to
+   `/usr/local/lib/gstreamer-1.0`.
+2. `gst-inspect-1.0 mpph264enc` answers `provided-by
+   /usr/local/lib/gstreamer-1.0/libgstrockchipmpp.so` — our build. The third-party deb was
+   removed first so the answer could be attributed to something.
+3. It **encodes**: `videotestsrc ! mpph264enc profile=baseline header-mode=each-idr bps=2000000 !
+   h264parse ! filesink` produced 476 KB for 60 frames of 720p in **0.44 s wall**, source
+   generation and pipeline setup included — comfortably faster than realtime. The result decodes
+   clean through `avdec_h264`.
+4. It works **without root**: after a udev rule puts `/dev/mpp_service` at `660 root:video` and
+   the user joins `video`, `gst-inspect` answers as that user. Which is the case `mediad` is in,
+   and every check before this one had been under `sudo`.
+
+**Not measured.** No camera has been attached, so the capture half — rkisp, rkaiq, the
+`v4l2-ctl`-into-`appsrc` question — is untested here; what is known comes from
+`microduck_runtime` on the same hardware. `webrtcsink` registers but has never negotiated with a
+peer. And `mediad` does not exist, so nothing has been assembled into a pipeline that runs as a
+service.
+
+One thing still worth reading off a real stream: whether the `baseline` profile above lands as
+**Constrained** Baseline. `h264parse` distinguishes them in its caps, so
+`gst-launch-1.0 -v filesrc location=… ! h264parse ! fakesink` names it. There is no camera attached, so the whole capture path is untested on
 this board; what is known about it comes from `microduck_runtime`, which drove an IMX219 on the
 same hardware. `mediad` does not exist, so no pipeline has been assembled end to end.
 
