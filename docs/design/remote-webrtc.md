@@ -298,7 +298,40 @@ What this section is *for* until then: knowing that two simultaneous drivers is 
 than a mystery, and that the first symptom is a robot ignoring both inputs rather than obeying the
 wrong one.
 
-## 10. Deferred, with reasons
+## 10. Building `mediad` at all
+
+The `gstreamer-rs` crates are pkg-config crates, so cross-compiling them needs the *target's*
+headers, `.pc` files and shared libraries on the developer's machine. `cargo board` cross-builds
+from macOS with `cargo-zigbuild`, and `scripts/ci-cross-deps.sh` says of the one C dependency it
+already has that it "is the cost of that one exception, and it is worth reading before adding
+another". This is the second, and much larger.
+
+**`scripts/cross-sysroot.sh` unpacks the robot's own Debian packages into a sysroot** — proven:
+the full workspace cross-builds against it, and `gstreamer`, `gstreamer-app` and
+`gstreamer-webrtc` all resolve at 1.26.2, the same version the board runs.
+
+Three things about it worth knowing before touching it:
+
+- **It serves the whole workspace, not just `mediad`.** `PKG_CONFIG_LIBDIR` *replaces*
+  pkg-config's search path rather than adding to it, so a sysroot carrying only GStreamer breaks
+  `padd` — whose `gilrs` needs libudev — and does it inside `libudev-sys`, nowhere near anything
+  about media. Replacing is still right: `PKG_CONFIG_PATH` is additive to the *host's*, which is
+  how pkg-config comes to answer with a macOS library and produce a binary that cannot run on the
+  robot.
+- **The package list is explicit, not resolved.** Walking Debian `Depends` from the obvious roots
+  pulls 543 packages, because `libgstreamer-plugins-bad1.0-dev` declares every optional backend's
+  dev package and the closure reaches Qt, Vulkan and OpenEXR. Nineteen packages satisfy what is
+  actually needed.
+- **A `-dev` package alone is not enough for anything actually linked.** It ships `libfoo.so` as a
+  symlink onto the `libfoo.so.N` in the runtime package, so `-lfoo` needs both. Libraries that
+  only appear in `Requires.private` need just the `-dev`.
+
+The alternative was building `mediad` on an arm64 runner like the plugins in
+[`media-bringup.md`](../project/media-bringup.md). Rejected because it splits the daemon build in
+two and leaves nobody able to build `mediad` on a laptop — which for the crate that will need the
+most iteration against real hardware is the wrong trade.
+
+## 11. Deferred, with reasons
 
 - **A WebSocket surface for server-side programs** (`architecture.md` §5.3). Same JSON-RPC, no
   media stack, `get_frame` returning a JPEG. It is a few dozen lines once §5's routing exists, and
