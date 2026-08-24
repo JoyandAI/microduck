@@ -67,6 +67,26 @@ Things the theremin/chorale steps built that the runtime's brain never had:
 - **One role each** — drone + rhythmic peck + melody. Small speakers do texture better
   than harmony.
 
+## Duck detector (camera + NPU) — wanted, waiting on mediad
+
+A tiny single-class detector for *our own duck*: precise **bearing** for gaze and following,
+which neither ToF nor BLE can give. The RK3566 has a 0.8 TOPS INT8 NPU (`rknpu2` /
+`rknn-toolkit2`); a YOLOv8n/11n-class model at 320 input should run ~20–40 ms → 15–30 Hz,
+leaving the CPUs alone. Range math: IMX219 ~62° HFOV, a 25 cm duck is ~25 px at 3 m — room
+scale, which is the interaction envelope.
+
+- **Gate first:** is the NPU driver on the board? (`dmesg | grep -i rknpu`) — vendor-kernel
+  `rknpu2`, not mainline. And `/dev/rga` for free NV12 resize. Ask mediad to tee raw NV12
+  from the ISP mainpath; the detector must not decode the streaming MJPEG.
+- **Data is the project, not the model.** Duck's-eye-view footage (robot height, robot
+  camera) auto-labeled by a big open-vocab model, distilled into the tiny one; synthetic
+  renders from the Open Duck CAD for the tail; hard negatives (rubber ducks, white prints).
+- **Fusion:** vision cannot tell identical ducks apart — camera = direction, ToF = distance,
+  BLE beacon = identity + presence. Follow-the-leader uses all three; "look at each other
+  when doing stuff" = beacon says *when*, detector says *where*, `robot.look` does the rest.
+- Same architecture as `tofd`/`pet-detect`: a perception worker outside `robotd`, safe to
+  kill. Fix the placeholder IMX219 intrinsics during the mediad port (audit §04 TODO).
+
 ## Shape notes for the port
 
 - Presence, mood, and the shared beat are **inputs to one brain**, not modes beside it —
