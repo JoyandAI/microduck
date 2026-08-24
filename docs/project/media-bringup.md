@@ -304,48 +304,47 @@ plugin loading in 1.26.2 with two decode elements.
    the user joins `video`, `gst-inspect` answers as that user. Which is the case `mediad` is in,
    and every check before this one had been under `sudo`.
 
-**The overlay works; the sensor has not been reached.** With
-`radxa-zero3-rpi-camera-v2` mirrored and enabled, a board comes up with `csi2-dphy0` probed,
-`rkisp` running, and ten `/dev/videoN` nodes — `rkisp_mainpath` on `platform:rkisp-vir0` and
-`rkisp-statistics`. So the overlay half is proven.
+**The whole media chain is closed on hardware.** Sensor to a WebRTC-negotiable stream:
 
-The sensor is not:
+| step | evidence |
+|---|---|
+| overlay applied | `csi2-dphy0` probed, `rkisp` up, ten `/dev/videoN` |
+| sensor identified | `imx219 2-0010: Model ID 0x0219, Lot ID 0x5a8e73, Chip ID 0x0773` |
+| capture node | `/dev/video0`, card name `rkisp_mainpath`, formats to 3280x2464 |
+| frames | 13,824,000 bytes for `--stream-count=10` at 720p NV12 — exact |
+| hardware encode | `v4l2-ctl … --stream-to=-` into `fdsrc ! rawvideoparse ! mpph264enc` |
+| the stream | decodes clean; `h264parse` reports **1280x720 constrained-baseline** |
 
-```
-imx219 2-0010: Reading register 100 from 10 failed
-imx219 2-0010: Error -5 setting default controls
-imx219: probe of 2-0010 failed with error -5
-```
+The node numbers are not stable across boots, so the capture node is found by matching the card
+name `rkisp_mainpath` under `/sys/class/video4linux/*/name` — as `camera.rs:219` does.
 
-`i2cdetect -y 2` on the camera's own bus is completely empty — no address, and no `UU` either,
-while other buses show `UU` where drivers hold devices. Nothing is answering electrically. Two
-things to know when picking this up:
+### Three device nodes need the `video` group, not one
 
-- **A format list capping at 800x600 is the ISP's fallback with no sensor.** A live IMX219 offers
-  up to 3280x2464, so that cap is a symptom rather than a limit.
-- **An empty `i2cdetect` after a failed probe proves less than it looks.** The driver releases the
-  sensor's clock and regulators when probe fails, so the bus reads empty either way. The probe
-  line in `dmesg` at boot is the signal; the scan is not.
+This cost three separate debugging rounds, each with a failure that named something else:
 
-Most likely physical: the Zero 3W's CSI connector is a **22-pin 0.5 mm FPC**, like a Pi Zero, not
-the 15-pin one on a full-size Pi — a standard Pi Camera ribbon does not mate with it. Reversed
-orientation is the other common cause. If the module turns out to be a Pi Cam v1.3 (OV5647,
-address `0x36`) rather than a v2, `DUCK_CAMERA_OVERLAY=radxa-zero3-rpi-camera-v1.3` is the
-overlay — a path nothing here has tested.
+| node | symptom when root-only |
+|---|---|
+| `/dev/mpp_service` | `mpi_enc_test` writes nothing and **exits 0**; `mpph264enc` is not registered at all |
+| `/dev/rga` | the element exists, the pipeline starts, then `Try to use uninit rgaCtx=(nil)` and pages of `rga call blit fail` |
+| `/dev/video0` | arrives `root:video` already, so it is the one that does not bite |
 
-**Not measured beyond that.** rkaiq, image quality, and the `v4l2src`-versus-own-mmap-loop
-question are all untouched; what is known about them comes from `microduck_runtime` on the same
-hardware. `webrtcsink` registers but has never negotiated with a
-peer. And `mediad` does not exist, so nothing has been assembled into a pipeline that runs as a
-service.
+`setup-gstreamer.sh` installs one udev rule covering the first two.
+**`mediad.service` needs `SupplementaryGroups=video`** — with `Environment=GST_PLUGIN_PATH`, that
+is two lines standing between a working pipeline and four different confusing failures.
 
-And `profile=baseline` does land as **Constrained** Baseline, which is the one thing here that
-could not be reasoned about and had to be read off a stream: `h264parse` distinguishes the two in
-its caps, and it reports `profile=(string)constrained-baseline`. That is exactly what WebRTC
-negotiates as `profile-level-id 42e01f`, so browser interop is settled at the encoder rather than
-left to a compatibility argument. There is no camera attached, so the whole capture path is untested on
-this board; what is known about it comes from `microduck_runtime`, which drove an IMX219 on the
-same hardware. `mediad` does not exist, so no pipeline has been assembled end to end.
+### Two things known to be unfinished
+
+**The bitrate came out ~50× under target.** 15,553 bytes for 3.3 s of capture against
+`bps=2000000` is about 37 kbps. Either the scene was static enough for CBR to collapse — plausible,
+the ISP was on raw defaults and the image is green and noisy until `setup_rkaiq.sh` runs — or
+capture is delivering well below 30 fps. The frame count has not been measured. If it is the
+latter, the sensor mode is the suspect: the IMX219 boots in 3280x2464 and the prototype pins the
+mode with `media-ctl` before every capture (`camera.rs:277`).
+
+**`rawvideoparse blocksize=1382400` is a bring-up shortcut, not a design.** It works because
+`v4l2-ctl` emits tightly-packed NV12 at a size we computed, and it is silently wrong the moment
+stride padding appears at another resolution — `camera.rs` notes exactly that. `mediad` doing its
+own V4L2 mmap loop into `appsrc` gets the real stride from the driver instead of assuming it.
 
 ## Two things the pipeline will have to decide
 
