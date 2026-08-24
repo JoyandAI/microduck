@@ -334,10 +334,16 @@ EOF
 
   Then try the plugin from that same pool *before* building one:
 
-    G=https://radxa-repo.github.io/bullseye/pool/main/g/gstreamer1.0-rockchip
-    curl -sL -O $G/gstreamer1.0-rockchip1_1.14-4_arm64.deb
-    sudo dpkg -i gstreamer1.0-rockchip1_1.14-4_arm64.deb
+    R=https://radxa-repo.github.io/bullseye/pool/main
+    curl -sL -O $R/libr/librga/librga2_2.2.0-1_arm64.deb
+    curl -sL -O $R/g/gstreamer1.0-rockchip/gstreamer1.0-rockchip1_1.14-4_arm64.deb
+    sudo dpkg -i librga2_2.2.0-1_arm64.deb gstreamer1.0-rockchip1_1.14-4_arm64.deb
     gst-inspect-1.0 mpph264enc
+
+  librga2 is the plugin's other dependency (Rockchip's 2D accelerator, used for colour
+  conversion and scaling). Both deb sets here name their full closure because these packages
+  do not come from a configured apt source: `dpkg -i` resolves nothing on your behalf, so a
+  missing dependency is an unconfigured package rather than an install that fixes itself.
 
   It was built against bullseye's GStreamer and this board runs 1.26.2. GStreamer keeps plugin
   ABI stable across 1.x, so it may simply load — and if it does, the encoder needs no source
