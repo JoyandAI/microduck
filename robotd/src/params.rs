@@ -343,8 +343,9 @@ pub struct SafetyParams {
     /// must not stay limp forever.
     pub limp_fall_max_ms: u64,
     /// How long the ramp back to the standing pose takes, once the robot has landed.
-    /// 0.3 s — measured on the robot, where a slower ramp was just dead time before the
-    /// stand-up: the joints are travelling across the floor unloaded, not lifting anything.
+    /// 0.6 s — settled on at the robot. The joints travel across the floor unloaded rather
+    /// than lifting anything, so a full second was mostly dead time before the stand-up;
+    /// 0.6 keeps some margin over the 0.3 that also worked.
     pub limp_fall_pose_ms: u64,
     /// Gain for that ramp. The joints have to actually travel across the floor, so it is
     /// not the limp gain; it is the softened standing gain rather than the walking one.
@@ -399,7 +400,7 @@ impl Default for SafetyParams {
             limp_fall_still_rate: 1.0,
             limp_fall_still_ms: 200,
             limp_fall_max_ms: 1500,
-            limp_fall_pose_ms: 300,
+            limp_fall_pose_ms: 600,
             limp_fall_pose_gain: 160,
         }
     }

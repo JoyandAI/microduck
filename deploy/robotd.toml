@@ -232,13 +232,14 @@ mode = "walk"
 # held in someone's hands does not stay limp forever.
 #
 # The pose ramp then travels the joints back to standing. Its gain is not the limp gain:
-# they have to actually move across the floor. 160 is the softened standing gain. 0.3 s is
-# measured on the robot — anything slower is dead time before the stand-up, since the joints
-# are travelling unloaded rather than lifting the robot.
+# they have to actually move across the floor. 160 is the softened standing gain. 0.6 s was
+# settled on at the robot: a full second is mostly dead time before the stand-up, since the
+# joints travel unloaded rather than lifting the robot, and 0.3 also worked — this keeps
+# some margin over it.
 # limp_fall_still_rate = 1.0
 # limp_fall_still_ms = 200
 # limp_fall_max_ms = 1500
-# limp_fall_pose_ms = 300
+# limp_fall_pose_ms = 600
 # limp_fall_pose_gain = 160
 
 # Sit down gracefully and power the machine off when the battery EMA reaches the empty
