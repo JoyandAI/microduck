@@ -74,6 +74,15 @@ const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// is an arbitrary bound that keeps the reply loop one shape instead of two.
 const FOLLOW_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
+/// How often the wait checks that the link is still up.
+///
+/// Without it a dropped connection is indistinguishable from a robot gone quiet: the notification
+/// stream simply stops yielding, so the wait runs to its idle budget and then reports a robot that
+/// has "stopped answering". After an `update apply` that is wrong twice over — the robot answered,
+/// and the link is what went away — and it takes `UPDATE_IDLE_TIMEOUT` to say so. Two seconds is
+/// far below every budget here and costs one cheap CoreBluetooth query each time.
+const LINK_POLL: Duration = Duration::from_secs(2);
+
 /// Every step before the first reply gets its own budget and its own message.
 ///
 /// btleplug bounds none of these, so without them a stall anywhere between "found the robot" and
@@ -1140,14 +1149,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut deadline = tokio::time::Instant::now() + timeout;
 
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(silence(timeout).into());
-        }
-
-        let Ok(Some(notification)) = tokio::time::timeout(remaining, notifications.next()).await
-        else {
-            return Err(silence(timeout).into());
+        let notification = match next_chunk(&peripheral, &mut notifications, deadline).await {
+            Waited::Chunk(notification) => notification,
+            Waited::Dropped => return Err(dropped(&cli.command).into()),
+            Waited::Silent => return Err(silence(timeout).into()),
         };
         deadline = tokio::time::Instant::now() + timeout;
 
@@ -1192,10 +1197,89 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// How a wait for the next notification ended.
+///
+/// Three outcomes rather than two, because "nothing arrived" hides the one that is diagnosable:
+/// a robot that is connected and not talking wants a different next move from a robot this Mac is
+/// no longer connected to.
+enum Waited {
+    /// Bytes arrived. Whether they complete a line is the reassembler's business.
+    Chunk(btleplug::api::ValueNotification),
+    /// The link is gone, so no budget is worth waiting out.
+    Dropped,
+    /// The budget expired with the link still up.
+    Silent,
+}
+
+/// Wait for the next notification, giving up when the deadline passes *or* the link goes.
+///
+/// The stream alone cannot report the second: on macOS a peripheral that disconnects mid-call
+/// leaves `notifications()` pending rather than ending it, so the only way to learn the link is
+/// gone is to ask. Hence the poll — [`LINK_POLL`] at a time, until one of the three answers.
+async fn next_chunk(
+    peripheral: &Peripheral,
+    notifications: &mut (impl futures::Stream<Item = btleplug::api::ValueNotification> + Unpin),
+    deadline: tokio::time::Instant,
+) -> Waited {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Waited::Silent;
+        }
+
+        match tokio::time::timeout(remaining.min(LINK_POLL), notifications.next()).await {
+            Ok(Some(notification)) => return Waited::Chunk(notification),
+            // The stream ended: btleplug has given up on the peripheral, which is the same news
+            // the poll below goes looking for.
+            Ok(None) => return Waited::Dropped,
+            // Nothing yet, so ask whether there ever will be. Only a definite "no" ends the
+            // wait: an adapter that errors on the question has not said the link is down, and
+            // treating that as a drop would end a working call early — whereas believing a link
+            // that is gone costs at most the silence this already tolerated.
+            Err(_) => {
+                if matches!(peripheral.is_connected().await, Ok(false)) {
+                    return Waited::Dropped;
+                }
+            }
+        }
+    }
+}
+
+/// What to say when the link goes before the reply does.
+///
+/// A different diagnosis from [`silence`], and the difference matters most for an update: `btd` is
+/// restarted about five seconds after an apply answers (`docs/design/restart-order.md` §1), so a
+/// drop is one of the shapes a *successful* update has. Calling that "the robot has stopped
+/// answering" describes a robot that is working perfectly as a robot that is dead.
+fn dropped(command: &Command) -> String {
+    // The transitions that restart daemons, and only for the release that ships `btd` — the same
+    // two conditions as `restart_note`, because they describe the same event: that one predicts
+    // the drop before it happens, and this one explains it afterwards.
+    let restarting = matches!(
+        command,
+        Command::Update(
+            Update::Apply { component, .. }
+            | Update::Rollback { component }
+            | Update::Select { component, .. },
+        ) if component == "daemon"
+    );
+
+    let next = if restarting {
+        "An update restarts the robot's daemons, `btd` among them, so this is as likely to be the \
+         update finishing as failing. Reconnect and run `duck-btctl update status`: \
+         `last_attempt` carries the outcome of what ran."
+    } else {
+        "Reconnect and try again. Anything the robot had already started — an update in \
+         particular — carries on without this connection."
+    };
+    format!("the link to the robot dropped before it answered. {next}")
+}
+
 /// What to say when the robot stops talking, which depends on what was expected of it.
 ///
 /// The budget is a silence rather than a total, so "no reply within 180s" would be a lie about an
-/// update that had been running for ten minutes and then stalled.
+/// update that had been running for ten minutes and then stalled. Reached only with the link still
+/// up: a drop is [`dropped`], and answered as soon as [`LINK_POLL`] notices it.
 fn silence(idle: Duration) -> String {
     format!(
         "nothing from the robot for {idle:?}, so it has stopped answering. Anything it had \
@@ -2103,5 +2187,53 @@ mod tests {
             .expect("parses")
             .command;
         assert!(restart_note(&model, &applied).is_none());
+    }
+
+    /// A drop during an apply is sent to the record, because the apply may well have worked.
+    ///
+    /// This is the message that replaces `silence` for the case it used to describe wrongly, and
+    /// it is worth the same care as the note that predicts the drop: it must send someone to
+    /// `last_attempt` when the update was restarting daemons, and not invent a restart when
+    /// nothing was being installed.
+    #[test]
+    fn a_drop_during_an_apply_points_at_the_record() {
+        let note = |argv: &[&str]| {
+            let mut full = vec!["duck-btctl"];
+            full.extend_from_slice(argv);
+            dropped(&Cli::try_parse_from(full).expect("parses").command)
+        };
+
+        for argv in [
+            vec!["update", "apply"],
+            vec!["update", "rollback"],
+            vec!["update", "select", "0.5.1"],
+        ] {
+            let said = note(&argv);
+            assert!(said.contains("update status"), "{argv:?}: {said}");
+        }
+
+        // A poll is not a transition, so nothing was restarting.
+        let said = note(&["update", "status"]);
+        assert!(!said.contains("restarts"), "{said}");
+
+        // Nor is anything else, and a component whose release does not ship `btd` restarts
+        // `robotd` and leaves this link alone.
+        for argv in [
+            vec!["wifi", "status"],
+            vec!["update", "apply", "--component", "model"],
+        ] {
+            let said = note(&argv);
+            assert!(!said.contains("restarts"), "{argv:?}: {said}");
+        }
+    }
+
+    /// The link is checked long before the budget it interrupts expires.
+    ///
+    /// The relationship is the whole point: a poll as long as the budget notices a dropped link
+    /// exactly when giving up would have, which is the three-minute silence this exists to end.
+    #[test]
+    fn the_link_is_checked_long_before_a_wait_gives_up() {
+        assert!(LINK_POLL < REPLY_TIMEOUT);
+        assert!(LINK_POLL * 10 < UPDATE_IDLE_TIMEOUT);
     }
 }
