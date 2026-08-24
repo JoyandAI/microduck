@@ -243,7 +243,20 @@ report_encoders() {
     esac
 
     if [ -e "$MPP_SERVICE" ]; then
-        printf '  %-16s present — Rockchip MPP is reachable\n' "$MPP_SERVICE"
+        # Mode and owner, not just presence. "Present" and "usable by a daemon" are different
+        # claims, and the gap between them is silent: with the node at 0600 root:root — which is
+        # how it arrives — a non-root `mpi_enc_test` writes an empty file and **exits 0**. No
+        # error, no log line. Measured on a Zero 3W, and it cost a round trip to find.
+        mode="$(stat -c '%a' "$MPP_SERVICE" 2>/dev/null || true)"
+        owner="$(stat -c '%U:%G' "$MPP_SERVICE" 2>/dev/null || true)"
+        printf '  %-16s present  %s %s\n' "$MPP_SERVICE" "${mode:-?}" "${owner:-?}"
+        # The group bit is what a daemon rides in on: `mediad` runs as its own user, like every
+        # other daemon here, so it needs group rw rather than root.
+        gbit="$(printf '%s' "$mode" | sed 's/.*\(..\)$/\1/' | cut -c1)"
+        case "$gbit" in
+            6|7) ;;
+            *) printf '  %-16s root-only — a non-root mediad cannot open it\n' '' ;;
+        esac
     else
         printf '  %-16s absent\n' "$MPP_SERVICE"
     fi
@@ -307,10 +320,14 @@ EOF
     curl -sL -O $P/rockchip-mpp-demos_1.5.0-1_arm64.deb
     sudo dpkg -i librockchip-mpp1_1.5.0-1_arm64.deb librockchip-vpu0_1.5.0-1_arm64.deb \
       rockchip-mpp-demos_1.5.0-1_arm64.deb
-    mpi_enc_test -w 1280 -h 720 -t 7 -n 60 -o /tmp/out.h264
+    sudo mpi_enc_test -w 1280 -h 720 -t 7 -n 60 -o /tmp/out.h264
 
-  All three, in one dpkg call: rockchip-mpp-demos depends on librockchip-vpu0 at exactly
-  1.5.0-1, so installing it alongside mpp1 leaves the demos package unconfigured.
+  All three debs in one dpkg call: rockchip-mpp-demos depends on librockchip-vpu0 at exactly
+  1.5.0-1, so installing it alongside mpp1 alone leaves the demos package unconfigured.
+
+  **sudo, and check the file size.** At 0600 root:root the test writes nothing and still exits
+  0 — no error, no log line — so `exit=0` is evidence of nothing. A non-empty /tmp/out.h264 is:
+  60 frames of 720p came out at ~428 KB on a Zero 3W.
 
   `-t` is MPP's coding enum, 7 being H.264; `mpi_enc_test -h` lists them. A bitstream in
   /tmp/out.h264 means the hardware encodes and only the GStreamer binding is missing.
