@@ -47,6 +47,9 @@ pub struct Row {
     pub set: Option<String>,
     /// The built-in default, rendered the same way.
     pub default: String,
+    /// What an *unset* optional key actually resolves to — per mode, per release — when the
+    /// daemon can say. The bare word `unset` told nobody anything.
+    pub resolved: Option<String>,
 }
 
 impl Row {
@@ -58,6 +61,12 @@ impl Row {
     /// Whether the file overrides the default.
     pub fn overridden(&self) -> bool {
         self.set.is_some()
+    }
+
+    /// Whether the value *differs* from the default — the thing worth a colour. A file that
+    /// writes the default out explicitly (the shipped example does) is not a divergence.
+    pub fn differs(&self) -> bool {
+        self.set.as_deref().is_some_and(|set| set != self.default)
     }
 }
 
@@ -114,10 +123,15 @@ impl Model {
                     Some(Edit::Clear) => None,
                     None => self.file_value(entry.key).map(|v| render(&v)),
                 };
+                let default = self.default_for(entry.key);
+                let resolved = (set.is_none() && default == "unset")
+                    .then(|| self.resolved_hint(entry.key))
+                    .flatten();
                 Row {
                     entry,
                     set,
-                    default: self.default_for(entry.key),
+                    default,
+                    resolved,
                 }
             })
             .collect()
@@ -137,6 +151,43 @@ impl Model {
             Some(value) => value.to_string(),
             // Not serialized: an `Option` at `None`. The registry doc says what unset means.
             None => "unset".to_owned(),
+        }
+    }
+
+    /// What an unset key resolves to, through the daemon's own resolution — per-mode policy
+    /// defaults, release-relative paths, the mic's mode-dependent switch. Parsed from the
+    /// pending state, so flipping `mode` updates every hint that depends on it.
+    fn resolved_hint(&self, key: &str) -> Option<String> {
+        let params: Params = toml::from_str(&self.rendered()).ok()?;
+        let policy = params.policy.resolved();
+        let path = |p: Option<std::path::PathBuf>| {
+            Some(match p {
+                Some(p) => p.display().to_string(),
+                None => "disabled".to_owned(),
+            })
+        };
+        let float = |f: f64| Some(f.to_string());
+        match key {
+            "policy.walk" => Some(policy.walk.display().to_string()),
+            "policy.stand" => path(policy.stand),
+            "policy.sitstand" => path(policy.sitstand),
+            "policy.ground_pick" => path(policy.ground_pick),
+            "policy.kick_left" => path(policy.kick_left),
+            "policy.kick_right" => path(policy.kick_right),
+            "policy.roulade" => path(policy.roulade),
+            "policy.action_scale" => float(policy.action_scale),
+            "policy.head_lowpass" => policy.head_lowpass.and_then(float),
+            "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
+            "policy.ground_pick_period" => float(policy.ground_pick_period),
+            "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
+            "audio.pet_detect" => Some(
+                params
+                    .audio
+                    .pet_detect_resolved(params.policy.mode)
+                    .to_string(),
+            ),
+            "audio.pet_model" => path(params.audio.pet_model_resolved()),
+            _ => None,
         }
     }
 
@@ -263,11 +314,21 @@ impl Model {
     }
 }
 
-/// A value as the UI shows it — bare strings without quotes, everything else as TOML spells it.
+/// A value as the UI shows it — the data alone. Strings lose their quotes, and everything
+/// loses its decor: `to_string` on a `toml_edit` value carries the whitespace and any inline
+/// comment along, which is how `50 # do not touch` once ended up in a value cell.
 fn render(value: &toml_edit::Value) -> String {
     match value {
         toml_edit::Value::String(s) => s.value().clone(),
-        other => other.to_string().trim().to_owned(),
+        toml_edit::Value::Integer(v) => v.value().to_string(),
+        toml_edit::Value::Float(v) => v.value().to_string(),
+        toml_edit::Value::Boolean(v) => v.value().to_string(),
+        toml_edit::Value::Datetime(v) => v.value().to_string(),
+        other => {
+            let mut bare = other.clone();
+            bare.decor_mut().clear();
+            bare.to_string().trim().to_owned()
+        }
     }
 }
 
@@ -563,7 +624,20 @@ fn draw(
         .saturating_sub(height / 2)
         .min(items.len().saturating_sub(height.max(1)));
     let mut lines: Vec<Line> = Vec::new();
+    // Whether the row being drawn sits under the [features] header — recovered by scanning
+    // back to the nearest header, since the window may start mid-block.
+    let block_of = |at: usize| {
+        items[..=at]
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Header(section) => Some(*section == "features"),
+                Item::Key(_) => None,
+            })
+            .unwrap_or(false)
+    };
     for (at, item) in items.iter().enumerate().skip(first).take(height.max(1)) {
+        let in_features = block_of(at);
         match item {
             Item::Header(section) => {
                 lines.push(Line::from(Span::styled(
@@ -573,7 +647,13 @@ fn draw(
             }
             Item::Key(index) => {
                 let row = &rows[*index];
-                let name = row.entry.key.split_once('.').expect("section.key").1;
+                // Inside a section the short name reads best; the features block gathers keys
+                // from *different* sections, where a bare `enabled` twice over says nothing.
+                let name = if in_features {
+                    row.entry.key
+                } else {
+                    row.entry.key.split_once('.').expect("section.key").1
+                };
                 let marker = if model.pending.contains_key(row.entry.key) {
                     "*"
                 } else if row.overridden() {
@@ -581,22 +661,22 @@ fn draw(
                 } else {
                     " "
                 };
-                let value = if row.overridden() {
-                    format!("{} (default {})", row.effective(), row.default)
+                // The colour means one thing: this robot runs something other than the
+                // default. A default written out explicitly is set (•) but not different.
+                let value = if row.differs() {
+                    Span::styled(
+                        format!("{} (default {})", row.effective(), row.default),
+                        Style::new().yellow(),
+                    )
+                } else if let Some(resolved) = &row.resolved {
+                    Span::styled(format!("{resolved} (auto)"), Style::new().dim())
                 } else {
-                    row.effective().to_owned()
+                    Span::styled(row.effective().to_owned(), Style::new().dim())
                 };
                 let mut line = Line::from(vec![
                     Span::raw(format!(" {marker} ")),
-                    Span::raw(format!("{name:<28}")),
-                    Span::styled(
-                        value,
-                        if row.overridden() {
-                            Style::new().yellow()
-                        } else {
-                            Style::new().dim()
-                        },
-                    ),
+                    Span::raw(format!("{name:<30}")),
+                    value,
                 ]);
                 if at == cursor {
                     line = line.style(Style::new().add_modifier(Modifier::REVERSED));
@@ -838,6 +918,71 @@ mod tests {
         }
     }
 
+    /// An inline comment is decor, not data: `hz = 50 # do not touch` is the value 50. This
+    /// once rode into the value cell and made an at-default key look overridden and annotated.
+    #[test]
+    fn an_inline_comment_is_not_part_of_the_value() {
+        let m = model("[control]\nhz = 50 # do not touch, bench board\n");
+        let rows = m.rows();
+        let hz = rows
+            .iter()
+            .find(|r| r.entry.key == "control.hz")
+            .expect("known");
+        assert_eq!(hz.set.as_deref(), Some("50"));
+        assert!(!hz.differs(), "50 is the default, however it is annotated");
+        assert!(hz.overridden(), "it is still written in the file");
+    }
+
+    /// The colour question: set-but-equal is not a divergence. Only a value actually away
+    /// from the default differs.
+    #[test]
+    fn writing_the_default_out_is_not_a_divergence() {
+        let m = model("[policy]\nenabled = true\nmode = \"roller\"\n");
+        let rows = m.rows();
+        let find = |key: &str| rows.iter().find(|r| r.entry.key == key).expect("known");
+        assert!(!find("policy.enabled").differs(), "true is the default");
+        assert!(find("policy.enabled").overridden());
+        assert!(find("policy.mode").differs(), "roller is not");
+    }
+
+    /// `unset` was a word that told nobody anything; the daemon can usually say what unset
+    /// *resolves to*, per mode — and the hint follows the mode when it changes.
+    #[test]
+    fn unset_keys_show_what_they_resolve_to() {
+        let mut m = model("");
+        let hint = |m: &Model, key: &str| {
+            m.rows()
+                .iter()
+                .find(|r| r.entry.key == key)
+                .expect("known")
+                .resolved
+                .clone()
+        };
+        let walk = hint(&m, "policy.walk").expect("resolves");
+        assert!(walk.contains("alpha_walking"), "{walk}");
+        assert_eq!(hint(&m, "policy.legs_lowpass").as_deref(), Some("0.7"));
+        assert_eq!(
+            hint(&m, "audio.pet_detect").as_deref(),
+            Some("true"),
+            "walking mode listens for petting"
+        );
+        // Flip the mode and the hints follow — they are resolved through the pending state.
+        m.edit(entry("policy.mode"), "roller").expect("edits");
+        assert_eq!(
+            hint(&m, "audio.pet_detect").as_deref(),
+            Some("false"),
+            "the roller does not"
+        );
+        let crouch = hint(&m, "policy.ground_pick").expect("resolves");
+        assert!(
+            crouch.contains("crouch") || crouch.contains("roller"),
+            "{crouch}"
+        );
+        // A set key hints nothing — the value speaks for itself.
+        m.edit(entry("policy.legs_lowpass"), "0.6").expect("edits");
+        assert_eq!(hint(&m, "policy.legs_lowpass"), None);
+    }
+
     /// The whole first screen renders without panicking, features first — the same
     /// TestBackend trick the monitor's tests use, so the layout code is exercised without a
     /// terminal.
@@ -857,8 +1002,11 @@ mod tests {
             .expect("draws");
         let screen = format!("{:?}", terminal.backend().buffer());
         assert!(screen.contains("[features]"), "features head the list");
-        assert!(screen.contains("mode"), "the first switches are visible");
-        // The override marker: mode is set in the file, away from default.
+        // In the features block keys keep their section — two bare `enabled`s from different
+        // sections were indistinguishable.
+        assert!(screen.contains("policy.enabled"), "{screen}");
+        assert!(screen.contains("audio.enabled"), "{screen}");
+        // The divergence annotation: mode is set away from default.
         assert!(screen.contains("roller (default walk)"), "{screen}");
     }
 
