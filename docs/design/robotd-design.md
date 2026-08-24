@@ -353,15 +353,47 @@ above it *can* command a motor — the invariant is structural rather than remem
 Three rules, unconditional:
 
 - **Joint clamp** — targets clipped to the model's range every tick, whatever the policy asked.
-- **Fall → limp** — projected gravity in the body frame, debounced (0.2 s in the runtime).
-  In the runtime this is `--fall-detect`, a flag, evaluated inline among the gamepad handling
-  and *skipped while a scripted skill is active*. Here it is always on and preempts anything.
 - **Intent deadman** — if intents stop arriving, velocity goes to zero.
 
 **Stop is not limp**, and the distinction matters: losing comms makes the robot *stand
-still*, because standing is the safe state for a biped. Losing balance makes it limp. Two
-events, two responses, written down rather than inferred from whichever got implemented
-first.
+still*, because standing is the safe state for a biped. Losing balance is a different event
+and this layer does not answer it.
+
+The fall verdict (projected gravity, debounced 0.2 s) lives here and is published, but it
+**gates nothing**: a fallen robot is enabled, init'd, driven and sent skills exactly like an
+upright one. That is deliberate — being on the floor is precisely when someone needs those
+calls to work — and it is what lets the answer to a fall live above this layer with no
+exemption to special-case. Earlier revisions had a `fall_limp` gate and a `fall_recover`
+auto-stand-up here; both were removed, because a safety rule that recovery has to bypass in
+order to work is not one.
+
+#### 5.4.1 Falling is a third event
+
+The fall verdict above answers "is the robot down". That is the right question for
+refusing to enable a robot lying on its side, and the wrong one for softening a landing:
+gravity past `fall_gravity_z` held for 200 ms *is* the robot on the floor, and the window
+worth acting in has closed by then.
+
+So `limp_fall` (on by default since it was validated on a robot) runs a second, separate
+detector — `duck_control::fall` —
+on the rate rather than the position. Projected gravity rotates with the trunk, so
+`ġ = −ω × g` is exact and comes straight from the gyro in the same 12-byte IMU block;
+extrapolating it over ~0.3 s says where gravity is heading. It fires when the robot is
+already tilted (≈26°), still tipping over rather than recovering, and predicted past the
+fall threshold — debounced three ticks. Differentiating the SFLP quaternion instead would
+add the filter's lag to the one number whose whole value is being early.
+
+What it buys is not the landing itself but the stand-up after it. The standing policy gets
+a still robot in a known posture up cleanly and a thrashing one up only after several
+attempts at walking gain against the floor, which is where the load on the motors comes
+from. So the sequence takes the fall away from the policy: limp at `gain_limp` following
+the joints down, wait for the gyro to go quiet, ramp back to the standing pose over ~1 s,
+hand over. The hand-back is nothing more than that — the twist has been held at zero
+throughout, so command magnitude selects the standing network, and that is the stand-up.
+
+The tuning is the feature, and it is asymmetric: a false positive is a fall the robot
+*caused*, which is worse than the stiff landing it was trying to avoid. The defaults sit
+deliberately on the late side.
 
 ### 5.5 Intents
 
