@@ -270,9 +270,14 @@ present at 0600 root:root; `mpi_enc_test` silently writing nothing as non-root a
 root; that bitstream decoding clean as High/4.0; the Radxa debs' dependency closure; the rockchip
 plugin loading in 1.26.2 with two decode elements.
 
-**Not measured.** `mpph264enc` **registers** — confirmed as root on the board, which is what
-finally proved the permission story — but no frame has been encoded through a GStreamer pipeline
-yet; only MPP's own test binary has run. There is no camera attached, so the whole capture path is untested on
+**The plugin path works end to end**, on a board: `v1` fetched from the public release, sha256
+verified, installed to `/usr/local/lib/gstreamer-1.0`, and `gst-inspect-1.0 mpph264enc` answering
+with `provided-by /usr/local/lib/gstreamer-1.0/libgstrockchipmpp.so` — our build, not a
+third-party deb, which was removed first so the answer could be attributed.
+
+**Not measured.** No frame has been encoded through a GStreamer pipeline yet — `mpph264enc`
+registers, and only MPP's own test binary has actually encoded anything. Nor has any of it run as
+a non-root user: every check so far has been under `sudo`, and `mediad` will not be. There is no camera attached, so the whole capture path is untested on
 this board; what is known about it comes from `microduck_runtime`, which drove an IMX219 on the
 same hardware. `mediad` does not exist, so no pipeline has been assembled end to end.
 
