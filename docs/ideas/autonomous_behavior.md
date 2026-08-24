@@ -1,0 +1,79 @@
+# The autonomous behavior stack — what it inherits, and ideas waiting for it
+
+The brain is the biggest untracked gap in the [parity audit] (§03): the runtime's
+`autonomous.rs` exists nowhere in the daemon and no design doc owns it yet. This file is the
+holding pen — what the port has to cover, and the ideas from the theremin/chorale work
+(2026-08) that should land as *behaviors in that stack* rather than as more ad-hoc modes.
+
+[parity audit]: https://claude.ai/code/artifact/4ea45b32-a298-42ea-bcb4-1d2a7a567948
+
+## To port from the runtime (audit §03)
+
+A 16-state machine — Chill, LookAround, Wander, TurnInPlace, Zoomies, Startle, Stretch,
+Ruffle, Preen, Sneeze, Dance, GroundPick, Nap, BallPlay, Petted, Held — built on:
+
+- an **energy/mood model** driving state choice
+- **novelty-grid exploration memory** for Wander
+- **ToF obstacle avoidance** with freshness gating
+- contrast-based **startle**; **sound reactions** (noise vs voice) with self-audio /
+  self-motion gating
+- **ball play** (approach / line up / kick), a **nap cycle**, **petting reactions**
+- the in-process gamepad↔autonomous toggle (DpadRight 2 s), `--autonomous-max-speed`
+
+Its inputs all exist in the daemon now: ambient sound events (step 2 — logged, no consumer),
+depth frames (step 3), classified trunk-frame obstacle points (step 5), and the voice tags
+(step 2, "ready and waiting for the brain step"). `Held` depended on pickup detection, which
+is deprecated — decide whether to revive it or drop the state.
+
+## New inputs the brain gets for free (2026-08 work)
+
+Things the theremin/chorale steps built that the runtime's brain never had:
+
+- **Nearby ducks, by stable id** — the chorale beacon (`ChoraleBeacon`), which survives BLE
+  address rotation (see `docs/../memory`: never key on the address)
+- **A shared beat** with no clock sync (`sounds::chorale::beat`) — ±20 ms across ducks
+- **RSSI per advertisement** — free coarse distance (near / far / approaching)
+- **~245 spare bytes** of extended-advertising payload
+- **A live synth voice** (`sounds::Stream`): pitch/level/vowel at runtime, not just bank wavs
+- **Hand distance from the ToF** (`kinematics::hand::Tracker`)
+
+## Behavior ideas, roughly by charm-per-line
+
+**Social (BLE presence — the new territory):**
+
+- **Recognition & greeting** — keep a persisted list of duck ids met; `greet` a stranger,
+  a warmer sound for a friend, a `peck`/sigh when a friend's beacon goes stale. Friendship
+  as a met-count that changes the greeting over time. Reads as *memory*; needs no sync.
+- **Lonely / content** — a duck alone calls out occasionally; a duck with company doesn't.
+  An input to the mood model, not a state.
+- **Excitement on approach** — RSSI rising for a known id → visible anticipation.
+- **Marco Polo** — one duck hidden, another guides you by quacking faster as RSSI grows.
+- **Follow-the-leader** — RSSI holds spacing, ToF handles the duck directly ahead.
+- **Applause / social feedback** — one duck does a roulade, nearby ducks react.
+- **Telephone** — a message hops duck to duck through the spare payload, mutating.
+- **Voting** — preferences in the beacon payload; majority picks the group's next behavior.
+
+**Beat-synced motion (cash in the sync work where it shows — no speaker involved):**
+
+- **Group head-bob / sway** — all ducks in phase on the shared beat; visual sync tolerates
+  ~50 ms where audio wanted 20. Group pose on the downbeat of a bar. Conga line.
+- **Dance** (already a runtime state) becomes *synchronized* dance when company is present.
+
+**Musical, beyond the chorale:**
+
+- **Call and response** — antiphonal phrases; the gap between phrases hides sync error, so
+  it is *easier* than the chorale and more duck-like.
+- **A round** — same melody, deliberate multi-bar offsets; the offsets absorb the error.
+- **One role each** — drone + rhythmic peck + melody. Small speakers do texture better
+  than harmony.
+
+## Shape notes for the port
+
+- Presence, mood, and the shared beat are **inputs to one brain**, not modes beside it —
+  the chorale/theremin grew as explicit modes because there was no brain to hang them on;
+  fold them in as states/inputs when it lands ("Petted" is to pet-detect what "Sing" is to
+  a heard beacon).
+- The chorale's consent rule generalizes: **anything social is opt-in and off = invisible**
+  (`[chorale] accept` today; probably one `[social]` switch tomorrow).
+- Recognition/greeting is the right *first* behavior: highest charm per line, no sync, and
+  it exercises the BLE discovery layer — the part still under hardware suspicion.
