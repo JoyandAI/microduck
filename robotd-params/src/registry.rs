@@ -1,0 +1,457 @@
+//! The machine-readable index of every key in `robotd.toml` — what an editor needs to know.
+//!
+//! [`Params`] and its `Default` impls are the truth about *values*; what they cannot carry at
+//! runtime is the part a human-facing editor needs — a one-line description, what kind of value
+//! a key takes, which named choices an enum offers. That is this table.
+//!
+//! **A table this shape usually drifts, so its completeness is a test, not a hope**:
+//! [`tests::the_registry_covers_every_key_exactly`] serializes `Params::default()` and walks the
+//! key tree — every leaf must appear here and nothing else may. Add a section to [`Params`] and
+//! the build stays green but the test names the keys the registry is missing; the editor can
+//! never silently not know about a setting. (The same trick that pins `deploy/robotd.toml` to
+//! the defaults.)
+//!
+//! The one-line docs are deliberately *short* — the full reasoning lives in the doc comments on
+//! [`Params`] and in the shipped `deploy/robotd.toml`, and an editor's footer is not the place
+//! for four paragraphs on voltage adaptation.
+
+use crate::Params;
+
+/// What kind of value a key takes — what an editor should offer for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// On or off. Toggle.
+    Bool,
+    /// On, off, or absent-meaning-auto (`Option<bool>` — e.g. pet detection resolves per
+    /// mode when unset). Cycle through the three.
+    TriBool,
+    /// A whole number.
+    Integer,
+    /// A fractional number.
+    Float,
+    /// A fractional number, or absent meaning "resolved per mode / measured / default".
+    OptionalFloat,
+    /// One of a fixed set of names.
+    Choice(&'static [&'static str]),
+    /// Free text (an ALSA device, a socket path...).
+    Text,
+    /// A filesystem path, or absent meaning the release's own copy; the literal `"none"`
+    /// disables the slot outright.
+    OptionalPath,
+}
+
+/// One key of `robotd.toml`.
+#[derive(Debug, Clone, Copy)]
+pub struct Entry {
+    /// `section.key`, exactly as serde spells it.
+    pub key: &'static str,
+    pub kind: Kind,
+    /// One line, for an editor's footer. The paragraph lives on the struct field.
+    pub doc: &'static str,
+    /// A *feature switch* — the handful of keys someone opens an editor to flip, as opposed
+    /// to tuning they should read the full docs before touching. Editors list these first.
+    pub feature: bool,
+}
+
+const fn entry(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
+    Entry {
+        key,
+        kind,
+        doc,
+        feature: false,
+    }
+}
+
+const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
+    Entry {
+        key,
+        kind,
+        doc,
+        feature: true,
+    }
+}
+
+/// Every key, grouped by section, sections in the shipped file's order.
+pub const REGISTRY: &[Entry] = &[
+    // ── [bus] ────────────────────────────────────────────────────────────────
+    entry("bus.port", Kind::Text, "Dynamixel serial port device"),
+    // ── [control] ────────────────────────────────────────────────────────────
+    entry("control.hz", Kind::Integer, "Control loop rate"),
+    entry(
+        "control.cmd_alpha",
+        Kind::Float,
+        "EMA smoothing on stick twist, 1.0 = pass-through",
+    ),
+    entry(
+        "control.head_alpha",
+        Kind::Float,
+        "EMA smoothing on head targets, 1.0 = pass-through",
+    ),
+    // ── [update_gate] ────────────────────────────────────────────────────────
+    entry(
+        "update_gate.min_achieved_hz",
+        Kind::Float,
+        "Loop rate below which an update is refused as unhealthy",
+    ),
+    entry(
+        "update_gate.stall_periods",
+        Kind::Integer,
+        "Periods with no tick at all before the loop counts as wedged",
+    ),
+    entry(
+        "update_gate.max_consecutive_errors",
+        Kind::Integer,
+        "Consecutive bus read failures before reporting unhealthy",
+    ),
+    // ── [policy] ─────────────────────────────────────────────────────────────
+    feature(
+        "policy.enabled",
+        Kind::Bool,
+        "Load policies at all — off holds the pose and stays healthy (bench)",
+    ),
+    feature(
+        "policy.mode",
+        Kind::Choice(&["walk", "roller"]),
+        "Legs or the roller: picks policies and per-mode tuning defaults",
+    ),
+    entry(
+        "policy.walk",
+        Kind::OptionalPath,
+        "Walking policy; unset = the release's",
+    ),
+    entry(
+        "policy.stand",
+        Kind::OptionalPath,
+        "Standing policy; unset = the release's",
+    ),
+    entry(
+        "policy.sitstand",
+        Kind::OptionalPath,
+        "Sit/stand policy; sit toggle and shutdown sit need it",
+    ),
+    entry(
+        "policy.ground_pick",
+        Kind::OptionalPath,
+        "Ground-pick policy (roller: the crouch)",
+    ),
+    entry("policy.kick_left", Kind::OptionalPath, "Left-kick policy"),
+    entry("policy.kick_right", Kind::OptionalPath, "Right-kick policy"),
+    entry("policy.roulade", Kind::OptionalPath, "Forward-roll policy"),
+    entry(
+        "policy.action_scale",
+        Kind::OptionalFloat,
+        "Policy output to joint offset; unset resolves per mode",
+    ),
+    entry(
+        "policy.standing_action_scale",
+        Kind::Float,
+        "Action scale while standing",
+    ),
+    entry(
+        "policy.standing_gain_ratio",
+        Kind::Float,
+        "Standing runs at this fraction of gain",
+    ),
+    entry(
+        "policy.gain",
+        Kind::Integer,
+        "Servo position P gain while running",
+    ),
+    entry(
+        "policy.head_lowpass",
+        Kind::OptionalFloat,
+        "Low-pass on head targets; must match training (0.5)",
+    ),
+    entry(
+        "policy.legs_lowpass",
+        Kind::OptionalFloat,
+        "Low-pass on leg targets; walking default 0.7",
+    ),
+    entry(
+        "policy.ground_pick_period",
+        Kind::OptionalFloat,
+        "One ground-pick cycle, seconds; unset resolves per mode",
+    ),
+    entry(
+        "policy.ground_pick_action_scale",
+        Kind::OptionalFloat,
+        "Action scale during the ground pick; unset resolves per mode",
+    ),
+    entry(
+        "policy.ground_pick_gain_ratio",
+        Kind::Float,
+        "Gain multiplier during the ground pick",
+    ),
+    entry("policy.kick_duration", Kind::Float, "Kick window, seconds"),
+    entry(
+        "policy.roulade_duration",
+        Kind::Float,
+        "One forward roll, seconds",
+    ),
+    entry(
+        "policy.roulade_action_scale",
+        Kind::Float,
+        "Action scale during a roulade",
+    ),
+    entry(
+        "policy.roulade_gain_ratio",
+        Kind::Float,
+        "Gain multiplier during a roulade",
+    ),
+    feature(
+        "policy.voltage_adapt",
+        Kind::Bool,
+        "Scale actions with battery voltage (nominal/measured)",
+    ),
+    entry(
+        "policy.nominal_voltage",
+        Kind::Float,
+        "Reference voltage the gains were identified at",
+    ),
+    // ── [safety] ─────────────────────────────────────────────────────────────
+    entry(
+        "safety.fall_gravity_z",
+        Kind::Float,
+        "Projected-gravity z above which the robot counts as fallen",
+    ),
+    entry(
+        "safety.fall_debounce_ms",
+        Kind::Integer,
+        "How long past the threshold before the fall verdict holds",
+    ),
+    entry(
+        "safety.deadman_ms",
+        Kind::Integer,
+        "Intent age past which velocity is zeroed",
+    ),
+    entry(
+        "safety.gain_limp",
+        Kind::Integer,
+        "The gain limp-fall yields at",
+    ),
+    feature(
+        "safety.battery_empty_shutdown",
+        Kind::Bool,
+        "Sit and power off when the battery EMA reaches empty",
+    ),
+    feature(
+        "safety.limp_fall",
+        Kind::Bool,
+        "Go limp while falling, land soft, pose back, hand to standing",
+    ),
+    entry(
+        "safety.limp_fall_tilt_z",
+        Kind::Float,
+        "Tilt the robot must already be past before a prediction counts",
+    ),
+    entry(
+        "safety.limp_fall_predict_z",
+        Kind::Float,
+        "Where the extrapolated tilt must reach to count as falling",
+    ),
+    entry(
+        "safety.limp_fall_lookahead_ms",
+        Kind::Integer,
+        "How far ahead the tilt rate is extrapolated",
+    ),
+    entry(
+        "safety.limp_fall_debounce_ms",
+        Kind::Integer,
+        "How long the fall verdict holds before the gains drop",
+    ),
+    entry(
+        "safety.limp_fall_still_rate",
+        Kind::Float,
+        "Angular rate below which the robot counts as landed, rad/s",
+    ),
+    entry(
+        "safety.limp_fall_still_ms",
+        Kind::Integer,
+        "How long it must stay that still before the limp ends",
+    ),
+    entry(
+        "safety.limp_fall_max_ms",
+        Kind::Integer,
+        "Hard cap on the limp, however the landing reads",
+    ),
+    entry(
+        "safety.limp_fall_pose_ms",
+        Kind::Integer,
+        "Ramp back to the standing pose, once landed",
+    ),
+    entry(
+        "safety.limp_fall_pose_gain",
+        Kind::Integer,
+        "Gain for that ramp — softened standing, not limp",
+    ),
+    // ── [audio] ──────────────────────────────────────────────────────────────
+    feature(
+        "audio.enabled",
+        Kind::Bool,
+        "The voice and the microphone; off walks identically and stays quiet",
+    ),
+    entry("audio.device", Kind::Text, "ALSA playback device"),
+    entry("audio.bank", Kind::Text, "Voice bank directory"),
+    feature(
+        "audio.pet_detect",
+        Kind::TriBool,
+        "Coo when petted; unset resolves per mode (walk on, roller off)",
+    ),
+    entry(
+        "audio.pet_model",
+        Kind::OptionalPath,
+        "Petting classifier; unset = the release's copy",
+    ),
+    entry(
+        "audio.pet_enter_threshold",
+        Kind::Float,
+        "Petting starts above this probability",
+    ),
+    entry(
+        "audio.pet_exit_threshold",
+        Kind::Float,
+        "…and ends below this one (hysteresis)",
+    ),
+];
+
+/// The registry entry for a key, if it is one.
+pub fn entry_for(key: &str) -> Option<&'static Entry> {
+    REGISTRY.iter().find(|entry| entry.key == key)
+}
+
+/// Every `section.key` path in [`Params`]'s own serialization, sorted — what the registry is
+/// tested against, and what an editor overlays file contents onto.
+pub fn schema_keys() -> Vec<String> {
+    let value = toml::Value::try_from(Params::default()).expect("Params serializes");
+    let mut keys = Vec::new();
+    walk(&value, String::new(), &mut keys);
+    keys.sort();
+    keys
+}
+
+fn walk(value: &toml::Value, prefix: String, out: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (name, child) in table {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                walk(child, path, out);
+            }
+        }
+        _ => out.push(prefix),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The drift-proofing this module exists for: the registry names every key `Params`
+    /// serializes, and nothing else. Add a section to `Params` and this test lists exactly
+    /// the keys the registry — and so `robotctl configure` — does not know yet.
+    ///
+    /// One asymmetry is deliberate: `Option` fields serialize as nothing when `None`, so the
+    /// walk over defaults cannot see them — the registry is therefore checked to be a
+    /// *superset* containing all serialized keys, and every registry key must deserialize
+    /// (which catches a typo'd or removed key).
+    #[test]
+    fn the_registry_covers_every_key_exactly() {
+        let serialized = schema_keys();
+        let registry: Vec<&str> = REGISTRY.iter().map(|entry| entry.key).collect();
+
+        let missing: Vec<&String> = serialized
+            .iter()
+            .filter(|key| !registry.contains(&key.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "keys Params has that the registry does not: {missing:?}"
+        );
+
+        // Every registry key must be a real key: setting it alone in a TOML must parse. This
+        // is what catches a registry entry for a key that was renamed or removed — and it
+        // covers the Option fields the serialization walk cannot see.
+        for entry in REGISTRY {
+            let (section, key) = entry
+                .key
+                .split_once('.')
+                .expect("registry keys are section.key");
+            let probe = match entry.kind {
+                Kind::Bool => format!("[{section}]\n{key} = true\n"),
+                Kind::TriBool => format!("[{section}]\n{key} = true\n"),
+                Kind::Integer => format!("[{section}]\n{key} = 1\n"),
+                Kind::Float | Kind::OptionalFloat => format!("[{section}]\n{key} = 0.5\n"),
+                Kind::Choice(choices) => {
+                    format!("[{section}]\n{key} = \"{}\"\n", choices[0])
+                }
+                Kind::Text | Kind::OptionalPath => {
+                    format!("[{section}]\n{key} = \"probe\"\n")
+                }
+            };
+            let parsed: Result<Params, _> = toml::from_str(&probe);
+            assert!(
+                parsed.is_ok(),
+                "registry names {:?} but Params rejects it: {probe}",
+                entry.key
+            );
+        }
+
+        // No duplicates, which `entry_for`'s first-match would otherwise hide.
+        let mut seen = registry.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), registry.len(), "a key is listed twice");
+    }
+
+    /// Every `Choice` must list what the type actually accepts — and reject what it does not,
+    /// so an editor cycling through choices can never write an invalid file.
+    #[test]
+    fn choices_match_the_types() {
+        for entry in REGISTRY {
+            let Kind::Choice(choices) = entry.kind else {
+                continue;
+            };
+            let (section, key) = entry.key.split_once('.').expect("section.key");
+            for choice in choices {
+                let toml = format!("[{section}]\n{key} = \"{choice}\"\n");
+                assert!(
+                    toml::from_str::<Params>(&toml).is_ok(),
+                    "{}: choice {choice:?} is rejected",
+                    entry.key
+                );
+            }
+            let toml = format!("[{section}]\n{key} = \"no-such-choice\"\n");
+            assert!(
+                toml::from_str::<Params>(&toml).is_err(),
+                "{}: accepts values beyond its listed choices",
+                entry.key
+            );
+        }
+    }
+
+    /// The feature switches are the editor's front page; a typo'd flag would quietly demote a
+    /// switch to the tuning list, so pin the set.
+    #[test]
+    fn the_feature_switches_are_the_expected_set() {
+        let features: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|entry| entry.feature)
+            .map(|entry| entry.key)
+            .collect();
+        assert_eq!(
+            features,
+            vec![
+                "policy.enabled",
+                "policy.mode",
+                "policy.voltage_adapt",
+                "safety.battery_empty_shutdown",
+                "safety.limp_fall",
+                "audio.enabled",
+                "audio.pet_detect",
+            ]
+        );
+    }
+}

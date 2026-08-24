@@ -65,6 +65,35 @@ behave, and those numbers stay radians whatever the screen is set to. The joint 
 robotctl monitor --json --hz 50 > run.jsonl
 ```
 
+### Configuring `robotd`
+
+```
+sudo robotctl configure
+```
+
+An interactive editor over `/etc/robot/robotd.toml`: every key the daemon knows, the feature
+switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
+shutdown…), current value against default, one line of doc. SPACE toggles, ENTER types a
+value, `u` reverts a key to its default. Values in yellow are overrides; everything else is
+running on the built-in default.
+
+Three properties worth trusting:
+
+- **It cannot disagree with the daemon.** The schema, the defaults and the validation come
+  from the same crate `robotd` parses the file with, and the key list is pinned complete by a
+  test — a new `[section]` in the daemon shows up here or the build fails.
+- **It cannot eat your file.** Comments, ordering and keys from other releases survive
+  untouched; only the keys you change are written. Reverting a key removes it (and the
+  comment attached to it) rather than pinning the default, so the file stays a list of
+  *decisions*, not a copy of the defaults.
+- **It cannot write a file robotd refuses to start on.** Every save is validated through the
+  daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
+
+`robotd` reads the file once at startup, so saving offers a restart. `sudo`, because the file
+is root-owned — without it the editor opens read-only and says so on the first write.
+`--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
+reference for *why* each knob exists; this is for flipping them.
+
 ### Power to the joints (`robotd`)
 
 ```

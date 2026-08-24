@@ -38,6 +38,7 @@ use std::process::ExitCode;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 
+mod configure;
 mod duck;
 mod monitor;
 mod path_map;
@@ -134,6 +135,19 @@ enum Namespace {
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
     /// its own — is the one you're SSH'd into.
     Quack,
+
+    /// Edit robotd's config (/etc/robot/robotd.toml) without reading a wall of comments.
+    ///
+    /// Every key the daemon knows, feature switches first, current value against default, one
+    /// line of doc. SPACE toggles, ENTER edits, u reverts to default. Comments and anything
+    /// this build does not know survive untouched, and nothing is written that robotd's own
+    /// validation would reject. The config is read once at robotd's startup, so saving offers
+    /// a restart. The file is root-owned: run as `sudo robotctl configure` to write.
+    Configure {
+        /// The file to edit. The default is where a provisioned robot keeps it.
+        #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+        file: PathBuf,
+    },
 
     /// The gamepad. Pair one, see what is paired, forget one.
     ///
@@ -2483,6 +2497,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
+        }
+        Namespace::Configure { file } => {
+            return configure::run(&file).map_err(|e| Failure::new(exit::FAILED, e));
         }
         Namespace::Update { command } => command,
     };

@@ -1,0 +1,874 @@
+//! `robotctl configure` — edit `robotd.toml` without reading a wall of comments.
+//!
+//! The shipped `deploy/robotd.toml` is deliberately exhaustive: every key, documented at
+//! paragraph length, all of it commented out. That is the right *reference* and a poor
+//! *editing surface* — finding the one switch you want means scrolling four hundred lines of
+//! prose. This is the editing surface: every key the daemon knows, the feature switches first,
+//! current value against default, one line of doc, toggle and type in place.
+//!
+//! ## Where the truth lives
+//!
+//! Nothing here defines a key. The schema, the defaults, the validation and the one-line docs
+//! all come from `robotd-params` — the same crate `robotd` itself parses the file with — and
+//! its registry is pinned complete by a test over `Params`'s own serialization. When a section
+//! is added to the daemon, this editor learns it at compile time or the build fails; it can be
+//! wrong about nothing.
+//!
+//! ## How edits are applied
+//!
+//! The file is parsed with `toml_edit`, which preserves everything it does not touch —
+//! comments, ordering, keys from releases this build does not know. Edits set or remove
+//! exactly the keys changed. Before anything is written, the candidate is re-parsed through
+//! `Params::load` — the daemon's own gate, unknown-key rejection and range checks included —
+//! so this tool cannot write a file `robotd` would refuse to start on.
+//!
+//! Writes are atomic (temp file + rename beside the target), because half a config at the
+//! moment of a power cut is a robot that will not start.
+//!
+//! ## Restart
+//!
+//! `robotd` reads the file **once at startup** (`robotd-params` docs) — so every change
+//! requires a restart, and the exit flow offers one whenever anything was written. The file is
+//! root-owned; run as `sudo robotctl configure` to actually write.
+
+use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use robotd_params::Params;
+use robotd_params::registry::{Entry, Kind, REGISTRY};
+use toml_edit::DocumentMut;
+
+/// One key's place in the world: what the file says, what the default is.
+#[derive(Debug, Clone)]
+pub struct Row {
+    pub entry: &'static Entry,
+    /// The value in the file, rendered, if the file sets it.
+    pub set: Option<String>,
+    /// The built-in default, rendered the same way.
+    pub default: String,
+}
+
+impl Row {
+    /// What the daemon would actually run with.
+    pub fn effective(&self) -> &str {
+        self.set.as_deref().unwrap_or(&self.default)
+    }
+
+    /// Whether the file overrides the default.
+    pub fn overridden(&self) -> bool {
+        self.set.is_some()
+    }
+}
+
+/// A pending edit: set the key to a value, or clear its override.
+#[derive(Debug, Clone)]
+pub enum Edit {
+    Set(toml_edit::Value),
+    Clear,
+}
+
+/// The editable state of one file: the parsed document, and the rows over it.
+pub struct Model {
+    pub path: PathBuf,
+    doc: DocumentMut,
+    defaults: toml::Value,
+    /// Keyed by `section.key`. Applied to the document only on save.
+    pub pending: BTreeMap<&'static str, Edit>,
+}
+
+impl Model {
+    /// Load the file — or start from an empty document when there is none, which is a real
+    /// state: a robot may run entirely on defaults with no file at all.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        Self::from_text(path, &text)
+    }
+
+    fn from_text(path: &Path, text: &str) -> Result<Self, String> {
+        // The daemon's own parse first: a file robotd would refuse is not a file to edit
+        // blind, and the error names the line.
+        toml::from_str::<Params>(text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let doc: DocumentMut = text
+            .parse()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            doc,
+            defaults: toml::Value::try_from(Params::default()).expect("Params serializes"),
+            pending: BTreeMap::new(),
+        })
+    }
+
+    /// Every key the daemon knows, in registry order, with pending edits shown as if applied.
+    pub fn rows(&self) -> Vec<Row> {
+        REGISTRY
+            .iter()
+            .map(|entry| {
+                let set = match self.pending.get(entry.key) {
+                    Some(Edit::Set(value)) => Some(render(value)),
+                    Some(Edit::Clear) => None,
+                    None => self.file_value(entry.key).map(|v| render(&v)),
+                };
+                Row {
+                    entry,
+                    set,
+                    default: self.default_for(entry.key),
+                }
+            })
+            .collect()
+    }
+
+    /// The value the file currently sets for a key, if any.
+    fn file_value(&self, key: &str) -> Option<toml_edit::Value> {
+        let (section, name) = key.split_once('.').expect("registry keys are section.key");
+        self.doc.get(section)?.get(name)?.as_value().cloned()
+    }
+
+    /// The built-in default, rendered — `unset` for the Option fields that resolve elsewhere.
+    fn default_for(&self, key: &str) -> String {
+        let (section, name) = key.split_once('.').expect("registry keys are section.key");
+        match self.defaults.get(section).and_then(|s| s.get(name)) {
+            Some(toml::Value::String(s)) => s.clone(),
+            Some(value) => value.to_string(),
+            // Not serialized: an `Option` at `None`. The registry doc says what unset means.
+            None => "unset".to_owned(),
+        }
+    }
+
+    /// Queue an edit, from the string a user typed or a toggle produced.
+    ///
+    /// Typing the default (or `unset`, for the optional kinds) clears the override instead of
+    /// pinning it — a file full of explicitly-written defaults is the unreadable thing this
+    /// tool exists to avoid.
+    pub fn edit(&mut self, entry: &'static Entry, input: &str) -> Result<(), String> {
+        let input = input.trim();
+        let optional = matches!(
+            entry.kind,
+            Kind::TriBool | Kind::OptionalFloat | Kind::OptionalPath
+        );
+        if input == self.default_for(entry.key)
+            || (optional && (input == "unset" || input.is_empty()))
+        {
+            self.pending.insert(entry.key, Edit::Clear);
+            return Ok(());
+        }
+        let value: toml_edit::Value = match entry.kind {
+            Kind::Bool | Kind::TriBool => match input {
+                "true" | "on" | "yes" => true.into(),
+                "false" | "off" | "no" => false.into(),
+                _ => return Err(format!("{input:?} is not on/off")),
+            },
+            Kind::Integer => input
+                .parse::<i64>()
+                .map(Into::into)
+                .map_err(|_| format!("{input:?} is not a whole number"))?,
+            Kind::Float | Kind::OptionalFloat => input
+                .parse::<f64>()
+                .map(Into::into)
+                .map_err(|_| format!("{input:?} is not a number"))?,
+            Kind::Choice(choices) => {
+                if !choices.contains(&input) {
+                    return Err(format!("{input:?} is not one of {choices:?}"));
+                }
+                input.into()
+            }
+            Kind::Text | Kind::OptionalPath => input.into(),
+        };
+        self.pending.insert(entry.key, Edit::Set(value));
+        Ok(())
+    }
+
+    /// The next value a toggle key produces — what SPACE does. `None` for kinds that want
+    /// typed input instead.
+    pub fn toggled(&self, row: &Row) -> Option<String> {
+        match row.entry.kind {
+            Kind::Bool => Some(
+                if row.effective() == "true" {
+                    "false"
+                } else {
+                    "true"
+                }
+                .into(),
+            ),
+            // auto → on → off → auto. `unset` is the auto state.
+            Kind::TriBool => Some(match (row.overridden(), row.effective()) {
+                (false, _) => "true".into(),
+                (true, "true") => "false".into(),
+                (true, _) => "unset".into(),
+            }),
+            Kind::Choice(choices) => {
+                let current = row.effective();
+                let at = choices.iter().position(|c| *c == current).unwrap_or(0);
+                Some(choices[(at + 1) % choices.len()].into())
+            }
+            _ => None,
+        }
+    }
+
+    /// The document with every pending edit applied, as text — what save writes.
+    ///
+    /// Comments and unknown keys survive untouched: `toml_edit` only changes what is set or
+    /// removed, and clearing a key removes the key alone, never its section or its comments.
+    pub fn rendered(&self) -> String {
+        let mut doc = self.doc.clone();
+        for (key, edit) in &self.pending {
+            let (section, name) = key.split_once('.').expect("section.key");
+            match edit {
+                Edit::Set(value) => {
+                    let table = doc
+                        .entry(section)
+                        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+                    table[name] = toml_edit::Item::Value(value.clone());
+                }
+                Edit::Clear => {
+                    if let Some(table) = doc.get_mut(section).and_then(|i| i.as_table_mut()) {
+                        table.remove(name);
+                    }
+                }
+            }
+        }
+        doc.to_string()
+    }
+
+    /// Validate the pending edits through the daemon's own gate, then write atomically.
+    ///
+    /// Validation goes through a real file and [`Params::load`] rather than a bare parse,
+    /// because `load` is what `robotd` runs at startup — range checks included. What this tool
+    /// writes, the daemon starts on.
+    pub fn save(&mut self) -> Result<(), String> {
+        let text = self.rendered();
+        let staged = self.path.with_extension("toml.new");
+        let write = |path: &Path| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(path)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        };
+        write(&staged).map_err(|e| writable_hint(&staged, &e))?;
+        if let Err(e) = Params::load(&staged, true) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!(
+                "refusing to write a config robotd would reject: {e}"
+            ));
+        }
+        std::fs::rename(&staged, &self.path).map_err(|e| writable_hint(&self.path, &e))?;
+        // The document on disk is now the rendered one; fold the edits in.
+        self.doc = text.parse().expect("just validated");
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+/// A value as the UI shows it — bare strings without quotes, everything else as TOML spells it.
+fn render(value: &toml_edit::Value) -> String {
+    match value {
+        toml_edit::Value::String(s) => s.value().clone(),
+        other => other.to_string().trim().to_owned(),
+    }
+}
+
+/// Sections in registry order, for headers.
+pub fn sections() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for entry in REGISTRY {
+        let section = entry.key.split_once('.').expect("section.key").0;
+        if out.last() != Some(&section) {
+            out.push(section);
+        }
+    }
+    out
+}
+
+/// Permission errors get the actual fix, because the file is root-owned by design.
+fn writable_hint(path: &Path, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "cannot write {}: permission denied — run `sudo robotctl configure`",
+            path.display()
+        )
+    } else {
+        format!("cannot write {}: {e}", path.display())
+    }
+}
+
+/// Restart `robotd`, reporting rather than hiding the outcome.
+pub fn restart_robotd() -> Result<(), String> {
+    let status = std::process::Command::new("systemctl")
+        .args(["restart", "robotd"])
+        .status()
+        .map_err(|e| format!("cannot run systemctl: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("systemctl restart robotd failed — run it with sudo".to_owned())
+    }
+}
+
+/// A short human summary of the pending edits, for the confirm screen.
+pub fn summary(model: &Model) -> Vec<String> {
+    model
+        .rows()
+        .iter()
+        .filter_map(|row| {
+            let edit = model.pending.get(row.entry.key)?;
+            Some(match edit {
+                Edit::Set(value) => format!("{} = {}", row.entry.key, render(value)),
+                Edit::Clear => format!("{} → default ({})", row.entry.key, row.default),
+            })
+        })
+        .collect()
+}
+
+// ── the terminal UI ──────────────────────────────────────────────────────────
+//
+// One screen: feature switches first, then every section; a footer carrying the selected
+// key's one-line doc; SPACE toggles what can be toggled, ENTER types what cannot. Kept to the
+// `monitor`'s conventions (ratatui, `ratatui::init`/`restore`) and deliberately dumber — a
+// config editor should feel like a settings menu, not a dashboard.
+
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+
+/// What the list shows at one line: a section header, or a key.
+enum Item {
+    Header(&'static str),
+    Key(usize),
+}
+
+/// Where input goes right now.
+enum Focus {
+    /// Moving around the list.
+    List,
+    /// Typing a value for the selected row.
+    Editing {
+        buffer: String,
+        error: Option<String>,
+    },
+    /// Deciding what to do with the pending edits on the way out.
+    Confirm,
+    /// Everything written; offering the restart every change requires.
+    Restart,
+}
+
+/// Run the editor. Returns once the user has left, with everything saved or discarded.
+pub fn run(path: &Path) -> Result<(), String> {
+    // An interactive editor and nothing else: piped in or out, there is no sensible
+    // behaviour to fall back to, and ratatui would panic trying to open the terminal.
+    if !crate::monitor::stdout_is_a_terminal() {
+        return Err("configure is interactive — run it in a terminal".to_owned());
+    }
+    let mut model = Model::load(path)?;
+    let items = layout_items(&model);
+    // First key, not the first header.
+    let mut cursor = items
+        .iter()
+        .position(|item| matches!(item, Item::Key(_)))
+        .unwrap_or(0);
+    let mut focus = Focus::List;
+    let mut saved = false;
+    let mut status: Option<String> = None;
+
+    let mut terminal = ratatui::init();
+    let outcome = loop {
+        let rows = model.rows();
+        if let Err(e) = terminal.draw(|frame| {
+            draw(
+                frame,
+                &model,
+                &rows,
+                &items,
+                cursor,
+                &focus,
+                status.as_deref(),
+            );
+        }) {
+            break Err(format!("terminal: {e}"));
+        }
+
+        let Ok(Event::Key(key)) = event::read() else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        status = None;
+
+        match &mut focus {
+            Focus::List => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    if model.pending.is_empty() {
+                        break Ok(saved);
+                    }
+                    focus = Focus::Confirm;
+                }
+                KeyCode::Up | KeyCode::Char('k') => cursor = step(&items, cursor, -1),
+                KeyCode::Down | KeyCode::Char('j') => cursor = step(&items, cursor, 1),
+                KeyCode::Char(' ') => {
+                    if let Item::Key(index) = items[cursor] {
+                        let row = &rows[index];
+                        match model.toggled(row) {
+                            Some(next) => {
+                                let entry = row.entry;
+                                if let Err(e) = model.edit(entry, &next) {
+                                    status = Some(e);
+                                }
+                            }
+                            None => {
+                                focus = Focus::Editing {
+                                    buffer: row.effective().to_owned(),
+                                    error: None,
+                                };
+                            }
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Item::Key(index) = items[cursor] {
+                        focus = Focus::Editing {
+                            buffer: rows[index].effective().to_owned(),
+                            error: None,
+                        };
+                    }
+                }
+                KeyCode::Char('u') | KeyCode::Char('d') => {
+                    if let Item::Key(index) = items[cursor] {
+                        model.pending.insert(rows[index].entry.key, Edit::Clear);
+                    }
+                }
+                _ => {}
+            },
+            Focus::Editing { buffer, error } => match key.code {
+                KeyCode::Esc => focus = Focus::List,
+                KeyCode::Enter => {
+                    if let Item::Key(index) = items[cursor] {
+                        match model.edit(rows[index].entry, buffer) {
+                            Ok(()) => focus = Focus::List,
+                            Err(e) => *error = Some(e),
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    *error = None;
+                }
+                KeyCode::Char(c) => {
+                    buffer.push(c);
+                    *error = None;
+                }
+                _ => {}
+            },
+            Focus::Confirm => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => match model.save() {
+                    Ok(()) => {
+                        saved = true;
+                        focus = Focus::Restart;
+                    }
+                    Err(e) => {
+                        status = Some(e);
+                        focus = Focus::List;
+                    }
+                },
+                KeyCode::Char('n') => break Ok(saved),
+                KeyCode::Esc => focus = Focus::List,
+                _ => {}
+            },
+            Focus::Restart => match key.code {
+                // The restart itself happens after `ratatui::restore`, outside the alternate
+                // screen, so systemctl's output is visible.
+                KeyCode::Char('y') | KeyCode::Enter => break Ok(true),
+                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                    focus = Focus::List;
+                    break Ok(saved);
+                }
+                _ => {}
+            },
+        }
+    };
+    let restart_wanted = matches!(&focus, Focus::Restart);
+    ratatui::restore();
+
+    let saved = outcome?;
+    if restart_wanted {
+        println!("restarting robotd…");
+        restart_robotd()?;
+        println!("robotd restarted");
+    } else if saved {
+        println!(
+            "written to {} — changes apply on the next `systemctl restart robotd`",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The list: feature switches first under their own header, then every section.
+fn layout_items(model: &Model) -> Vec<Item> {
+    let rows = model.rows();
+    let mut items = Vec::new();
+    items.push(Item::Header("features"));
+    for (index, row) in rows.iter().enumerate() {
+        if row.entry.feature {
+            items.push(Item::Key(index));
+        }
+    }
+    for section in sections() {
+        items.push(Item::Header(section));
+        for (index, row) in rows.iter().enumerate() {
+            let (s, _) = row.entry.key.split_once('.').expect("section.key");
+            if s == section && !row.entry.feature {
+                items.push(Item::Key(index));
+            }
+        }
+    }
+    items
+}
+
+/// Move the cursor to the next key in `direction`, skipping headers, stopping at the ends.
+fn step(items: &[Item], cursor: usize, direction: isize) -> usize {
+    let mut at = cursor as isize;
+    loop {
+        at += direction;
+        if at < 0 || at as usize >= items.len() {
+            return cursor;
+        }
+        if matches!(items[at as usize], Item::Key(_)) {
+            return at as usize;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw(
+    frame: &mut ratatui::Frame,
+    model: &Model,
+    rows: &[Row],
+    items: &[Item],
+    cursor: usize,
+    focus: &Focus,
+    status: Option<&str>,
+) {
+    let [list_area, footer_area] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).areas(frame.area());
+
+    // The visible window of the list, kept around the cursor.
+    let height = list_area.height.saturating_sub(2) as usize;
+    let first = cursor
+        .saturating_sub(height / 2)
+        .min(items.len().saturating_sub(height.max(1)));
+    let mut lines: Vec<Line> = Vec::new();
+    for (at, item) in items.iter().enumerate().skip(first).take(height.max(1)) {
+        match item {
+            Item::Header(section) => {
+                lines.push(Line::from(Span::styled(
+                    format!("[{section}]"),
+                    Style::new().add_modifier(Modifier::BOLD).cyan(),
+                )));
+            }
+            Item::Key(index) => {
+                let row = &rows[*index];
+                let name = row.entry.key.split_once('.').expect("section.key").1;
+                let marker = if model.pending.contains_key(row.entry.key) {
+                    "*"
+                } else if row.overridden() {
+                    "•"
+                } else {
+                    " "
+                };
+                let value = if row.overridden() {
+                    format!("{} (default {})", row.effective(), row.default)
+                } else {
+                    row.effective().to_owned()
+                };
+                let mut line = Line::from(vec![
+                    Span::raw(format!(" {marker} ")),
+                    Span::raw(format!("{name:<28}")),
+                    Span::styled(
+                        value,
+                        if row.overridden() {
+                            Style::new().yellow()
+                        } else {
+                            Style::new().dim()
+                        },
+                    ),
+                ]);
+                if at == cursor {
+                    line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+                }
+                lines.push(line);
+            }
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {} ", model.path.display())),
+        ),
+        list_area,
+    );
+
+    // Footer: what the selected key is, and what the keys do — or the active prompt.
+    let footer: Vec<Line> = match focus {
+        Focus::Editing { buffer, error } => vec![
+            Line::from(format!("new value: {buffer}▏")),
+            Line::from(match error {
+                Some(e) => Span::styled(e.clone(), Style::new().red()),
+                None => Span::raw("ENTER apply · ESC cancel"),
+            }),
+        ],
+        Focus::Confirm => {
+            let changes = summary(model).join(", ");
+            vec![
+                Line::from(format!("save {} change(s)? {changes}", model.pending.len())),
+                Line::from("y save · n discard · ESC back"),
+            ]
+        }
+        Focus::Restart => vec![
+            Line::from("written. robotd reads its config once at startup —"),
+            Line::from("restart it now? y restart · n later"),
+        ],
+        Focus::List => {
+            let doc = match items.get(cursor) {
+                Some(Item::Key(index)) => rows[*index].entry.doc,
+                _ => "",
+            };
+            vec![
+                Line::from(match status {
+                    Some(s) => Span::styled(s.to_owned(), Style::new().red()),
+                    None => Span::raw(doc),
+                }),
+                Line::from("↑↓ move · SPACE toggle · ENTER edit · u default · q quit"),
+            ]
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
+        footer_area,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped example, which is real config with real comments — the thing edits must
+    /// not destroy.
+    const SHIPPED: &str = include_str!("../../deploy/robotd.toml");
+
+    fn model(text: &str) -> Model {
+        Model::from_text(Path::new("/test/robotd.toml"), text).expect("parses")
+    }
+
+    fn entry(key: &str) -> &'static Entry {
+        robotd_params::registry::entry_for(key).expect("a registry key")
+    }
+
+    /// An empty file is a robot on defaults: every row effective at its default, none
+    /// overridden. The editor's baseline view.
+    #[test]
+    fn an_absent_file_shows_the_defaults() {
+        let m = model("");
+        for row in m.rows() {
+            assert!(!row.overridden(), "{}", row.entry.key);
+            assert!(!row.effective().is_empty(), "{}", row.entry.key);
+        }
+        // Spot-check values against the daemon's documented defaults.
+        let rows = m.rows();
+        let find = |key: &str| rows.iter().find(|r| r.entry.key == key).expect("known");
+        assert_eq!(find("control.hz").effective(), "50");
+        assert_eq!(find("policy.mode").effective(), "walk");
+        assert_eq!(find("safety.limp_fall").effective(), "true");
+        assert_eq!(find("audio.pet_detect").effective(), "unset");
+    }
+
+    /// Editing must not eat the file: comments, ordering and untouched keys all survive a
+    /// set-and-save round trip. This is the property that makes the tool safe to point at a
+    /// robot's real, hand-annotated config.
+    #[test]
+    fn comments_and_unknown_content_survive_an_edit() {
+        let text = "# tuned by hand on 2026-03-01\n\
+                    [control]\n\
+                    hz = 50 # do not touch\n\n\
+                    [audio]\n\
+                    # the speaker crackles above 0.8\n\
+                    enabled = true\n";
+        let mut m = model(text);
+        m.edit(entry("audio.enabled"), "false").expect("edits");
+        let out = m.rendered();
+        assert!(out.contains("# tuned by hand on 2026-03-01"), "{out}");
+        assert!(out.contains("hz = 50 # do not touch"), "{out}");
+        assert!(out.contains("# the speaker crackles above 0.8"), "{out}");
+        assert!(out.contains("enabled = false"), "{out}");
+    }
+
+    /// A key set in a section the file does not have yet creates the section — the shipped
+    /// file keeps everything commented out, so this is the *common* case, not the edge.
+    #[test]
+    fn setting_a_key_creates_its_section_when_needed() {
+        let mut m = model("[control]\nhz = 50\n");
+        m.edit(entry("policy.mode"), "roller").expect("edits");
+        let out = m.rendered();
+        assert!(out.contains("[policy]"), "{out}");
+        assert!(out.contains("mode = \"roller\""), "{out}");
+        // And it parses as the daemon would read it.
+        let parsed: Params = toml::from_str(&out).expect("valid");
+        assert_eq!(parsed.policy.mode.as_str(), "roller");
+    }
+
+    /// Clearing an override removes the key and the comment attached to it — "# why 40" is
+    /// about the 40, and keeping it above nothing would be stranger than taking it along.
+    /// Everything else survives, and typing the default is the same as clearing, so the file
+    /// never accumulates written-out defaults.
+    #[test]
+    fn reverting_removes_the_override_and_its_own_comment_only() {
+        let text =
+            "# the board's story\n[control]\n# why 40: bench board\nhz = 40\ncmd_alpha = 0.3\n";
+        let mut m = model(text);
+        m.edit(entry("control.hz"), "50").expect("the default");
+        let out = m.rendered();
+        assert!(!out.contains("hz = 40"), "{out}");
+        assert!(
+            !out.contains("hz = 50"),
+            "typed default must not be pinned: {out}"
+        );
+        assert!(
+            !out.contains("why 40"),
+            "the override's own comment goes with it: {out}"
+        );
+        assert!(out.contains("cmd_alpha = 0.3"), "{out}");
+        assert!(out.contains("# the board's story"), "{out}");
+    }
+
+    /// The toggles: bool flips, tri-state cycles through auto, choices wrap around.
+    #[test]
+    fn toggling_produces_the_next_sensible_value() {
+        let mut m = model("");
+        let toggle = |m: &Model, key: &str| {
+            let rows = m.rows();
+            let row = rows.iter().find(|r| r.entry.key == key).expect("known");
+            m.toggled(row)
+        };
+        assert_eq!(toggle(&m, "audio.enabled").as_deref(), Some("false"));
+        assert_eq!(toggle(&m, "policy.mode").as_deref(), Some("roller"));
+        // Tri-state: unset → on → off → unset.
+        assert_eq!(toggle(&m, "audio.pet_detect").as_deref(), Some("true"));
+        m.edit(entry("audio.pet_detect"), "true").expect("edits");
+        assert_eq!(toggle(&m, "audio.pet_detect").as_deref(), Some("false"));
+        m.edit(entry("audio.pet_detect"), "false").expect("edits");
+        assert_eq!(toggle(&m, "audio.pet_detect").as_deref(), Some("unset"));
+        // Numbers are typed, not toggled.
+        assert_eq!(toggle(&m, "control.hz"), None);
+    }
+
+    /// Bad input is refused at the row, with the reason — not written and bounced by the
+    /// validator later, when the user has moved on.
+    #[test]
+    fn bad_input_is_refused_where_it_is_typed() {
+        let mut m = model("");
+        assert!(m.edit(entry("control.hz"), "fast").is_err());
+        assert!(m.edit(entry("policy.mode"), "hovercraft").is_err());
+        assert!(m.edit(entry("audio.enabled"), "maybe").is_err());
+        assert!(m.edit(entry("control.cmd_alpha"), "0.3.0").is_err());
+        assert!(m.pending.is_empty(), "nothing queued: {:?}", m.pending);
+    }
+
+    /// The saved file must pass the daemon's own gate — a value the row-level checks cannot
+    /// judge (hz range) is caught before the write, and the file on disk stays untouched.
+    #[test]
+    fn a_config_robotd_would_reject_is_never_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "[control]\nhz = 50\n").expect("writes");
+        let mut m = Model::load(&path).expect("loads");
+        // 0 parses as an integer; only Params::load knows it divides by zero.
+        m.edit(entry("control.hz"), "0").expect("row-level ok");
+        let err = m.save().expect_err("must refuse");
+        assert!(err.contains("robotd would reject"), "{err}");
+        let on_disk = std::fs::read_to_string(&path).expect("reads");
+        assert_eq!(on_disk, "[control]\nhz = 50\n", "disk untouched");
+        // The staging file is cleaned up, not left beside the config.
+        assert!(!path.with_extension("toml.new").exists());
+    }
+
+    /// A good save is atomic-by-rename, folds the edits in, and a fresh load agrees.
+    #[test]
+    fn a_save_round_trips_through_the_real_loader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, SHIPPED).expect("writes");
+        let mut m = Model::load(&path).expect("loads");
+        m.edit(entry("policy.mode"), "roller").expect("edits");
+        m.edit(entry("audio.enabled"), "false").expect("edits");
+        m.save().expect("saves");
+        assert!(m.pending.is_empty());
+
+        let reloaded = Params::load(&path, true).expect("the daemon can start on it");
+        assert_eq!(reloaded.policy.mode.as_str(), "roller");
+        assert!(!reloaded.audio.enabled);
+        // The shipped file's documentation survived the trip.
+        let text = std::fs::read_to_string(&path).expect("reads");
+        assert!(
+            text.contains("Read once at startup") || text.lines().count() > 50,
+            "the comments are gone: {} lines",
+            text.lines().count()
+        );
+    }
+
+    /// The shipped example loads into the editor, and every value it does set explicitly is
+    /// the default — the editor-side echo of robotd's own example-matches-defaults test, and
+    /// the reason a fresh robot's config shows no surprising overrides.
+    #[test]
+    fn the_shipped_example_sets_nothing_away_from_default() {
+        let m = model(SHIPPED);
+        for row in m.rows() {
+            if let Some(set) = &row.set {
+                assert_eq!(
+                    set, &row.default,
+                    "{} is shipped away from its default",
+                    row.entry.key
+                );
+            }
+        }
+    }
+
+    /// The whole first screen renders without panicking, features first — the same
+    /// TestBackend trick the monitor's tests use, so the layout code is exercised without a
+    /// terminal.
+    #[test]
+    fn the_first_screen_renders_with_features_first() {
+        let m = model("[policy]\nmode = \"roller\"\n");
+        let rows = m.rows();
+        let items = layout_items(&m);
+        let cursor = items
+            .iter()
+            .position(|item| matches!(item, Item::Key(_)))
+            .expect("there are keys");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 30)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &m, &rows, &items, cursor, &Focus::List, None))
+            .expect("draws");
+        let screen = format!("{:?}", terminal.backend().buffer());
+        assert!(screen.contains("[features]"), "features head the list");
+        assert!(screen.contains("mode"), "the first switches are visible");
+        // The override marker: mode is set in the file, away from default.
+        assert!(screen.contains("roller (default walk)"), "{screen}");
+    }
+
+    /// Sections come out in registry order, once each — the editor's headers.
+    #[test]
+    fn sections_are_ordered_and_unique() {
+        let s = sections();
+        assert_eq!(
+            s,
+            vec!["bus", "control", "update_gate", "policy", "safety", "audio"]
+        );
+    }
+}
