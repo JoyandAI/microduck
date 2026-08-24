@@ -2869,8 +2869,12 @@ impl ChoraleBeacon {
         self.piece != Self::IDLE
     }
 
-    /// The most ducks a roster carries. Four parts, so a fifth doubles one — and a beacon is not
-    /// the place to describe a choir.
+    /// The most ducks a roster carries, and so the most that can sing together.
+    ///
+    /// Four, because the piece has four parts. A fifth duck in the room keeps listening rather than
+    /// joining: `sounds::chorale::seat` can double a part, but nothing seats a fifth duck over the
+    /// radio, and a beacon is not the place to describe a choir. If doubling is ever wanted on
+    /// hardware, this and the roster guard in `robotd`'s chorale are the two places that cap it.
     pub const MAX_ROSTER: usize = 4;
 
     /// The manufacturer-data payload: tag, the fixed fields, then the roster length and its pairs.

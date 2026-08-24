@@ -570,8 +570,11 @@ pub fn cast(personalities: &[Personality]) -> Vec<Singer> {
 /// Still decided by every duck independently, with nothing negotiated: the join order is what
 /// each duck observed, and they all observed the same beacon.
 ///
-/// Past four, the parts double up — which is what a real choir does with more singers than
-/// lines, and the doubling duck takes the part nearest its own register.
+/// Past four, the parts double up here — which is what a real choir does with more singers than
+/// lines, and the doubling duck takes the part nearest its own register. Note that the *radio* does
+/// not currently reach that: `ChoraleBeacon::MAX_ROSTER` is four, so a fifth duck in a real room
+/// listens rather than joining. Doubling is reachable only by a caller that seats an ensemble
+/// itself, such as the offline render.
 pub fn seat(existing: &[Singer], newcomer: &Personality) -> Singer {
     let held: Vec<Part> = existing.iter().map(|s| s.part).collect();
     let part = seat_by_register(&held, newcomer.pitch_center_hz);

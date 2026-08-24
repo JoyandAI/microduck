@@ -308,62 +308,77 @@ mod tests {
         }
     }
 
-    /// The claim the whole design rests on: two ducks hearing the same beacon through independent
-    /// 50 ms slot jitter end up agreeing about where the beat is, to well inside the ±20 ms an
-    /// ensemble needs.
+    /// The claim the whole design rests on: every duck hearing the same beacon through its own
+    /// independent 50 ms slot jitter ends up agreeing where the beat is, to well inside the ±20 ms
+    /// an ensemble needs.
     ///
-    /// This is the test that says the conductor-beacon idea works, and it runs on a laptop with no
-    /// radio in it.
+    /// Run for a full quartet — a conductor and three followers — because that is what the piece is
+    /// written for, and because the bar gets *harder* with more of them: the thing that has to hold
+    /// is the worst disagreement between any two, and three followers have three pairs to go wrong
+    /// rather than one. This is the test that says the conductor-beacon idea works, and it runs on a
+    /// laptop with no radio in it.
     #[test]
-    fn two_followers_agree_within_the_ensemble_budget() {
+    fn a_whole_quartet_agrees_within_the_ensemble_budget() {
         const BPM: f64 = 58.0;
         let beat_s = 60.0 / BPM;
         let mut conductor = Conductor::new(BPM, 0.0);
-        let mut left = Follower::new(BPM);
-        let mut right = Follower::new(BPM);
-        // Different seeds: the two ducks are not hearing the same delays.
-        let mut left_slot = Slot::new(0x2545F4914F6CDD1D);
-        let mut right_slot = Slot::new(0x9E3779B97F4A7C15);
+        // Three followers, each with its own jitter sequence: they are not hearing the same delays.
+        let mut followers: Vec<(Follower, Slot)> =
+            [0x2545F4914F6CDD1D, 0x9E3779B97F4A7C15, 0x8EBC6AF09C88C6E3]
+                .into_iter()
+                .map(|seed| (Follower::new(BPM), Slot::new(seed)))
+                .collect();
 
-        let mut worst = 0.0f64;
+        let mut worst_pair = 0.0f64;
         let mut worst_against_conductor = 0.0f64;
         // Two minutes of beats — twice the length of the shipped piece.
         let mut now = 0.0;
         while now < 120.0 {
             if let Some(beat) = conductor.due(now) {
                 let wire = (beat % 256) as u8;
-                left.observe(wire, now + left_slot.delay());
-                right.observe(wire, now + right_slot.delay());
+                for (follower, slot) in followers.iter_mut() {
+                    let delay = slot.delay();
+                    follower.observe(wire, now + delay);
+                }
             }
-            // Once locked, compare where each duck thinks it is. Relative agreement is what an
-            // ensemble is; the absolute value is a common-mode offset nobody can hear.
-            if let (Some(l), Some(r)) = (left.position_beats(now), right.position_beats(now)) {
-                worst = worst.max(((l - r) * beat_s).abs());
-                let c = conductor.position_beats(now);
-                worst_against_conductor = worst_against_conductor.max(((l - c) * beat_s).abs());
+            // Relative agreement is what an ensemble is; the absolute value is a common-mode offset
+            // nobody can hear.
+            let positions: Vec<f64> = followers
+                .iter()
+                .filter_map(|(follower, _)| follower.position_beats(now))
+                .collect();
+            if positions.len() == followers.len() {
+                let low = positions.iter().copied().fold(f64::MAX, f64::min);
+                let high = positions.iter().copied().fold(f64::MIN, f64::max);
+                worst_pair = worst_pair.max((high - low) * beat_s);
+                let at = conductor.position_beats(now);
+                for position in &positions {
+                    worst_against_conductor =
+                        worst_against_conductor.max(((position - at) * beat_s).abs());
+                }
             }
             now += 0.010;
         }
 
         assert!(
-            worst < 0.020,
-            "two followers drifted {:.1} ms apart, budget is 20 ms",
-            worst * 1000.0
+            worst_pair < 0.020,
+            "the widest pair of followers drifted {:.1} ms apart, budget is 20 ms",
+            worst_pair * 1000.0
         );
-        // The conductor sings what the room hears, so it has to be inside the budget too — this
-        // is what `SLOT_MEAN_S` is for, and it fails if that constant is wrong.
+        // The conductor sings what the room hears, so it has to be inside the budget too — this is
+        // what `SLOT_MEAN_S` is for, and it fails if that constant is wrong.
         assert!(
             worst_against_conductor < 0.020,
             "the conductor is {:.1} ms out of its own ensemble",
             worst_against_conductor * 1000.0
         );
-        // And both locks are *tight*, not merely agreeing: a wide spread that happens to average
-        // to the same place is a duck about to wander off.
-        for (name, follower) in [("left", &left), ("right", &right)] {
+        // And every lock is *tight*, not merely agreeing: a wide spread that happens to average to
+        // the same place is a duck about to wander off.
+        for (index, (follower, _)) in followers.iter().enumerate() {
             let spread = follower.spread_s().expect("locked");
             assert!(
                 spread < 0.020,
-                "{name}'s phase estimates are {:.1} ms apart — that is not a lock",
+                "follower {index}'s phase estimates are {:.1} ms apart — that is not a lock",
                 spread * 1000.0
             );
         }
