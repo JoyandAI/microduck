@@ -353,15 +353,19 @@ above it *can* command a motor — the invariant is structural rather than remem
 Three rules, unconditional:
 
 - **Joint clamp** — targets clipped to the model's range every tick, whatever the policy asked.
-- **Fall → limp** — projected gravity in the body frame, debounced (0.2 s in the runtime).
-  In the runtime this is `--fall-detect`, a flag, evaluated inline among the gamepad handling
-  and *skipped while a scripted skill is active*. Here it is always on and preempts anything.
 - **Intent deadman** — if intents stop arriving, velocity goes to zero.
 
 **Stop is not limp**, and the distinction matters: losing comms makes the robot *stand
-still*, because standing is the safe state for a biped. Losing balance makes it limp. Two
-events, two responses, written down rather than inferred from whichever got implemented
-first.
+still*, because standing is the safe state for a biped. Losing balance is a different event
+and this layer does not answer it.
+
+The fall verdict (projected gravity, debounced 0.2 s) lives here and is published, but it
+**gates nothing**: a fallen robot is enabled, init'd, driven and sent skills exactly like an
+upright one. That is deliberate — being on the floor is precisely when someone needs those
+calls to work — and it is what lets the answer to a fall live above this layer with no
+exemption to special-case. Earlier revisions had a `fall_limp` gate and a `fall_recover`
+auto-stand-up here; both were removed, because a safety rule that recovery has to bypass in
+order to work is not one.
 
 #### 5.4.1 Falling is a third event
 
@@ -383,8 +387,8 @@ a still robot in a known posture up cleanly and a thrashing one up only after se
 attempts at walking gain against the floor, which is where the load on the motors comes
 from. So the sequence takes the fall away from the policy: limp at `gain_limp` following
 the joints down, wait for the gyro to go quiet, ramp back to the standing pose over ~1 s,
-hand over. With `fall_recover` also on, that hands straight to its rise — its 0.3 s settle
-is what just happened, at length.
+hand over. The hand-back is nothing more than that — the twist has been held at zero
+throughout, so command magnitude selects the standing network, and that is the stand-up.
 
 The tuning is the feature, and it is asymmetric: a false positive is a fall the robot
 *caused*, which is worse than the stiff landing it was trying to avoid. The defaults sit

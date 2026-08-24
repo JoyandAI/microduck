@@ -9,7 +9,7 @@
 //! ```text
 //! skill windows ← advance / expire (roulade window, kick timer, ground-pick phase, sit↔stand rise)
 //! command      ← the caller's smoothed command, re-encoded for the active skill
-//! net          ← roulade > kick > ground pick > sit/rise > stand-by-magnitude (or forced) > walk
+//! net          ← roulade > kick > ground pick > sit/rise > stand-by-magnitude > walk
 //! action       ← ONNX
 //! targets      ← home pose + action_scale × action
 //! filters      ← optional first-order low-pass on head and legs
@@ -122,7 +122,7 @@ pub struct Step {
     /// Which network drove, as the wire label: `walk`, `stand`, `ground_pick`, `kick_left`,
     /// `kick_right`, `sit`, `rise`.
     pub label: &'static str,
-    /// What the gain should be while upright. Safety still overrides it on a fall.
+    /// What the gain should be for this tick.
     pub gain: u16,
     /// A scripted move is mid-flight — the robot is moving regardless of the twist, so
     /// restarting the daemon now would put it on the floor.
@@ -164,8 +164,6 @@ pub struct Controller {
     /// end of a roll, positive means chain another.
     roulade_chain: f64,
     sit: Sit,
-    /// Drive the standing network regardless of command magnitude — fall recovery.
-    pub force_standing: bool,
 }
 
 impl Controller {
@@ -181,7 +179,6 @@ impl Controller {
             roulade: None,
             roulade_chain: 0.0,
             sit: Sit::Up,
-            force_standing: false,
         }
     }
 
@@ -376,7 +373,7 @@ impl Controller {
                         c.twist = [0.0; 3];
                     }
                     let standing = self.policy.will_stand(c.twist_magnitude())
-                        || ((self.force_standing || body_active) && self.policy.has_standing());
+                        || (body_active && self.policy.has_standing());
                     if standing {
                         (Net::Stand, c, "stand")
                     } else {

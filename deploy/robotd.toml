@@ -162,9 +162,14 @@ mode = "walk"
 # nominal_voltage = 7.4
 
 [safety]
-# Fall detection, on projected gravity in the trunk frame. Upright reads about -1.0 on z;
-# a robot on its side reads near 0. Debounced, because the impulse from a firm footfall
-# would otherwise read as a fall — and dropping the robot mid-stride is how you cause one.
+# The fall verdict: is the robot down? On projected gravity in the trunk frame — upright
+# reads about -1.0 on z, a robot on its side reads near 0. Debounced, because the impulse
+# from a firm footfall would otherwise read as a fall.
+#
+# It is a REPORT and nothing else. It shows in `robotctl monitor` and the state stream, and
+# it refuses nothing: a fallen robot can still be enabled, init'd, driven and sent skills,
+# because being down is exactly when someone needs to do those things. What the daemon
+# *does* about a fall is limp_fall, further down, and that runs off its own detector.
 # fall_gravity_z = -0.5
 # fall_debounce_ms = 200
 
@@ -174,22 +179,8 @@ mode = "walk"
 # standing is its safe state. Losing balance is the other event, and it goes limp instead.
 # deadman_ms = 500
 
-# Whether a detected fall preempts anything: hold at gain_limp, refuse init/enable/skills
-# until upright. OFF by default, as the prototype is — a fallen robot keeps being driven
-# and the humans stay in charge; the fall verdict still shows in robotctl monitor either
-# way. fall_recover = true implies this (recovery starts with the limp settle).
-# fall_limp = false
-
-# Gain once fallen (only used when fall_limp/fall_recover arms the gate) — low enough to
-# yield rather than fight the floor.
+# The gain limp-fall yields at — low enough to give way rather than fight the floor.
 # gain_limp = 50
-
-# Stand back up after a fall, on its own: limp 0.3 s so the robot settles, then the
-# standing network drives until the robot has been solidly upright (gravity z < -0.85) for
-# a full second. While this is on, the standing network is RESERVED for recovery and body
-# pose — command magnitude no longer selects it. Off by default, matching the prototype's
-# `--fall-detect` flag.
-# fall_recover = false
 
 # Land soft, then stand up from a still robot instead of a thrashing one.
 #
@@ -202,12 +193,13 @@ mode = "walk"
 # wherever they are pushed, so the robot arrives limp. Once it has stopped moving it is
 # ramped back to the standing pose over `limp_fall_pose_ms`, and only then handed back: what
 # the standing policy sees is a still robot in a known posture, which is the case it is good
-# at. (With `fall_recover` also on, the landed robot goes straight to the recovery rise —
-# its own 0.3 s settle is exactly what just happened, at length.)
+# at. The hand-back is a hand-back and nothing more — with nobody driving, command magnitude
+# selects the standing network, and that is the stand-up.
 #
-# Independent of `fall_limp`/`fall_recover`, which act on a robot that is already down.
-# This one acts in the second before it gets there. Off by default: it is new, and its
-# failure mode is causing the fall it predicted.
+# The only thing the daemon does about a fall. With it off, a fall changes nothing: the
+# policy keeps driving and the humans stay in charge, which is the prototype's behaviour
+# and the default here. Off by default: it is new, and its failure mode is causing the
+# fall it predicted.
 # limp_fall = false
 
 # When a fall counts as started. This is the whole feature, and both ways of getting it

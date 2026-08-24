@@ -572,7 +572,7 @@ fn notify(stream: &mut UnixStream, call: &proto::Call) -> std::io::Result<()> {
 /// Send a discrete intent and read its answer.
 ///
 /// Answered, unlike the continuous ones, because "refused, and here is why" is a real
-/// outcome — safety declines to enable a policy on a fallen robot — and a client that
+/// outcome — a skill with no policy loaded, a sound with no bank — and a client that
 /// ignored it would leave the operator wondering why nothing happened.
 fn request(
     stream: &mut UnixStream,

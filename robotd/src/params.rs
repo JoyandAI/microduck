@@ -304,20 +304,8 @@ pub struct SafetyParams {
     pub fall_debounce_ms: u64,
     /// Intent age past which the velocity is zeroed. Stop, not limp.
     pub deadman_ms: u64,
-    /// Gain once fallen — low enough to yield rather than fight the floor.
+    /// The gain limp-fall yields at — low enough to give way rather than fight the floor.
     pub gain_limp: u16,
-    /// Whether a detected fall preempts the policy: hold at `gain_limp`, refuse
-    /// `robot.init`/`robot.enable`/skills until the robot is upright again. Off by
-    /// default, as the prototype is — its `--fall-detect` ships off, so a fallen robot
-    /// keeps being driven and the humans stay in charge. The fall verdict is reported in
-    /// the state stream either way. `fall_recover = true` implies this: recovery starts
-    /// with the limp settle.
-    pub fall_limp: bool,
-    /// Stand back up after a fall, on its own: limp 0.3 s, then the standing network drives
-    /// until the robot has been solidly upright for a second. Reserves the standing network
-    /// for recovery, so command magnitude stops selecting it. Off by default, as the
-    /// prototype ships `--fall-detect`.
-    pub fall_recover: bool,
     /// Sit down and power the machine off when the battery EMA reaches the empty floor
     /// (6.6 V — `duck_control::model::BATTERY_EMPTY_V`). The EMA moves over ~10 s, so a
     /// load sag cannot trip it.
@@ -327,11 +315,11 @@ pub struct SafetyParams {
     /// down. Off by default: it is a new behaviour, and one whose failure mode is causing
     /// the fall it predicted.
     ///
-    /// Independent of `fall_limp`/`fall_recover` — those act on a robot that is already
-    /// down. This acts in the second before it gets there: drop to `gain_limp`, let the
-    /// robot collapse, then pose it back to standing and hand it to the standing policy,
-    /// which stands up far more cleanly from a still robot than from one that has been
-    /// thrashing since the fall began.
+    /// The only thing the daemon does about a fall. Drop to `gain_limp`, let the robot
+    /// collapse, pose it back to standing once it has landed, then hand it to the standing
+    /// policy — which stands up far more cleanly from a still robot than from one that has
+    /// been thrashing since the fall began. With it off, a fall changes nothing: the policy
+    /// keeps driving and the humans stay in charge.
     pub limp_fall: bool,
     /// Projected-gravity z the robot must already be past before a fall prediction counts
     /// — about 26° of tilt, which ordinary walking does not reach.
@@ -399,8 +387,6 @@ impl Default for SafetyParams {
             fall_debounce_ms: 200,
             deadman_ms: 500,
             gain_limp: 50,
-            fall_limp: false,
-            fall_recover: false,
             battery_empty_shutdown: true,
             limp_fall: false,
             limp_fall_tilt_z: -0.90,
@@ -640,7 +626,7 @@ mod tests {
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);
         assert_eq!(from_file.policy.resolved(), built_in.policy.resolved());
-        assert_eq!(from_file.safety.fall_recover, built_in.safety.fall_recover);
+        assert_eq!(from_file.safety.limp_fall, built_in.safety.limp_fall);
         assert_eq!(
             from_file.safety.battery_empty_shutdown,
             built_in.safety.battery_empty_shutdown
