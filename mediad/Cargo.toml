@@ -1,0 +1,23 @@
+[package]
+name = "mediad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Camera, mic, WebRTC — and the remote gateway"
+
+# A library and no binary yet, deliberately. What exists is the transport policy: which calls a
+# WebRTC peer may make, which is the decision `docs/design/remote-webrtc.md` §5 says constrains
+# everything after it. A daemon that starts and serves nothing would have to be packaged, unit-ed
+# and enabled to be tested, and none of that would be testing anything.
+#
+# It links no GStreamer yet either, and that is not an oversight: `mediad` will, and the moment it
+# does, CI's `board` job needs `scripts/cross-sysroot.sh` rather than the multiarch libudev in
+# `ci-cross-deps.sh`. That is its own change and belongs beside the code that needs it.
+
+[dependencies]
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+
+[dev-dependencies]
+# `every_call()`, so this crate's exhaustive-match tests use the same list every other
+# transport's do rather than growing a third copy of it.
+duck-ipc-proto = { path = "../duck-ipc-proto", features = ["test-support"] }

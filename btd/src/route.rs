@@ -299,6 +299,9 @@ pub fn refusal(call: &proto::Call) -> proto::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The shared list, not a local copy. Two copies of this had already drifted — 115 lines here
+    // against 82 — which is how `pad.input` came to be missing from one of them.
+    use duck_ipc_proto::test_support::every_call;
     use duck_ipc_proto::{ComponentId, semver};
 
     fn component() -> ComponentId {
@@ -629,91 +632,5 @@ mod tests {
             );
             assert_eq!(route_for(&call), Route::Refused, "{}", call.method());
         }
-    }
-
-    /// Every variant, so the tests above cannot silently skip one. The exhaustive match in
-    /// `upstream_for` is what forces this list to be maintained: a new variant breaks the
-    /// build there, and whoever fixes it arrives here next.
-    fn every_call() -> Vec<proto::Call> {
-        let version = semver::Version::new(1, 4, 2);
-        vec![
-            proto::Call::Hello(proto::HelloParams {
-                api_version: proto::API_VERSION,
-            }),
-            proto::Call::Check(proto::ComponentParams {
-                component: component(),
-            }),
-            proto::Call::Apply(proto::ApplyParams {
-                component: component(),
-                target: proto::Target::Latest,
-                options: proto::ApplyOptions::default(),
-            }),
-            proto::Call::Rollback(proto::ComponentParams {
-                component: component(),
-            }),
-            proto::Call::ResetToGolden(proto::ComponentParams {
-                component: component(),
-            }),
-            proto::Call::Select(proto::SelectParams {
-                component: component(),
-                version: version.clone(),
-            }),
-            proto::Call::Pin(proto::PinParams {
-                component: component(),
-                version: Some(version),
-            }),
-            proto::Call::Status,
-            proto::Call::ListInstalled(proto::ComponentParams {
-                component: component(),
-            }),
-            proto::Call::Log(proto::LogParams { limit: 20 }),
-            proto::Call::Subscribe,
-            proto::Call::RobotSafeToRestart,
-            proto::Call::RobotHealth,
-            proto::Call::RobotModelApi,
-            proto::Call::RobotRemoteSessionActive,
-            proto::Call::NetStatus,
-            proto::Call::NetScan,
-            proto::Call::NetConnect(proto::NetConnectParams {
-                ssid: "Home".into(),
-                psk: Some("secret".into()),
-            }),
-            proto::Call::NetForget(proto::NetForgetParams {
-                ssid: "Home".into(),
-            }),
-            proto::Call::SystemInfo,
-            proto::Call::SystemSetName(proto::SetNameParams {
-                name: "duck".into(),
-            }),
-            proto::Call::SystemReboot,
-            proto::Call::RobotMove(proto::MoveParams {
-                vx: 0.1,
-                vy: 0.0,
-                vyaw: 0.0,
-            }),
-            proto::Call::RobotHead(proto::HeadParams {
-                neck_pitch: 0.0,
-                head_pitch: 0.0,
-                head_yaw: 0.0,
-                head_roll: 0.0,
-            }),
-            proto::Call::RobotStop,
-            proto::Call::RobotEnable(proto::EnableParams {
-                on: true,
-                toggle: false,
-            }),
-            proto::Call::RobotInit,
-            proto::Call::RobotRelax,
-            proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
-            proto::Call::SystemPairingPin,
-            proto::Call::SystemSetPairingPin(proto::SetPairingPinParams {
-                pin: "000000".into(),
-            }),
-            proto::Call::PadStatus,
-            proto::Call::PadPair(proto::PadPairParams::default()),
-            proto::Call::PadForget(proto::PadForgetParams {
-                mac: "78:86:2E:BB:13:28".into(),
-            }),
-        ]
     }
 }

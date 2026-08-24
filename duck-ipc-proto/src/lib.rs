@@ -944,6 +944,143 @@ impl Call {
     }
 }
 
+/// Fixtures for tests, in this crate and in its consumers.
+///
+/// Behind a feature so nothing here reaches a robot, and it adds no dependencies — this crate is
+/// on the recovery path and its dependency list is deliberately three crates long.
+///
+/// It exists because two copies of [`every_call`] had already appeared, one here and one in
+/// `btd::route`, and they had already drifted — 115 lines against 82. A third was about to be
+/// written for `mediad`.
+// `any(test, ...)` so this crate's own tests reach it without the feature being enabled, which is
+// the difference between `cargo test -p duck-ipc-proto` working and not.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::*;
+
+    /// One of every [`Call`] variant, so a test cannot silently skip one.
+    ///
+    /// The exhaustive matches over [`Call`] — `method`, `destination`, and each transport's
+    /// permission table — are what force this list to stay complete: a new variant breaks those
+    /// builds, and whoever fixes them arrives here next.
+    pub fn every_call() -> Vec<Call> {
+        let component = ComponentId::new("daemon");
+        let version = semver::Version::new(1, 4, 2);
+        vec![
+            Call::Hello(HelloParams {
+                api_version: API_VERSION,
+            }),
+            Call::Check(ComponentParams {
+                component: component.clone(),
+            }),
+            Call::Apply(ApplyParams {
+                component: component.clone(),
+                target: Target::Exact(version.clone()),
+                options: ApplyOptions {
+                    dry_run: true,
+                    interrupt_sessions: false,
+                    from_dir: None,
+                },
+            }),
+            Call::Rollback(ComponentParams {
+                component: component.clone(),
+            }),
+            Call::ResetToGolden(ComponentParams {
+                component: component.clone(),
+            }),
+            Call::Select(SelectParams {
+                component: component.clone(),
+                version: version.clone(),
+            }),
+            Call::Pin(PinParams {
+                component: component.clone(),
+                version: Some(version),
+            }),
+            Call::Status,
+            Call::ListInstalled(ComponentParams { component }),
+            Call::Log(LogParams { limit: 20 }),
+            Call::Subscribe,
+            Call::RobotSafeToRestart,
+            Call::RobotHealth,
+            Call::RobotModelApi,
+            Call::RobotRemoteSessionActive,
+            Call::RobotMove(MoveParams {
+                vx: 0.2,
+                vy: -0.1,
+                vyaw: 0.4,
+            }),
+            Call::RobotHead(HeadParams {
+                neck_pitch: 0.35,
+                head_pitch: -0.1,
+                head_yaw: 0.2,
+                head_roll: 0.0,
+            }),
+            Call::RobotLook(LookParams {
+                x: 1.0,
+                y: 0.25,
+                z: -0.1,
+                neck_pitch: 0.2,
+            }),
+            Call::RobotStop,
+            Call::RobotEnable(EnableParams {
+                on: true,
+                toggle: false,
+            }),
+            Call::RobotInit,
+            Call::RobotRelax,
+            Call::RobotDo(DoParams {
+                skill: Skill::GroundPick,
+            }),
+            Call::RobotPose(PoseParams {
+                z: -0.01,
+                roll: 0.05,
+                pitch: -0.1,
+                active: true,
+            }),
+            Call::RobotMouth(MouthParams { open: 0.5 }),
+            Call::RobotSound(SoundParams {
+                tag: SoundTag::Chirp,
+                hold: None,
+            }),
+            Call::RobotShutdown,
+            Call::RobotMode,
+            Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
+            Call::NetStatus,
+            Call::NetScan,
+            Call::NetConnect(NetConnectParams {
+                ssid: "Pollen Guest".into(),
+                psk: Some("hunter2 with spaces".into()),
+            }),
+            Call::NetForget(NetForgetParams {
+                ssid: "Old Network".into(),
+            }),
+            Call::SystemInfo,
+            Call::SystemServices,
+            Call::SystemSetName(SetNameParams {
+                name: "duck-01".into(),
+            }),
+            Call::SystemReboot,
+            Call::SystemPairingPin,
+            Call::SystemSetPairingPin(SetPairingPinParams {
+                pin: "042042".into(),
+            }),
+            Call::SystemAuthenticate(AuthenticateParams {
+                pin: "000000".into(),
+            }),
+            Call::PadStatus,
+            Call::PadPair(PadPairParams {
+                mac: Some("78:86:2E:BB:13:28".into()),
+                timeout_seconds: Some(20),
+            }),
+            Call::PadForget(PadForgetParams {
+                mac: "78:86:2E:BB:13:28".into(),
+            }),
+            Call::PadInput,
+            Call::TofStream,
+        ]
+    }
+}
+
 // ── envelopes ────────────────────────────────────────────────────────────────
 
 /// A request or a notification, as it appears on the wire.
@@ -2894,6 +3031,7 @@ macro_rules! log_startup_identity {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::every_call;
     use super::*;
 
     /// The path a release actually installs to, which is what makes "which version is running"
@@ -2972,123 +3110,6 @@ mod tests {
         unsafe { std::env::remove_var("DUCK_RUNTIME_DIR") };
     }
 
-    /// One of every [`Call`] variant, so the tests below cannot silently skip one.
-    fn every_call() -> Vec<Call> {
-        let component = ComponentId::new("daemon");
-        let version = semver::Version::new(1, 4, 2);
-        vec![
-            Call::Hello(HelloParams {
-                api_version: API_VERSION,
-            }),
-            Call::Check(ComponentParams {
-                component: component.clone(),
-            }),
-            Call::Apply(ApplyParams {
-                component: component.clone(),
-                target: Target::Exact(version.clone()),
-                options: ApplyOptions {
-                    dry_run: true,
-                    interrupt_sessions: false,
-                    from_dir: None,
-                },
-            }),
-            Call::Rollback(ComponentParams {
-                component: component.clone(),
-            }),
-            Call::ResetToGolden(ComponentParams {
-                component: component.clone(),
-            }),
-            Call::Select(SelectParams {
-                component: component.clone(),
-                version: version.clone(),
-            }),
-            Call::Pin(PinParams {
-                component: component.clone(),
-                version: Some(version),
-            }),
-            Call::Status,
-            Call::ListInstalled(ComponentParams { component }),
-            Call::Log(LogParams { limit: 20 }),
-            Call::Subscribe,
-            Call::RobotSafeToRestart,
-            Call::RobotHealth,
-            Call::RobotModelApi,
-            Call::RobotRemoteSessionActive,
-            Call::RobotMove(MoveParams {
-                vx: 0.2,
-                vy: -0.1,
-                vyaw: 0.4,
-            }),
-            Call::RobotHead(HeadParams {
-                neck_pitch: 0.35,
-                head_pitch: -0.1,
-                head_yaw: 0.2,
-                head_roll: 0.0,
-            }),
-            Call::RobotLook(LookParams {
-                x: 1.0,
-                y: 0.25,
-                z: -0.1,
-                neck_pitch: 0.2,
-            }),
-            Call::RobotStop,
-            Call::RobotEnable(EnableParams {
-                on: true,
-                toggle: false,
-            }),
-            Call::RobotInit,
-            Call::RobotRelax,
-            Call::RobotDo(DoParams {
-                skill: Skill::GroundPick,
-            }),
-            Call::RobotPose(PoseParams {
-                z: -0.01,
-                roll: 0.05,
-                pitch: -0.1,
-                active: true,
-            }),
-            Call::RobotMouth(MouthParams { open: 0.5 }),
-            Call::RobotSound(SoundParams {
-                tag: SoundTag::Chirp,
-                hold: None,
-            }),
-            Call::RobotShutdown,
-            Call::RobotMode,
-            Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
-            Call::NetStatus,
-            Call::NetScan,
-            Call::NetConnect(NetConnectParams {
-                ssid: "Pollen Guest".into(),
-                psk: Some("hunter2 with spaces".into()),
-            }),
-            Call::NetForget(NetForgetParams {
-                ssid: "Old Network".into(),
-            }),
-            Call::SystemInfo,
-            Call::SystemServices,
-            Call::SystemSetName(SetNameParams {
-                name: "duck-01".into(),
-            }),
-            Call::SystemReboot,
-            Call::SystemPairingPin,
-            Call::SystemSetPairingPin(SetPairingPinParams {
-                pin: "042042".into(),
-            }),
-            Call::SystemAuthenticate(AuthenticateParams {
-                pin: "000000".into(),
-            }),
-            Call::PadStatus,
-            Call::PadPair(PadPairParams {
-                mac: Some("78:86:2E:BB:13:28".into()),
-                timeout_seconds: Some(20),
-            }),
-            Call::PadForget(PadForgetParams {
-                mac: "78:86:2E:BB:13:28".into(),
-            }),
-            Call::TofStream,
-        ]
-    }
-
     /// `every_call` is a hand-written list, so a new variant is silently untested unless
     /// someone remembers to add it. Pin the count: adding a `Call` without extending the
     /// list fails here, which is the only thing standing between a new method and it never
@@ -3142,8 +3163,30 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            44,
+            45,
             "a Call variant was added or removed — update every_call() and this count"
+        );
+    }
+
+    /// Every method name in the list is distinct.
+    ///
+    /// Worth stating what the count above can and cannot do, because it gave false comfort once.
+    /// It catches a list edited without the count being bumped — and it cannot catch a variant
+    /// added to [`Call`] and to neither, which is how `pad.input` came to be missing from
+    /// `every_call` while this test passed at 44.
+    ///
+    /// What actually caught that is a property test in a consumer: `mediad`'s route table asserts
+    /// that some permitted call reaches every service, and `pad.input` is the only one that
+    /// reaches `padd`. So the real defence is tests that *use* the list for something, and this
+    /// pair only guards against the cheaper mistake.
+    #[test]
+    fn every_call_has_a_distinct_method() {
+        let calls = every_call();
+        let names: std::collections::BTreeSet<_> = calls.iter().map(|c| c.method()).collect();
+        assert_eq!(
+            names.len(),
+            calls.len(),
+            "every_call lists the same method twice, so a variant is standing in for another"
         );
     }
 
