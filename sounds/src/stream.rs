@@ -110,9 +110,12 @@ pub struct Stream {
     /// Static gain, from the weights' worst-case sum.
     gain: f32,
 
-    /// The joy-ride softening (see [`Stream::wheee`]) folded into the modulation depths.
+    /// Per-voice softening (see [`Stream::wheee`], [`Stream::choral`]) folded into the
+    /// modulation depths, rather than read off the personality — the ensemble voice needs
+    /// less of all three than the solo one.
     vibrato_depth: f64,
     quackiness: f64,
+    jitter_depth: f64,
     /// Excitement wobble: the wheee's own, at full swell.
     wobble_hz: f64,
     wobble_depth: f64,
@@ -147,6 +150,7 @@ impl Stream {
             gain: 1.0,
             vibrato_depth: p.vibrato_depth,
             quackiness: p.quackiness,
+            jitter_depth: p.jitter_depth,
             wobble_hz,
             wobble_depth: 0.0,
         };
@@ -164,6 +168,26 @@ impl Stream {
         s.vibrato_depth = p.vibrato_depth * 0.5;
         s.quackiness = p.quackiness * 0.5;
         s.wobble_depth = 0.5;
+        s
+    }
+
+    /// The ensemble voice: this duck's timbre with its tuning-wrecking modulation tamed.
+    ///
+    /// A solo duck's charm is partly that it wavers — vibrato, random jitter, the quack-buzz
+    /// AM. In a chord all three fight the *tuning*: two voices wobbling independently around
+    /// the same note beat against each other, and a chord that beats sounds sour rather than
+    /// lush. So they are scaled down hard rather than off — the duck must still be
+    /// recognisable, and a chorus of perfectly steady tones sounds like an organ.
+    ///
+    /// What is *not* touched is everything that makes this duck this duck: the harmonic
+    /// weights, the formant, the nasality, the breath. Identity is timbre here; the pitch
+    /// belongs to the score.
+    pub fn choral(p: &Personality, variant: u32) -> Self {
+        let mut s = Self::new(p, "chorale", variant);
+        s.vibrato_depth = p.vibrato_depth * 0.30;
+        s.quackiness = p.quackiness * 0.35;
+        s.jitter_depth = p.jitter_depth * 0.30;
+        s.wobble_depth = 0.0;
         s
     }
 
@@ -234,7 +258,7 @@ impl Stream {
                     * (std::f64::consts::TAU * self.p.vibrato_rate_hz * self.t).sin(),
             );
             self.jitter += (self.rng.standard_normal() - self.jitter) * a_jitter;
-            let jit = semitones(self.p.jitter_depth * f64::from(self.jitter));
+            let jit = semitones(self.jitter_depth * f64::from(self.jitter));
             let wob = semitones(
                 self.wobble_depth * (std::f64::consts::TAU * self.wobble_hz * self.t).sin(),
             );

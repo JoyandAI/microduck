@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use sounds::{BANK_VERSION, Personality, hardware_seed, render, render_all, to_wav};
+use sounds::{BANK_VERSION, Personality, chorale, hardware_seed, render, render_all, to_wav};
 
 #[derive(Parser)]
 #[command(
@@ -71,6 +71,36 @@ enum Cmd {
         seed: Option<u32>,
         #[arg(long, default_value_t = 0)]
         variant: u32,
+        /// ALSA device; the robot's codec by default.
+        #[arg(long, default_value = "plughw:aic3104")]
+        device: String,
+    },
+    /// The duck chorale, on a laptop: several ducks singing one piece in four parts.
+    ///
+    /// Renders the ensemble offline and mixes it down, so the arrangement can be judged before
+    /// any two ducks have to agree on a clock. Each duck keeps its own timbre; the *notes* are
+    /// absolute, because four ducks each singing a chord in their own tuning is four ducks out
+    /// of tune with each other.
+    Chorale {
+        /// How many ducks. 2 takes the outer voices, 3 drops the tenor, 4 is full SATB.
+        #[arg(long, default_value_t = 4)]
+        voices: usize,
+        /// The ducks' seeds, comma-separated. Defaults to a spread that casts cleanly.
+        #[arg(long, value_delimiter = ',')]
+        seeds: Option<Vec<u32>>,
+        /// Write a wav here instead of playing it.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Override the tempo, beats per minute.
+        #[arg(long)]
+        bpm: Option<f64>,
+        /// Transpose, semitones. Default fits the piece to the cast's registers.
+        #[arg(long)]
+        transpose: Option<i32>,
+        /// How much room, 0..1. Real ducks get this free by being objects in a room; a dry
+        /// preview is harsher than the hardware will actually sound.
+        #[arg(long, default_value_t = 0.25)]
+        room: f64,
         /// ALSA device; the robot's codec by default.
         #[arg(long, default_value = "plughw:aic3104")]
         device: String,
@@ -242,6 +272,72 @@ fn main() -> Result<()> {
                     println!("wrote {}", path.display());
                 }
                 None => play_pcm(&buf, &device)?,
+            }
+        }
+        Cmd::Chorale {
+            voices,
+            seeds,
+            out,
+            bpm,
+            transpose,
+            room,
+            device,
+        } => {
+            // A spread of seeds that casts to four clearly different registers, so the default
+            // invocation demonstrates the thing rather than four ducks that sound alike.
+            const DEFAULT_SEEDS: [u32; 8] = [100, 7, 313, 42, 9001, 1234, 55, 777];
+            let seeds: Vec<u32> = match seeds {
+                Some(given) => given,
+                None => DEFAULT_SEEDS
+                    .iter()
+                    .copied()
+                    .take(voices.clamp(1, DEFAULT_SEEDS.len()))
+                    .collect(),
+            };
+            let personalities: Vec<Personality> =
+                seeds.iter().copied().map(Personality::from_seed).collect();
+            let singers = chorale::cast(&personalities);
+
+            let mut score = chorale::Score::wistful();
+            if let Some(bpm) = bpm {
+                score.bpm = bpm;
+            }
+            let shift = transpose.unwrap_or(0);
+
+            println!(
+                "{} · {} ducks · {:.0} bpm · {shift:+} semitones · {:.0}s",
+                score.name,
+                singers.len(),
+                score.bpm,
+                score.duration_s()
+            );
+            // Print the casting: which duck got which part is the first thing to sanity-check,
+            // and on real hardware it is decided this same way with nobody in charge.
+            let mut seated = singers.clone();
+            seated.sort_by_key(|s| s.part);
+            for singer in &seated {
+                println!(
+                    "  {:8} seed {:<6} centre {:5.1} Hz  {:+.1} cents  {:+.0} ms",
+                    singer.part.as_str(),
+                    singer.personality.seed,
+                    singer.personality.pitch_center_hz,
+                    singer.detune_cents,
+                    singer.onset_offset_s * 1000.0,
+                );
+            }
+
+            let options = chorale::Options {
+                transpose: shift,
+                room,
+                ..chorale::Options::default()
+            };
+            let mix = chorale::render(&score, &singers, &options);
+            match out {
+                Some(path) => {
+                    to_wav(&mix, &path)?;
+                    println!("wrote {}", path.display());
+                }
+                None => play_pcm(&mix, &device)?,
             }
         }
         Cmd::EnsureBank { dir, force, seed } => {
