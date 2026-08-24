@@ -53,6 +53,15 @@ const OPEN_TAU_S: f64 = 0.060;
 /// The jitter filter's time constant — the offline `jitter`'s 64-sample window at 22.05 kHz.
 const JITTER_TAU_S: f64 = 64.0 / 22_050.0;
 
+/// How far a vowel may move the formant, in harmonics.
+///
+/// The synth has no filter — the formant is a boost on one harmonic of seven
+/// ([`Personality::harmonics`]) — so a "vowel" here is that boost moving up and down the
+/// series, plus the mouth opening. Crude against a real vocal tract, and enough: `oo` and
+/// `ee` are unmistakably different sounds, which is the whole requirement for a chorale that
+/// should sound like it is singing *something* rather than humming.
+const FORMANT_RANGE: f64 = 3.0;
+
 /// How much a wide-open mouth lifts the harmonic tilt.
 ///
 /// The weights fall off as `n^-tilt`, so subtracting from the exponent raises every harmonic
@@ -101,10 +110,15 @@ pub struct Stream {
     open: f64,
     open_target: f64,
 
+    /// Formant offset in harmonics, from the vowel being sung. See [`FORMANT_RANGE`].
+    formant_shift: f64,
+    formant_shift_target: f64,
     /// Harmonic weights for the current `open`, and the `open` they were computed at — 7
     /// `powf`s are not worth spending while the mouth has not moved.
     weights: Vec<f64>,
     weights_open: f64,
+    /// The formant offset the weights were computed at, for the same reason.
+    weights_formant: f64,
     /// Samples until the next weight refresh. See [`REFRESH_SAMPLES`].
     refresh_in: u32,
     /// Static gain, from the weights' worst-case sum.
@@ -143,9 +157,12 @@ impl Stream {
             level_target: 0.0,
             open: 0.0,
             open_target: 0.0,
+            formant_shift: 0.0,
+            formant_shift_target: 0.0,
             weights: Vec::new(),
             // Not any reachable `open`, so the first sample computes the weights.
             weights_open: f64::NAN,
+            weights_formant: f64::NAN,
             refresh_in: 0,
             gain: 1.0,
             vibrato_depth: p.vibrato_depth,
@@ -201,6 +218,16 @@ impl Stream {
         hz_at(&self.p, position)
     }
 
+    /// Set the vowel being sung: which harmonic the formant boosts, relative to this duck's
+    /// own [`Personality::formant_n`].
+    ///
+    /// Separate from [`Stream::set`] because it is a different *kind* of parameter — the
+    /// theremin has no vowels and passes only pitch, level and mouth. Slewed like the rest, so
+    /// a change of syllable is a movement rather than a click.
+    pub fn set_formant_shift(&mut self, harmonics: f64) {
+        self.formant_shift_target = harmonics.clamp(-FORMANT_RANGE, FORMANT_RANGE);
+    }
+
     /// Set the targets the stream glides toward.
     ///
     /// - `hz`: carrier frequency. Clamped to something a voice can actually sing.
@@ -240,7 +267,9 @@ impl Stream {
         for sample in out.iter_mut() {
             // Timbre, on its own cadence — see `REFRESH_SAMPLES` for why not per block.
             if self.refresh_in == 0 {
-                if (self.open - self.weights_open).abs() > 0.005 {
+                if (self.open - self.weights_open).abs() > 0.005
+                    || (self.formant_shift - self.weights_formant).abs() > 0.02
+                {
                     self.refresh_weights();
                 }
                 self.refresh_in = REFRESH_SAMPLES;
@@ -251,6 +280,7 @@ impl Stream {
             self.freq += (self.freq_target - self.freq) * a_pitch;
             self.level += (self.level_target - self.level) * a_level;
             self.open += (self.open_target - self.open) * a_open;
+            self.formant_shift += (self.formant_shift_target - self.formant_shift) * a_open;
 
             // Pitch modulation: this duck's vibrato, its jitter, and the ride's wobble.
             let vib = semitones(
@@ -305,8 +335,13 @@ impl Stream {
         // A wider mouth is a shallower rolloff. Floored, so an extreme personality tilt
         // plus a wide mouth cannot invert into a weight set with no fundamental.
         p.tilt = (p.tilt - OPEN_TILT_LIFT * self.open.clamp(0.0, 1.0)).max(0.8);
+        // The vowel moves the formant along the series. Rounded, because `harmonics` boosts
+        // one whole harmonic and there is nothing between them to boost.
+        p.formant_n =
+            ((p.formant_n as f64 + self.formant_shift).round() as i64).clamp(1, 7) as usize;
         self.weights = p.harmonics();
         self.weights_open = self.open;
+        self.weights_formant = self.formant_shift;
         let sum: f64 = self.weights.iter().sum();
         self.gain = PEAK / (sum.max(1e-6) as f32);
     }

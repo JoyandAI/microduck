@@ -34,6 +34,9 @@
 //! is what has to be exact, and that needs no synchronisation at all — only a shared reference
 //! pitch, which is a constant.
 
+pub mod midi;
+pub mod text;
+
 use crate::personality::Personality;
 use crate::stream::Stream;
 use crate::synth::SR;
@@ -90,56 +93,186 @@ pub struct Note {
     pub start_beat: f64,
     pub beats: f64,
     pub midi: u8,
+    /// How loud, 0..1. A chorale that does not swell is flat, and this is where the swell
+    /// lives — one value per note, since a note is the smallest thing anyone marks.
+    pub level: f64,
+    /// What is being sung on it. Ducks cannot pronounce words, but a vowel is most of what a
+    /// listener hears as singing rather than humming — see [`Vowel`].
+    pub vowel: Vowel,
 }
 
 impl Note {
-    fn end_beat(&self) -> f64 {
+    pub fn end_beat(&self) -> f64 {
         self.start_beat + self.beats
     }
+}
+
+/// A sung vowel: a mouth opening and a formant position.
+///
+/// Not phonetics — the synth has no vocal tract, only a boost on one harmonic of seven. But
+/// `oo` and `ee` are unmistakably different sounds even at that resolution, and having the
+/// ensemble move between them is the difference between four voices singing and four voices
+/// humming. The mouth opening is the *same number* the beak servo gets, so the vowel is
+/// visible as well as audible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Vowel {
+    /// Full and open. The default, and what a chord wants when it lands.
+    #[default]
+    Ah,
+    Eh,
+    /// Bright and narrow.
+    Ee,
+    Oh,
+    /// Dark and closed. The pad under a solo.
+    Oo,
+    /// A closed hum, quieter than the rest — a real choir's way of holding a chord without
+    /// occupying the foreground.
+    Mm,
+}
+
+impl Vowel {
+    /// How far the beak opens on it, 0..1.
+    pub fn open(&self) -> f64 {
+        match self {
+            Vowel::Ah => 0.90,
+            Vowel::Eh => 0.60,
+            Vowel::Ee => 0.35,
+            Vowel::Oh => 0.45,
+            Vowel::Oo => 0.15,
+            Vowel::Mm => 0.02,
+        }
+    }
+
+    /// Where it puts the formant, in harmonics relative to this duck's own.
+    pub fn formant_shift(&self) -> f64 {
+        match self {
+            Vowel::Ah => 0.0,
+            Vowel::Eh => 1.0,
+            Vowel::Ee => 3.0,
+            Vowel::Oh => -1.0,
+            Vowel::Oo => -2.0,
+            Vowel::Mm => -2.0,
+        }
+    }
+
+    /// A hum sits back in the mix; everything else sings at its written dynamic.
+    pub fn level_scale(&self) -> f64 {
+        match self {
+            Vowel::Mm => 0.65,
+            _ => 1.0,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Vowel::Ah => "ah",
+            Vowel::Eh => "eh",
+            Vowel::Ee => "ee",
+            Vowel::Oh => "oh",
+            Vowel::Oo => "oo",
+            Vowel::Mm => "mm",
+        }
+    }
+
+    /// Parse a vowel name. Used by the text score format and by nothing else.
+    pub fn parse(word: &str) -> Option<Self> {
+        Some(match word.to_ascii_lowercase().as_str() {
+            "ah" | "a" => Vowel::Ah,
+            "eh" | "e" => Vowel::Eh,
+            "ee" | "i" => Vowel::Ee,
+            "oh" | "o" => Vowel::Oh,
+            "oo" | "u" => Vowel::Oo,
+            "mm" | "m" | "hum" => Vowel::Mm,
+            _ => return None,
+        })
+    }
+}
+
+/// The classical dynamic marks, as levels.
+///
+/// A named ramp rather than raw numbers in the score, because `mf` is what anyone writing
+/// music actually means, and because the mapping wants to be one decision in one place.
+pub fn dynamic(mark: &str) -> Option<f64> {
+    Some(match mark.to_ascii_lowercase().as_str() {
+        "ppp" => 0.15,
+        "pp" => 0.25,
+        "p" => 0.40,
+        "mp" => 0.55,
+        "mf" => 0.70,
+        "f" => 0.85,
+        "ff" => 1.00,
+        _ => return None,
+    })
 }
 
 /// A voicing with a tacet voice allowed: `None` is a part that does not sing here.
 pub type Voicing = [Option<u8>; 4];
 
 /// Four voices in unison rhythm — the plain block chord.
+///
+/// A test convenience. Real scores arrive as text ([`text`]) or MIDI ([`midi`]), which is the
+/// whole point of those two modules; nothing in the shipped path writes a voicing in Rust.
+#[cfg(test)]
 fn chord(bass: u8, tenor: u8, alto: u8, soprano: u8) -> Voicing {
     [Some(bass), Some(tenor), Some(alto), Some(soprano)]
 }
 
-/// What a score is written in.
+/// One note of a solo line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoloNote {
+    pub midi: u8,
+    pub beats: f64,
+    pub vowel: Vowel,
+}
+
+/// A gesture a score is written in.
 ///
 /// Not a list of block chords, which is where this started and which can only write one kind
 /// of music: a real chorale breathes, assembles chords from below, and drops to one voice.
-/// Each variant here is a *gesture* an arranger actually thinks in, and it compiles down to
-/// per-part [`Note`]s — so the source reads as the musical intent rather than as a table of
+/// Each variant is a gesture an arranger actually thinks in, and they compile down to per-part
+/// [`Note`]s — so a hand-written score reads as musical intent rather than as a table of
 /// simultaneities.
+///
+/// This is one *front end*, not the score itself. [`Score`] holds notes, because the other way
+/// in is a MIDI file ([`crate::chorale::midi`]) where staggered entries and solos are already
+/// expressed as plain note timings and there are no gestures to recover.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Gesture {
     /// Everyone together, one duration. The homophonic tread.
-    Chord { voicing: Voicing, beats: f64 },
+    Chord {
+        voicing: Voicing,
+        beats: f64,
+        vowel: Vowel,
+        level: f64,
+    },
     /// Voices enter one at a time, `stagger` beats apart, and each holds to the end of the
     /// gesture — so the chord *assembles* and is then sustained whole.
     ///
     /// The single most effective thing a group of singers can do that a keyboard cannot, and
     /// on hardware it is also the most forgiving: a chord whose entries are deliberately
-    /// 0.5 s apart does not care whether two ducks disagree by 20 ms.
+    /// half a second apart does not care whether two ducks disagree by 20 ms.
     Build {
         voicing: Voicing,
         beats: f64,
         stagger: f64,
         /// Enter from the top voice down instead of the bass up.
         from_top: bool,
+        vowel: Vowel,
+        level: f64,
     },
     /// One voice moves while the others hold a chord under it.
     ///
-    /// The gesture lasts as long as the solo line does. Parts left `None` in `under` are
-    /// silent for it — a solo over nothing at all is `under: [None; 4]`, which is what a
-    /// genuinely unaccompanied entry is.
+    /// The gesture lasts as long as the solo line does. Parts left `None` in `under` are silent
+    /// for it — a solo over nothing at all is `under: [None; 4]`, which is what a genuinely
+    /// unaccompanied entry is. The accompaniment usually wants a different vowel from the
+    /// soloist, which is what `under_vowel` is for: `mm` under an `ah` is a choir holding a
+    /// chord behind someone.
     Solo {
         part: Part,
-        /// `(midi, beats)`, in order.
-        notes: Vec<(u8, f64)>,
+        notes: Vec<SoloNote>,
         under: Voicing,
+        under_vowel: Vowel,
+        level: f64,
     },
     /// Silence for everyone. A breath, and the thing that makes the chord after it land.
     Rest { beats: f64 },
@@ -150,147 +283,46 @@ impl Gesture {
     pub fn beats(&self) -> f64 {
         match self {
             Gesture::Chord { beats, .. } | Gesture::Build { beats, .. } => *beats,
-            Gesture::Solo { notes, .. } => notes.iter().map(|(_, b)| b).sum(),
+            Gesture::Solo { notes, .. } => notes.iter().map(|n| n.beats).sum(),
             Gesture::Rest { beats } => *beats,
         }
     }
 }
 
-/// A four-part score.
+/// A four-part score: per-part notes, and the tempo to read them at.
+///
+/// **Notes, not gestures.** This is the load-bearing shape in the whole module. A hand-written
+/// score comes in as [`Gesture`]s and a MuseScore export comes in as MIDI, and only one of
+/// those has gestures to recover — so the two converge here, and everything downstream
+/// (rendering, casting, the eventual sync) reads one thing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Score {
-    pub name: &'static str,
+    pub name: String,
     pub bpm: f64,
-    pub gestures: Vec<Gesture>,
+    /// Sorted by part, then by start. No part overlaps itself.
+    pub notes: Vec<Note>,
 }
 
 impl Score {
-    /// The default piece: an original arrangement, ours to ship.
+    /// Compile gestures into a score.
     ///
-    /// Written for this rather than borrowed, and that is a licensing fact as much as a
-    /// musical one — the close-harmony records this is meant to evoke are all in copyright, so
-    /// the *idiom* is the reference and the notes are not. What it borrows is the grammar: a
-    /// slow homophonic tread, chords in inversion so the bass line moves by step, common tones
-    /// held across changes rather than re-attacked, suspensions that resolve late, and one
-    /// borrowed minor chord (an F minor in C major) which is where the ache in this kind of
-    /// writing always comes from.
-    ///
-    /// It opens and closes with the chord *assembling* from the bass up, has a soprano line
-    /// over a held triad in the middle, and takes a breath before the last entry — the three
-    /// things that make a group of singers sound like singers rather than like one instrument
-    /// with four oscillators.
-    ///
-    /// Voicings stay inside ranges a duck can sing and a small speaker can reproduce: bass
-    /// A2–A3, soprano D4–D5. A duck's voice bottoms out around 110 Hz, and a chorale whose
-    /// bass is inaudible on the hardware is a trio.
-    pub fn wistful() -> Self {
-        Self {
-            name: "wistful",
-            bpm: 58.0,
-            gestures: vec![
-                // The chord assembles, low to high, and holds.
-                Gesture::Build {
-                    voicing: chord(48, 55, 60, 64),
-                    beats: 6.0,
-                    stagger: 0.75,
-                    from_top: false,
-                },
-                // The tread. The alto's C4 is the thread these hang on; the bass walks under it.
-                Gesture::Chord {
-                    voicing: chord(45, 55, 60, 64),
-                    beats: 2.0,
-                }, // Am7
-                Gesture::Chord {
-                    voicing: chord(53, 57, 60, 65),
-                    beats: 2.0,
-                }, // F
-                Gesture::Chord {
-                    voicing: chord(53, 56, 60, 65),
-                    beats: 3.0,
-                }, // Fm — the ache
-                Gesture::Chord {
-                    voicing: chord(52, 55, 60, 64),
-                    beats: 3.0,
-                }, // C/E
-                // One voice over a held triad. The alto keeps its C4 and the soprano moves.
-                Gesture::Solo {
-                    part: Part::Soprano,
-                    notes: vec![(64, 1.0), (65, 1.0), (67, 2.0), (65, 1.0), (64, 3.0)],
-                    under: [Some(48), Some(55), Some(60), None],
-                },
-                Gesture::Chord {
-                    voicing: chord(50, 57, 60, 65),
-                    beats: 2.0,
-                }, // Dm7
-                Gesture::Chord {
-                    voicing: chord(55, 59, 62, 65),
-                    beats: 2.0,
-                }, // G7
-                Gesture::Chord {
-                    voicing: chord(48, 55, 60, 65),
-                    beats: 2.0,
-                }, // Csus4
-                Gesture::Chord {
-                    voicing: chord(48, 55, 60, 64),
-                    beats: 4.0,
-                }, // C, arrived at
-                // The same trick from the other end: the soprano enters first, the bass last.
-                Gesture::Build {
-                    voicing: chord(45, 57, 60, 64),
-                    beats: 5.0,
-                    stagger: 0.5,
-                    from_top: true,
-                },
-                Gesture::Chord {
-                    voicing: chord(53, 57, 60, 65),
-                    beats: 2.0,
-                }, // F
-                Gesture::Chord {
-                    voicing: chord(53, 56, 60, 65),
-                    beats: 3.0,
-                }, // Fm again
-                Gesture::Chord {
-                    voicing: chord(55, 60, 62, 65),
-                    beats: 2.0,
-                }, // G7sus4
-                Gesture::Chord {
-                    voicing: chord(55, 59, 62, 65),
-                    beats: 2.0,
-                }, // G7
-                // The breath. Short, and it is what makes the last chord land.
-                Gesture::Rest { beats: 0.75 },
-                Gesture::Build {
-                    voicing: chord(48, 55, 60, 64),
-                    beats: 8.0,
-                    stagger: 0.6,
-                    from_top: false,
-                },
-            ],
-        }
-    }
-
-    /// Seconds per beat.
-    pub fn beat_s(&self) -> f64 {
-        60.0 / self.bpm.max(1.0)
-    }
-
-    /// How long the piece runs, seconds.
-    pub fn duration_s(&self) -> f64 {
-        self.gestures.iter().map(|g| g.beats()).sum::<f64>() * self.beat_s()
-    }
-
-    /// Compile the gestures into per-part notes, with ties merged.
-    ///
-    /// A voice holding the same pitch across a gesture boundary comes out as **one** note, not
-    /// two — which is how part-writing actually works, and audibly the difference between a
-    /// chorale and a sequence of chords. A [`Gesture::Rest`] breaks a tie by leaving a gap,
-    /// which is the whole point of putting one there.
-    pub fn notes(&self) -> Vec<Note> {
+    /// Ties are merged: a voice holding the same pitch, vowel and dynamic across a gesture
+    /// boundary comes out as **one** note, which is how part-writing works and audibly the
+    /// difference between a chorale and a sequence of chords. A change of *vowel* on the same
+    /// pitch does re-articulate, because that is what a singer does with a new syllable, and a
+    /// [`Gesture::Rest`] breaks a tie by leaving a gap — which is the whole point of writing
+    /// one.
+    pub fn from_gestures(name: &str, bpm: f64, gestures: &[Gesture]) -> Self {
         let mut notes: Vec<Note> = Vec::new();
         let mut at = 0.0f64;
-        for gesture in &self.gestures {
+        for gesture in gestures {
             match gesture {
-                Gesture::Chord { voicing, beats } => {
+                Gesture::Chord {
+                    voicing,
+                    beats,
+                    vowel,
+                    level,
+                } => {
                     for part in Part::ALL {
                         if let Some(midi) = voicing[part as usize] {
                             notes.push(Note {
@@ -298,6 +330,8 @@ impl Score {
                                 start_beat: at,
                                 beats: *beats,
                                 midi,
+                                level: *level,
+                                vowel: *vowel,
                             });
                         }
                     }
@@ -307,6 +341,8 @@ impl Score {
                     beats,
                     stagger,
                     from_top,
+                    vowel,
+                    level,
                 } => {
                     let mut order: Vec<Part> = Part::ALL
                         .into_iter()
@@ -328,6 +364,8 @@ impl Score {
                             start_beat: at + offset,
                             beats: held,
                             midi: voicing[part as usize].expect("filtered"),
+                            level: *level,
+                            vowel: *vowel,
                         });
                     }
                 }
@@ -335,6 +373,8 @@ impl Score {
                     part,
                     notes: line,
                     under,
+                    under_vowel,
+                    level,
                 } => {
                     let total = gesture.beats();
                     for other in Part::ALL {
@@ -347,25 +387,34 @@ impl Score {
                                 start_beat: at,
                                 beats: total,
                                 midi,
+                                level: *level,
+                                vowel: *under_vowel,
                             });
                         }
                     }
                     let mut solo_at = at;
-                    for (midi, beats) in line {
+                    for note in line {
                         notes.push(Note {
                             part: *part,
                             start_beat: solo_at,
-                            beats: *beats,
-                            midi: *midi,
+                            beats: note.beats,
+                            midi: note.midi,
+                            level: *level,
+                            vowel: note.vowel,
                         });
-                        solo_at += beats;
+                        solo_at += note.beats;
                     }
                 }
                 Gesture::Rest { .. } => {}
             }
             at += gesture.beats();
         }
+        Self::from_notes(name, bpm, notes)
+    }
 
+    /// A score from a bare note list — the MIDI importer's way in, and the tie merge both
+    /// paths share.
+    pub fn from_notes(name: &str, bpm: f64, mut notes: Vec<Note>) -> Self {
         notes.sort_by(|a, b| {
             a.part.cmp(&b.part).then(
                 a.start_beat
@@ -376,9 +425,16 @@ impl Score {
         let mut tied: Vec<Note> = Vec::new();
         for note in notes {
             match tied.last_mut() {
+                // Pitch and vowel, but deliberately *not* the dynamic: a mark that arrives
+                // over a note already sounding is a crescendo, and re-attacking the note
+                // would be the one thing a crescendo is not. A tied note keeps the dynamic it
+                // began on, so a mark applies to whatever *starts* after it — and an arranger
+                // who wants the note sung again writes a rest or a new vowel, both of which do
+                // break the tie.
                 Some(previous)
                     if previous.part == note.part
                         && previous.midi == note.midi
+                        && previous.vowel == note.vowel
                         // Contiguous, within a rounding error of a beat boundary.
                         && (note.start_beat - previous.end_beat()).abs() < 1e-6 =>
                 {
@@ -387,29 +443,57 @@ impl Score {
                 _ => tied.push(note),
             }
         }
-        tied
+        Self {
+            name: name.to_owned(),
+            bpm,
+            notes: tied,
+        }
+    }
+
+    /// The default piece: an original arrangement, ours to ship.
+    ///
+    /// Parsed from `scores/wistful.duckscore`, embedded — deliberately the same text file that
+    /// ships as the worked example, so the example cannot drift from the thing it is an example
+    /// of. If it stops parsing, the tests say so.
+    pub fn wistful() -> Self {
+        text::parse(include_str!("../../scores/wistful.duckscore"))
+            .expect("the embedded default score must parse")
+    }
+
+    /// Seconds per beat.
+    pub fn beat_s(&self) -> f64 {
+        60.0 / self.bpm.max(1.0)
+    }
+
+    /// How long the piece runs, seconds — to the end of the last note.
+    pub fn duration_s(&self) -> f64 {
+        self.notes.iter().map(|n| n.end_beat()).fold(0.0, f64::max) * self.beat_s()
     }
 
     /// One part's notes, in order.
-    pub fn line(&self, part: Part) -> Vec<Note> {
-        self.notes()
-            .into_iter()
-            .filter(|n| n.part == part)
-            .collect()
+    pub fn line(&self, part: Part) -> impl Iterator<Item = &Note> {
+        self.notes.iter().filter(move |n| n.part == part)
     }
 
     /// The mean MIDI pitch of one part, weighted by how long each note is held — what "where
     /// does this part sit" has to mean when the notes are not equal length.
     pub fn mean_pitch(&self, part: Part) -> f64 {
-        let line = self.line(part);
-        let beats: f64 = line.iter().map(|n| n.beats).sum();
+        let beats: f64 = self.line(part).map(|n| n.beats).sum();
         if beats <= 0.0 {
             return 0.0;
         }
-        line.iter()
+        self.line(part)
             .map(|n| f64::from(n.midi) * n.beats)
             .sum::<f64>()
             / beats
+    }
+
+    /// Which parts actually sing in this score.
+    pub fn parts(&self) -> Vec<Part> {
+        Part::ALL
+            .into_iter()
+            .filter(|p| self.line(*p).next().is_some())
+            .collect()
     }
 }
 
@@ -541,56 +625,55 @@ fn sing(score: &Score, singer: &Singer, shift: i32, total: usize) -> Vec<f32> {
     let detune = 2.0f64.powf(singer.detune_cents / 1200.0);
     let beat_s = score.beat_s();
 
-    // This part's line, in seconds. Ties are already merged by `Score::notes`, so a common
-    // tone held across a chord change arrives here as one note and is not re-attacked.
-    let notes: Vec<(f64, f64, u8)> = score
-        .line(singer.part)
-        .into_iter()
-        .map(|note| {
-            (
-                note.start_beat * beat_s,
-                (note.start_beat + note.beats) * beat_s,
-                note.midi,
-            )
-        })
-        .collect();
+    // This part's line, in seconds. Ties are already merged by `Score::from_notes`, so a common
+    // tone held across a chord change arrives here as one note and is not re-attacked — while a
+    // change of *vowel* on the same pitch does arrive as two, which is what a new syllable is.
+    let line: Vec<Note> = score.line(singer.part).copied().collect();
+    if line.is_empty() {
+        return vec![0.0; total];
+    }
 
-    // Where in its own part this note sits, for the mouth-and-timbre shape below.
-    let (low, high) = notes
-        .iter()
-        .fold((127.0f64, 0.0f64), |(lo, hi), &(_, _, m)| {
-            (lo.min(f64::from(m)), hi.max(f64::from(m)))
-        });
+    // Where in its own part a note sits, for the mouth-and-timbre shape below.
+    let (low, high) = line.iter().fold((127.0f64, 0.0f64), |(lo, hi), note| {
+        (lo.min(f64::from(note.midi)), hi.max(f64::from(note.midi)))
+    });
 
     let mut out = vec![0.0f32; total];
     let mut note_index = 0usize;
-    // Held across rests: a silent voice keeps its last pitch so the next entry does not glide
-    // up from nowhere. The level is what makes it silent.
-    let mut last_hz = notes.first().map_or(220.0, |&(_, _, midi)| {
-        midi_hz(f64::from(midi) + f64::from(shift))
-    });
+    // Held across rests: a silent voice keeps its last pitch so the next entry does not glide up
+    // from nowhere. The level is what makes it silent.
+    let mut last_hz = midi_hz(f64::from(line[0].midi) + f64::from(shift));
 
     for start in (0..total).step_by(BLOCK) {
         let now = start as f64 / f64::from(SR) - singer.onset_offset_s;
-        while note_index < notes.len() && now >= notes[note_index].1 {
+        while note_index < line.len() && now >= line[note_index].end_beat() * beat_s {
             note_index += 1;
         }
-        let (level, open) = match notes.get(note_index) {
-            Some(&(begin, end, midi)) if now >= begin => {
-                last_hz = midi_hz(f64::from(midi) + f64::from(shift)) * detune;
-                // A breath before the next entry: the note releases a little early, so a
-                // change of chord re-articulates instead of sliding into the next one.
-                let sustain = (end - begin) * 0.92;
-                // Higher in your own part is a more open mouth and a brighter tone, which is
-                // what a singer reaching up actually does — and on a duck it is the same
-                // number that moves the beak.
-                let reach = ((f64::from(midi) - low) / (high - low).max(1.0)).clamp(0.0, 1.0);
-                let level = if now - begin < sustain { 1.0 } else { 0.0 };
-                (level, 0.30 + 0.45 * reach)
+        let (level, open, formant) = match line.get(note_index) {
+            Some(note) if now >= note.start_beat * beat_s => {
+                last_hz = midi_hz(f64::from(note.midi) + f64::from(shift)) * detune;
+                // A breath before the next entry: the note releases a little early, so a change
+                // of chord re-articulates instead of sliding into the next one.
+                let begin = note.start_beat * beat_s;
+                let sustain = note.beats * beat_s * 0.92;
+                let singing = now - begin < sustain;
+                // The written dynamic, and a hum sits back behind everything else.
+                let level = if singing {
+                    note.level * note.vowel.level_scale()
+                } else {
+                    0.0
+                };
+                // The vowel decides the beak; reaching up in your own part opens it a little
+                // further, which is what a singer actually does. One number, so what is heard
+                // and what is seen are the same gesture.
+                let reach = ((f64::from(note.midi) - low) / (high - low).max(1.0)).clamp(0.0, 1.0);
+                let open = (note.vowel.open() + 0.12 * reach).clamp(0.0, 1.0);
+                (level, open, note.vowel.formant_shift())
             }
             // Before the first entry, or after the last release.
-            _ => (0.0, 0.30),
+            _ => (0.0, Vowel::default().open(), 0.0),
         };
+        stream.set_formant_shift(formant);
         stream.set(last_hz, level, open);
         let end = (start + BLOCK).min(total);
         stream.block(&mut out[start..end]);
@@ -732,32 +815,48 @@ mod tests {
         }
     }
 
-    /// Common tones across a chord change are tied, not re-attacked — the audible difference
-    /// between a chorale and a list of chords, and the reason `notes()` merges rather than
-    /// emitting one note per gesture.
+    fn score_of(gestures: Vec<Gesture>) -> Score {
+        Score::from_gestures("test", 60.0, &gestures)
+    }
+
+    fn plain(voicing: Voicing, beats: f64) -> Gesture {
+        Gesture::Chord {
+            voicing,
+            beats,
+            vowel: Vowel::Ah,
+            level: 1.0,
+        }
+    }
+
+    /// Common tones are tied, not re-attacked — the audible difference between a chorale and a
+    /// list of chords, and the reason both front ends merge rather than emitting one note per
+    /// gesture or per MIDI event.
     #[test]
     fn common_tones_come_out_as_one_note() {
         let score = Score::wistful();
-        let alto = score.line(Part::Alto);
-        // The alto's C4 opens the piece and is held through the tread that follows: the
-        // opening build plus four chords are one note, not five.
-        let first = alto[0];
-        assert_eq!(first.midi, 60);
+        let alto: Vec<&Note> = score.line(Part::Alto).collect();
+        // The alto's C4 is the thread the opening hangs on: it is held right through the tread
+        // as one note, across four chord changes and a change of dynamic, and re-articulates
+        // only where the *vowel* changes.
+        let longest = alto.iter().map(|n| n.beats).fold(0.0, f64::max);
         assert!(
-            first.beats > 12.0,
-            "the alto's opening C4 should be one long tie, got {} beats",
-            first.beats
+            longest >= 9.0,
+            "the alto's C4 through the tread should be one long tie, longest is {longest} beats"
         );
-        // Nothing anywhere is a zero-length or backwards note.
-        for note in score.notes() {
+        // And the opening is a *shorter* note, because the vowel opens when the harmony starts
+        // to move — a new syllable is a new note even on the same pitch.
+        assert!(alto[0].beats < longest, "{:?}", alto[0]);
+        for note in &score.notes {
             assert!(note.beats > 0.0, "{note:?}");
             assert!(note.start_beat >= 0.0, "{note:?}");
+            assert!((0.0..=1.0).contains(&note.level), "{note:?}");
         }
         // And a part's notes never overlap themselves — one voice, one note at a time.
         for part in Part::ALL {
-            for pair in score.line(part).windows(2) {
+            let line: Vec<&Note> = score.line(part).collect();
+            for pair in line.windows(2) {
                 assert!(
-                    pair[1].start_beat + 1e-9 >= pair[0].start_beat + pair[0].beats,
+                    pair[1].start_beat + 1e-9 >= pair[0].end_beat(),
                     "{part:?} overlaps itself: {:?} then {:?}",
                     pair[0],
                     pair[1]
@@ -766,25 +865,21 @@ mod tests {
         }
     }
 
-    /// A `Build` assembles the chord: voices enter apart and end together. This is the gesture
-    /// a keyboard cannot make, and the one that will be most forgiving of imperfect sync
-    /// between real ducks.
+    /// A `Build` assembles the chord: voices enter apart and end together. This is the gesture a
+    /// keyboard cannot make, and the one most forgiving of imperfect sync between real ducks.
     #[test]
     fn a_build_staggers_the_entries_and_lands_them_together() {
-        let score = Score {
-            name: "test",
-            bpm: 60.0,
-            gestures: vec![Gesture::Build {
-                voicing: chord(48, 55, 60, 64),
-                beats: 6.0,
-                stagger: 0.75,
-                from_top: false,
-            }],
-        };
-        let notes = score.notes();
-        assert_eq!(notes.len(), 4, "one note per voice");
+        let score = score_of(vec![Gesture::Build {
+            voicing: chord(48, 55, 60, 64),
+            beats: 6.0,
+            stagger: 0.75,
+            from_top: false,
+            vowel: Vowel::Ah,
+            level: 1.0,
+        }]);
+        assert_eq!(score.notes.len(), 4, "one note per voice");
         for part in Part::ALL {
-            let note = notes.iter().find(|n| n.part == part).expect("sings");
+            let note = score.line(part).next().expect("sings");
             // Entries are ordered low to high...
             assert!(
                 (note.start_beat - part as usize as f64 * 0.75).abs() < 1e-9,
@@ -796,83 +891,92 @@ mod tests {
         }
 
         // From the top, the soprano is first in and the bass last.
-        let flipped = Score {
-            gestures: vec![Gesture::Build {
-                voicing: chord(48, 55, 60, 64),
-                beats: 6.0,
-                stagger: 0.75,
-                from_top: true,
-            }],
-            ..score.clone()
-        };
-        let soprano = flipped.line(Part::Soprano)[0];
-        let bass = flipped.line(Part::Bass)[0];
-        assert!(soprano.start_beat < bass.start_beat, "{soprano:?} {bass:?}");
+        let flipped = score_of(vec![Gesture::Build {
+            voicing: chord(48, 55, 60, 64),
+            beats: 6.0,
+            stagger: 0.75,
+            from_top: true,
+            vowel: Vowel::Ah,
+            level: 1.0,
+        }]);
+        assert!(
+            flipped
+                .line(Part::Soprano)
+                .next()
+                .expect("sings")
+                .start_beat
+                < flipped.line(Part::Bass).next().expect("sings").start_beat
+        );
 
         // A stagger too long for the gesture drops the late voices rather than emitting a
         // negative-length note.
-        let crowded = Score {
-            gestures: vec![Gesture::Build {
-                voicing: chord(48, 55, 60, 64),
-                beats: 1.0,
-                stagger: 0.75,
-                from_top: false,
-            }],
-            ..score
-        };
-        let notes = crowded.notes();
-        assert_eq!(notes.len(), 2, "only two voices fit: {notes:?}");
-        assert!(notes.iter().all(|n| n.beats > 0.0));
+        let crowded = score_of(vec![Gesture::Build {
+            voicing: chord(48, 55, 60, 64),
+            beats: 1.0,
+            stagger: 0.75,
+            from_top: false,
+            vowel: Vowel::Ah,
+            level: 1.0,
+        }]);
+        assert_eq!(
+            crowded.notes.len(),
+            2,
+            "only two voices fit: {:?}",
+            crowded.notes
+        );
+        assert!(crowded.notes.iter().all(|n| n.beats > 0.0));
     }
 
-    /// A solo is one voice moving over a held chord — and the voices left out of `under` are
-    /// genuinely silent for it, which is what makes an unaccompanied entry possible.
+    /// A solo is one voice moving over a held chord, and the voices left out of `under` are
+    /// genuinely silent — which is what makes an unaccompanied entry possible.
     #[test]
     fn a_solo_moves_over_what_is_held_under_it() {
-        let score = Score {
-            name: "test",
-            bpm: 60.0,
-            gestures: vec![Gesture::Solo {
-                part: Part::Soprano,
-                notes: vec![(64, 1.0), (65, 1.0), (67, 2.0)],
-                under: [Some(48), None, Some(60), None],
-            }],
-        };
-        assert_eq!(
-            score.gestures[0].beats(),
-            4.0,
-            "the solo line sets the length"
-        );
-        assert_eq!(score.line(Part::Soprano).len(), 3, "the soloist moves");
-        assert_eq!(score.line(Part::Tenor).len(), 0, "tacet under this solo");
-        let alto = score.line(Part::Alto);
-        assert_eq!(alto.len(), 1, "the accompaniment is one held note");
-        assert_eq!(alto[0].beats, 4.0);
-        // A soloist's own pitch is theirs, not `under`'s.
-        assert_eq!(score.line(Part::Bass)[0].midi, 48);
-        assert_eq!(score.line(Part::Soprano)[0].midi, 64);
-    }
-
-    /// A rest breaks the tie. Without that, a breath written before a chord the voices were
-    /// already holding would be silently swallowed by the tie merge.
-    #[test]
-    fn a_rest_is_a_real_gap() {
-        let score = Score {
-            name: "test",
-            bpm: 60.0,
-            gestures: vec![
-                Gesture::Chord {
-                    voicing: chord(48, 55, 60, 64),
-                    beats: 2.0,
+        let solo = Gesture::Solo {
+            part: Part::Soprano,
+            notes: vec![
+                SoloNote {
+                    midi: 64,
+                    beats: 1.0,
+                    vowel: Vowel::Ah,
                 },
-                Gesture::Rest { beats: 1.0 },
-                Gesture::Chord {
-                    voicing: chord(48, 55, 60, 64),
+                SoloNote {
+                    midi: 65,
+                    beats: 1.0,
+                    vowel: Vowel::Ah,
+                },
+                SoloNote {
+                    midi: 67,
                     beats: 2.0,
+                    vowel: Vowel::Ee,
                 },
             ],
+            under: [Some(48), None, Some(60), None],
+            under_vowel: Vowel::Mm,
+            level: 0.7,
         };
-        let bass = score.line(Part::Bass);
+        assert_eq!(solo.beats(), 4.0, "the solo line sets the length");
+        let score = score_of(vec![solo]);
+        assert_eq!(score.line(Part::Soprano).count(), 3, "the soloist moves");
+        assert_eq!(score.line(Part::Tenor).count(), 0, "tacet under this solo");
+        let alto: Vec<&Note> = score.line(Part::Alto).collect();
+        assert_eq!(alto.len(), 1, "the accompaniment is one held note");
+        assert_eq!(alto[0].beats, 4.0);
+        assert_eq!(alto[0].vowel, Vowel::Mm, "and it hums");
+        // A soloist's own pitch is theirs, not `under`'s.
+        assert_eq!(score.line(Part::Bass).next().expect("sings").midi, 48);
+        assert_eq!(score.line(Part::Soprano).next().expect("sings").midi, 64);
+    }
+
+    /// A rest breaks the tie. Without that, a breath written between two chords the voices were
+    /// already holding would be silently swallowed by the merge.
+    #[test]
+    fn a_rest_is_a_real_gap() {
+        let score = score_of(vec![
+            plain(chord(48, 55, 60, 64), 2.0),
+            Gesture::Rest { beats: 1.0 },
+            plain(chord(48, 55, 60, 64), 2.0),
+        ]);
+        let bass: Vec<&Note> = score.line(Part::Bass).collect();
         assert_eq!(
             bass.len(),
             2,
@@ -883,42 +987,68 @@ mod tests {
         assert_eq!(score.duration_s(), 5.0, "the rest occupies time");
 
         // Whereas without the rest, it is one tied note.
-        let tied = Score {
-            gestures: vec![
-                Gesture::Chord {
-                    voicing: chord(48, 55, 60, 64),
-                    beats: 2.0,
-                },
-                Gesture::Chord {
-                    voicing: chord(48, 55, 60, 64),
-                    beats: 2.0,
-                },
-            ],
-            ..score
-        };
-        assert_eq!(tied.line(Part::Bass).len(), 1);
-        assert_eq!(tied.line(Part::Bass)[0].beats, 4.0);
+        let tied = score_of(vec![
+            plain(chord(48, 55, 60, 64), 2.0),
+            plain(chord(48, 55, 60, 64), 2.0),
+        ]);
+        assert_eq!(tied.line(Part::Bass).count(), 1);
+        assert_eq!(tied.line(Part::Bass).next().expect("sings").beats, 4.0);
     }
 
-    /// The shipped piece uses all of it — a chord assembling, a solo, and a breath. If someone
-    /// flattens it back to block chords this is what notices.
+    /// A new vowel or a new dynamic on the same pitch re-articulates: that is what a singer does
+    /// with a new syllable, and what a `<` in a score means.
+    #[test]
+    fn a_change_of_syllable_or_dynamic_is_a_new_note() {
+        let resung = score_of(vec![
+            plain(chord(48, 55, 60, 64), 1.0),
+            Gesture::Chord {
+                voicing: chord(48, 55, 60, 64),
+                beats: 1.0,
+                vowel: Vowel::Ee,
+                level: 1.0,
+            },
+        ]);
+        assert_eq!(resung.line(Part::Bass).count(), 2, "a new syllable");
+
+        // A dynamic, by contrast, does *not* re-attack — a mark over a sounding note is a
+        // crescendo, and the note keeps the dynamic it began on.
+        let louder = score_of(vec![
+            plain(chord(48, 55, 60, 64), 1.0),
+            Gesture::Chord {
+                voicing: chord(48, 55, 60, 64),
+                beats: 1.0,
+                vowel: Vowel::Ah,
+                level: 0.4,
+            },
+        ]);
+        let bass: Vec<&Note> = louder.line(Part::Bass).collect();
+        assert_eq!(bass.len(), 1, "a crescendo is not a new note");
+        assert_eq!(bass[0].beats, 2.0);
+        assert_eq!(bass[0].level, 1.0, "it keeps the dynamic it started on");
+    }
+
+    /// The shipped piece uses all of it — a chord assembling, a solo, a breath, a change of
+    /// dynamic and a hum. If someone flattens it back to block chords, this notices.
     #[test]
     fn the_default_piece_is_more_than_block_chords() {
         let score = Score::wistful();
-        let has = |f: fn(&Gesture) -> bool| score.gestures.iter().any(f);
         assert!(
-            has(|g| matches!(g, Gesture::Build { .. })),
-            "no chord assembles"
+            score.notes.iter().any(|n| n.vowel == Vowel::Mm),
+            "nobody ever hums"
         );
+        let levels: Vec<f64> = score.notes.iter().map(|n| n.level).collect();
         assert!(
-            has(|g| matches!(g, Gesture::Solo { .. })),
-            "nobody ever sings alone"
+            levels.iter().any(|l| *l != levels[0]),
+            "the dynamic never moves"
         );
+        // Voices enter at different times somewhere, which is what a build is.
+        let mut starts: Vec<f64> = score.notes.iter().map(|n| n.start_beat).collect();
+        starts.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        starts.dedup();
         assert!(
-            has(|g| matches!(g, Gesture::Rest { .. })),
-            "nobody ever breathes"
+            starts.len() > score.notes.len() / 2,
+            "everything is simultaneous"
         );
-        // And the whole thing is a sensible length for a demo.
         assert!(
             (30.0..90.0).contains(&score.duration_s()),
             "{}s",
@@ -927,14 +1057,12 @@ mod tests {
     }
 
     /// Every note has to be singable by a duck and audible on its speaker: a chorale whose bass
-    /// is below what the hardware reproduces is a trio. Voices must not cross either — checked
-    /// on the written voicings, where simultaneity is unambiguous.
+    /// is below what the hardware reproduces is a trio.
     #[test]
-    fn the_score_stays_inside_ranges_a_duck_can_sing() {
-        let score = Score::wistful();
+    fn the_default_score_stays_inside_ranges_a_duck_can_sing() {
         // Bass A2..A3, tenor E3..E4, alto A3..A4, soprano D4..D5.
         let bounds = [(45u8, 57u8), (52, 64), (57, 69), (62, 74)];
-        for note in score.notes() {
+        for note in &Score::wistful().notes {
             let (low, high) = bounds[note.part as usize];
             assert!(
                 (low..=high).contains(&note.midi),
@@ -943,41 +1071,6 @@ mod tests {
                 note.midi
             );
         }
-        for gesture in &score.gestures {
-            let voicing = match gesture {
-                Gesture::Chord { voicing, .. } | Gesture::Build { voicing, .. } => *voicing,
-                // A solo's `under` is checked with its soloist's line excluded, since the two
-                // are not a chord in the voice-leading sense.
-                Gesture::Solo { .. } | Gesture::Rest { .. } => continue,
-            };
-            let sung: Vec<u8> = voicing.iter().flatten().copied().collect();
-            assert!(
-                sung.windows(2).all(|w| w[0] <= w[1]),
-                "voices cross in {sung:?}"
-            );
-        }
-    }
-
-    /// A transposition is a property of the performance, not of a singer: one shift moves
-    /// everyone, so the ensemble stays in one key. The default is no shift at all — see the
-    /// note in this module on the heuristic that was tried and removed.
-    #[test]
-    fn a_transposition_moves_the_whole_ensemble_or_nobody() {
-        assert_eq!(Options::default().transpose, 0);
-        let score = Score::wistful();
-        let singers = cast_of(&[100, 101, 102, 103]);
-        let plain = render(&score, &singers, &Options::default());
-        let up = render(
-            &score,
-            &singers,
-            &Options {
-                transpose: 4,
-                room: 0.0,
-                ..Options::default()
-            },
-        );
-        assert_eq!(plain.len(), up.len(), "a shift is not a different piece");
-        assert!(up.iter().all(|v| v.is_finite()));
     }
 
     /// The whole ensemble must render to finite, audible, non-clipping audio for any number of

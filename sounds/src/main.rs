@@ -6,7 +6,7 @@
 //! ships, regenerate a bank by hand, print the personality behind a voice.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -88,6 +88,10 @@ enum Cmd {
         /// The ducks' seeds, comma-separated. Defaults to a spread that casts cleanly.
         #[arg(long, value_delimiter = ',')]
         seeds: Option<Vec<u32>>,
+        /// A score to sing: a `.duckscore` text file, or a `.mid` exported from a notation
+        /// editor. Defaults to the built-in piece.
+        #[arg(long)]
+        score: Option<PathBuf>,
         /// Write a wav here instead of playing it.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -228,6 +232,48 @@ fn theremin_sweep(p: &Personality, variant: u32) -> Vec<f32> {
     out
 }
 
+/// Read a score from either front end, chosen by extension.
+///
+/// `.mid`/`.midi` goes through the MIDI importer, anything else through the text parser. The
+/// import reports what it decided and what it dropped, on stdout, because "why is the tenor
+/// singing the bass line" is a question about that decision and it is otherwise invisible.
+fn load_score(path: &Path) -> Result<chorale::Score> {
+    let is_midi = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"));
+    if !is_midi {
+        let source =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        return chorale::text::parse(&source)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()));
+    }
+
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let import =
+        chorale::midi::parse(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    println!(
+        "imported {} — {} tracks: {}",
+        path.display(),
+        import.tracks.len(),
+        import.tracks.join(", ")
+    );
+    for (part, why) in &import.casting {
+        println!("  {:8} {why}", part.as_str());
+    }
+    for dropped in &import.dropped {
+        println!("  dropped: {dropped}");
+    }
+    let mut score = import.score;
+    // A MIDI file's name is the file's name; the importer has nothing better to call it.
+    score.name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("imported")
+        .to_owned();
+    Ok(score)
+}
+
 fn main() -> Result<()> {
     match Args::parse().command {
         Cmd::Show { seed } => {
@@ -277,6 +323,7 @@ fn main() -> Result<()> {
         Cmd::Chorale {
             voices,
             seeds,
+            score: score_path,
             out,
             bpm,
             transpose,
@@ -298,7 +345,12 @@ fn main() -> Result<()> {
                 seeds.iter().copied().map(Personality::from_seed).collect();
             let singers = chorale::cast(&personalities);
 
-            let mut score = chorale::Score::wistful();
+            // Either front end, chosen by extension: a hand-written text score, or anything a
+            // notation editor exported. Both land on the same `Score`.
+            let mut score = match score_path.as_deref() {
+                None => chorale::Score::wistful(),
+                Some(path) => load_score(path)?,
+            };
             if let Some(bpm) = bpm {
                 score.bpm = bpm;
             }
@@ -311,6 +363,19 @@ fn main() -> Result<()> {
                 score.bpm,
                 score.duration_s()
             );
+            // Which parts the score actually has, against how many ducks turned up: a four-part
+            // piece sung by two ducks is missing two lines, and that is worth saying rather than
+            // leaving someone to wonder where the harmony went.
+            let sung: Vec<chorale::Part> = singers.iter().map(|s| s.part).collect();
+            let missing: Vec<&str> = score
+                .parts()
+                .into_iter()
+                .filter(|p| !sung.contains(p))
+                .map(|p| p.as_str())
+                .collect();
+            if !missing.is_empty() {
+                println!("  (not sung by anyone: {})", missing.join(", "));
+            }
             // Print the casting: which duck got which part is the first thing to sanity-check,
             // and on real hardware it is decided this same way with nobody in charge.
             let mut seated = singers.clone();
