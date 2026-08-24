@@ -1,0 +1,227 @@
+# WebRTC: sessions, signalling, and the control channel
+
+How a phone, a browser or a server-side program drives and observes the robot over WebRTC.
+[`architecture.md`](architecture.md) §5 states the requirement; this owns the mechanism.
+
+Scoped to **local signalling**: everything below runs on the robot and works on a LAN with no
+backend at all. Reaching a robot from outside the LAN is the same design with a proxy in front of
+it (§7) — deliberately not the first thing built, because the local case is the one every other
+case is defined in terms of.
+
+## 1. What this is not
+
+`webrtcbin` is not used. `mediad` uses **`webrtcsink`** from `gst-plugins-rs`, and the difference
+is the whole reason this document is short: `webrtcsink` brings a signalling protocol, a session
+model, and per-consumer encoder management, so what is left to design is the *control* surface
+rather than the media plumbing.
+
+`webrtcbin` would mean writing all three. It is in Debian and `webrtcsink` is not
+([`media-bringup.md`](../project/media-bringup.md) covers how that plugin is built and shipped),
+which is the one argument for it — and it is outweighed by the protocol coming for free, because
+that protocol is what a remote bridge proxies (§7).
+
+## 2. One session, four streams
+
+```
+peer (browser / phone / server-side program)
+   ├── video track      camera, hardware H.264 (mpph264enc, constrained-baseline)
+   ├── audio track      mic; two-way for telepresence
+   ├── datachannel "control"   reliable, ordered      → the robot API (§5)
+   └── datachannel "teleop"    unreliable, unordered  → input and high-rate telemetry
+```
+
+Two data channels rather than one, for the reason `architecture.md` §5.2 gives: a retransmitted
+80 ms-old joystick command is worse than useless, so teleop goes `maxRetransmits: 0` and always
+takes the newest. That choice has a consequence people miss, and §6 is about it.
+
+**`webrtcsink` takes pre-encoded H.264 on its sink pad**, so the pipeline is
+`appsrc ! mpph264enc ! h264parse ! webrtcsink` and the encoder never reaches negotiation. Verified
+on hardware; the four encoder properties that are decisions rather than defaults are in
+[`media-bringup.md`](../project/media-bringup.md).
+
+## 3. `mediad` runs the signalling server itself
+
+`webrtcsink` has `run-signalling-server`, with `signalling-server-host` and
+`signalling-server-port` (gst-plugins-rs 0.15.3). So the server runs **in `mediad`'s own process**
+and there is no second binary to build, ship or supervise — which matters, because the plugin we
+ship is a `.so` while `gst-webrtc-signalling-server` is a separate Rust binary from the same
+upstream crate. Not shipping it is a real simplification, not a shortcut.
+
+`webrtcsink`'s own signaller defaults to `ws://127.0.0.1:8443` and connects to the server it just
+started. A LAN client connects to the same server directly.
+
+**Bind address is a decision, not a default.** Loopback only would mean a LAN peer cannot reach it
+at all and every session goes through a bridge, which defeats the point of a local mode. So it
+binds on all interfaces — and that makes §4 load-bearing rather than optional.
+
+## 4. Authorisation, because the signalling port is open on the LAN
+
+A peer that reaches the signalling server can start a session, and a session carries the control
+channel, which carries the robot API. So the question is not "who may signal" but "who may drive".
+
+**Reuse `system.authenticate`.** It already exists — `API_VERSION` v4 added it — and it already
+solves this problem once, for BLE: a client proves knowledge of the robot's pairing PIN before
+anything else is served. `app-path-design.md` §5 explains why the check lives at the protocol layer
+rather than the link layer, and that reasoning transfers unchanged: *we* define the rules here too.
+
+So the control channel is **unauthorised until `system.authenticate` succeeds on it**, exactly as a
+BLE session is. Concretely:
+
+- A fresh `control` channel serves `system.authenticate` and nothing else. Every other method is
+  refused, by name, with the same error a BLE session gives.
+- Media tracks do not flow before that either. A camera in someone's home must not stream to
+  whoever found port 8443.
+- The PIN comes from `configd` over its unix socket, never over the channel being authenticated —
+  the same rule that makes `system.pairingPin` unroutable to BLE.
+
+This is deliberately the *same* mechanism rather than a second one. Two authorisation schemes for
+two transports is how one of them ends up weaker, and it is usually the newer one.
+
+## 5. The control channel is a pipe to the existing API
+
+Frames on `control` are **JSON-RPC 2.0, one object per line**, which is what
+[`duck-ipc-proto`](../../duck-ipc-proto/src/lib.rs) already defines and what `robotctl` and `btd`
+already speak. Nothing new is invented: `mediad` routes a call to the unix socket of the service
+that owns it and pumps replies back.
+
+`btd` is the working precedent and should become the shared one:
+
+| `btd` today | what `mediad` needs |
+|---|---|
+| `route.rs` — which calls may travel, which socket answers, which lane carries them | the same table, with a *different permitted subset* |
+| `session.rs` — the `system.authenticate` gate | the same gate |
+| `upstream.rs` — dial the sockets, timeout everything | the same |
+| `framing.rs` — BLE MTU chunking | **not needed**; SCTP frames itself |
+
+So three of the four files are transport-independent and one is not. **Lift the routing table into
+something both transports use**, parameterised by which subset a transport may reach.
+
+The property worth preserving is not the code, it is the exhaustive match. `route.rs` says it
+plainly: adding a variant to `proto::Call` makes the file fail to compile, so a new method cannot
+reach the radio because somebody forgot this file existed. A `_ => None` wildcard would deny new
+methods silently, and the first symptom would be an app that cannot see a feature nobody remembered
+to route. That guarantee has to hold **per transport**, or WebRTC becomes the hole in it.
+
+### What WebRTC may reach, and why it is not BLE's subset
+
+BLE's subset is narrow because the radio is slow and anyone within a few metres can talk to it.
+Neither applies here, so WebRTC gets more — but "more" is not "everything", and two categories stay
+out:
+
+- **`system.pairingPin` and `system.setPairingPin`.** A PIN readable over the channel it authorises
+  makes the authorisation theatre. Same reasoning as BLE, same answer.
+- **`update.*` mutations.** Not on security grounds — on honesty grounds. §8 explains.
+
+### Replies are not correlated, deliberately
+
+`btd` forwards whatever a socket emits without parsing it, and has a test pinning that: a
+subscription is a stream of notifications on an open connection, and every one has to reach the
+client. Correlating replies to requests would break exactly that. `mediad` inherits the same rule,
+which also means **no per-method work in `mediad` when a method is added** — the pipe stays dumb,
+and `duck-ipc-proto` stays the only place a method is defined.
+
+The lane concept transfers too, and it is easy to assume it will not. Every daemon serves one
+request at a time per connection, so `update.subscribe` followed by anything else on the same
+connection hangs — the exact bug `app-path-design.md` §7 records. One datachannel is one ordered
+stream with the same hazard, and `btd`'s answer works unchanged: route by method to a per-lane
+socket, pump each socket back, never correlate.
+
+## 6. Teleop needs sequence numbers, and this is not optional
+
+`intents.rs` stores each intent in an `ArcSwap` and takes last-writer-wins. That is correct today
+because every writer reaches it through a unix socket, where a later message cannot arrive before an
+earlier one.
+
+**SCTP with `maxRetransmits: 0` reorders.** A twist from 80 ms ago can land after a fresher one and
+win, and the robot then drives on a stale command with nothing anywhere reporting a problem. It is
+not a rare race: it is the normal behaviour of the channel we chose on purpose.
+
+So teleop frames carry a **monotonic sequence number per stream**, and the writer drops anything
+not newer than what it last applied. This is a property of the *transport*, so it belongs in
+`mediad` rather than in `robotd` — `robotd` should keep receiving intents it can trust the ordering
+of, which is what makes `intents.rs` simple.
+
+The deadman needs nothing: `safety.gate(command, twist_age)` is already age-based, so a partition
+stops the robot with no new code. Worth stating because it is the one thing about lossy links that
+is already handled.
+
+## 7. Reaching a robot that is not on your LAN
+
+**The remote path is a bridge to the local signalling server, not a second design.** A relay
+process connects outward to a rendezvous service and proxies the same protocol to
+`ws://127.0.0.1:8443`. The robot's signalling server, session model, authorisation and control
+channel are unchanged; DTLS-SRTP keeps media encrypted end to end even through a relay, which is
+worth stating to clients plainly.
+
+Two properties follow, and both are the reason for this shape:
+
+- **Local mode never depends on the bridge.** If the rendezvous service is down, a LAN client still
+  connects. Invariant 1 in `architecture.md` — local recovery stays independent — extends to media.
+- **The bridge parses nothing.** It proxies the gst signalling protocol, which is the same protocol
+  a LAN client speaks. That is the concrete payoff for using `webrtcsink` rather than `webrtcbin`:
+  the protocol already exists, so the bridge is a relay rather than a translator.
+
+`reachy_mini` runs exactly this arrangement against a Hugging Face Space, with the robot
+registering as a `producer` and the Space keeping a TTL lease refreshed by a heartbeat. Whether we
+adopt that service, and how a robot is bound to an account, is out of scope here and stays out
+until local mode works.
+
+### The signalling protocol, for whoever writes the bridge
+
+From `gst-plugins-rs` 0.15.3, `net/webrtc/protocol` — the wire is JSON with a `type` tag,
+camelCase:
+
+| peer → server | server → peer |
+|---|---|
+| `setPeerStatus` (`roles`, `meta`, `peerId`) | `welcome` (`peerId`) |
+| `startSession` (`peerId`, optional `offer`) | `sessionStarted` (`peerId`, `sessionId`) |
+| `endSession` (`sessionId`) | `startSession`, `endSession` |
+| `peer` (SDP `offer`/`answer`, or `ice`) | `peer`, `error` (`details`) |
+| `list`, `listConsumers` | `list` (`producers`), `listConsumers` (`consumers`) |
+
+Roles are `producer`, `listener`, `consumer`. The robot is a `producer`; `meta` is free-form JSON
+and is where a robot's identity goes.
+
+## 8. Updating the robot over WebRTC: refused, and say so
+
+`RobotRemoteSessionActive` already exists in `duck-ipc-proto`, and
+`updater/src/preflight.rs::check_no_remote_session` already refuses an update while a remote session
+is up. Nothing sets it true yet, because nothing creates remote sessions.
+
+Once `mediad` reports honestly, **an update requested over WebRTC refuses itself.** That is not a
+bug to work around. Restarting `mediad` mid-session drops the session, so the client that asked
+would lose the connection it was watching progress on — and `update-over-ble.md` records what
+"start an update and watch it" failing silently already cost once.
+
+So: `update.*` mutations are not in WebRTC's permitted subset, and the refusal names the reason and
+points at BLE, which is the transport that survives the restart. Read-only `update.*` calls stay
+available, because seeing the version and history over a remote session is useful and harmless.
+
+## 9. Authority: the thing this feature breaks
+
+`intents.rs` says its slots are "single-writer in practice, so last-writer-wins means what it
+says". That premise is true with one gamepad. **It is false the moment a pad and a remote peer both
+drive**, and the failure is not a contest — it is two writers at 50 Hz interleaving into one slot,
+producing a robot that obeys neither.
+
+`architecture.md` §6 already calls for defined priority and handoff rather than last-writer-wins,
+with local physical able to preempt remote, and the roadmap defers it to M6. **WebRTC is what makes
+it due**, so it lands with this rather than after it: an intent carries its source, the loop
+resolves by priority, and a remote peer cannot quietly take the robot from someone holding a pad.
+
+This is the one part of this document that changes a file `robotd` owns, and it is the part most
+worth arguing about before it is written.
+
+## 10. Deferred, with reasons
+
+- **A WebSocket surface for server-side programs** (`architecture.md` §5.3). Same JSON-RPC, no
+  media stack, `get_frame` returning a JPEG. It is a few dozen lines once §5's routing exists, and
+  it is what makes "an LLM drives the robot" easy — but it is a second transport and the first one
+  should work.
+- **Multi-peer video.** One media session at a time, plus control-only clients. Simulcast and
+  encode-once-send-many are a real project.
+- **Consent and the streaming indicator.** `architecture.md` §7 wants explicit per-session consent
+  and a visible indicator, and is right that they are cheap now and expensive later. They need
+  hardware that exists — an LED under software control — which is not yet established.
+- **TURN.** LAN-only needs none. A bridge does, and it costs real bandwidth; that decision belongs
+  with the rendezvous service, not here.
