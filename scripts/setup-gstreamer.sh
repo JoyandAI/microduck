@@ -303,9 +303,14 @@ EOF
 
     P=https://radxa-repo.github.io/bullseye/pool/main/m/mpp
     curl -sL -O $P/librockchip-mpp1_1.5.0-1_arm64.deb
+    curl -sL -O $P/librockchip-vpu0_1.5.0-1_arm64.deb
     curl -sL -O $P/rockchip-mpp-demos_1.5.0-1_arm64.deb
-    sudo dpkg -i librockchip-mpp1_1.5.0-1_arm64.deb rockchip-mpp-demos_1.5.0-1_arm64.deb
+    sudo dpkg -i librockchip-mpp1_1.5.0-1_arm64.deb librockchip-vpu0_1.5.0-1_arm64.deb \
+      rockchip-mpp-demos_1.5.0-1_arm64.deb
     mpi_enc_test -w 1280 -h 720 -t 7 -n 60 -o /tmp/out.h264
+
+  All three, in one dpkg call: rockchip-mpp-demos depends on librockchip-vpu0 at exactly
+  1.5.0-1, so installing it alongside mpp1 leaves the demos package unconfigured.
 
   `-t` is MPP's coding enum, 7 being H.264; `mpi_enc_test -h` lists them. A bitstream in
   /tmp/out.h264 means the hardware encodes and only the GStreamer binding is missing.
