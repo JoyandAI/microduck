@@ -386,6 +386,44 @@ fn choose<T>(found: Vec<(T, String)>, target: &Target) -> Result<(T, String), St
     })
 }
 
+/// Has discovery found what it came for, or should it keep listening until the deadline?
+///
+/// **Without a name, the first candidate wins**, and stopping there is the point: a bonded robot may
+/// never re-advertise the service to this Mac, so waiting out the deadline for a better one would
+/// just be eight seconds of nothing.
+///
+/// **With a name, "a candidate" is not the same thing as "the candidate".** The tiers are built
+/// before the name is applied — `advertised` holds every robot carrying the service UUID, whoever it
+/// is — so stopping at the first non-empty tier stops at whichever robot the radio happened to
+/// report first. On a bench with two of them that is a coin flip, and the robot that loses it is
+/// never scanned for at all: the failure then reads `no robot named "olducky" in range` and lists
+/// the other robot as evidence, which is a claim about eight seconds made after two hundred
+/// milliseconds. `scan`, which runs the deadline out, reports both — and the two commands
+/// disagreeing about what is in range is the symptom.
+///
+/// So a name means: keep listening until something answers to it. The cost is that a named command
+/// whose robot is out of range pays the full [`SCAN_TIME`] before failing, which is the right trade
+/// — that failure's entire content is that the radio looked for eight seconds and found nothing.
+fn worth_connecting<T>(
+    advertised: &[(T, String)],
+    named: &[(T, String)],
+    connected: &[(T, String)],
+    target: &Target,
+) -> bool {
+    let Some(wanted) = target.wanted() else {
+        return !advertised.is_empty() || !named.is_empty() || !connected.is_empty();
+    };
+    // All three tiers, though only the first two can hold a match: `connected` is suppressed
+    // entirely when a name is wanted, and a named device that is not advertising the service lands
+    // in `named` before that tier is reached. Asking the same question of all three is one rule
+    // instead of a rule plus the reason the third is exempt from it.
+    advertised
+        .iter()
+        .chain(named)
+        .chain(connected)
+        .any(|(_, name)| answers_to(name, wanted))
+}
+
 /// Devices as indented lines: what names each one, what it calls itself, where it is, what it is
 /// doing.
 ///
@@ -883,14 +921,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Stop as soon as there is anything worth connecting to: a bonded robot may never
-        // re-advertise the service to this Mac, so waiting out the deadline for a better candidate
-        // would just be eight seconds of nothing.
-        //
         // A listing is the exception, and runs the deadline out: stopping at the first robot would
         // report one and hide the second, which is the only question worth asking in a room with
         // three of them.
-        if (!list_only && (!advertised.is_empty() || !named.is_empty() || !connected.is_empty()))
+        if (!list_only && worth_connecting(&advertised, &named, &connected, &target))
             || Instant::now() >= deadline
         {
             break;
@@ -1549,6 +1583,61 @@ mod tests {
 
         assert!(error.contains("no robot named"), "{error}");
         assert!(error.contains("duck-aaaa, duck-bbbb"), "{error}");
+    }
+
+    /// **The bug this replaced.** Two robots on the bench, `--name` picking one of them: the scan
+    /// used to stop at the first non-empty tier, which is whichever robot the radio reported first.
+    /// With the other one in `advertised`, discovery ended before the named robot had said anything,
+    /// and the failure listed the robot that won the race as proof the named one was absent — while
+    /// `scan`, which runs the deadline out, listed both.
+    #[test]
+    fn a_named_robot_is_waited_for_rather_than_the_first_one_reported() {
+        let none = &candidates(&[]);
+        let other = candidates(&["graphite"]);
+        let both = candidates(&["graphite", "olducky"]);
+        let target = asked_for("olducky");
+
+        assert!(
+            !worth_connecting(&other, none, none, &target),
+            "another robot is not this one: keep listening"
+        );
+        assert!(
+            worth_connecting(&both, none, none, &target),
+            "the named robot answered: stop"
+        );
+        // And through the tier a bonded robot actually lands in, which is the case `--name` exists
+        // for: no service UUID, so the name is the only evidence there is.
+        assert!(worth_connecting(
+            none,
+            &candidates(&["olducky"]),
+            none,
+            &target
+        ));
+        // Either half of a macOS composite, on the same rule the search itself uses.
+        assert!(worth_connecting(
+            &candidates(&["radxa-zero3 [olducky]"]),
+            none,
+            none,
+            &target,
+        ));
+    }
+
+    /// Without a name the fast path is unchanged, and that matters as much as the fix: a bonded
+    /// robot may never re-advertise the service, so a shorthand that waited for a better candidate
+    /// would wait out all eight seconds on every single command.
+    #[test]
+    fn without_a_name_the_first_candidate_still_stops_the_scan() {
+        let none = &candidates(&[]);
+        let one = candidates(&["duck-c51b"]);
+        let anybody = Target::new(None, None);
+
+        assert!(!worth_connecting(none, none, none, &anybody), "nothing yet");
+        assert!(worth_connecting(&one, none, none, &anybody));
+        assert!(worth_connecting(none, &one, none, &anybody));
+        assert!(
+            worth_connecting(none, none, &one, &anybody),
+            "an already-connected peripheral is a candidate when nobody named one"
+        );
     }
 
     /// `--name` says which robot to talk to and the `name` subcommand's positional says what to
