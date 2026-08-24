@@ -91,7 +91,7 @@ the route `microduck_runtime/radxa_setup/setup_rkaiq.sh` already uses on this bo
 | `m/mpp/librockchip-mpp-dev` | 1.5.0-1 | headers, to build the encoder plugin |
 | `libr/librga/librga2` | 2.2.0-1 | Rockchip 2D accelerator; the rockchip plugin depends on it |
 | `libr/librga/librga-dev` | 2.2.0-1 | headers, same build |
-| `g/gstreamer1.0-rockchip/gstreamer1.0-rockchip1` | 1.14-4 | **decode only** — see below |
+| `g/gstreamer1.0-rockchip/gstreamer1.0-rockchip1` | 1.14-4 | the MPP GStreamer plugin — see below |
 
 These are bullseye builds and they configure cleanly against glibc 2.41 on trixie.
 
@@ -99,15 +99,33 @@ These are bullseye builds and they configure cleanly against glibc 2.41 on trixi
 missing dependency is an unconfigured package rather than an install that repairs itself, so each
 set has to name its full closure. That cost three round trips to learn.
 
-### Radxa's prebuilt GStreamer plugin is decode-only
+### Radxa's prebuilt plugin is *not* decode-only, and this page said it was
 
-`gstreamer1.0-rockchip1_1.14-4` installs, registers cleanly in GStreamer 1.26.2, and provides
-exactly two elements: `mppvideodec` and `mppjpegdec`. No encoders — 1.14.4 predates them.
+`gstreamer1.0-rockchip1_1.14-4` installs and registers cleanly in GStreamer 1.26.2, showing
+exactly `mppvideodec` and `mppjpegdec`. That reads as "no encoders", and this page claimed it —
+wrongly. `strings` on its `.so` lists `mpph264enc`, `mpph265enc`, `mppjpegenc` and `mppvp8enc`.
+They are all there.
 
-Install it anyway if hardware **decode** is wanted (a two-way telepresence session decodes the
-peer's video), and for what it proves: **a plugin built against GStreamer 1.14 registers without
-complaint in 1.26.2.** Plugin ABI was the stated reason to fear building this from source, and it
-is not the risk.
+**The permission trap is the whole explanation, and it produced four separate misleading results
+before that was clear:**
+
+| what it looked like | what was actually true |
+|---|---|
+| `mpi_enc_test` wrote nothing and **exited 0** | the node was unopenable; a zero exit says nothing |
+| Radxa's deb was decode-only | it has every encoder |
+| a third-party 1.14-8 deb still showed no `mpph264enc` | same cause again |
+| our own CI build lists only the two decoders | a container has no `/dev/mpp_service` either — expected, not a failure |
+
+An MPP plugin **registers its decoders unconditionally, and probes MPP before registering its
+encoders.** With `/dev/mpp_service` at `0600 root:root` the probe fails silently, so the encoders
+are omitted from a plugin that contains them perfectly well.
+
+So a plugin listing only decoders is evidence about the *device node*, not about the plugin, and
+`gst-inspect-1.0 mpph264enc` means nothing until the udev rule is in place.
+
+One thing that install did prove, and it stands: **a plugin built against GStreamer 1.14 registers
+without complaint in 1.26.2.** Plugin ABI was the stated reason to fear a source build, and it is
+not the risk.
 
 ## What has to be built
 
@@ -115,7 +133,7 @@ Two plugins, for two unrelated reasons. Neither substitutes for the other.
 
 | plugin | source | gives | why it cannot be installed |
 |---|---|---|---|
-| `gstreamer-rockchip` | [`JeffyCN/mirrors`](https://github.com/JeffyCN/mirrors) branch `gstreamer-rockchip`, meson | `mpph264enc` — the hardware encoder | Debian has no Rockchip encoder at all, and Radxa's build predates the encoders |
+| `gstreamer-rockchip` | [`JeffyCN/mirrors`](https://github.com/JeffyCN/mirrors) branch `gstreamer-rockchip`, meson | `mpph264enc` — the hardware encoder | Debian has no Rockchip encoder at all. Radxa's build *does* have them, so this one is about a pin we control, dropping `libx11-6`, and riding along with the plugin below |
 | `gst-plugin-webrtc` | [`gst-plugins-rs`](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs) at 0.15.3, cargo-c | `webrtcsink`, `webrtcsrc` | `gst-plugins-rs` is packaged in **no** Debian suite |
 
 0.15.3 rather than the 0.14.5 the `reachy_mini` SDK documents: 0.14.5 is the floor that matters —

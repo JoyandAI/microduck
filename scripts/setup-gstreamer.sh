@@ -354,24 +354,10 @@ EOF
   `-t` is MPP's coding enum, 7 being H.264; `mpi_enc_test -h` lists them. A bitstream in
   /tmp/out.h264 means the hardware encodes and only the GStreamer binding is missing.
 
-  The encoder plugin has to be built. Radxa's prebuilt one is decode-only — measured, not
-  assumed: gstreamer1.0-rockchip1_1.14-4 (needs librga2 from libr/librga in the same pool)
-  installs and registers cleanly, and provides exactly `mppvideodec` and `mppjpegdec`. No
-  encoders; 1.14.4 predates them.
-
-  Install it anyway if you want hardware *decode*, and for what it proves: a plugin built
-  against GStreamer 1.14 registers without complaint in 1.26.2, so plugin ABI is not the risk
-  in the build below. The encoders are in the current tree — gstmpph264enc.c, gstmpph265enc.c,
-  gstmppjpegenc.c, gstmppvp8enc.c — which is meson-built:
-
-    sudo /usr/local/sbin/robot-setup-gstreamer --dev
-    sudo apt-get install -y meson ninja-build
-    curl -sL -O $R/m/mpp/librockchip-mpp-dev_1.5.0-1_arm64.deb
-    curl -sL -O $R/libr/librga/librga-dev_2.2.0-1_arm64.deb
-    sudo dpkg -i librockchip-mpp-dev_1.5.0-1_arm64.deb librga-dev_2.2.0-1_arm64.deb
-    git clone -b gstreamer-rockchip --depth 1 https://github.com/JeffyCN/mirrors.git
-    cd mirrors && meson setup build && ninja -C build && sudo ninja -C build install
-    gst-inspect-1.0 mpph264enc
+  If mpph264enc is missing above, suspect the node before the plugin. An MPP plugin registers
+  its decoders unconditionally and *probes MPP* before registering its encoders, so at 0600
+  root:root the encoders are silently omitted from a plugin that contains them. That is what
+  made Radxa's own deb look decode-only when it is not.
 
   Three notes, one settled and two not.
 
