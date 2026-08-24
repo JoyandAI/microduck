@@ -518,13 +518,22 @@ impl Server {
                 })
                 .await
                 .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
-            Call::Check(params) => {
-                let engine = self.engine.lock().await;
-                match engine.check(params.component.as_str()).await {
+            // `try_lock`, like every other read here, and for a reason the header states:
+            // a request that blocks on the engine mutex is answered whenever the update
+            // finishes, which is minutes for a daemon release. A client asking "is there an
+            // update?" during one has an immediate answer — there is one running — and getting
+            // `BUSY` back at once is what lets it say so. Blocking instead produced a spinner
+            // indistinguishable from a robot that had stopped answering.
+            Call::Check(params) => match self.engine.try_lock() {
+                Ok(engine) => match engine.check(params.component.as_str()).await {
                     Ok(result) => Response::ok(Some(id), &result),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
-                }
-            }
+                },
+                Err(_) => Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::BUSY, "an update is in progress; retry shortly"),
+                ),
+            },
 
             // ── mutating ─────────────────────────────────────────────────────
             Call::Apply(params) => {
@@ -569,13 +578,19 @@ impl Server {
                 })
                 .await
             }
-            Call::Pin(params) => {
-                let mut engine = self.engine.lock().await;
-                match engine.pin(params.component.as_str(), params.version).await {
+            // Also `try_lock`, and the same `BUSY` every other mutation answers with. Pinning
+            // during an update is a request about which version may be installed, made while one
+            // is being installed: waiting for the answer to become moot is worse than saying so.
+            Call::Pin(params) => match self.engine.try_lock() {
+                Ok(mut engine) => match engine.pin(params.component.as_str(), params.version).await {
                     Ok(()) => Response::ok(Some(id), &serde_json::json!({})),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
-                }
-            }
+                },
+                Err(_) => Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::BUSY, "another update is already in progress"),
+                ),
+            },
 
             // Owned by `handle_connection`, which hands the whole connection to
             // `stream_progress` instead of answering once.
@@ -595,11 +610,13 @@ impl Server {
             | Call::RobotRemoteSessionActive
             | Call::RobotMove(_)
             | Call::RobotHead(_)
+            | Call::RobotLook(_)
             | Call::RobotStop
             | Call::RobotEnable(_)
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotDo(_)
+            | Call::RobotSound(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotShutdown
@@ -650,6 +667,15 @@ impl Server {
                 ),
             ),
 
+            // Same story one namespace over: `tofd` owns the sensor and answers for it.
+            Call::TofStream => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "tof.stream is served by tofd itself, on /run/tofd/tof.sock",
+                ),
+            ),
+
             // Answered by the transport that received it — `btd` checks the PIN itself and never
             // forwards this. Reaching updaterd means a client sent it to the wrong socket, or over
             // a transport that has no PIN gate: on a unix socket, `SO_PEERCRED` already decided who
@@ -666,6 +692,11 @@ impl Server {
     }
 
     /// Run a read-only engine call, falling back to nothing if the engine is busy.
+    ///
+    /// The `Err` here IS the wire answer, ready to send — that is the point of the shape,
+    /// not an accident of it, so clippy's size advice (box the error) would trade one heap
+    /// allocation per refusal for nothing: both variants are consumed immediately.
+    #[allow(clippy::result_large_err)]
     async fn with_engine<T, F>(&self, id: Id, f: F) -> Result<T, Response>
     where
         F: FnOnce(&Engine) -> Result<T, crate::Error>,
@@ -817,7 +848,9 @@ impl Server {
     /// a unix socket is the only transport able to answer (`architecture.md` §2.2).
     ///
     /// Returns the refusal as a ready-made response, so a caller cannot forget to act
-    /// on a denial.
+    /// on a denial. Which is also why the `Err` is a full `Response` and clippy's
+    /// large-error advice is declined — see `with_engine`.
+    #[allow(clippy::result_large_err)]
     async fn authorise(
         &self,
         id: &Id,

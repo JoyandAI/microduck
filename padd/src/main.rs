@@ -20,7 +20,7 @@
 //! A (South)    ground pick
 //! LB / RB      left / right kick
 //! DPad-Down    sit ↔ stand
-//! RT / LT      mouth (either trigger; the max wins)
+//! RT / LT      mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
 //! Select, 2 s  sit down, then power off
 //! ```
 //!
@@ -249,6 +249,10 @@ fn main() -> std::process::ExitCode {
     let mut driving = false;
     let mut select_held_since: Option<Instant> = None;
     let mut shutdown_sent = false;
+    // Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
+    // starts the wheee ride. The prototype's threshold.
+    let mut prev_rt = 0.0f64;
+    let mut prev_lt = 0.0f64;
 
     loop {
         let tick = Instant::now();
@@ -430,16 +434,51 @@ fn main() -> std::process::ExitCode {
         let right_x = deadzone(pad.value(Axis::RightStickX));
         let right_y = deadzone(pad.value(Axis::RightStickY));
 
-        // Either trigger opens the mouth; the max wins, as in the prototype (where RT also
-        // chirps and LT rides the wheee — the sounds return with the audio stack).
+        // Either trigger opens the mouth; the max wins, as in the prototype — where RT
+        // also chirps and LT rides the wheee, which they now do here too.
         let trigger = |b: Button| pad.button_data(b).map(|d| d.value()).unwrap_or(0.0) as f64;
-        let mouth = trigger(Button::RightTrigger2).max(trigger(Button::LeftTrigger2));
+        let rt = trigger(Button::RightTrigger2);
+        let lt = trigger(Button::LeftTrigger2);
+        let mouth = rt.max(lt);
         if let Err(e) = notify(
             &mut stream,
             &proto::Call::RobotMouth(proto::MouthParams { open: mouth }),
         ) {
             tracing::error!(error = %e, "send failed");
             return std::process::ExitCode::FAILURE;
+        }
+
+        // Chirp on the right trigger's rising edge; the robot cuts off a still-playing
+        // sound, so rapid pulses quack rapidly. The wheee rides the left trigger: start on
+        // press, then a hold notification per tick — the robot treats the hold as a level
+        // that decays, so a padd that dies mid-ride leaves a ride that lands. Release cuts
+        // it instantly, as the prototype does.
+        const SOUND_THRESHOLD: f64 = 0.3;
+        let mut sound_calls: Vec<proto::SoundParams> = Vec::new();
+        if prev_rt < SOUND_THRESHOLD && rt >= SOUND_THRESHOLD {
+            sound_calls.push(proto::SoundParams {
+                tag: proto::SoundTag::Chirp,
+                hold: None,
+            });
+        }
+        if lt >= SOUND_THRESHOLD {
+            sound_calls.push(proto::SoundParams {
+                tag: proto::SoundTag::Wheee,
+                hold: Some(true),
+            });
+        } else if prev_lt >= SOUND_THRESHOLD {
+            sound_calls.push(proto::SoundParams {
+                tag: proto::SoundTag::Wheee,
+                hold: Some(false),
+            });
+        }
+        prev_rt = rt;
+        prev_lt = lt;
+        for params in sound_calls {
+            if let Err(e) = notify(&mut stream, &proto::Call::RobotSound(params)) {
+                tracing::error!(error = %e, "send failed");
+                return std::process::ExitCode::FAILURE;
+            }
         }
 
         let call = match mode {
@@ -533,7 +572,7 @@ fn notify(stream: &mut UnixStream, call: &proto::Call) -> std::io::Result<()> {
 /// Send a discrete intent and read its answer.
 ///
 /// Answered, unlike the continuous ones, because "refused, and here is why" is a real
-/// outcome — safety declines to enable a policy on a fallen robot — and a client that
+/// outcome — a skill with no policy loaded, a sound with no bank — and a client that
 /// ignored it would leave the operator wondering why nothing happened.
 fn request(
     stream: &mut UnixStream,

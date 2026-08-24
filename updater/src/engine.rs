@@ -49,6 +49,73 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(120);
 /// Interval between health probes while the gate is open.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Shortest gap between two download-progress notifications.
+///
+/// The source reports every HTTP chunk it writes, which for a release artifact is thousands of
+/// events, and every subscriber pays for all of them. Over BLE that is fatal rather than
+/// wasteful: a progress line is around a hundred bytes, which is five or six notifications at the
+/// 20-byte floor `btd` frames to, and `btd` drops lines when the client falls behind — so a phone
+/// saw an arbitrary subset of the percentages and a bar that jumped 12 → 61 → 34. Four a second,
+/// each a different whole percent, is a bar that moves smoothly and a stream a 20-byte pipe can
+/// carry.
+const PROGRESS_MIN_GAP: Duration = Duration::from_millis(250);
+
+/// Which of a download's progress reports are worth publishing.
+///
+/// [`PROGRESS_MIN_GAP`] is why this exists at all. Two rules, and the third method is why it is a
+/// type rather than three variables: a percent held back by the gap has to be published when the
+/// download ends, or a download whose last change lands inside the gap visibly finishes at 97%.
+struct DownloadProgress {
+    /// The last percent published, so an unchanged one is dropped. Starts at 0 because the caller
+    /// publishes that before the first chunk arrives.
+    sent: Option<u8>,
+    last: tokio::time::Instant,
+    /// Computed, suppressed by the gap, and not yet superseded.
+    held: Option<u8>,
+}
+
+impl DownloadProgress {
+    fn started(now: tokio::time::Instant) -> Self {
+        Self {
+            sent: Some(0),
+            last: now,
+            held: None,
+        }
+    }
+
+    /// Whether this report should be published.
+    fn admit(&mut self, percent: Option<u8>, now: tokio::time::Instant) -> bool {
+        let due = now.duration_since(self.last) >= PROGRESS_MIN_GAP;
+
+        // With no total there is no percent to coalesce on, so the gap is the only thing
+        // rationing "still downloading" — and there is no number worth holding back either.
+        if percent.is_none() {
+            if due {
+                self.last = now;
+                return true;
+            }
+            return false;
+        }
+
+        if percent == self.sent {
+            return false;
+        }
+        if due {
+            self.sent = percent;
+            self.held = None;
+            self.last = now;
+            return true;
+        }
+        self.held = percent;
+        false
+    }
+
+    /// The percent held back by the gap, once there are no more reports coming.
+    fn flush(&mut self) -> Option<u8> {
+        self.held.take()
+    }
+}
+
 /// Headroom multiplier over the artifact size: download + extracted copy + slack.
 const SPACE_MULTIPLIER: u64 = 3;
 
@@ -579,16 +646,28 @@ impl Engine {
             let progress = progress.clone();
             let component = component.to_owned();
             tokio::spawn(async move {
-                while let Some((done, total)) = rx.recv().await {
-                    let percent = total
-                        .filter(|t| *t > 0)
-                        .map(|t| ((done.min(t) * 100) / t) as u8);
+                let send = |percent| {
                     let _ = progress.send(Progress {
                         component: ComponentId::new(component.clone()),
                         phase: Phase::Downloading,
                         percent,
                         detail: None,
                     });
+                };
+
+                // Coalesced rather than forwarded one-for-one: the source speaks once per HTTP
+                // chunk and nobody watching needs that. See `DownloadProgress`.
+                let mut gate = DownloadProgress::started(tokio::time::Instant::now());
+                while let Some((done, total)) = rx.recv().await {
+                    let percent = total
+                        .filter(|t| *t > 0)
+                        .map(|t| ((done.min(t) * 100) / t) as u8);
+                    if gate.admit(percent, tokio::time::Instant::now()) {
+                        send(percent);
+                    }
+                }
+                if let Some(percent) = gate.flush() {
+                    send(Some(percent));
                 }
             })
         };
@@ -2936,5 +3015,119 @@ esac
         assert!(log.contains("restart configd"), "{log}");
         // Never both in one command, which is what broke.
         assert!(!log.contains("restart robotd configd"), "{log}");
+    }
+}
+
+/// How much of a download's chatter reaches whoever is watching.
+///
+/// Unit tests with an injected clock rather than a real download: the property under test is a
+/// count of notifications per second, and sleeping to observe it would make the suite slower and
+/// the assertion flakier.
+#[cfg(test)]
+mod download_progress {
+    use super::*;
+
+    /// The headline: thousands of chunk reports become at most a hundred and one notifications,
+    /// which is what makes the stream carryable over a 20-byte BLE pipe. Before this, a phone
+    /// received an arbitrary subset of them — `btd` drops progress when the client falls behind —
+    /// and showed a bar that jumped 12 → 61 → 34.
+    #[test]
+    fn a_whole_download_publishes_at_most_one_notification_per_percent() {
+        let start = tokio::time::Instant::now();
+        let mut gate = DownloadProgress::started(start);
+
+        // 5000 chunks over 20 seconds: a release artifact on a decent connection.
+        let total = 5000u64;
+        let mut published = 0;
+        for chunk in 1..=total {
+            let now = start + Duration::from_millis(chunk * 4);
+            let percent = Some(((chunk * 100) / total) as u8);
+            if gate.admit(percent, now) {
+                published += 1;
+            }
+        }
+
+        assert!(
+            (1..=101).contains(&published),
+            "published {published} of {total} reports"
+        );
+    }
+
+    /// And the rate is bounded, not only the count. A small artifact that downloads in a second
+    /// would otherwise send a hundred notifications into that second, which over BLE is the same
+    /// flood in less time.
+    #[test]
+    fn nothing_is_published_more_often_than_four_times_a_second() {
+        let start = tokio::time::Instant::now();
+        let mut gate = DownloadProgress::started(start);
+
+        let mut published = 0;
+        for chunk in 1..=1000u64 {
+            let now = start + Duration::from_millis(chunk);
+            if gate.admit(Some((chunk / 10) as u8), now) {
+                published += 1;
+            }
+        }
+
+        assert!(published <= 4, "{published} notifications in one second");
+    }
+
+    /// A percent that does not move is not news. This is what collapses the tail of a download,
+    /// where many chunks land on the same whole percent.
+    #[test]
+    fn an_unchanged_percent_is_never_republished() {
+        let start = tokio::time::Instant::now();
+        let mut gate = DownloadProgress::started(start);
+
+        assert!(
+            !gate.admit(Some(0), start + Duration::from_secs(1)),
+            "0% was already published by the caller"
+        );
+        assert!(gate.admit(Some(1), start + Duration::from_secs(2)));
+        assert!(!gate.admit(Some(1), start + Duration::from_secs(3)));
+        assert!(gate.admit(Some(2), start + Duration::from_secs(4)));
+    }
+
+    /// The last number always gets out.
+    ///
+    /// Without this a download whose final percent change lands inside the gap — every download
+    /// that finishes quickly — visibly stops at 97% and then jumps to the next phase. The same
+    /// concern made the pump `drop` its sender rather than `abort` the task.
+    #[test]
+    fn a_percent_held_back_by_the_gap_is_published_when_the_download_ends() {
+        let start = tokio::time::Instant::now();
+        let mut gate = DownloadProgress::started(start);
+
+        assert!(gate.admit(Some(96), start + Duration::from_secs(1)));
+        assert!(!gate.admit(Some(97), start + Duration::from_millis(1050)));
+        assert!(!gate.admit(Some(100), start + Duration::from_millis(1100)));
+
+        assert_eq!(gate.flush(), Some(100), "the download ended at 100%");
+        assert_eq!(gate.flush(), None, "and only once");
+    }
+
+    /// A published percent leaves nothing to flush, so the end of a download does not repeat it.
+    #[test]
+    fn nothing_is_held_when_the_last_report_was_published() {
+        let start = tokio::time::Instant::now();
+        let mut gate = DownloadProgress::started(start);
+
+        assert!(gate.admit(Some(100), start + Duration::from_secs(1)));
+        assert_eq!(gate.flush(), None);
+    }
+
+    /// A mirror that sends no `Content-Length` gives every report the same content — "still
+    /// downloading" — so the gap is the only thing rationing them, and there is no number to
+    /// hold back at the end.
+    #[test]
+    fn with_no_total_the_gap_alone_rations_the_stream() {
+        let start = tokio::time::Instant::now();
+        let mut gate = DownloadProgress::started(start);
+
+        assert!(!gate.admit(None, start + Duration::from_millis(10)));
+        assert!(gate.admit(None, start + Duration::from_millis(300)));
+        assert!(!gate.admit(None, start + Duration::from_millis(400)));
+        assert!(gate.admit(None, start + Duration::from_millis(600)));
+        assert_eq!(gate.flush(), None);
     }
 }

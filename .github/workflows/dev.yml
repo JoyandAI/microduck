@@ -101,6 +101,14 @@ jobs:
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
           cp target/aarch64-unknown-linux-gnu/release/padd staged/
+          # The voice generator (postinstall renders the per-robot bank with it) and the
+          # mic classifier pair — pet-detect for live listening, pet-features for training.
+          cp target/aarch64-unknown-linux-gnu/release/sounds staged/
+          cp target/aarch64-unknown-linux-gnu/release/pet-detect staged/
+          cp target/aarch64-unknown-linux-gnu/release/pet-features staged/
+          # The head ToF daemon. Its unit is packaged below; a board with no sensor
+          # fitted runs it anyway and says so, which is cheaper than a special case.
+          cp target/aarch64-unknown-linux-gnu/release/tofd staged/
 
           # Same contents as a real release: a dev build that omitted the units or robotd
           # would fail its own restart step on the board and roll itself back, which is a
@@ -125,6 +133,8 @@ jobs:
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "padd/systemd/padd.service=systemd/padd.service" \
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+            --include "tof/systemd/tofd.service=systemd/tofd.service" \
+            --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
             --include "docs/design/architecture.md=docs/architecture.md" \
             --include "docs/design/updater-design.md=docs/updater-design.md" \
@@ -137,7 +147,8 @@ jobs:
             --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
             --include "policies/roller.onnx=policies/roller.onnx" \
             --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx" \
-            --include "policies/roulade.onnx=policies/roulade.onnx"
+            --include "policies/roulade.onnx=policies/roulade.onnx" \
+            --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx"
 
 
           # `--ref` resolves a *tag*, and the manifest it fetches is the asset named

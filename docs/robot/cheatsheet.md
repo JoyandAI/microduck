@@ -131,7 +131,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **X** / square | roulade — one forward roll; hold to chain rolls |
 | **LB / RB** | left / right kick |
 | **DPad-Down** | sit ↔ stand |
-| **RT / LT** | mouth (either trigger) |
+| **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **Select**, held 2 s | sit down, then power off |
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
@@ -198,6 +198,69 @@ saved to `/tmp/pad-stack-<host>-<when>.log`. `--fingerprint` prints only the val
 between two boards, for `diff`.
 [`pair-a-gamepad.md`](pair-a-gamepad.md#is-this-board-running-the-same-stack-as-that-one) has the
 comparison.
+
+### The voice
+
+```
+robotctl quack
+```
+
+The loudest way to tell ducks apart: every robot's voice bank is generated from its SoC
+serial (`sounds ensure-bank`, run by every release install), so the robot that answers — in
+a voice that is only its own — is the one you're SSH'd into. A robot with no voice — audio
+off, or no bank — says so instead of printing 🦆, so silence always means the wrong duck. The robot also greets when
+`robotd` comes up, pecks goodbye before powering off, and coos when the mic hears its head
+being scratched (walk mode; the classifier ships in the release). Audio hardware bring-up —
+codec driver, overlays, mixer — is `setup-board.sh`'s audio section, once per board.
+
+To audition a voice or regenerate the bank by hand, the release carries the generator:
+
+```
+/opt/robot/daemon/current/bin/sounds show
+sudo /opt/robot/daemon/current/bin/sounds ensure-bank --force
+```
+
+### The ToF sensor (`tofd`)
+
+An 8×8 depth matrix from the head sensor. `robotctl monitor`, then **`t`**:
+
+```
+┌ tof VL53L8CX · 15 Hz · 8×8 · 48/64 ranged · 0.12–3.54 m ─────────────┐
+│ 0.12 0.15    x 1.44 1.86    · 2.70 3.12                              │
+└ · nothing in range · x could not measure · near→far ── seq 412 · 6 ms ┘
+```
+
+Distances in metres, coloured near-warm to far-cool. The two marks matter: `·` is
+*measured, nothing in range* — free space, which is information — and `x` is
+*could not measure*, which says nothing at all about what is out there. A grid
+that showed both as blank would hide the difference.
+
+This is the sensor's own frame, not the robot's: there is no reprojection until
+the kinematics exist, which is also what makes the block the right place to check
+a mounting angle.
+
+`tofd` owns the sensor and nothing else reads the bus. It is an ordinary service —
+`sudo systemctl stop tofd` is safe, nothing depends on it, and `monitor` says
+"no depth stream" and carries on. Three things it distinguishes, because they need
+different fixes:
+
+| the block says | what it means |
+| --- | --- |
+| `connecting to tofd…` / `no depth stream` | the daemon is not running |
+| `no sensor: …` | `tofd` is up; nothing answered on the bus (most ducks) |
+| `waiting for the first frame…` | a sensor is ranging; its first scan is ~66 ms away |
+
+To see what is on the bus by hand, or to watch frames without a terminal UI:
+
+```
+sudo i2cdetect -y -r 3
+journalctl -u tofd -b
+```
+
+The sensor shares the codec's I²C bus, so `setup-board.sh`'s audio section already
+provisions the bus itself; the ToF step only adds the stable `/dev/i2c-pihat`
+name. Both sensor generations are supported — a VL53L5CX and a VL53L8CX are
+interchangeable on the board, and the daemon picks the driver from an ID read.
 
 ### Wifi (`configd`)
 

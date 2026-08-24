@@ -26,6 +26,75 @@ pub struct Params {
     pub update_gate: UpdateGate,
     pub policy: PolicyParams,
     pub safety: SafetyParams,
+    pub audio: AudioParams,
+}
+
+/// `[audio]` — the voice and the microphone. All optional equipment: a robot without a
+/// codec (or a bank) walks identically and stays quiet, so nothing here reaches a health
+/// verdict.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AudioParams {
+    /// Master switch: no sounds, no mic worker.
+    pub enabled: bool,
+    /// ALSA playback device — the TLV320AIC3104 codec.
+    pub device: String,
+    /// Where the per-robot voice bank lives. The release's postinstall renders it there
+    /// (`sounds ensure-bank`), seeded from the SoC serial.
+    pub bank: PathBuf,
+    /// Listen for petting on the onboard mic. Absent resolves per mode, as the prototype's
+    /// launcher does: on for walking, off for the roller (its launch line dropped
+    /// `--pet-detect`).
+    pub pet_detect: Option<bool>,
+    /// The petting classifier. Absent means the release's copy; the literal `"none"`
+    /// disables it outright.
+    pub pet_model: Option<PathBuf>,
+    /// Probability above which petting starts, and below which it ends (hysteresis).
+    pub pet_enter_threshold: f32,
+    pub pet_exit_threshold: f32,
+}
+
+impl Default for AudioParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            device: "plughw:aic3104".to_owned(),
+            bank: PathBuf::from("/var/lib/robot/sounds"),
+            pet_detect: None,
+            pet_model: None,
+            pet_enter_threshold: 0.95,
+            pet_exit_threshold: 0.85,
+        }
+    }
+}
+
+impl AudioParams {
+    /// Whether the mic worker runs, resolved against the drive mode.
+    pub fn pet_detect_resolved(&self, mode: Mode) -> bool {
+        self.pet_detect.unwrap_or(mode == Mode::Walk)
+    }
+
+    /// The capture PCM for the mic worker: the playback device with subdevice 0. Only
+    /// appended when the operator has not already spelled a subdevice out — `plughw:aic3104`
+    /// in `robotd.toml` is the default and needs it, but the equally natural full spec
+    /// `plughw:aic3104,0` would otherwise become `plughw:aic3104,0,0`, which no card
+    /// answers to. That lands the worker in its restart loop for the life of the daemon.
+    pub fn capture_device(&self) -> String {
+        if self.device.contains(',') {
+            self.device.clone()
+        } else {
+            format!("{},0", self.device)
+        }
+    }
+
+    /// The classifier path, or `None` when disabled with the `"none"` sentinel.
+    pub fn pet_model_resolved(&self) -> Option<PathBuf> {
+        match &self.pet_model {
+            Some(p) if is_none_sentinel(p) => None,
+            Some(p) => Some(p.clone()),
+            None => Some(PathBuf::from(RELEASE_DIR).join("models/pet_detect.onnx")),
+        }
+    }
 }
 
 /// Which drive configuration this robot runs. One robot, two personalities: legs, or the
@@ -235,24 +304,52 @@ pub struct SafetyParams {
     pub fall_debounce_ms: u64,
     /// Intent age past which the velocity is zeroed. Stop, not limp.
     pub deadman_ms: u64,
-    /// Gain once fallen — low enough to yield rather than fight the floor.
+    /// The gain limp-fall yields at — low enough to give way rather than fight the floor.
     pub gain_limp: u16,
-    /// Whether a detected fall preempts the policy: hold at `gain_limp`, refuse
-    /// `robot.init`/`robot.enable`/skills until the robot is upright again. Off by
-    /// default, as the prototype is — its `--fall-detect` ships off, so a fallen robot
-    /// keeps being driven and the humans stay in charge. The fall verdict is reported in
-    /// the state stream either way. `fall_recover = true` implies this: recovery starts
-    /// with the limp settle.
-    pub fall_limp: bool,
-    /// Stand back up after a fall, on its own: limp 0.3 s, then the standing network drives
-    /// until the robot has been solidly upright for a second. Reserves the standing network
-    /// for recovery, so command magnitude stops selecting it. Off by default, as the
-    /// prototype ships `--fall-detect`.
-    pub fall_recover: bool,
     /// Sit down and power the machine off when the battery EMA reaches the empty floor
     /// (6.6 V — `duck_control::model::BATTERY_EMPTY_V`). The EMA moves over ~10 s, so a
     /// load sag cannot trip it.
     pub battery_empty_shutdown: bool,
+
+    /// Go limp *while falling*, to land soft instead of fighting the floor all the way
+    /// down. **On by default** since it was validated on a robot — the whole point is that
+    /// the fleet lands soft, and a mode every board has to opt into individually is a mode
+    /// most boards do not have.
+    ///
+    /// The only thing the daemon does about a fall. Drop to `gain_limp`, let the robot
+    /// collapse, pose it back to standing once it has landed, then hand it to the standing
+    /// policy — which stands up far more cleanly from a still robot than from one that has
+    /// been thrashing since the fall began. With it off, a fall changes nothing: the policy
+    /// keeps driving and the humans stay in charge.
+    pub limp_fall: bool,
+    /// Projected-gravity z the robot must already be past before a fall prediction counts
+    /// — about 26° of tilt, which ordinary walking does not reach.
+    pub limp_fall_tilt_z: f64,
+    /// Where the extrapolation must reach to count as falling. Same sense as
+    /// `fall_gravity_z`, and by default the same number.
+    pub limp_fall_predict_z: f64,
+    /// How far ahead the tilt rate is extrapolated.
+    pub limp_fall_lookahead_ms: u64,
+    /// How long the fall verdict must hold before the gains drop. Three ticks at 50 Hz —
+    /// longer than a footfall impulse, short enough to leave most of the fall to limp
+    /// through.
+    pub limp_fall_debounce_ms: u64,
+    /// Angular-rate magnitude below which the robot counts as having landed, rad/s.
+    pub limp_fall_still_rate: f64,
+    /// How long it has to stay that still before the limp ends.
+    pub limp_fall_still_ms: u64,
+    /// Hard cap on the limp, however the landing reads. A robot that never goes still —
+    /// held in someone's hands, or resting against something that keeps nudging it —
+    /// must not stay limp forever.
+    pub limp_fall_max_ms: u64,
+    /// How long the ramp back to the standing pose takes, once the robot has landed.
+    /// 0.6 s — settled on at the robot. The joints travel across the floor unloaded rather
+    /// than lifting anything, so a full second was mostly dead time before the stand-up;
+    /// 0.6 keeps some margin over the 0.3 that also worked.
+    pub limp_fall_pose_ms: u64,
+    /// Gain for that ramp. The joints have to actually travel across the floor, so it is
+    /// not the limp gain; it is the softened standing gain rather than the walking one.
+    pub limp_fall_pose_gain: u16,
 }
 
 impl Default for PolicyParams {
@@ -294,9 +391,17 @@ impl Default for SafetyParams {
             fall_debounce_ms: 200,
             deadman_ms: 500,
             gain_limp: 50,
-            fall_limp: false,
-            fall_recover: false,
             battery_empty_shutdown: true,
+            limp_fall: true,
+            limp_fall_tilt_z: -0.90,
+            limp_fall_predict_z: -0.5,
+            limp_fall_lookahead_ms: 300,
+            limp_fall_debounce_ms: 60,
+            limp_fall_still_rate: 1.0,
+            limp_fall_still_ms: 200,
+            limp_fall_max_ms: 1500,
+            limp_fall_pose_ms: 600,
+            limp_fall_pose_gain: 160,
         }
     }
 }
@@ -464,6 +569,24 @@ mod tests {
         path
     }
 
+    /// The capture device is derived from the playback one, and the derivation must be
+    /// idempotent: an operator who writes the full ALSA spec gets the device they wrote,
+    /// not one with a second subdevice glued on that no card answers to.
+    #[test]
+    fn the_capture_device_does_not_double_its_subdevice() {
+        let plain = AudioParams {
+            device: "plughw:aic3104".to_owned(),
+            ..AudioParams::default()
+        };
+        assert_eq!(plain.capture_device(), "plughw:aic3104,0");
+
+        let spelled_out = AudioParams {
+            device: "plughw:aic3104,0".to_owned(),
+            ..AudioParams::default()
+        };
+        assert_eq!(spelled_out.capture_device(), "plughw:aic3104,0");
+    }
+
     /// An unprovisioned board must still come up. A daemon that refuses to start because a
     /// config file is absent is far harder to diagnose on a robot than one running on
     /// documented defaults.
@@ -507,7 +630,7 @@ mod tests {
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);
         assert_eq!(from_file.policy.resolved(), built_in.policy.resolved());
-        assert_eq!(from_file.safety.fall_recover, built_in.safety.fall_recover);
+        assert_eq!(from_file.safety.limp_fall, built_in.safety.limp_fall);
         assert_eq!(
             from_file.safety.battery_empty_shutdown,
             built_in.safety.battery_empty_shutdown

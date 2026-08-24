@@ -359,6 +359,14 @@ cp "$BIN"/robotd staged/
 cp "$BIN"/configd staged/
 cp "$BIN"/btd staged/
 cp "$BIN"/padd staged/
+# The voice generator (postinstall renders the per-robot bank with it) and the
+# mic classifier pair — pet-detect for live listening, pet-features for training.
+cp "$BIN"/sounds staged/
+cp "$BIN"/pet-detect staged/
+cp "$BIN"/pet-features staged/
+# The head ToF daemon. Its unit is packaged below; a board with no sensor
+# fitted runs it anyway and says so, which is cheaper than a special case.
+cp "$BIN"/tofd staged/
 
 # No `--base-url`: the manifest `LocalDir` reads names the artifact by bare filename, and
 # `package` leaves it bare when no base is given.
@@ -386,6 +394,8 @@ cargo run -p xtask -- package \
     --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
     --include "padd/systemd/padd.service=systemd/padd.service" \
     --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+    --include "tof/systemd/tofd.service=systemd/tofd.service" \
+    --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
     --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
     --include "docs/design/architecture.md=docs/architecture.md" \
     --include "docs/design/updater-design.md=docs/updater-design.md" \
@@ -398,7 +408,8 @@ cargo run -p xtask -- package \
     --include "policies/ball_kick_right.onnx=policies/ball_kick_right.onnx" \
     --include "policies/roller.onnx=policies/roller.onnx" \
     --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx" \
-    --include "policies/roulade.onnx=policies/roulade.onnx"
+    --include "policies/roulade.onnx=policies/roulade.onnx" \
+    --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx"
 
 
 echo "==> signing with $KEY"

@@ -318,14 +318,45 @@ fn attitude(gravity: [f64; 3]) -> Pose {
 /// Turning the camera skips the wait: a hand on `[` must feel the view move.
 const RASTER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 
+/// One ToF return to overlay: a trunk-frame contact point, already classified
+/// and coloured by the caller. The view only knows how to draw it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Marker {
+    pub at: [f32; 3],
+    pub rgb: [u8; 3],
+}
+
+/// Markers farther than this from the trunk (horizontally) are not drawn: the
+/// view is about the robot's immediate surroundings, and framing a wall three
+/// metres out would shrink the robot to a speck. The depth panel still shows
+/// every range as a number.
+const MARKER_REACH: f32 = 0.45;
+
+/// How long the view holds a zoom level after the last point that needed it —
+/// see [`DuckView::settle_zoom`].
+const ZOOM_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Zoom quantum, metres of framed world.
+const ZOOM_STEP: f32 = 0.05;
+
+/// What the pixels were rendered through: azimuth bits, zoom bits, width, height.
+type CameraKey = (u32, u32, usize, usize);
+
 /// Scratch the renderer reuses frame to frame, plus the one piece of view state — where
 /// the camera stands. Owned by the monitor's `View`.
 pub struct DuckView {
     /// Camera azimuth, radians. Starts on the three-quarter view the sim opens with.
     azimuth: f32,
+    /// The zoom the view is currently committed to — the framed world, metres.
+    /// Grows the instant a marker needs the room, shrinks only after
+    /// [`ZOOM_HOLD`] without one: a view that breathes at the depth sensor's
+    /// frame rate is a view nobody can read.
+    zoom: f32,
+    /// When a marker last justified the current zoom.
+    zoom_needed_at: std::time::Instant,
     /// What the pixels currently hold: the pose it was rasterized from, the camera it
     /// was seen by, and when. `None` means the pixels are nothing at all.
-    cached: Option<(u64, (u32, usize, usize), std::time::Instant)>,
+    cached: Option<(u64, CameraKey, std::time::Instant)>,
     depth: Vec<f32>,
     pixels: Vec<[u8; 3]>,
     lit: Vec<bool>,
@@ -336,6 +367,8 @@ impl DuckView {
     pub fn new() -> Self {
         Self {
             azimuth: -0.7,
+            zoom: WINDOW,
+            zoom_needed_at: std::time::Instant::now(),
             cached: None,
             depth: Vec::new(),
             pixels: Vec::new(),
@@ -349,6 +382,19 @@ impl DuckView {
         self.azimuth = (self.azimuth + radians).rem_euclid(std::f32::consts::TAU);
     }
 
+    /// The zoom's hysteresis: out at once — a new far point must be seen *now* —
+    /// in only after [`ZOOM_HOLD`] with nothing needing the room, so the view
+    /// does not breathe at the depth sensor's frame rate. Quantized to
+    /// [`ZOOM_STEP`] bins so marker jitter cannot flap it either.
+    fn settle_zoom(&mut self, needed: f32, now: std::time::Instant) -> f32 {
+        let needed = (needed / ZOOM_STEP).ceil() * ZOOM_STEP;
+        if needed >= self.zoom || now.duration_since(self.zoom_needed_at) >= ZOOM_HOLD {
+            self.zoom = needed;
+            self.zoom_needed_at = now;
+        }
+        self.zoom
+    }
+
     /// Pose the model and draw it into `area`, two pixels per cell.
     ///
     /// `joints` is the wire's measured-angle array in `JOINT_NAMES` order and `gravity`
@@ -360,6 +406,7 @@ impl DuckView {
         model: &Model,
         joints: &[f64],
         gravity: [f64; 3],
+        markers: &[Marker],
         area: Rect,
         buf: &mut Buffer,
     ) {
@@ -368,12 +415,22 @@ impl DuckView {
             return;
         }
 
+        // The zoom settles before the cache is consulted, and rides in the camera
+        // key: a zoom-in fires five quiet seconds after the pose stopped changing,
+        // which is exactly when the pose key alone would say "nothing new".
+        let now = std::time::Instant::now();
+        let needed = markers
+            .iter()
+            .filter(|m| m.at[0].hypot(m.at[1]) <= MARKER_REACH)
+            .fold(WINDOW, |acc, m| acc.max(2.2 * m.at[0].hypot(m.at[1])));
+        let window = self.settle_zoom(needed, now);
+
         // Reuse the pixels when they still say the truth — same pose, or a pose newer
         // than [`RASTER_INTERVAL`] — but never across a camera change, which has to
-        // land on the very next paint.
-        let pose = pose_key(joints, gravity);
-        let camera = (self.azimuth.to_bits(), w, h);
-        let now = std::time::Instant::now();
+        // land on the very next paint. Markers are part of the pose key: a new
+        // depth frame is a new picture, still throttled by the same interval.
+        let pose = pose_key(joints, gravity, markers);
+        let camera = (self.azimuth.to_bits(), window.to_bits(), w, h);
         if let Some((cached_pose, cached_camera, at)) = self.cached
             && cached_camera == camera
             && (cached_pose == pose || now.duration_since(at) < RASTER_INTERVAL)
@@ -405,6 +462,17 @@ impl DuckView {
             }
             poses.push(pose);
         }
+
+        // Markers into world space through the trunk body's own pose — root rest
+        // offset included, not bare `attitude`: the baked root keeps its scene rest
+        // pose, and a marker missing it floats a body-height from the robot that
+        // saw it. Far returns are dropped rather than framed (see MARKER_REACH).
+        let trunk = poses.first().copied().unwrap_or(Pose::IDENTITY);
+        let in_world: Vec<([f32; 3], [u8; 3])> = markers
+            .iter()
+            .filter(|m| m.at[0].hypot(m.at[1]) <= MARKER_REACH)
+            .map(|m| (trunk.apply(m.at), m.rgb))
+            .collect();
 
         // Every vertex into world space once, kept, because it is read three ways:
         // to find the floor, to shade, and to rasterize.
@@ -438,7 +506,7 @@ impl DuckView {
             0.4 * right[2] + 0.6 * up[2] - 0.7 * fwd[2],
         ]);
 
-        let scale = (w as f32 / WINDOW).min(h as f32 / WINDOW);
+        let scale = (w as f32 / window).min(h as f32 / window);
         // The floor shift rides in the projection instead of re-touching every vertex:
         // the robot is drawn with its lowest point on z = 0, wherever the pose put it.
         let project = |v: [f32; 3]| -> [f32; 3] {
@@ -472,7 +540,48 @@ impl DuckView {
             }
         }
 
+        // The ToF contact points, in the same z-buffer as the mesh. Transformed by
+        // the trunk body's full pose — not bare `attitude` — because the baked root
+        // keeps its scene rest offset, and a marker missing that offset floats a
+        // body-height away from the robot that saw it.
+        for (at, rgb) in &in_world {
+            self.marker(*at, *rgb, w, h, project);
+        }
+
         self.blit(area, buf);
+    }
+
+    /// One contact point: a small plus-shaped blob, z-tested like everything
+    /// else so the robot's own body can stand in front of it.
+    fn marker(
+        &mut self,
+        at: [f32; 3],
+        rgb: [u8; 3],
+        w: usize,
+        h: usize,
+        project: impl Fn([f32; 3]) -> [f32; 3],
+    ) {
+        let p = project(at);
+        if !p[0].is_finite() || !p[1].is_finite() {
+            return;
+        }
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx * dx + dy * dy > 1 {
+                    continue; // a plus, not a square: rounder at this resolution
+                }
+                let (x, y) = (p[0] as i32 + dx, p[1] as i32 + dy);
+                if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                    continue;
+                }
+                let i = y as usize * w + x as usize;
+                if p[2] < self.depth[i] {
+                    self.depth[i] = p[2];
+                    self.pixels[i] = rgb;
+                    self.lit[i] = true;
+                }
+            }
+        }
     }
 
     /// The sim floor: grid lines on z = 0, sampled as points finer than a pixel and
@@ -595,7 +704,7 @@ fn rgb(c: [u8; 3]) -> Color {
 /// The pose, reduced to one comparable number. Angles are quantized to ~0.3° first:
 /// sensor noise wiggles every measurement, and re-rasterizing over a wiggle no cell
 /// can show would defeat the cache that keeps this view cheap.
-fn pose_key(joints: &[f64], gravity: [f64; 3]) -> u64 {
+fn pose_key(joints: &[f64], gravity: [f64; 3], markers: &[Marker]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for &j in joints {
@@ -603,6 +712,14 @@ fn pose_key(joints: &[f64], gravity: [f64; 3]) -> u64 {
     }
     for g in gravity {
         ((g * 100.0).round() as i64).hash(&mut hasher);
+    }
+    for marker in markers {
+        // Centimetre bins: finer motion than that is invisible at this resolution,
+        // and quantizing keeps sensor noise from defeating the cache entirely.
+        for c in marker.at {
+            ((c * 100.0).round() as i64).hash(&mut hasher);
+        }
+        marker.rgb.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -631,7 +748,7 @@ mod tests {
         let mut view = DuckView::new();
         let area = Rect::new(0, 0, 48, 40);
         let mut buf = Buffer::empty(area);
-        view.draw(model, &[0.0; 15], [0.0, 0.0, -1.0], area, &mut buf);
+        view.draw(model, &[0.0; 15], [0.0, 0.0, -1.0], &[], area, &mut buf);
 
         let drawn = (0..40u16)
             .flat_map(|y| (0..48u16).map(move |x| (x, y)))
@@ -641,6 +758,74 @@ mod tests {
             drawn > 200,
             "only {drawn} cells drawn — the robot is missing"
         );
+    }
+
+    /// The zoom's manners: out the instant a point needs the room, back in
+    /// only after five quiet seconds — never breathing at the sensor's rate.
+    #[test]
+    fn the_zoom_backs_out_instantly_and_creeps_back_in() {
+        let mut view = DuckView::new();
+        let t0 = std::time::Instant::now();
+
+        let wide = view.settle_zoom(0.9, t0);
+        assert!(
+            (wide - 0.9).abs() < ZOOM_STEP,
+            "zooming out must be instant"
+        );
+
+        // The far point is gone, but the hold is not up: the view stays put.
+        let held = view.settle_zoom(WINDOW, t0 + std::time::Duration::from_secs(2));
+        assert_eq!(held, wide, "two quiet seconds must not zoom back in");
+
+        // A fresh far point re-arms the hold without changing the zoom.
+        view.settle_zoom(0.9, t0 + std::time::Duration::from_secs(4));
+        let still = view.settle_zoom(WINDOW, t0 + std::time::Duration::from_secs(8));
+        assert_eq!(still, wide, "the hold restarts with every far point");
+
+        // Five quiet seconds later, the view comes home.
+        let home = view.settle_zoom(WINDOW, t0 + std::time::Duration::from_secs(10));
+        assert!(home < wide, "after the hold the zoom must come back in");
+    }
+
+    /// A contact point must actually reach the pixels — its own colour, in
+    /// frame thanks to the auto-zoom — while one beyond [`MARKER_REACH`] is
+    /// dropped rather than shrinking the robot to frame it. And a vanished
+    /// point must vanish (markers are part of the cache key), once the raster
+    /// throttle's 80 ms window has passed.
+    #[test]
+    fn a_tof_marker_paints_its_colour_and_a_far_one_is_dropped() {
+        let model = model().unwrap();
+        let mut view = DuckView::new();
+        let area = Rect::new(0, 0, 48, 40);
+        let mut buf = Buffer::empty(area);
+        let rgb = [225, 200, 70];
+        let near = Marker {
+            at: [0.35, 0.0, -0.05],
+            rgb,
+        };
+        let far = Marker {
+            at: [2.0, 0.0, -0.05],
+            rgb,
+        };
+        view.draw(
+            model,
+            &[0.0; 15],
+            [0.0, 0.0, -1.0],
+            &[near, far],
+            area,
+            &mut buf,
+        );
+
+        let painted = view.pixels.iter().filter(|p| **p == rgb).count();
+        assert!(
+            (3..=10).contains(&painted),
+            "one marker should paint one small blob, not {painted} pixels"
+        );
+
+        std::thread::sleep(RASTER_INTERVAL + std::time::Duration::from_millis(10));
+        view.draw(model, &[0.0; 15], [0.0, 0.0, -1.0], &[], area, &mut buf);
+        let stale = view.pixels.iter().filter(|p| **p == rgb).count();
+        assert_eq!(stale, 0, "a vanished marker must vanish from the pixels");
     }
 
     /// Optional visual check for humans: `DUCK_DUMP=/tmp/duck.ppm cargo test -p robotctl`
@@ -661,9 +846,30 @@ mod tests {
                 *j = v.parse().unwrap();
             }
         }
+        // `DUCK_MARKERS=demo` runs a synthetic depth frame — a wall ahead over a
+        // visible floor — through the real reprojector, head pitched down, so
+        // the whole marker pipeline can be eyeballed without a robot.
+        let mut markers = Vec::new();
+        if std::env::var("DUCK_MARKERS").as_deref() == Ok("demo") {
+            joints[6] = 0.5;
+            let rp = kinematics::tof::Reprojector::alpha();
+            let head = [joints[5], joints[6], joints[7], joints[8]];
+            let ranges = [Some(0.35f64); kinematics::tof::ROWS * kinematics::tof::COLS];
+            for zone in rp.project(&ranges, head, &kinematics::tof::Posture::default()) {
+                let (point, rgb) = match zone {
+                    kinematics::tof::Zone::Hit { point, .. } => (point, [225, 200, 70]),
+                    kinematics::tof::Zone::Floor { point } => (point, [70, 160, 80]),
+                    _ => continue,
+                };
+                markers.push(Marker {
+                    at: point.map(|v| v as f32),
+                    rgb,
+                });
+            }
+        }
         let area = Rect::new(0, 0, 100, 100);
         let mut buf = Buffer::empty(area);
-        view.draw(model, &joints, [0.0, 0.0, -1.0], area, &mut buf);
+        view.draw(model, &joints, [0.0, 0.0, -1.0], &markers, area, &mut buf);
         let (w, h) = (100usize, 200usize);
         let mut out = format!("P6 {w} {h} 255\n").into_bytes();
         for y in 0..h {
@@ -686,13 +892,25 @@ mod bench {
 
     /// Not a benchmark harness, a stopwatch: `cargo test -p robotctl --release
     /// frame_cost -- --nocapture` prints what the view costs per frame, split into the
-    /// three paths a live monitor actually takes — a full re-raster (the camera or the
-    /// pose moved), and the cached blit every other repaint gets — at the panel sizes
-    /// the layout actually deals. Run it *on the board* to know what the robot pays:
-    /// compute there is shared with the control loop this view watches.
+    /// paths a live monitor actually takes — a full re-raster (the camera or the
+    /// pose moved), the same with a worst-case beam overlay, and the cached blit every
+    /// other repaint gets — at the panel sizes the layout actually deals. Run it *on
+    /// the board* to know what the robot pays: compute there is shared with the
+    /// control loop this view watches.
     #[test]
     fn frame_cost() {
         let model = model().unwrap();
+        // Worst case: all 64 zones return, spread around the robot in frame.
+        let markers: Vec<Marker> = (0..64)
+            .map(|i| Marker {
+                at: [
+                    0.30,
+                    (i % 8) as f32 * 0.05 - 0.18,
+                    (i / 8) as f32 * 0.05 - 0.18,
+                ],
+                rgb: [225, 200, 70],
+            })
+            .collect();
         // (cells wide, cells tall): the narrowest panel the layout accepts, and the
         // widest it ever grants, at a tall terminal.
         for (w, h) in [(26u16, 24u16), (44, 40), (62, 48)] {
@@ -701,30 +919,32 @@ mod bench {
             let mut buf = Buffer::empty(area);
             let joints = [0.1f64; 15];
 
-            let mut time = |view: &mut DuckView, n: u32, step: Step| {
+            let mut time = |view: &mut DuckView, n: u32, rays: &[Marker], step: Step| {
                 let mut j = joints;
                 let start = std::time::Instant::now();
                 for i in 0..n {
                     step(view, i, &mut j);
-                    view.draw(model, &j, [0.05, 0.02, -1.0], area, &mut buf);
+                    view.draw(model, &j, [0.05, 0.02, -1.0], rays, area, &mut buf);
                 }
                 start.elapsed() / n
             };
 
             // Every frame re-rasters: the camera moved, which bypasses the pose cache.
-            let raster = time(&mut view, 200, &mut |v, _, _| v.orbit(0.013));
+            let raster = time(&mut view, 200, &[], &mut |v, _, _| v.orbit(0.013));
+            // The same, drawing a full 64-point depth frame on top.
+            let rays = time(&mut view, 200, &markers, &mut |v, _, _| v.orbit(0.013));
             // Every frame re-rasters: the pose moved past the 0.3° quantum. The cache's
             // 80 ms gate is what spares the board this at 50 Hz; it is bypassed here by
             // clearing the stamp, because the gate is the thing being priced.
-            let pose = time(&mut view, 200, &mut |v, i, j| {
+            let pose = time(&mut view, 200, &[], &mut |v, i, j| {
                 j[3] = 0.1 + 0.02 * f64::from(i);
                 v.cached = None;
             });
             // Nothing changed: the path a 50 Hz stream takes ~5 frames out of 6.
-            let blit = time(&mut view, 500, &mut |_, _, _| {});
+            let blit = time(&mut view, 500, &[], &mut |_, _, _| {});
 
             println!(
-                "{w:>3}x{h:<3} cells   raster {raster:>10.2?}   pose-change {pose:>10.2?}   cached blit {blit:>10.2?}"
+                "{w:>3}x{h:<3} cells   raster {raster:>10.2?}   +64 points {rays:>10.2?}   pose-change {pose:>10.2?}   cached blit {blit:>10.2?}"
             );
         }
     }

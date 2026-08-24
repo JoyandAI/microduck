@@ -149,12 +149,12 @@ Where the data goes, once per period:
                      │
                      │  [f64; 15] proposed targets
                      ▼
-        ╔════════════════════════════════════════════╗
-        ║  safety.apply   ← owns the only RobotIo     ║
-        ║  · refuse non-finite                        ║
-        ║  · clamp to actuator range                  ║
-        ║  · fallen → hold pose, soft gain (a mode)   ║
-        ╚════════════════════════════════════════════╝
+        ╔═════════════════════════════════════════════╗
+        ║  safety.apply   ← owns the only RobotIo      ║
+        ║  · refuse non-finite                         ║
+        ║  · clamp to actuator range                   ║
+        ║  · no fall gate — the verdict only reports   ║
+        ╚═════════════════════════════════════════════╝
                      │  sync_write goal positions
                      ▼
               Dynamixel bus
@@ -177,9 +177,9 @@ And the decisions around it, which the dataflow above does not show:
     read ─┬─ ok  ─► clear the consecutive-error count
           └─ err ─► count++, sensors = None   (the tick still runs)
 
-    observe → fallen?
+    observe → fallen?     published; gates nothing
 
-    driving = enabled ∧ policy loaded ∧ ¬fallen ∧ sensors this tick
+    driving = enabled ∧ policy loaded ∧ sensors this tick ∧ ¬limp-fall
 
     edges ─┬─ started driving ──► controller.reset()
            │                      else a stale last action, or a filter anchored to
@@ -187,8 +187,9 @@ And the decisions around it, which the dataflow above does not show:
            └─ stopped driving ──► hold = current pose, captured once
                                   re-reading each tick would sag under gravity
 
-    driving ─┬─ yes ─► step() → targets, gain, the active net's name
-             └─ no  ─► targets = hold, default gain, "held"
+    driving ─┬─ limp-fall ─► the sequence's own targets and gain    (§2.4.1)
+             ├─ yes ──────► step() → targets, gain, the active net's name
+             └─ no  ──────► targets = hold, default gain, "held"
 
     safety.apply(targets, hold, gain)
 
@@ -198,7 +199,9 @@ And the decisions around it, which the dataflow above does not show:
 
 The four conditions on `driving` are each load-bearing. `sensors this tick` is the non-obvious
 one: a read that failed leaves nothing to build an observation from, and inventing one would
-feed the policy a robot that does not exist.
+feed the policy a robot that does not exist. `¬limp-fall` is the one that is not a refusal —
+while the limp-fall sequence owns the robot (§2.4.1) the policy is deliberately not driving,
+and the targets come from the sequence instead.
 
 The loop stays a `tokio` task with `interval`. It is not being made real-time (§5.4). One
 change from the runtime is worth naming: **`MissedTickBehavior::Skip`**. `Burst` fires the
@@ -435,20 +438,53 @@ Two rules, unconditional:
 
 Plus a deadman on the command: if intents stop arriving, the velocity goes to zero. **Stop is
 not limp**, and the distinction matters — losing comms makes the robot *stand still*, because
-standing is the safe state for a biped; losing balance makes it yield. Two events, two
-responses, written down rather than inferred from whichever got implemented first.
+standing is the safe state for a biped; losing balance is a different event, and this layer
+does not answer it.
 
-**Fall → limp is a mode, not a rule, and it ships off.** The fall *verdict* is always computed
-— projected gravity in the trunk frame, debounced 0.2 s so a firm footfall is not a fall — and
-always reported. What the flag changes is only whether it preempts the policy. The prototype
-never limps on a fall: its `--fall-detect` defaults off and doubles as auto-recovery when on,
-and a robot that yields the moment gravity misreads a lean is a robot that keeps sitting down
-while someone handles it. Fall recovery needs the limp for its settle phase, so `robotd` turns
-`fall_limp` on whenever `fall_recover` is on. An earlier draft of this document said the limp
-was unconditional; it is not, and the difference is visible the first time someone tips the
-robot.
+**The fall verdict is a report, not a rule.** It is computed every tick — projected gravity in
+the trunk frame, debounced 0.2 s so a firm footfall is not a fall — and published, and it
+**gates nothing**: a fallen robot is enabled, init'd, driven and sent skills exactly like an
+upright one. That is deliberate. Being on the floor is precisely when someone needs those
+calls to work, and a robot that yields the moment gravity misreads a lean is a robot that
+keeps sitting down while someone handles it. It is also what lets the answer to a fall live
+above this layer with no exemption to special-case: earlier revisions had a `fall_limp` gate
+and a `fall_recover` auto-stand-up here, and both were removed, because a safety rule that
+recovery has to bypass in order to work is not one.
 
-A spent pack is the one other condition that moves the robot on its own: with
+#### 2.4.1 Falling is a third event
+
+The fall verdict above answers "is the robot down". That is the right question for reporting
+a robot lying on its side, and the wrong one for softening a landing: gravity past
+`fall_gravity_z` held for 200 ms *is* the robot on the floor, and the window worth acting in
+has closed by then.
+
+So `limp_fall` (on by default since it was validated on a robot) runs a second, separate
+detector — `duck_control::fall` — on the rate rather than the position. Projected gravity
+rotates with the trunk, so `ġ = −ω × g` is exact and comes straight from the gyro in the same
+12-byte IMU block; extrapolating it over ~0.3 s says where gravity is heading. It fires when
+the robot is already tilted (≈26°), still tipping over rather than recovering, and predicted
+past the fall threshold — debounced three ticks. Differentiating the SFLP quaternion instead
+would add the filter's lag to the one number whose whole value is being early.
+
+What it buys is not the landing itself but the stand-up after it. The standing policy gets a
+still robot in a known posture up cleanly and a thrashing one up only after several attempts
+at walking gain against the floor, which is where the load on the motors comes from. So the
+sequence takes the fall away from the policy: limp at `gain_limp` following the joints down,
+wait for the gyro to go quiet, ramp back to the standing pose over ~1 s, hand over. The
+hand-back is nothing more than that — the twist has been held at zero throughout, so command
+magnitude selects the standing network, and that is the stand-up.
+
+It runs off the policy's path by construction: `driving` is false for the whole sequence
+(§1.4), so the targets come from the sequence rather than the controller, and they reach the
+motors through `apply` like anything else — no exemption, no back door. Nothing in `safety`
+needs telling, precisely because the verdict gates nothing: the pose ramp moves a robot lying
+on the floor like any other tick.
+
+The tuning is the feature, and it is asymmetric: a false positive is a fall the robot
+*caused*, which is worse than the stiff landing it was trying to avoid. The defaults sit
+deliberately on the late side.
+
+A spent pack is the other thing that moves the robot without being asked: with
 `safety.battery_empty_shutdown` (on by default), reaching the empty floor on the smoothed
 voltage sits the robot down and powers the board off. The EMA moves over ~10 s, so a load sag
 cannot trip it — reaching 6.6 V requires a genuinely empty pack.
@@ -571,7 +607,7 @@ wrote positions, and the servos ignored them. So the loop has a bring-up state, 
 `robot.enable` is what advances it:
 
 ```
-Limp ──enable (policy loaded, not fallen)──▶ Homing (torque on, 2 s ramp) ──▶ Ready ──▶ policy drives
+Limp ──enable (policy loaded, a fresh sample)──▶ Homing (torque on, 2 s ramp) ──▶ Ready ──▶ policy drives
 ```
 
 **The invariant the old rule protected is unchanged: nothing here happens because a process
@@ -581,15 +617,18 @@ any write rather than on a write of `false`. What changed is that "never touch t
 broader rule than the property it was defending, and it put a manual step in front of every
 drive.
 
-Three conditions gate the bring-up, each for its own reason:
+Two conditions gate the bring-up, each for its own reason:
 
 - **A loaded policy.** `enable` means "enable the policy"; powering the joints to run one that
   is disabled or would not load would stand a robot up on a broken release and then hold it.
-- **Not fallen.** `Safety::apply` commands a fallen robot at limp gain and holds it, so a ramp
-  there would be writing a stand-up that cannot happen. `robot.enable` refuses in that state and
-  says to stand the robot up first.
 - **A fresh sample.** The ramp starts from where the joints are. Starting from a position nobody
   read is the lurch the ramp exists to avoid.
+
+**Being down is not one of them.** An earlier revision refused there, back when `apply` held a
+fallen robot at limp gain and a ramp would have been writing a stand-up that could not happen;
+it went when the verdict stopped gating anything (§2.4). Start on a robot lying on the floor is
+exactly how someone asks it to stand back up — the ramp runs like any other, and the standing
+policy takes it from there.
 
 Torque is *not* dropped when the policy is disabled again: the robot holds its pose, which is
 what "a standing robot stays standing" means on this side too.
@@ -787,7 +826,7 @@ the boot counter.
 gamepad client. Done when: it walks on a board, driven through the intent API; an update applied
 with `robotctl` restarts it cleanly with the gate passing; and `--unhealthy` still rolls back.
 
-Everything since — the skill chain, the bring-up state machine, the roller preset, fall recovery —
+Everything since — the skill chain, the bring-up state machine, the roller preset, limp-fall —
 arrived on top of that shape rather than changing it.
 
 ### 5.4 Not regressing is the acceptance criterion
@@ -804,8 +843,10 @@ way while the code around it gets simpler.
 
 - health goes false when deadlines are missed;
 - startup adopts the current pose and never commands motion;
-- safety clamps a policy output past a joint limit, and fall → limp preempts a running policy when
-  the mode is on;
+- safety refuses a non-finite target and clamps one past the actuator's range, and a fall
+  preempts neither the policy nor the caller's gain;
+- the limp-fall predictor fires on a fall and not on a footfall or a static tilt, and its pose
+  ramp ends at the standing pose;
 - deadman zeroes velocity when intents stop;
 - **golden observation vectors** — `(inputs, expected 61-float array)` pairs exported from mjlab and
   committed. A wrong index in the observation does not fail loudly; it produces a plausible robot
@@ -825,6 +866,7 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 | policy path in params, default = release dir | updates carry the policy; devs override it |
 | adopt current pose on start | an update must not move a standing robot |
 | bring-up as a state machine, not a flag | `set_torque` is a transaction per joint |
+| the fall verdict reports, it does not gate | what to do about a fall is a control decision (§2.4) |
 | no odometry | nothing reads it; one 50 Hz rate instead of 50/100 |
 | the priority chain keeps the runtime's shape | the skills were tuned against its quirks |
 | gamepad as its own crate | keeps `gilrs` out of the recovery CLI |

@@ -40,6 +40,7 @@ use duck_ipc_proto as proto;
 
 mod duck;
 mod monitor;
+mod path_map;
 
 /// Exit codes. Stable — CI asserts on these.
 mod exit {
@@ -90,6 +91,13 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::PAD)]
     pad_socket: PathBuf,
 
+    /// Path to `tofd`'s depth stream, which `monitor` draws the ToF matrix from.
+    ///
+    /// Optional in the same sense as the pad tap, and more often absent: most ducks
+    /// have no ToF fitted, and `monitor` says so in the block rather than failing.
+    #[arg(long, global = true, default_value = proto::socket::TOF)]
+    tof_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -121,6 +129,11 @@ enum Namespace {
         #[command(subcommand)]
         command: RobotCommand,
     },
+
+    /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
+    /// is generated from its SoC serial, so the one that answers — in a voice that is only
+    /// its own — is the one you're SSH'd into.
+    Quack,
 
     /// The gamepad. Pair one, see what is paired, forget one.
     ///
@@ -290,8 +303,8 @@ enum RobotCommand {
     /// robot with no walking network can still stand — and it is what the gamepad's Start does on
     /// its way to driving, so running this by hand is for the bench rather than the everyday path.
     ///
-    /// Refused on a fallen robot only when `[safety] fall_limp` or `fall_recover` arms the
-    /// fall gate — by default it works whatever gravity says, as the prototype does.
+    /// Works whatever gravity says — a robot lying on the floor is exactly the one that
+    /// needs it, and being down never refuses anything.
     Init {
         #[arg(long)]
         json: bool,
@@ -330,6 +343,47 @@ enum RobotCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Point the camera at a trunk-frame point: X forward, Y left, Z up, metres.
+    ///
+    /// The daemon runs the gaze IK against its own robot model and moves the head — no sign
+    /// conventions to remember. `robotctl robot look 1 0 0` looks straight ahead;
+    /// `1 0.5 -0.1` looks ahead-left and slightly down. A point beyond the head's reach gets
+    /// the closest gaze the joints allow, and says so.
+    // `allow_negative_numbers`, or `look 0.3 0 -0.3` reads `-0.3` as a flag —
+    // and looking down is the single most common thing to ask a duck.
+    #[command(allow_negative_numbers = true)]
+    Look {
+        x: f64,
+        y: f64,
+        z: f64,
+        /// Neck posture to aim around, radians. The IK holds it rather than solving it.
+        #[arg(long, default_value_t = 0.0)]
+        neck_pitch: f64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `robotctl quack` — the loudest way to tell ducks apart. SSH into one, quack it, and the
+/// robot that answers in its own voice is the one you're talking to: every voice bank is
+/// seeded from the SoC serial, so the voice itself is an identity.
+fn run_quack(socket: &Path) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    let result = result_of(client.call(&proto::Call::RobotSound(proto::SoundParams {
+        tag: proto::SoundTag::Chirp,
+        hold: None,
+    }))?)?;
+    let outcome: proto::IntentResult = decode(&result)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
+    println!("🦆");
+    Ok(())
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -1770,6 +1824,21 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             *json,
         ),
         RobotCommand::Mode { json } => (proto::Call::RobotMode, *json),
+        RobotCommand::Look {
+            x,
+            y,
+            z,
+            neck_pitch,
+            json,
+        } => (
+            proto::Call::RobotLook(proto::LookParams {
+                x: *x,
+                y: *y,
+                z: *z,
+                neck_pitch: *neck_pitch,
+            }),
+            *json,
+        ),
     };
 
     let result = result_of(client.call(&call)?)?;
@@ -1782,6 +1851,24 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     if let RobotCommand::Mode { .. } = command {
         let mode: proto::ModeResult = decode(&result)?;
         println!("{}", mode.mode);
+        return Ok(());
+    }
+
+    // `look` answers with the joints it chose, not an intent result.
+    if let RobotCommand::Look { .. } = command {
+        let look: proto::LookResult = decode(&result)?;
+        println!(
+            "head → neck_pitch {:+.2}  head_pitch {:+.2}  head_yaw {:+.2}  head_roll {:+.2} rad{}",
+            look.head.neck_pitch,
+            look.head.head_pitch,
+            look.head.head_yaw,
+            look.head.head_roll,
+            if look.clamped {
+                "\nout of reach — this is the closest the head can look"
+            } else {
+                ""
+            }
+        );
         return Ok(());
     }
 
@@ -1798,7 +1885,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
         RobotCommand::Relax { .. } => println!("torque off"),
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
-        RobotCommand::Mode { .. } => unreachable!("answered above"),
+        RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())
 }
@@ -2362,7 +2449,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return run_version(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }
         Namespace::Monitor { hz, json } => {
-            return monitor::run(&cli.robot_socket, &cli.pad_socket, hz, json);
+            return monitor::run(
+                &cli.robot_socket,
+                &cli.pad_socket,
+                &cli.tof_socket,
+                hz,
+                json,
+            );
         }
         // Pure codegen: no socket, no daemon, no root. It must keep working on a robot
         // where nothing is running, since that is where an operator most wants to type
@@ -2387,6 +2480,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
+        }
+        Namespace::Quack => {
+            return run_quack(&cli.robot_socket);
         }
         Namespace::Update { command } => command,
     };

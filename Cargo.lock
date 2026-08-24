@@ -68,6 +68,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "approx"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -433,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "btd"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "bluer",
  "btleplug",
@@ -654,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "configd"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -1007,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "duck-control"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "duck-ipc-proto",
  "libloading 0.8.9",
@@ -1021,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "duck-ipc-proto"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "semver",
  "serde",
@@ -1448,6 +1454,12 @@ checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
 
 [[package]]
 name = "http"
@@ -1917,6 +1929,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kinematics"
+version = "0.9.1"
+dependencies = [
+ "roxmltree",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2322,6 +2344,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "odometry"
+version = "0.9.1"
+dependencies = [
+ "duck-ipc-proto",
+ "kinematics",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2370,7 +2400,7 @@ checksum = "06503bb33f294c5f1ba484011e053bfa6ae227074bdb841e9863492dc5960d4b"
 
 [[package]]
 name = "padd"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -2468,6 +2498,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pet-detect"
+version = "0.9.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hound",
+ "ort",
+ "rustfft",
+ "tracing",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2553,6 +2595,15 @@ name = "powerfmt"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
+
+[[package]]
+name = "primal-check"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc0d895b311e3af9902528fbb8f928688abbd95872819320517cc24ca6b2bd08"
+dependencies = [
+ "num-integer",
+]
 
 [[package]]
 name = "proc-macro-crate"
@@ -2846,11 +2897,12 @@ dependencies = [
 
 [[package]]
 name = "robotctl"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "clap",
  "clap_complete",
  "duck-ipc-proto",
+ "kinematics",
  "libc",
  "ratatui",
  "semver",
@@ -2860,18 +2912,22 @@ dependencies = [
 
 [[package]]
 name = "robotd"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "arc-swap",
  "clap",
  "duck-control",
  "duck-ipc-proto",
+ "kinematics",
  "libc",
  "minisign",
+ "odometry",
+ "pet-detect",
  "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sounds",
  "tar",
  "tempfile",
  "test-support",
@@ -2882,6 +2938,15 @@ dependencies = [
  "tracing-subscriber",
  "updater",
  "zstd",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -2918,6 +2983,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustfft"
+version = "6.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21db5f9893e91f41798c88680037dba611ca6674703c1a18601b01a72c8adb89"
+dependencies = [
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "primal-check",
+ "strength_reduce",
+ "transpose",
 ]
 
 [[package]]
@@ -3336,6 +3415,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sounds"
+version = "0.9.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hound",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3346,6 +3435,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "strength_reduce"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
 
 [[package]]
 name = "strsim"
@@ -3485,7 +3580,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "clap",
  "minisign",
@@ -3591,6 +3686,22 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tof"
+version = "0.9.1"
+dependencies = [
+ "anyhow",
+ "cc",
+ "clap",
+ "duck-ipc-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "tokio"
@@ -3839,6 +3950,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "transpose"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
+dependencies = [
+ "num-integer",
+ "strength_reduce",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3907,7 +4028,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -4481,7 +4602,7 @@ checksum = "636f85e5ca6488e96401b61eb7de54f4e44755c988af0f52cf90230c312a1a89"
 
 [[package]]
 name = "xtask"
-version = "0.7.0"
+version = "0.9.1"
 dependencies = [
  "clap",
  "minisign",

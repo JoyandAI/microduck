@@ -47,43 +47,63 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-./scripts/provision-board.sh --weird-ble --name <MY_COOL_ROBOT_NAME> radxa@192.168.1.42
+./scripts/provision-board.sh --pause-btd-on-pair --name <MY_COOL_ROBOT_NAME> radxa@192.168.1.42
 ```
 
 That sends your dev key, starts provisioning, waits out the reboot, streams the log, and ends on
 `robotctl health`.
 
-### Why `--weird-ble` is in that command
+### Why `--pause-btd-on-pair` is in that command
 
-Roughly half the Radxa Zero 3W units here cannot bond a gamepad under BlueZ's default settings, and
-nothing measurable tells them apart from the ones that can — same kernel, same BlueZ, same firmware
-bytes. So the flag is the default here: a board that needed it and was provisioned without it
-presents as a gamepad that will not pair, for no visible reason — and every plausible cause you
-chase first is somewhere else entirely. A board that did not need it pays a smaller price, described
-below.
+On the aic8800 radio a pad cannot form a **new** bond while `btd` is advertising. That flag leaves a
+marker so `robotctl pad pair` stops `btd` and power-cycles the adapter for the pairing window, then
+starts it again. An existing bond is unaffected — a bonded pad connects and drives with the whole
+stack up — so the cost is one daemon being down for the length of a pairing.
 
-**Drop it once you know the board is fine.** On a board that bonds a pad under the defaults, the flag
-buys nothing and costs something real: `Privacy = device` means a pad cannot form a *new* bond while
-`btd` advertises, so `robotctl pad pair` has to stop `btd` and power-cycle the adapter for every
-pairing. To find out, and to undo it:
+It is the default here because a board that needed it and was provisioned without it presents as a
+gamepad that will not pair, and every plausible cause you chase first is somewhere else.
+
+### The three configurations, and how to tell which you have
+
+There are two independent faults, so there are two flags. **Pair a pad and read the failure**, then
+pick:
+
+| what you see | what the board wants |
+|---|---|
+| the pad bonds and drives | nothing — provision with no flag |
+| the pad will not bond; the last SMP step never completes | `--pause-btd-on-pair` |
+| the pad will not bond even with `btd` paused | `--weird-ble` (implies the pause, and adds `Privacy = device`) |
+| the pad bonds, then **flaps** — `PIN or Key Missing (0x06)`, no input device | `--weird-ble` is wrong for this board: drop it, keep the pause |
+
+That last row is the one to watch for. `Privacy = device` on a board that only needed the pause
+produces a bond that immediately stops working, which is harder to diagnose than a pad that plainly
+will not pair — measured on `50:37:CD:16:1D:90`, where `off` plus the pause bonds and holds while
+`device` flaps 46 times in 45 seconds. `--weird-ble` is therefore **not** the default any more.
+
+To move a board from `--weird-ble` to the pause alone, keeping the marker:
 
 ```bash
-sudo rm /var/lib/robot/weird-ble
+sudo sed -i 's/^Privacy = device/Privacy = off/' /etc/bluetooth/main.conf && sudo reboot
 ```
 
-```bash
-sudo sed -i '/^Privacy = device/d' /etc/bluetooth/main.conf && sudo reboot
-```
-
-Then pair a pad. If it bonds, that board never needed the flag — provision it without one next time.
-If it does not, put both back with the copy of the script provisioning leaves on the board:
+To go the other way, with the copy of the script provisioning leaves on the board:
 
 ```bash
 sudo DUCK_WEIRD_BLE=1 /usr/local/sbin/robot-setup-board && sudo reboot
 ```
 
-Both are workarounds for the aic8800 radio, not properties of the design; they go when the radio
-does. [`pair-a-gamepad.md`](pair-a-gamepad.md) has the detail.
+And to check a board needs neither, drop both and pair a pad:
+
+```bash
+sudo rm /var/lib/robot/weird-ble
+sudo sed -i '/^Privacy = /d' /etc/bluetooth/main.conf && sudo reboot
+```
+
+Re-pair after any change to `Privacy`: it changes the address the stored keys were derived against,
+so existing bonds stop matching and flap with `PIN or Key Missing` until they are re-made.
+
+All of this is a workaround for the aic8800 radio, not a property of the design; it goes when the
+radio does. [`pair-a-gamepad.md`](pair-a-gamepad.md) has the detail.
 
 It is a **viewer**, not the thing doing the work — provisioning installs a systemd unit that
 resumes at boot, so the board finishes whether or not you are still watching. Ctrl-C costs you

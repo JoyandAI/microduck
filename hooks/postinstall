@@ -45,6 +45,15 @@ for script in robot-rescue robot-boot-check; do
         || echo "postinstall: cannot install ${script}; the board keeps the previous copy" >&2
 done
 
+# The robot's voice bank, rendered from the SoC serial by the release's own generator.
+# Idempotent — a marker records the seed and bank version, and a current bank is a no-op —
+# so this runs on every install and only actually renders on the first one (or when the
+# synth's bank version bumps). A warning, not a failure: a robot without a voice walks.
+if [ -x bin/sounds ]; then
+    bin/sounds ensure-bank --dir /var/lib/robot/sounds \
+        || echo "postinstall: could not render the voice bank; the robot stays quiet" >&2
+fi
+
 [ -d systemd ] || exit 0
 
 # Users and groups before units: a unit naming a `User=` that does not exist fails to start, and

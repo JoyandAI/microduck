@@ -112,7 +112,23 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `robot.mouth`, `robot.shutdown` (sit, then power off) and `robot.mode` (walk vs roller),
 /// ported from `microduck_runtime`; `robot.enable` gains `toggle`, the pad's Start
 /// evaluated robot-side. Additive, and bumps anyway, per the rule above.
-pub const API_VERSION: u32 = 9;
+///
+/// # v10 — `robot.sound`
+///
+/// The robot's voice: play a voice-bank tag (chirp, greet, coo, ...), with `wheee` as a
+/// held ride the client keeps alive per tick. Additive, same rule.
+///
+/// # v11 — `tof.stream`
+///
+/// The head ToF sensor's 8×8 depth frames, served by `tofd` on its own socket. A new
+/// namespace, like `pad.*` was: nothing existing changes shape, and a client built before
+/// this simply never asks.
+///
+/// # v12 — `robot.look`
+///
+/// Gaze as a point instead of joint angles: `robot.head`'s doc always promised both forms,
+/// and this is the second one — the daemon runs the IK and answers with the joints it chose.
+pub const API_VERSION: u32 = 12;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -134,6 +150,11 @@ pub mod socket {
     /// directory when the unit stops, so a socket left behind cannot outlive the daemon that
     /// would have answered on it.
     pub const PAD: &str = "/run/padd/pad.sock";
+
+    /// `tofd`'s depth stream — [`super::method::TOF_STREAM`], and nothing else.
+    /// Under `/run/tofd/` for the same reason as the pad's: it is that unit's
+    /// `RuntimeDirectory=`, so systemd removes the socket when the daemon stops.
+    pub const TOF: &str = "/run/tofd/tof.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -239,6 +260,9 @@ pub mod method {
     pub const ROBOT_MOVE: &str = "robot.move";
     /// Head joint targets. Continuous; send as a notification.
     pub const ROBOT_HEAD: &str = "robot.head";
+    /// Point the camera at a trunk-frame point; the daemon runs the gaze IK.
+    /// Discrete; send as a request — the answer says what the head will do.
+    pub const ROBOT_LOOK: &str = "robot.look";
     /// Stop moving — zero the velocity. Not "go limp".
     pub const ROBOT_STOP: &str = "robot.stop";
     /// Turn policy execution on or off.
@@ -286,6 +310,17 @@ pub mod method {
     /// Mouth opening, 0 (closed) to 1 (open). Continuous; send as a notification. The mouth
     /// is not part of any policy — this is the only thing that moves it.
     pub const ROBOT_MOUTH: &str = "robot.mouth";
+    /// Play one of the robot's voice-bank sounds — chirp, greet, coo... `wheee` is the
+    /// held ride: `hold: true` starts it and must keep arriving (a notification per tick,
+    /// like the mouth) or the ride ends; `hold: false` releases it deliberately. The two
+    /// endings differ: a deliberate release cuts the ride, a hold that stops arriving plays
+    /// it out through its end segment.
+    ///
+    /// Refused, with a reason, by a robot that has no voice — audio disabled, or no bank
+    /// rendered. Sounds are never refused for circumstance (a chirp out of a fallen robot
+    /// is diagnostics, not danger), but "accepted" from a robot that cannot make a sound
+    /// would make `robotctl quack` lie about which duck answered.
+    pub const ROBOT_SOUND: &str = "robot.sound";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
     /// Which drive mode this `robotd` was configured with: `walk` or `roller`.
@@ -372,6 +407,22 @@ pub mod method {
 
     /// One report from the pad, pushed after [`PAD_INPUT`].
     pub const PAD_REPORT: &str = "pad.report";
+
+    // ── tof.* ────────────────────────────────────────────────────────────────
+    /// Subscribe to the head ToF sensor's depth frames, on [`super::socket::TOF`].
+    ///
+    /// **The one method in this namespace, and `tofd` answers it itself.** Like
+    /// the pad tap, this is a sensor stream on the socket of the daemon that owns
+    /// the sensor — `robotd` is not in the path, because nothing in the control
+    /// loop reads depth and putting perception in front of it would be the
+    /// coupling `architecture.md` §1 splits `mediad` off to avoid.
+    ///
+    /// The answer describes the sensor (or says why there is none); frames then
+    /// arrive as [`TOF_FRAME`] notifications until the connection closes.
+    pub const TOF_STREAM: &str = "tof.stream";
+
+    /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
+    pub const TOF_FRAME: &str = "tof.frame";
 }
 
 /// JSON-RPC error codes.
@@ -461,6 +512,8 @@ pub enum Call {
     RobotMove(MoveParams),
     /// Continuous. Send as a notification.
     RobotHead(HeadParams),
+    /// Discrete. Send as a request; the answer is [`LookResult`].
+    RobotLook(LookParams),
     RobotStop,
     RobotEnable(EnableParams),
     /// Power the joints and ramp to the home pose. No policy needed.
@@ -473,6 +526,8 @@ pub enum Call {
     RobotPose(PoseParams),
     /// Mouth opening. Continuous. Send as a notification.
     RobotMouth(MouthParams),
+    /// Play a voice-bank sound.
+    RobotSound(SoundParams),
     /// Sit down, then power the machine off.
     RobotShutdown,
     /// Which drive mode this robotd runs: walk or roller.
@@ -511,6 +566,8 @@ pub enum Call {
     PadForget(PadForgetParams),
     /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
     PadInput,
+    /// Subscribe to the ToF depth stream. Answered by `tofd`.
+    TofStream,
 }
 
 impl Call {
@@ -534,6 +591,7 @@ impl Call {
             Call::RobotRemoteSessionActive => method::ROBOT_SESSION_ACTIVE,
             Call::RobotMove(_) => method::ROBOT_MOVE,
             Call::RobotHead(_) => method::ROBOT_HEAD,
+            Call::RobotLook(_) => method::ROBOT_LOOK,
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
             Call::RobotInit => method::ROBOT_INIT,
@@ -541,6 +599,7 @@ impl Call {
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
+            Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
@@ -559,6 +618,7 @@ impl Call {
             Call::PadPair(_) => method::PAD_PAIR,
             Call::PadForget(_) => method::PAD_FORGET,
             Call::PadInput => method::PAD_INPUT,
+            Call::TofStream => method::TOF_STREAM,
         }
     }
 
@@ -624,10 +684,12 @@ impl Call {
             Call::Log(p) => encode(p),
             Call::RobotMove(p) => encode(p),
             Call::RobotHead(p) => encode(p),
+            Call::RobotLook(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
             Call::RobotDo(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
+            Call::RobotSound(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
@@ -654,7 +716,8 @@ impl Call {
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::PadStatus
-            | Call::PadInput => Value::Object(serde_json::Map::new()),
+            | Call::PadInput
+            | Call::TofStream => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -687,6 +750,7 @@ impl Call {
             method::ROBOT_SESSION_ACTIVE => Call::RobotRemoteSessionActive,
             method::ROBOT_MOVE => Call::RobotMove(decode(params)?),
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
+            method::ROBOT_LOOK => Call::RobotLook(decode(params)?),
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             method::ROBOT_INIT => Call::RobotInit,
@@ -694,6 +758,7 @@ impl Call {
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
+            method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
@@ -720,6 +785,7 @@ impl Call {
             }
             method::PAD_FORGET => Call::PadForget(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
+            method::TOF_STREAM => Call::TofStream,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -805,6 +871,24 @@ impl Request {
     /// Read a raw-pad notification back.
     pub fn as_pad_report(&self) -> Option<PadReport> {
         if self.method != method::PAD_REPORT {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A depth-frame notification: no `id`, so no response is expected.
+    pub fn notify_tof_frame(frame: &TofFrame) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::TOF_FRAME.to_owned(),
+            params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a depth-frame notification back.
+    pub fn as_tof_frame(&self) -> Option<TofFrame> {
+        if self.method != method::TOF_FRAME {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -1003,6 +1087,81 @@ pub struct HeadParams {
     pub head_pitch: f64,
     pub head_yaw: f64,
     pub head_roll: f64,
+}
+
+/// A point to look at, trunk frame, metres — see [`method::ROBOT_LOOK`]. The gaze form
+/// [`HeadParams`]' doc promised: the daemon solves the IK against its own MJCF model, so a
+/// client never has to know which way a positive head_yaw turns.
+///
+/// `neck_pitch` is posture, not aim — the IK holds it and aims around it. Defaults to 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LookParams {
+    /// Forward of the trunk origin.
+    pub x: f64,
+    /// Left of it.
+    pub y: f64,
+    /// Above it. NOTE: trunk frame, not floor — the floor is about 0.12 m below.
+    pub z: f64,
+    pub neck_pitch: f64,
+}
+
+/// Answer to [`Call::RobotLook`]: the joints the head was sent to.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LookResult {
+    /// What was handed to the same path `robot.head` feeds — resend these to hold the gaze.
+    pub head: HeadParams,
+    /// The point is beyond the head's reach (travel limits, or the gimbal geometry near
+    /// ±90° yaw); the joints are the closest gaze, not a lock.
+    pub clamped: bool,
+}
+
+/// A voice-bank tag — what kind of sound, not which file: the robot picks a random
+/// variant per play, which is what keeps the duck from sounding like a stuck recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoundTag {
+    /// Sharp honk.
+    Alarm,
+    /// Wake-up quack (sometimes a double "wak-wak").
+    Greet,
+    /// Rising question.
+    Inquire,
+    /// Low "tock" — the goodbye before power-off.
+    Peck,
+    /// The mouth-trigger quack. `robotctl quack` plays this.
+    Chirp,
+    /// Drowsy, breathy — the petting response.
+    Coo,
+    /// The held joy ride: start → loop while held → end.
+    Wheee,
+}
+
+impl SoundTag {
+    /// The voice-bank directory name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SoundTag::Alarm => "alarm",
+            SoundTag::Greet => "greet",
+            SoundTag::Inquire => "inquire",
+            SoundTag::Peck => "peck",
+            SoundTag::Chirp => "chirp",
+            SoundTag::Coo => "coo",
+            SoundTag::Wheee => "wheee",
+        }
+    }
+}
+
+/// See [`method::ROBOT_SOUND`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoundParams {
+    pub tag: SoundTag,
+    /// Only meaningful for [`SoundTag::Wheee`]: `Some(true)` starts/keeps the ride,
+    /// `Some(false)` releases it. The hold decays on its own if the trues stop arriving,
+    /// so a client that dies mid-ride does not leave the robot going "wheee" forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<bool>,
 }
 
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
@@ -1767,6 +1926,23 @@ pub struct RobotState {
     pub joints: Vec<f64>,
     /// What was commanded, so a viewer can show tracking error rather than guessing at it.
     pub targets: Vec<f64>,
+    /// Where contact odometry believes the robot is. `default` so a frame from
+    /// a `robotd` predating the estimator still parses — zeros, like a robot
+    /// that has not moved.
+    #[serde(default)]
+    pub odom: OdomState,
+}
+
+/// The contact-odometry estimate: trunk pose in the world frame the IMU chose
+/// at boot. There is no magnetometer and no absolute reference — this frame is
+/// "wherever the robot was when it came up", which is exactly what relative
+/// motion (walked distance, turn angle, a ToF map) needs and all it promises.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OdomState {
+    /// Trunk position, metres. Z is height above the ground plane.
+    pub position: [f64; 3],
+    /// Heading, radians.
+    pub yaw: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2316,6 +2492,60 @@ pub struct PadInputResult {
     pub reason: Option<String>,
 }
 
+/// Answer to [`Call::TofStream`].
+///
+/// Describes the sensor rather than merely accepting, for the same reason
+/// [`SubscribeResult`] names the policy: "subscribed" and "there is a sensor" are
+/// different facts, and a viewer that cannot tell them apart shows an empty grid
+/// for both a robot with no ToF fitted and one whose frames have not arrived yet.
+///
+/// Accepted with `sensor: None` is the ordinary state of a duck without the
+/// sensor: `tofd` runs, the socket answers, and `unavailable` says why there is
+/// nothing to show. The daemon keeps retrying, so a sensor fitted later needs no
+/// reconnect — a fresh subscription will name it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TofStreamResult {
+    pub accepted: bool,
+    /// The sensor generation that answered, e.g. `VL53L8CX`. `None` when there is
+    /// none — see `unavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor: Option<String>,
+    /// Why there is no sensor: not fitted, wrong generation, bus unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// Frame geometry, so a viewer can lay out before the first frame lands.
+    pub rows: u8,
+    pub cols: u8,
+    /// Ranging rate the sensor was started at, Hz.
+    pub hz: u8,
+}
+
+/// One 8×8 depth frame — a [`method::TOF_FRAME`] notification.
+///
+/// **Millimetres and ST's raw status, not metres.** JSON has no NaN, so a
+/// distance-only frame would have to encode "no measurement" as a magic number;
+/// carrying the status byte instead keeps the sensor's own three-way answer
+/// intact — a range, nothing in range, or a measurement that failed. The `tof`
+/// crate's `Frame::zone` is the interpretation, and consumers should use it
+/// rather than re-deriving the thresholds.
+///
+/// `distance_mm` and `status` are parallel and row-major, `rows × cols` long.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TofFrame {
+    /// Frames since this `tofd` started, so a consumer can see a gap it did not
+    /// cause. Not a wall clock: `tofd` has no business publishing one.
+    pub seq: u64,
+    /// Microseconds since `tofd` started — the sender's monotonic clock, like
+    /// [`PadFrame::at_us`].
+    pub at_us: u64,
+    pub rows: u8,
+    pub cols: u8,
+    pub distance_mm: Vec<i16>,
+    pub status: Vec<u8>,
+}
+
 /// `skip_serializing_if` for a `bool` that is false by default.
 fn not(b: &bool) -> bool {
     !*b
@@ -2647,6 +2877,12 @@ mod tests {
                 head_yaw: 0.2,
                 head_roll: 0.0,
             }),
+            Call::RobotLook(LookParams {
+                x: 1.0,
+                y: 0.25,
+                z: -0.1,
+                neck_pitch: 0.2,
+            }),
             Call::RobotStop,
             Call::RobotEnable(EnableParams {
                 on: true,
@@ -2664,6 +2900,10 @@ mod tests {
                 active: true,
             }),
             Call::RobotMouth(MouthParams { open: 0.5 }),
+            Call::RobotSound(SoundParams {
+                tag: SoundTag::Chirp,
+                hold: None,
+            }),
             Call::RobotShutdown,
             Call::RobotMode,
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
@@ -2697,6 +2937,7 @@ mod tests {
             Call::PadForget(PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
             }),
+            Call::TofStream,
         ]
     }
 
@@ -2708,7 +2949,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            41,
+            44,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -3140,6 +3381,7 @@ mod tests {
             },
             joints: vec![0.0; 15],
             targets: vec![0.0; 15],
+            odom: OdomState::default(),
         };
 
         let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();
@@ -3222,6 +3464,29 @@ mod tests {
             !imu.frozen(),
             "a default run must never look like a dead IMU"
         );
+    }
+
+    /// A `robot.state` frame from a `robotd` predating odometry has no `odom`
+    /// key; a monitor built after it must read that as a robot at the origin,
+    /// not a parse error. Literal JSON because a struct cannot express "this
+    /// field does not exist".
+    #[test]
+    fn a_state_frame_missing_odom_still_parses() {
+        let state: RobotState = serde_json::from_str(
+            r#"{
+                "t": 1.0,
+                "move": {"requested": [0,0,0], "applied": [0,0,0]},
+                "head": [0,0,0,0],
+                "policy": "held",
+                "safety": {"fallen": false, "limp": false},
+                "loop": {"hz": 50.0, "missed": 0},
+                "joints": [],
+                "targets": []
+            }"#,
+        )
+        .expect("an old frame must parse");
+        assert_eq!(state.odom, OdomState::default());
+        assert_eq!(state.odom.position, [0.0; 3]);
     }
 
     /// Same for the bus counters, where a missing counter means "no failures" by construction.

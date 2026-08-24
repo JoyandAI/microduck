@@ -48,15 +48,27 @@ CMDLINE="${CMDLINE:-/proc/cmdline}"
 
 BT_CONF=/etc/bluetooth/main.conf
 
-# Does this board need the Bluetooth workarounds? `--weird-ble` on provision-board.sh.
+# Does this board need `Privacy = device`? `--weird-ble` on provision-board.sh.
 #
-# Off by default: most Zero 3W units bond a pad under BlueZ's own default and want nothing from
+# Off by default: some Zero 3W units bond a pad under BlueZ's own default and want nothing from
 # this script. See `configure_bluetooth`.
 WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
+
+# Does `robotctl pad pair` have to pause `btd` on this board? `--pause-btd-on-pair`.
+#
+# Separate from `WEIRD_BLE` because they fix different faults, and a board can need this one
+# without wanting `Privacy = device` — measured, see `configure_bluetooth`. `--weird-ble` implies
+# it, so every board provisioned before this flag existed keeps behaving the same way.
+PAUSE_BTD="${DUCK_PAUSE_BTD:-}"
 
 # Where the answer is left for `robotctl`, which has to pause `btd` while a pad bonds on such a
 # board. Under /var/lib rather than in a release directory: it is a fact about this board and must
 # survive an update and a rollback.
+#
+# The name is now narrower than what it means — it marks "pause btd for a pairing", which is no
+# longer tied to `Privacy = device`. Kept as-is deliberately: `robotctl` reads this exact path, and
+# renaming it would make every board already carrying one stop pausing `btd` with nothing to say
+# why. Rename both together, or neither.
 WEIRD_BLE_MARKER=/var/lib/robot/weird-ble
 
 # A gamepad is paired with `sudo robotctl pad pair` on the installed release, with the pad held in
@@ -430,26 +442,307 @@ free_motor_port() {
 # pairing reaching the last SMP step and the pad answering `DHKey check failed (0x0b)`. That was
 # `device` with `btd` running — the interaction above, not evidence against the setting.
 #
-# Both are workarounds for the aic8800 radio, which is not what ships. When the radio changes, this
-# flag and `BtdPaused` in robotctl/src/main.rs both go.
+# ## Two faults, two flags
+#
+# `--weird-ble` used to do both halves of the workaround at once, and on `50:37:CD:16:1D:90` that
+# combination cannot be made to work. Measured there on 2026-08-19, one variable at a time, daemon
+# 0.6.0 throughout:
+#
+#   | Privacy | btd paused for the pairing | result                                          |
+#   |---------|----------------------------|-------------------------------------------------|
+#   | off     | no                         | pairing dies ~800us after Encryption Change     |
+#   |         |                            | with Remote User Terminated (0x13)              |
+#   | off     | YES                        | bonds, held 45/45 samples, real input, driving   |
+#   | device  | yes                        | bonds, then flaps: 46x PIN or Key Missing (0x06) |
+#
+# So the two halves fix different faults and are not a package:
+#
+#   - **`btd` advertising breaks a NEW bond.** Pausing it for the pairing window fixes that, and it
+#     is what makes the aic8800 driver build irrelevant — every earlier failure blamed on the driver
+#     had `btd` advertising, which was the uncontrolled variable.
+#   - **`Privacy = device` breaks RECONNECTION** on a board that does not need it. A clean bond then
+#     flaps with `PIN or Key Missing`, on either driver build, whether or not the bond was made under
+#     `device`. On such a board the flag is not merely unnecessary, it is harmful — and it fails in a
+#     worse way than not pairing at all, because it looks like it worked.
+#
+# Hence `--pause-btd-on-pair` for the first alone. `--weird-ble` still implies it, so nothing that
+# was provisioned before this behaves differently. A board that pairs with the pause and `off` wants
+# the new flag; a board that cannot bond under `off` at all still wants `--weird-ble`.
+#
+# Both are workarounds for the aic8800 radio, which is not what ships. When the radio changes, both
+# flags and `BtdPaused` in robotctl/src/main.rs all go.
 #
 # The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon here leaves
 # the kernel holding hci0 while bluetoothd reports "No default controller available", which needs a
 # reboot to clear.
+# ── audio: the TLV320AIC3104 codec (speaker + microphone) ─────────────────────────────────
+#
+# The robot's voice and ear. Ported from the prototype installer's audio bring-up, and like
+# everything it did, every step here fails *soft* — a board without working audio walks
+# identically, so nothing below is allowed to stop the provisioning.
+#
+# Five layers, each idempotent:
+#   1. alsa-utils (aplay/arecord/amixer) + the DKMS toolchain + dtc.
+#   2. The Armbian *vendor* (BSP 6.1) kernel: the codec's I²S clock tree only exists there,
+#      and the DKMS module builds against its headers.
+#   3. Device-tree overlays, compiled from the sources vendored in deploy/audio/: the
+#      hardware i2c3 bus on header pins 3/5, and the codec + I²S sound card grafted onto it.
+#      (The prototype also kept a bit-banged i2c-gpio fallback; it was the revert path for
+#      rise-time trouble that never came back, and it is not carried here.)
+#   4. The codec driver itself, out of tree via DKMS — the vendor kernel does not build
+#      SND_SOC_AIC3X, which is why a stock board has no aic3104 card.
+#   5. Mixer levels at boot: aic3104-init.service, running the vendored amixer script
+#      before robotd so the greet is audible.
+#
+# The voice bank itself is NOT provisioned here — the release's postinstall renders it with
+# the `sounds` binary the release carries, seeded from the SoC serial.
+
+# Fetch a repository file (deploy/audio/...) into $2. The token, when given, rides along —
+# same reasoning as fetch_cmd, done rather than printed.
+fetch_repo_file() {
+    if [ -n "$TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer $TOKEN" "${RAW%/scripts}/$1" -o "$2"
+    else
+        curl -fsSL "${RAW%/scripts}/$1" -o "$2"
+    fi
+}
+
+# Add one word to armbianEnv's overlays= line, preserving order (the codec overlay must
+# come after its bus overlay — it grafts the codec node onto the bus that overlay enables).
+ensure_overlay_word() {
+    # Same guard `configure_overlay` has, for the same reason — and here it matters more:
+    # without it the `echo >>` below *creates* an armbianEnv.txt that never existed, on a
+    # board that boots from something else entirely, and asks for a reboot to load it.
+    if [ ! -f "$ENV_TXT" ]; then
+        warn "no ${ENV_TXT}; not an Armbian image?
+  Load the ${1} overlay by whatever means this image provides, then re-run.
+  Everything else here will still be done."
+        return 0
+    fi
+    if ! grep -Eq '^overlays=' "$ENV_TXT"; then
+        echo "overlays=$1" >> "$ENV_TXT"
+        needs_reboot=1
+    elif ! grep -E '^overlays=' "$ENV_TXT" | grep -qw "$1"; then
+        sed -i "s/^overlays=\(.*\)\$/overlays=\1 $1/" "$ENV_TXT"
+        needs_reboot=1
+    fi
+}
+
+configure_audio() {
+    say "audio: TLV320AIC3104 codec bring-up"
+
+    # 1. Packages. i2c-tools is here rather than with the ToF below because it is
+    #    what *creates the `i2c` group* (its postinst does), and both the codec and
+    #    the ToF sit on that bus — plus `i2cdetect` is the first thing anyone runs
+    #    when a device on it goes quiet.
+    audio_pkgs="alsa-utils device-tree-compiler dkms gcc make i2c-tools"
+    missing=""
+    for pkg in $audio_pkgs; do
+        dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+    done
+    if [ -n "$missing" ]; then
+        say "installing:$missing"
+        apt-get update -qq || true
+        # shellcheck disable=SC2086  # word-splitting the package list is the point
+        apt-get install -y -qq $missing \
+            || { warn "apt failed — audio will not work on this board"; return 0; }
+    fi
+
+    # 2. The vendor kernel, with headers for the DKMS build.
+    if ! dpkg -s linux-image-vendor-rk35xx >/dev/null 2>&1 \
+        || ! dpkg -s linux-dtb-vendor-rk35xx >/dev/null 2>&1 \
+        || ! dpkg -s linux-headers-vendor-rk35xx >/dev/null 2>&1; then
+        say "installing the Armbian vendor kernel (the codec's I²S tree lives there)"
+        apt-get update -qq || true
+        if apt-get install -y linux-image-vendor-rk35xx linux-dtb-vendor-rk35xx \
+            linux-headers-vendor-rk35xx; then
+            needs_reboot=1
+        else
+            warn "could not install the vendor kernel — audio will not work"
+            return 0
+        fi
+    fi
+    vendor_ver=$(find /lib/modules -maxdepth 1 -name '*-vendor-rk35xx' 2>/dev/null | sort -V | tail -1 | xargs -r basename)
+    if [ -z "$vendor_ver" ]; then
+        warn "no vendor kernel under /lib/modules — audio will not work"
+        return 0
+    fi
+    # Make it the active kernel. The apt postinst repoints these on a fresh install;
+    # re-asserted here for idempotent re-runs where the 'current' kernel touched them last.
+    for pair in "Image:vmlinuz-$vendor_ver" "uInitrd:uInitrd-$vendor_ver" "dtb:dtb-$vendor_ver"; do
+        link="${pair%%:*}"; target="${pair#*:}"
+        if [ -e "/boot/$target" ] && [ "$(readlink "/boot/$link")" != "$target" ]; then
+            say "pointing /boot/$link -> $target"
+            ln -sfn "$target" "/boot/$link"
+            needs_reboot=1
+        fi
+    done
+    depmod "$vendor_ver" 2>/dev/null || true
+
+    # 3. Overlays: compile the vendored sources against the vendor kernel's overlay dir.
+    dtbo_dir="/boot/dtb-${vendor_ver}/rockchip/overlay"
+    [ -d "$dtbo_dir" ] || dtbo_dir=$(find /boot -maxdepth 3 -type d -path '*/rockchip/overlay' 2>/dev/null | head -1)
+    if [ -n "$dtbo_dir" ]; then
+        for ov_name in i2c3-pihat aic3104-i2c3; do
+            ov_tmp=$(mktemp -d)
+            if fetch_repo_file "deploy/audio/${ov_name}.dts" "$ov_tmp/src.dts" \
+                && dtc -@ -I dts -O dtb -o "$ov_tmp/out.dtbo" "$ov_tmp/src.dts" 2>/dev/null; then
+                if [ ! -f "$dtbo_dir/rk3568-${ov_name}.dtbo" ] \
+                    || ! cmp -s "$ov_tmp/out.dtbo" "$dtbo_dir/rk3568-${ov_name}.dtbo"; then
+                    say "installing overlay rk3568-${ov_name}.dtbo"
+                    cp "$ov_tmp/out.dtbo" "$dtbo_dir/rk3568-${ov_name}.dtbo"
+                    needs_reboot=1
+                fi
+                ensure_overlay_word "$ov_name"
+            else
+                warn "could not fetch or compile ${ov_name}.dts — audio will not work"
+            fi
+            rm -rf "$ov_tmp"
+        done
+    else
+        warn "no rockchip overlay directory under /boot — audio overlays not installed"
+    fi
+
+    # 4. The codec driver, via DKMS. Versioned by the vendored dkms.conf, so a source bump
+    #    upstream re-deploys cleanly.
+    dkms_tmp=$(mktemp -d)
+    dkms_ok=1
+    for f in dkms.conf Makefile tlv320aic3x.c tlv320aic3x.h tlv320aic3x-i2c.c; do
+        fetch_repo_file "deploy/audio/aic3x-dkms/$f" "$dkms_tmp/$f" || { dkms_ok=0; break; }
+    done
+    if [ "$dkms_ok" = 1 ]; then
+        dkms_ver=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"$/\1/p' "$dkms_tmp/dkms.conf")
+        dkms_src="/usr/src/aic3x-$dkms_ver"
+        deploy_needed=0
+        for f in dkms.conf Makefile tlv320aic3x.c tlv320aic3x.h tlv320aic3x-i2c.c; do
+            cmp -s "$dkms_tmp/$f" "$dkms_src/$f" || deploy_needed=1
+        done
+        if [ "$deploy_needed" = 1 ]; then
+            say "deploying aic3x DKMS sources to $dkms_src"
+            dkms remove "aic3x/$dkms_ver" --all >/dev/null 2>&1 || true
+            mkdir -p "$dkms_src"
+            cp "$dkms_tmp"/* "$dkms_src/"
+        fi
+        if dkms status "aic3x/$dkms_ver" 2>/dev/null | grep "$vendor_ver" | grep -q installed; then
+            say "aic3x DKMS module already installed"
+        else
+            # Armbian ships the vendor headers without built host tools; DKMS needs modpost.
+            if [ -d "/usr/src/linux-headers-$vendor_ver" ] \
+                && [ ! -x "/usr/src/linux-headers-$vendor_ver/scripts/mod/modpost" ]; then
+                say "rebuilding the vendor headers' host tools (modpost)"
+                dpkg-reconfigure linux-headers-vendor-rk35xx >/dev/null 2>&1 || true
+            fi
+            say "building the aic3x codec driver via DKMS (takes a minute)"
+            if dkms install "aic3x/$dkms_ver" -k "$vendor_ver"; then
+                say "aic3x DKMS module installed for $vendor_ver"
+                needs_reboot=1
+            else
+                warn "DKMS build failed — audio will not work"
+                warn "see /var/lib/dkms/aic3x/$dkms_ver/build/make.log"
+            fi
+        fi
+    else
+        warn "could not fetch the aic3x DKMS sources — audio will not work"
+    fi
+    rm -rf "$dkms_tmp"
+
+    # 5. Mixer levels at boot. The service polls for the card (the probe is deferred until
+    #    the DKMS module autoloads), sets the speaker path and routes the onboard mic.
+    init_tmp=$(mktemp)
+    if fetch_repo_file "deploy/audio/aic3104-init.sh" "$init_tmp"; then
+        if [ ! -f /usr/local/bin/aic3104-init.sh ] \
+            || ! cmp -s "$init_tmp" /usr/local/bin/aic3104-init.sh; then
+            say "installing /usr/local/bin/aic3104-init.sh"
+            install -m 755 "$init_tmp" /usr/local/bin/aic3104-init.sh
+        fi
+        svc_tmp=$(mktemp)
+        cat > "$svc_tmp" <<'UNIT'
+[Unit]
+Description=TLV320AIC3104 mixer init
+After=systemd-modules-load.service
+# No ConditionPathExists: the sound card probe is deferred until the DKMS codec module
+# autoloads, so the card can appear seconds into boot — the script polls for it instead.
+Before=robotd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aic3104-init.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        if [ ! -f /etc/systemd/system/aic3104-init.service ] \
+            || ! cmp -s "$svc_tmp" /etc/systemd/system/aic3104-init.service; then
+            say "installing aic3104-init.service"
+            install -m 644 "$svc_tmp" /etc/systemd/system/aic3104-init.service
+            systemctl daemon-reload
+        fi
+        systemctl is-enabled --quiet aic3104-init.service \
+            || systemctl enable aic3104-init.service >/dev/null 2>&1 || true
+        rm -f "$svc_tmp"
+    else
+        warn "could not fetch aic3104-init.sh — the mixer stays at power-on levels"
+    fi
+    rm -f "$init_tmp"
+}
+
+# ── the head ToF sensor's bus ──────────────────────────────────────────────────
+#
+# The sensor is a VL53L5CX or VL53L8CX on the *same* i2c3 bus the audio codec is
+# on, so `configure_audio` has already done the expensive part: the overlay, the
+# vendor kernel, and i2c-tools (which is what creates the `i2c` group `tofd`
+# joins). This adds the one thing left — a stable name for the bus.
+#
+# `/dev/i2c-3` is what the overlay happens to produce today, and a kernel or
+# overlay change can renumber it. A udev symlink keeps `tofd`'s default correct
+# across that. `tofd` also falls back to `/dev/i2c-3` on a board provisioned
+# before this rule existed, so neither half is load-bearing on its own.
+configure_tof() {
+    rule=/etc/udev/rules.d/99-robot-i2c-pihat.rules
+    # Two matchers, one per bus flavour the board may end up with: the RK3566's
+    # i2c3 controller by its device-tree address, and the bit-banged i2c-gpio bus
+    # by name. Only one exists at a time, so the symlink follows whichever it is.
+    content='SUBSYSTEM=="i2c-dev", KERNELS=="fe5c0000.i2c", SYMLINK+="i2c-pihat"
+SUBSYSTEM=="i2c-dev", ATTR{name}=="i2c-gpio-pihat", SYMLINK+="i2c-pihat"'
+
+    if [ -f "$rule" ] && [ "$(cat "$rule")" = "$content" ]; then
+        say "ToF: /dev/i2c-pihat rule already in place"
+        return 0
+    fi
+    say "ToF: installing the /dev/i2c-pihat udev rule"
+    printf '%s\n' "$content" > "$rule"
+    chmod 644 "$rule"
+    # Applied now as well as at the next boot, so a sensor already fitted works
+    # without one — `udevadm` failing is not worth stopping provisioning for.
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=i2c-dev 2>/dev/null || true
+}
+
 configure_bluetooth() {
-    if [ -z "$WEIRD_BLE" ]; then
-        # Reported rather than silent, because a board that needs the workaround and was provisioned
-        # without the flag presents as a pad that will not pair for no visible reason.
-        say "leaving bluetooth Privacy alone (no --weird-ble); a pad that will not bond may need it"
-        # The marker is deliberately *not* removed here. Without the flag this function changes
+    if [ -z "$WEIRD_BLE" ] && [ -z "$PAUSE_BTD" ]; then
+        # Reported rather than silent, because a board that needs either workaround and was
+        # provisioned without the flag presents as a pad that will not pair for no visible reason.
+        say "leaving bluetooth alone (no --weird-ble, no --pause-btd-on-pair)"
+        say "  a pad that pairs and then flaps wants neither; one that will not pair wants one"
+        # The marker is deliberately *not* removed here. Without a flag this function changes
         # nothing, so a board that has `Privacy = device` still has it — and clearing the marker
         # would leave `robotctl` no longer pausing `btd` on a board that still needs it, which is
-        # the silent version of the bug this whole flag exists for. Undoing it is a hand edit.
+        # the silent version of the bug these flags exist for. Undoing it is a hand edit.
         return 0
     fi
 
     if [ ! -f "$BT_CONF" ]; then
         warn "no ${BT_CONF}; skipping the gamepad Bluetooth settings"
+        return 0
+    fi
+
+    # The marker alone, for a board that pairs under `off` once `btd` is out of the way. Returns
+    # before touching `Privacy`, which is the whole point of the flag: on such a board `device` is
+    # what breaks it.
+    if [ -z "$WEIRD_BLE" ]; then
+        write_pause_marker
+        say "left Privacy alone (--pause-btd-on-pair without --weird-ble)"
         return 0
     fi
 
@@ -468,23 +761,36 @@ configure_bluetooth() {
     fi
 
     # Written after the setting, so the marker never claims a board is configured that is not.
+    write_pause_marker
+}
+
+# The marker `robotctl` reads to decide whether to pause `btd` for a pairing.
+#
+# Its own function because both flags write it and only one of them touches `Privacy` — which is the
+# distinction this whole section exists to make.
+write_pause_marker() {
     if [ -f "$WEIRD_BLE_MARKER" ]; then
-        say "weird-ble marker already at ${WEIRD_BLE_MARKER}"
-    else
-        mkdir -p "$(dirname "$WEIRD_BLE_MARKER")"
-        cat > "$WEIRD_BLE_MARKER" <<'MARKER'
-# This board was provisioned with --weird-ble.
-#
-# Its Bluetooth cannot bond a gamepad under BlueZ's default Privacy = off, so
-# /etc/bluetooth/main.conf sets Privacy = device. Under that setting a pad cannot form a new bond
-# while btd advertises, so `robotctl pad pair` stops btd for the pairing window and starts it again.
-#
-# Both are workarounds for the aic8800 radio. Delete this file, unset Privacy, and drop BtdPaused
-# from robotctl when the radio changes.
-MARKER
-        chmod 644 "$WEIRD_BLE_MARKER"
-        say "wrote ${WEIRD_BLE_MARKER} so robotctl pauses btd while a pad bonds"
+        say "btd-pause marker already at ${WEIRD_BLE_MARKER}"
+        return 0
     fi
+    mkdir -p "$(dirname "$WEIRD_BLE_MARKER")"
+    cat > "$WEIRD_BLE_MARKER" <<'MARKER'
+# This board needs btd paused while a gamepad bonds.
+#
+# On the aic8800 radio a pad cannot form a NEW bond while btd advertises, so `robotctl pad pair`
+# stops btd for the pairing window, power-cycles the adapter, and starts btd again afterwards. An
+# existing bond is unaffected: a bonded pad connects and drives with the whole stack up.
+#
+# This says nothing about Privacy. A board provisioned with --pause-btd-on-pair keeps BlueZ's
+# default (off); one provisioned with --weird-ble also has Privacy = device because it cannot bond
+# under off at all. Setting device on a board that did not need it makes a bond flap with
+# `PIN or Key Missing` instead, so the two are deliberately separate.
+#
+# A workaround for a radio that is not what ships. Delete this file and drop BtdPaused from
+# robotctl when the radio changes.
+MARKER
+    chmod 644 "$WEIRD_BLE_MARKER"
+    say "wrote ${WEIRD_BLE_MARKER} so robotctl pauses btd while a pad bonds"
 }
 
 # What the board looks like now. Printed whether or not anything was changed, because "is
@@ -504,17 +810,28 @@ report() {
   will not drive anything."
     fi
 
-    # Gamepad readiness. This board's part of it is one setting; who may read the pad is
+    # Gamepad readiness. This board's part of it is two independent settings; who may read the pad is
     # `padd.service`'s business now, and pairing one is `sudo robotctl pad pair`.
+    #
+    # Both are reported, because the pair of them is what says which of the three configurations a
+    # board is in — and the advice for a pad that will not bond depends on which one is missing.
+    if [ -f "$WEIRD_BLE_MARKER" ]; then
+        printf '  %-22s %s\n' "btd on pairing" "paused — the marker is set"
+    else
+        printf '  %-22s %s\n' "btd on pairing" \
+            "not paused — a pad that will not bond wants --pause-btd-on-pair"
+    fi
+
     if [ -f "$BT_CONF" ] && grep -Eq '^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device' "$BT_CONF"; then
-        # Worth naming the consequence every time: this is the board where `robotctl pad pair` stops
-        # btd for the pairing window, and someone reading this should know that is expected.
-        printf '  %-22s %s\n' "bluetooth privacy" "device — pad pair pauses btd"
+        # Worth naming the consequence every time: `device` is what makes a bond flap on a board
+        # that only needed the pause, and that failure looks like success at first.
+        printf '  %-22s %s\n' "bluetooth privacy" \
+            "device — drop --weird-ble if a bond flaps with PIN or Key Missing"
     else
         # Covers both `off` and absent, which behave the same. Named as a possible cause rather than
-        # a fault: most boards bond a pad exactly like this.
+        # a fault: with btd paused, most boards bond a pad exactly like this.
         printf '  %-22s %s\n' "bluetooth privacy" \
-            "off — if a pad will not bond, re-provision with --weird-ble"
+            "off — if a pad will not bond even with btd paused, try --weird-ble"
     fi
 
     # The device node is what gilrs opens, so this is the only claim that matters.
@@ -694,6 +1011,8 @@ main() {
     check_network
     free_motor_port
     configure_bluetooth
+    configure_audio
+    configure_tof
     install_onnxruntime
     report
 }
