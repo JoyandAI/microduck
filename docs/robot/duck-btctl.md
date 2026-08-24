@@ -316,9 +316,10 @@ One command is one connection: it finds the robot, pairs if it has to, proves th
 disconnects.
 
 Every command gives up after a period of silence rather than after a fixed total, so a slow update
-is never cut off and a robot that stops answering is reported in seconds. An update in flight
-survives that: the robot pulls, so it carries on with nobody watching, and `update status` afterwards
-says how it went.
+is never cut off and a robot that stops answering is reported in seconds. A link that *drops* is
+reported at once rather than waited out, and after an apply it says so: the restart is what took the
+connection down. An update in flight survives either: the robot pulls, so it carries on with nobody
+watching, and `update status` afterwards says how it went.
 
 ## What is refused
 
