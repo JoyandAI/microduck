@@ -15,8 +15,6 @@
 //! [`Params`] and in the shipped `deploy/robotd.toml`, and an editor's footer is not the place
 //! for four paragraphs on voltage adaptation.
 
-use crate::Params;
-
 /// What kind of value a key takes — what an editor should offer for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -319,61 +317,76 @@ pub fn entry_for(key: &str) -> Option<&'static Entry> {
     REGISTRY.iter().find(|entry| entry.key == key)
 }
 
-/// Every `section.key` path in [`Params`]'s own serialization, sorted — what the registry is
-/// tested against, and what an editor overlays file contents onto.
-pub fn schema_keys() -> Vec<String> {
-    let value = toml::Value::try_from(Params::default()).expect("Params serializes");
-    let mut keys = Vec::new();
-    walk(&value, String::new(), &mut keys);
-    keys.sort();
-    keys
-}
-
-fn walk(value: &toml::Value, prefix: String, out: &mut Vec<String>) {
-    match value {
-        toml::Value::Table(table) => {
-            for (name, child) in table {
-                let path = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{prefix}.{name}")
-                };
-                walk(child, path, out);
-            }
-        }
-        _ => out.push(prefix),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Params;
+
+    /// Every field a section actually has, `Option`s included — extracted from serde's own
+    /// unknown-field error, which lists the expected fields by name.
+    ///
+    /// The trick exists because the honest alternatives cannot see everything: serializing
+    /// `Params::default()` omits every `Option` at `None`, so a walk over it would let a new
+    /// optional field slip past the completeness test silently. `deny_unknown_fields` is
+    /// already on every section, so the rejection message is guaranteed to exist — this just
+    /// reads the list serde was going to print anyway.
+    fn fields_of(section: &str) -> Vec<String> {
+        let probe = format!("[{section}]\n__no_such_key__ = 0\n");
+        let error = toml::from_str::<Params>(&probe)
+            .expect_err("deny_unknown_fields must reject the probe")
+            .to_string();
+        let fields: Vec<String> = error
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|name| *name != "__no_such_key__")
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            !fields.is_empty(),
+            "serde's error format changed and the coverage test is blind: {error}"
+        );
+        fields
+    }
 
     /// The drift-proofing this module exists for: the registry names every key `Params`
-    /// serializes, and nothing else. Add a section to `Params` and this test lists exactly
-    /// the keys the registry — and so `robotctl configure` — does not know yet.
-    ///
-    /// One asymmetry is deliberate: `Option` fields serialize as nothing when `None`, so the
-    /// walk over defaults cannot see them — the registry is therefore checked to be a
-    /// *superset* containing all serialized keys, and every registry key must deserialize
-    /// (which catches a typo'd or removed key).
+    /// has — `Option` fields included — and nothing else. Add a field or a section and this
+    /// test lists exactly the keys the registry (and so `robotctl configure`) does not know.
     #[test]
     fn the_registry_covers_every_key_exactly() {
-        let serialized = schema_keys();
-        let registry: Vec<&str> = REGISTRY.iter().map(|entry| entry.key).collect();
-
-        let missing: Vec<&String> = serialized
-            .iter()
-            .filter(|key| !registry.contains(&key.as_str()))
+        // Sections first, from the top level's own rejection message.
+        let top = toml::from_str::<Params>("__no_such_section__ = 0\n")
+            .expect_err("unknown sections are rejected")
+            .to_string();
+        let sections: Vec<String> = top
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|name| *name != "__no_such_section__")
+            .map(str::to_owned)
             .collect();
+        // A sanity anchor so a serde message change cannot pass vacuously: the sections this
+        // build certainly has must all be found.
+        for known in ["bus", "control", "update_gate", "policy", "safety", "audio"] {
+            assert!(sections.contains(&known.to_owned()), "{top}");
+        }
+
+        let registry: Vec<&str> = REGISTRY.iter().map(|entry| entry.key).collect();
+        let mut missing: Vec<String> = Vec::new();
+        for section in &sections {
+            for field in fields_of(section) {
+                let key = format!("{section}.{field}");
+                if !registry.contains(&key.as_str()) {
+                    missing.push(key);
+                }
+            }
+        }
         assert!(
             missing.is_empty(),
             "keys Params has that the registry does not: {missing:?}"
         );
-
         // Every registry key must be a real key: setting it alone in a TOML must parse. This
-        // is what catches a registry entry for a key that was renamed or removed — and it
-        // covers the Option fields the serialization walk cannot see.
+        // is what catches a registry entry for a key that was renamed or removed.
         for entry in REGISTRY {
             let (section, key) = entry
                 .key
