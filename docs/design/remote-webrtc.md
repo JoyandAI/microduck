@@ -32,7 +32,10 @@ peer (browser / phone / server-side program)
 
 Two data channels rather than one, for the reason `architecture.md` §5.2 gives: a retransmitted
 80 ms-old joystick command is worse than useless, so teleop goes `maxRetransmits: 0` and always
-takes the newest. That choice has a consequence people miss, and §6 is about it.
+takes the newest.
+
+**The first version opens `control` only.** Teleop is not the near-term priority, and leaving it
+out is not merely deferral — §6 is about what it removes.
 
 **`webrtcsink` takes pre-encoded H.264 on its sink pad**, so the pipeline is
 `appsrc ! mpph264enc ! h264parse ! webrtcsink` and the encoder never reaches negotiation. Verified
@@ -161,24 +164,42 @@ connection hangs — the exact bug `app-path-design.md` §7 records. One datacha
 stream with the same hazard, and `btd`'s answer works unchanged: route by method to a per-lane
 socket, pump each socket back, never correlate.
 
-## 6. Teleop needs sequence numbers, and this is not optional
+## 6. Why `control`-only comes first, and what `teleop` will cost when it lands
 
 `intents.rs` stores each intent in an `ArcSwap` and takes last-writer-wins. That is correct today
 because every writer reaches it through a unix socket, where a later message cannot arrive before an
 earlier one.
 
+**A reliable, ordered datachannel keeps that true.** SCTP in that mode delivers in order by
+definition, so intents arriving over `control` preserve the property `intents.rs` already depends
+on. Starting with one channel is therefore not a compromise that stores up work — it means there is
+no ordering problem to solve in the first version at all.
+
+### What it costs instead, so nobody is surprised
+
+Head-of-line blocking. On a reliable channel a lost packet stalls everything behind it, including
+the control RPCs, so a bad link shows up as *everything* pausing rather than as a stale joystick.
+Driving over `control` is fine at a modest rate and gets worse with rate and loss — which is
+precisely why `architecture.md` §5.2 specifies a second channel, and why the answer to "the robot
+feels laggy over a poor link" is teleop rather than tuning.
+
+### And when teleop lands, it needs sequence numbers
+
 **SCTP with `maxRetransmits: 0` reorders.** A twist from 80 ms ago can land after a fresher one and
-win, and the robot then drives on a stale command with nothing anywhere reporting a problem. It is
-not a rare race: it is the normal behaviour of the channel we chose on purpose.
+win last-writer-wins, and the robot then drives on a stale command with nothing anywhere reporting a
+problem. It is not a rare race: it is the normal behaviour of the channel, chosen deliberately.
 
-So teleop frames carry a **monotonic sequence number per stream**, and the writer drops anything
-not newer than what it last applied. This is a property of the *transport*, so it belongs in
-`mediad` rather than in `robotd` — `robotd` should keep receiving intents it can trust the ordering
-of, which is what makes `intents.rs` simple.
+So teleop frames carry a **monotonic sequence number per stream**, and the writer drops anything not
+newer than what it last applied. This is a property of the *transport*, so it belongs in `mediad`
+rather than in `robotd` — `robotd` should keep receiving intents whose ordering it can trust, which
+is what lets `intents.rs` stay as simple as it is.
 
-The deadman needs nothing: `safety.gate(command, twist_age)` is already age-based, so a partition
-stops the robot with no new code. Worth stating because it is the one thing about lossy links that
-is already handled.
+Worth writing down before the channel exists rather than after: the failure is silent, it looks like
+bad tuning rather than a bug, and the fix is trivial if it is designed in and awkward if a stale
+twist has to be diagnosed first.
+
+The deadman needs nothing either way: `safety.gate(command, twist_age)` is already age-based, so a
+partition stops the robot with no new code.
 
 ## 7. Reaching a robot that is not on your LAN
 
@@ -283,6 +304,8 @@ wrong one.
   media stack, `get_frame` returning a JPEG. It is a few dozen lines once §5's routing exists, and
   it is what makes "an LLM drives the robot" easy — but it is a second transport and the first one
   should work.
+- **The `teleop` datachannel.** Not the near-term priority; §6 covers what deferring it removes,
+  what it costs in the meantime, and the sequence numbers it will need.
 - **Multi-peer video.** One media session at a time, plus control-only clients. Simulcast and
   encode-once-send-many are a real project.
 - **Consent and the streaming indicator.** `architecture.md` §7 wants explicit per-session consent
