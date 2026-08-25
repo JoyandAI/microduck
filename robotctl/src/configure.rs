@@ -421,6 +421,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 /// What the list shows at one line: a section header, or a key.
+#[derive(Debug)]
 enum Item {
     Header(&'static str),
     Key(usize),
@@ -603,13 +604,24 @@ fn layout_items(model: &Model) -> Vec<Item> {
         }
     }
     for section in sections() {
-        items.push(Item::Header(section));
-        for (index, row) in rows.iter().enumerate() {
-            let (s, _) = row.entry.key.split_once('.').expect("section.key");
-            if s == section && !row.entry.feature {
-                items.push(Item::Key(index));
-            }
+        let keys: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                let (s, _) = row.entry.key.split_once('.').expect("section.key");
+                s == section && !row.entry.feature
+            })
+            .map(|(index, _)| index)
+            .collect();
+        // A section whose every key is a feature switch — `[chorale]`, which is one opt-in bool
+        // and nothing else — has all of them hoisted into the features block above. Drawing its
+        // header anyway leaves a heading with nothing under it, which reads as "this section has
+        // no settings" rather than "its setting is up there".
+        if keys.is_empty() {
+            continue;
         }
+        items.push(Item::Header(section));
+        items.extend(keys.into_iter().map(Item::Key));
     }
     items
 }
@@ -1036,6 +1048,46 @@ mod tests {
         assert!(screen.contains("audio.enabled"), "{screen}");
         // The divergence annotation: mode is set away from default.
         assert!(screen.contains("roller (default walk)"), "{screen}");
+    }
+
+    /// A section whose only key is a feature switch draws no header.
+    ///
+    /// `[chorale]` is exactly that — one opt-in bool — and it appeared on the board as a bare
+    /// heading with nothing under it, which reads as a section that forgot its settings. The
+    /// switch itself must still be there, in the features block, or this "fix" hides it.
+    #[test]
+    fn an_all_feature_section_has_no_empty_header() {
+        let m = model("");
+        let items = layout_items(&m);
+        let headers: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Header(h) => Some(*h),
+                Item::Key(_) => None,
+            })
+            .collect();
+        assert!(
+            !headers.contains(&"chorale"),
+            "chorale's only key is a feature switch: {headers:?}"
+        );
+        // Every header that *is* drawn has at least one key under it.
+        for (at, item) in items.iter().enumerate() {
+            if matches!(item, Item::Header(_)) {
+                assert!(
+                    matches!(items.get(at + 1), Some(Item::Key(_))),
+                    "empty header at {at}: {items:?}"
+                );
+            }
+        }
+        // And the switch is still reachable, up in the features block.
+        let rows = m.rows();
+        assert!(
+            items.iter().any(|item| match item {
+                Item::Key(index) => rows[*index].entry.key == "chorale.accept",
+                Item::Header(_) => false,
+            }),
+            "chorale.accept must still be editable"
+        );
     }
 
     /// Sections come out in registry order, once each — the editor's headers.
