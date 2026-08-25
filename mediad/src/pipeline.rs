@@ -140,6 +140,9 @@ pub fn start(
     height: u32,
     fps: u32,
 ) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
+    // GStreamer's own log has to be bridged before `init`, or the first thing it says is lost.
+    bridge_gstreamer_log();
+
     gst::init().context("gstreamer would not initialise")?;
 
     // **A GStreamer signal handler runs on a GStreamer thread, which is not inside the tokio
@@ -293,6 +296,16 @@ pub fn start(
     link_tee_branch(&tee, &video_queue).context("could not attach the video branch to the tee")?;
     link_tee_branch(&tee, &raw_queue).context("could not attach the raw branch to the tee")?;
 
+    // **Watch the bus, or every media failure is silent.**
+    //
+    // This was learned the hard way. `webrtcsink` drops a codec whose discovery pipeline fails
+    // with nothing more than `gst::warning!` — "We don't consider this fatal, as long as we end up
+    // with one potential codec" — and a consumer pipeline that dies posts an ERROR to the bus.
+    // Neither reaches `tracing`, so the journal showed a session starting, a session ending, and
+    // no reason for either. Two rounds of guessing went into diagnosing something GStreamer was
+    // already saying out loud.
+    watch_bus(&pipeline);
+
     pipeline
         .set_state(gst::State::Playing)
         .context("the pipeline would not start")?;
@@ -349,6 +362,102 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
             })
             .build(),
     );
+}
+
+/// Send GStreamer's own log into `tracing`, so the journal shows what it says.
+///
+/// **The bus is not enough.** `webrtcsink` drops a codec whose discovery pipeline fails with a
+/// `gst::warning!` and nothing else — "We don't consider this fatal, as long as we end up with one
+/// potential codec for each input stream" — and that goes to GStreamer's debug log, not the bus. So
+/// a robot offering VP8 instead of H.264 said nothing at all about why, and it had been saying it
+/// the whole time to a log nobody was reading.
+///
+/// `GST_DEBUG` is honoured if set, so raising a category still works the usual way. Unset, the
+/// threshold is `WARNING`: enough to catch a codec being dropped or an element refusing, quiet
+/// enough for a journal.
+fn bridge_gstreamer_log() {
+    if std::env::var_os("GST_DEBUG").is_none() {
+        // SAFETY: single-threaded here — this runs before `gst::init` and before any task is
+        // spawned, which is the only point at which setting an env var is sound.
+        unsafe { std::env::set_var("GST_DEBUG", "*:WARNING") };
+    }
+
+    // Otherwise every message is printed to stderr by GStreamer *and* logged by us, which in a
+    // journal is the same line twice with different formatting.
+    gst::log::remove_default_log_function();
+
+    // This is called from arbitrary GStreamer threads and from C, so — as everywhere in this file
+    // — it must not panic. It formats and forwards, and nothing else.
+    gst::log::add_log_function(|category, level, file, _function, line, object, message| {
+        let text = message.get().unwrap_or_default();
+        let src = object
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let cat = category.name();
+        match level {
+            gst::DebugLevel::Error => {
+                tracing::error!(target: "gst", %cat, %src, %file, line, "{text}")
+            }
+            gst::DebugLevel::Warning => {
+                tracing::warn!(target: "gst", %cat, %src, %file, line, "{text}")
+            }
+            gst::DebugLevel::Fixme | gst::DebugLevel::Info => {
+                tracing::info!(target: "gst", %cat, %src, "{text}")
+            }
+            _ => tracing::debug!(target: "gst", %cat, %src, "{text}"),
+        }
+    });
+}
+
+/// Forward what the pipeline says about itself into the journal.
+///
+/// A dedicated thread rather than `bus.add_watch`, which needs a GLib main loop this daemon does
+/// not run, and rather than a tokio task, because `timed_pop` blocks.
+fn watch_bus(pipeline: &gst::Pipeline) {
+    let Some(bus) = pipeline.bus() else {
+        tracing::warn!("the pipeline has no bus; media failures will be silent");
+        return;
+    };
+    std::thread::Builder::new()
+        .name("gst-bus".into())
+        .spawn(move || {
+            // `None` blocks until a message arrives; the loop ends when the bus is flushed on
+            // teardown, which is the daemon exiting.
+            while let Some(msg) = bus.timed_pop(gst::ClockTime::NONE) {
+                let src = msg
+                    .src()
+                    .map(|s| s.path_string().to_string())
+                    .unwrap_or_else(|| "?".into());
+                match msg.view() {
+                    gst::MessageView::Error(e) => {
+                        // `debug` carries the element's own detail, which is usually the part that
+                        // names the actual cause — a caps mismatch, a device that would not open.
+                        tracing::error!(
+                            %src,
+                            error = %e.error(),
+                            detail = e.debug().unwrap_or_default().as_str(),
+                            "pipeline error"
+                        );
+                    }
+                    gst::MessageView::Warning(w) => {
+                        tracing::warn!(
+                            %src,
+                            warning = %w.error(),
+                            detail = w.debug().unwrap_or_default().as_str(),
+                            "pipeline warning"
+                        );
+                    }
+                    // Everything else is state changes and stream status at a rate nobody wants in
+                    // a journal — visible with GST_DEBUG when it is wanted.
+                    _ => {}
+                }
+            }
+            tracing::debug!("bus watch ended");
+        })
+        .map(|_| ())
+        .unwrap_or_else(
+            |e| tracing::warn!(error = %e, "no bus watch thread; failures will be silent"),
+        );
 }
 
 fn make(name: &str) -> Result<gst::Element> {
