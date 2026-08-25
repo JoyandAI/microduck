@@ -647,12 +647,9 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
             match allocation.allocation_pools().next() {
                 // Size 0 is fine: `decide_allocation` overwrites it with the driver's own frame
                 // size in every io-mode this can reach. Max 0 means unlimited.
-                None => allocation.add_allocation_pool(
-                    None::<&gst::BufferPool>,
-                    0,
-                    CAPTURE_BUFFERS,
-                    0,
-                ),
+                None => {
+                    allocation.add_allocation_pool(None::<&gst::BufferPool>, 0, CAPTURE_BUFFERS, 0)
+                }
                 Some((pool, size, min, max)) if min < CAPTURE_BUFFERS => {
                     allocation.set_nth_allocation_pool(
                         0,
