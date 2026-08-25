@@ -121,10 +121,11 @@ RuntimeDirectory=mediad
 # are visible in `robotctl health` as a unit that is not running, and neither touches the control
 # loop, BLE, the pad or an update:
 #
-#   * **A board with no GStreamer stack.** `setup-gstreamer.sh` installs it and provisioning has
-#     run it by default since before `mediad` shipped — so this is a board provisioned earlier than
-#     that. The pipeline cannot start, `Restart=always` retries every five seconds, and the fix is
-#     one command: `sudo /usr/local/sbin/robot-setup-gstreamer`.
+#   * **A board with no GStreamer stack.** Provisioning installs it, and so does the pre-install
+#     hook of every update — `hooks/preinstall` runs the release's own `setup-gstreamer.sh` — so a
+#     board reaching this state has had both fail, most likely for want of network. The pipeline
+#     cannot start, `Restart=always` retries every five seconds, and re-running it by hand is
+#     `sudo /usr/local/sbin/robot-setup-gstreamer`.
 #   * **A board with no camera**, because `ExecStart` carries `--camera`. Same shape, and the
 #     drop-in above is the fix.
 #

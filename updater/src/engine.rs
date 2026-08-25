@@ -46,6 +46,19 @@ const APPLY_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// unbounded.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The pre-install hook gets much longer, because it is the one that installs what the release
+/// needs and cannot have: ONNX Runtime, and the GStreamer stack for `mediad` — around 100 MB of
+/// apt on a board that has never had it, over whatever wifi the robot is on.
+///
+/// **Affordable precisely because of where it runs.** Nothing has been swapped yet, the old
+/// release is still live and serving, and a hook that runs long is a slow update rather than a
+/// robot at risk — where the same minutes spent in the post-install hook would sit between the
+/// swap and the restart, with the board running neither release properly.
+///
+/// Ten minutes is the point past which a stuck apt is more likely wedged than slow. Bounded, not
+/// unbounded, for the reason the ceiling exists at all.
+const PRE_INSTALL_HOOK_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Interval between health probes while the gate is open.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -768,7 +781,13 @@ impl Engine {
                 .map(|m| m.schema_version),
             new_schema_version: manifest.schema_version,
         };
-        hooks::run(extract_dir, hooks::HookKind::PreInstall, &ctx, HOOK_TIMEOUT).await?;
+        hooks::run(
+            extract_dir,
+            hooks::HookKind::PreInstall,
+            &ctx,
+            PRE_INSTALL_HOOK_TIMEOUT,
+        )
+        .await?;
 
         // 7. Publish the release directory with one rename, then arm the boot
         //    counter *before* the symlink swap so a crash in between is

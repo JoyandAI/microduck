@@ -6,9 +6,11 @@
 #
 #  1. **Different lifetime.** The overlay fix and the ONNX install in `setup-board.sh` are
 #     what makes a board a robot: without them there is no motor bus and no policy. GStreamer
-#     is what makes it a *camera*, and a board doing walking work needs none of it. Around
-#     100 MB of media stack installed on every board before anything uses it is a cost with
-#     no payer, so this is invoked rather than assumed.
+#     is what makes it a *camera*. That was a cost with no payer while nothing used it; `mediad`
+#     ships now, so the callers are provisioning (`provision.sh`, on by default) and the
+#     updater's pre-install hook, which runs this script out of the release on every apply —
+#     which is how a board provisioned before this existed gets the stack without anybody
+#     remembering a command.
 #  2. **Different question.** Everything in `setup-board.sh` either works or fails. Half of
 #     this script's value is the report at the end, which answers a question nothing else on
 #     the board answers: *can this kernel encode H.264 in hardware, and through which
@@ -21,6 +23,11 @@
 #
 # Full paths, because this advice gets copy-pasted and /tmp does not survive a reboot. The
 # first run leaves a copy at the second path.
+#
+# **`hooks/preinstall` runs this too**, from `scripts/setup-gstreamer.sh` in the release, with a
+# ten-minute ceiling and no token in its environment — which is why the plugins repository is
+# public and why nothing here may prompt. An xtask test keeps the packaging lists in step with
+# the hook that runs it.
 #
 #   --dev     also install the headers and pkg-config files needed to *build* against
 #             GStreamer — `gst-plugin-webrtc` on this board, or an aarch64 sysroot to

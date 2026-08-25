@@ -102,7 +102,7 @@ live path.
 | 4 | download to `releases/.staging-<ver>/dl/` | no |
 | 5 | verify sha256, then verify the artifact signature | no |
 | 6 | extract to `releases/.staging-<ver>/root/`, write `.updater-manifest.json` | no |
-| 7 | **`hooks/preinstall`** (cwd = the staged tree) — installs ONNX Runtime if below the floor | no |
+| 7 | **`hooks/preinstall`** (cwd = the staged tree) — installs ONNX Runtime if below the floor, then runs the release's `scripts/setup-gstreamer.sh` for `mediad`'s stack | no |
 | 8 | `rename` the staged tree to `releases/<ver>/` | no |
 | 9 | arm the boot counter (`pending.json`), *before* the swap | no |
 | 10 | swap `current` → `releases/<ver>` | no |

@@ -832,6 +832,12 @@ so no unsigned code ever runs. Rust binary or shell script — the engine just
 **Contract**
 - Runs *after* the symlink swap, *before* `apply`. (A `pre_install` hook, if
   present, runs before the swap.)
+- The pre-install hook gets a longer ceiling than the post-install one — ten minutes
+  against two. It is the hook that installs what the release needs and the board may not
+  have (ONNX Runtime; the GStreamer stack for `mediad`, which is around 100 MB of apt on a
+  board that has never had it), and it can afford the minutes precisely because nothing has
+  been swapped: the old release is still live and serving, so a long pre-install is a slow
+  update rather than a robot in an unclear state.
 - Non-zero exit ⇒ failed update ⇒ rollback.
 - Environment provided (absent values are **omitted**, not set empty, so a hook can
   tell "first install" from "unknown"):

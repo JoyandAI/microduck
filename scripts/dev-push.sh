@@ -371,6 +371,7 @@ cargo run -p xtask -- package \
     --include "updater/systemd/sysusers.d/robot.conf=systemd/sysusers.d/robot.conf" \
     --include "robotd/systemd/robotd.service=systemd/robotd.service" \
     --include "hooks/postinstall=hooks/postinstall" \
+    --include "scripts/setup-gstreamer.sh=scripts/setup-gstreamer.sh" \
     --include "scripts/robot-rescue=scripts/robot-rescue" \
     --include "scripts/robot-boot-check=scripts/robot-boot-check" \
     --include "updater/systemd/robot-boot-check.service=systemd/robot-boot-check.service" \
@@ -524,8 +525,9 @@ for svc in robotd configd padd updaterd btd mediad; do
         silent)
             # Not treated as a failure: systemd removes the runtime directory when a unit stops, so
             # this is what a deliberately disabled `padd` looks like, and what `mediad` looks like on
-            # a board with no GStreamer stack — `sudo /usr/local/sbin/robot-setup-gstreamer` — or no
-            # camera. Neither is something this push did.
+            # a board with no camera. The GStreamer stack is not a cause any more — the preinstall
+            # hook this push just ran installs it — so a silent `mediad` here is worth
+            # `journalctl -u mediad -b` rather than a command to type.
             echo "    [--] $svc published nothing — stopped, or a build too old to say"
             ;;
         stale)
