@@ -2,8 +2,8 @@
 <meta charset="utf-8">
 <title>mediad test client</title>
 <!--
-  A test client for mediad. One file, no build step, no dependencies: open it from disk and point
-  it at a robot.
+  A test client for mediad. One file, no build step, no dependencies: serve it and point it at a
+  robot.
 
       cd mediad/webclient && python3 -m http.server 8080     # then http://localhost:8080/
 
@@ -22,8 +22,8 @@
     * the video track, hardware-encoded H.264         (constrained-baseline, so a browser takes it)
     * the `control` datachannel, and the JSON-RPC on it, including a refusal   (§5)
 
-  ws:// from a file:// page is allowed. https:// would not be — mixed content — which is another
-  reason this is a local file rather than something served.
+  Serve it over http, never https: ws:// from an https page is mixed content and blocked outright,
+  and a robot on a LAN has no certificate to offer wss.
 -->
 <style>
   :root { color-scheme: light dark; }
