@@ -2103,6 +2103,11 @@ pub struct ChoraleState {
     /// listening, alone, or waiting to be seated by a conductor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part: Option<String>,
+    /// A conductor has been adopted and the phase lock is still filling — the state between
+    /// "waiting for company" and "singing". Carried because a readout that showed both as
+    /// "listening" hid a locking failure through three debugging sessions.
+    #[serde(default, skip_serializing_if = "not")]
+    pub joining: bool,
     /// How far into the piece, in beats. `None` when not singing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub beats: Option<f64>,

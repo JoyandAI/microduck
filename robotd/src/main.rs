@@ -2018,6 +2018,7 @@ async fn control_loop<T: RobotIo>(
                     listening: true,
                     part: tick.singing.map(|(part, _)| part.as_str().to_owned()),
                     beats: tick.singing.map(|(_, beats)| beats),
+                    joining: tick.joining,
                     voices: tick.voices as u32,
                 });
             } else {

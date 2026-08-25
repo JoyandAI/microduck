@@ -152,6 +152,9 @@ pub struct Tick {
     /// Which part this duck is singing, and how far into the score, in beats. `None` when it is not
     /// singing — listening, alone, or off.
     pub singing: Option<(Part, f64)>,
+    /// Following a conductor but not yet singing — the phase lock is still filling, or the
+    /// roster has not seated this duck yet. The state a readout must not call "listening".
+    pub joining: bool,
     /// How many ducks are actually singing, this one included.
     ///
     /// Not the roster's length: a duck that walks out of range keeps its *seat* — pruning it would
@@ -386,6 +389,7 @@ impl Chorale {
                 Tick {
                     advertise,
                     singing: None,
+                    joining: false,
                     voices: 0,
                 }
             }
@@ -448,7 +452,8 @@ impl Chorale {
                 Tick {
                     advertise,
                     singing: None,
-                    voices: 0,
+                    joining: false,
+                    voices: self.peers.len(),
                 }
             }
             State::Conducting { .. } => self.conduct(now),
@@ -495,6 +500,7 @@ impl Chorale {
         Tick {
             advertise,
             singing: self.my_part(&roster).map(|part| (part, position)),
+            joining: false,
             voices: self.voices(&roster),
         }
     }
@@ -536,9 +542,11 @@ impl Chorale {
         // holding the beat, and two beacons carrying a piece would be two conductors.
         let idle = self.beacon(proto::ChoraleBeacon::IDLE, self.heartbeat(now), Vec::new());
         let advertise = self.publish(Some(idle), true);
+        let singing = position.and_then(|at| self.my_part(&roster).map(|part| (part, at)));
         Tick {
             advertise,
-            singing: position.and_then(|at| self.my_part(&roster).map(|part| (part, at))),
+            joining: singing.is_none(),
+            singing,
             voices: self.voices(&roster),
         }
     }

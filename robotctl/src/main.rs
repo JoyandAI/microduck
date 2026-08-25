@@ -635,6 +635,15 @@ fn run_chorale(socket: &Path, off: bool, piece: Option<u8>) -> Result<(), Failur
                 beats,
                 chorale.voices
             ),
+            // Two different silences, and the difference is the whole diagnosis: "listening"
+            // means no conductor found, "joining" means found one and the phase lock is still
+            // filling — which stuck at "joining" points at beat delivery, not discovery.
+            _ if chorale.joining => {
+                print!(
+                    "\r  joining — locking onto the beat ({} voices)   ",
+                    chorale.voices
+                )
+            }
             _ => print!("\r  listening — {} ducks in range      ", chorale.voices),
         }
         let _ = std::io::stdout().flush();
