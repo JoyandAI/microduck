@@ -85,7 +85,7 @@ it this way first.
 Three things keep it there, and they are requirements on the change rather than hopes:
 
 - **One address is typed.** `http://<robot>:8080`. The 8443 is reached by the page's own
-  JavaScript and never by a human. `duck-btctl open` (§2) removes even that one.
+  JavaScript and never by a human. `duckctl open` (§2) removes even that one.
 - **`mediad` fills the signalling URL in as it serves the page**, rather than the page carrying a
   constant. It knows the host the request arrived on and it knows its own `--port`, so the page
   gets the real answer — one `str::replace` over the embedded string at startup. This is what
@@ -112,18 +112,18 @@ Worth writing down now rather than discovering it while wiring a microphone.
 
 ## 2. Finding the robot: two commands, and one of them is already hand-rolled
 
-`btd` files the robot's IPv4 in its advertisement under company id `0xFFFF`, and `duck-btctl`
+`btd` files the robot's IPv4 in its advertisement under company id `0xFFFF`, and `duckctl`
 already parses it — `Address::At`, `Unassigned`, `Unsaid`, three answers rather than two, and
 `scan` prints it today. So the work is a command, not a mechanism.
 
-### 2.1 `duck-btctl ip`
+### 2.1 `duckctl ip`
 
-The robot's address on stdout and nothing else, so `ssh radxa@$(duck-btctl ip)` works — the split
+The robot's address on stdout and nothing else, so `ssh radxa@$(duckctl ip)` works — the split
 the tool already keeps, diagnostics on stderr and data on stdout.
 
 **This is not a new idea in this repo; it is one that has already been written badly once.**
 `scripts/dev-push.sh` needs exactly this and hand-rolls it: `resolve_board()` calls
-`duck-btctl wifi status` and pipes the JSON through a six-line Python program embedded in the
+`duckctl wifi status` and pipes the JSON through a six-line Python program embedded in the
 shell script to pull `result.ip4`. That is the command, minus a home.
 
 Reading the advertisement rather than calling `net.status` is better on three counts, all of them
@@ -134,21 +134,21 @@ visible in what `dev-push.sh` had to write around:
   refused, so that branch stops existing.
 - **Seconds rather than tens of seconds.** `dev-push.sh` caches the address per robot precisely
   because "BLE discovery costs ten to twenty seconds"; a scan that stops at the first matching
-  advertisement is about a second, because `duck-btctl` already polls until something appears
+  advertisement is about a second, because `duckctl` already polls until something appears
   rather than sleeping out `SCAN_TIME`.
 - **It is not stale.** `btd`'s `reconcile_advertisement` re-reads `net.status` every `ADV_POLL`
   (5s) and re-advertises when the answer moves, so the advertisement *is* `net.status` with a
   five-second lag — well inside the window in which a new lease has already broken ssh.
 
 **With one fallback, which is not optional.** A robot bonded to this Mac often stops advertising
-the service to it — `duck-btctl`'s own scan tiers exist for that — so when no advertisement is
+the service to it — `duckctl`'s own scan tiers exist for that — so when no advertisement is
 seen, `ip` connects and asks `net.status`, which is what `dev-push.sh` does today. Cheap read
 first, call second. Without the fallback this command would fail on exactly the laptops that use
 it most.
 
 The three-way `Address` already carries the right failure text and this is where it pays:
 
-- `Unassigned` — the robot has no network. The fix is `duck-btctl wifi connect`, and it has to be
+- `Unassigned` — the robot has no network. The fix is `duckctl wifi connect`, and it has to be
   over BLE, because `net.connect` is refused over WebRTC by design ("a robot that has never seen a
   network cannot be configured over that network").
 - `Unsaid` — a release from before `btd` advertised an address. The fallback answers anyway;
@@ -157,19 +157,19 @@ The three-way `Address` already carries the right failure text and this is where
 Its third caller is neither of the two above: `install-dev.md` opens by asking for "the board's
 **IP address**", with the note that mDNS on this image is unreliable, and offers no way to get it.
 
-### 2.2 `duck-btctl open`
+### 2.2 `duckctl open`
 
 Resolve, then open `http://<address>:8080/` in the browser. `--print` prints the URL instead, for
 a machine with no browser or a script; `--port` for a robot started with a non-default
 `--web-port`.
 
 A command rather than a documented shell substitution, for one reason: **the port default should
-live in exactly one place that a person never has to read.** `open "http://$(duck-btctl ip):8080"`
+live in exactly one place that a person never has to read.** `open "http://$(duckctl ip):8080"`
 works, and it is the kind of line someone writes once and then looks up forever.
 
 ### 2.3 Not these
 
-- **`duck-btctl url`.** That is `open --print`. A third command whose entire content is a port
+- **`duckctl url`.** That is `open --print`. A third command whose entire content is a port
   number.
 - **A URL column on `scan`.** `scan` lists earbuds too, and the robot lines already carry the
   address. One note under the list pointing at `open` is enough.
@@ -184,23 +184,23 @@ alternatives and become a sequence — which is worth saying because `route.rs` 
 over WebRTC deliberately, and this is the other half of that refusal.
 
 The follow-on, in its own change rather than these four: `dev-push.sh`'s `resolve_board` becomes
-`btctl --name "$1" ip`, deleting the embedded Python and the wrong-PIN branch. Separate because it
+`client --name "$1" ip`, deleting the embedded Python and the wrong-PIN branch. Separate because it
 touches the push path, and because it should land after `ip` has been used by hand a few times.
 
-Both commands are written here under today's name; §3 is the argument that it should be
-`duckctl` by the time they land.
-
-`duck-btctl` is a stopgap for the phone app, so this stays at two commands and no new mechanism.
+`duckctl` is a stopgap for the phone app, so this stays at two commands and no new mechanism.
 The durable halves are the ones that outlive it: `btd` broadcasting the address, and `mediad`
 serving on a known port. The app will do the same two steps natively.
 
 ## 3. The tool is named after a transport it is about to stop being
 
-`open` launches a browser at an http URL, and the name of the tool that does it says `bt`. Worth
-pulling on, because it turns out to point at something larger than one command.
+**Decided and landed** — `duck-btctl` is `duckctl`, in its own crate. The rest of this section is
+the reasoning, kept because the alternatives are the part worth being able to re-read.
+
+`open` launches a browser at an http URL, and the name of the tool that does it said `bt`. Worth
+pulling on, because it turned out to point at something larger than one command.
 
 **`open` itself is not misplaced.** Its substance *is* Bluetooth: it scans for an advertisement to
-learn where the robot is, and the `xdg-open` on the end is one line. `duck-btctl open` reads as
+learn where the robot is, and the `xdg-open` on the end is one line. `duckctl open` reads as
 "use the radio to find the robot, then show me its console", which is exactly what it does — the
 same way `wifi connect` is a wifi command whose whole mechanism is BLE.
 
@@ -241,23 +241,32 @@ without an alias.
 plausible on a Mac. `microduck` is the repository and too long for a command someone runs twenty
 times an hour.
 
-### 3.3 What not to rewrite
+### 3.3 What was not rewritten
 
-196 references across about twenty files, and most are prose. **`docs/project/` is not among them.**
-Those are dated records that describe a moment — an update session in August, four install-path
-bugs and what closed them — and rewriting a tool name into an account of something that happened
-before the tool had that name makes the record slightly false. They keep saying `duck-btctl`.
-`docs/robot/`, `docs/design/`, the scripts and the code are the rename.
+196 references across about twenty files, most of them prose. **The dated records keep the old
+name.** `update-over-ble.md` and `install-path-gap.md` describe a moment — an update session, four
+install-path bugs and what closed them — and rewriting a tool name into an account of something
+that happened before the tool had it makes the record slightly false. Their *links* are repointed
+so they still resolve; their prose is not.
+
+`roadmap.md` sits in the same directory and is the exception, because it is not a record of a
+moment: it describes the repo as it is now, down to a crate-by-crate layout table. A layout table
+naming a directory that does not exist is simply wrong.
 
 **No compatibility shim, no alias.** One user and one robot: a `duck-btctl` that still works is a
 second name to keep in step and a reason for the old one to survive in someone's shell history for
 a year.
 
-### 3.4 When
+### 3.4 What keeps it off the board
 
-Before the console work adds commands under the old name, and ideally before `ip` and `open` are
-documented — otherwise `docs/robot/duck-btctl.md` gets those two entries written twice. It blocks
-nothing and nothing blocks it, so it is cheapest first and merely tidy later.
+`cargo board --bins` — in `dev-push.sh` and in the release workflow — builds every default member
+for aarch64. As an example it was excluded for free; as a crate it would be cross-compiled, which
+means building a Bluetooth stack for a board that must never see one, on the release path.
+
+**`default-members` in the workspace root, everything except `duckctl`.** One list, rather than
+naming binaries at each of the two `--bins` call sites and keeping the two in step by hand — which
+is the failure this repo keeps writing down. `--workspace` is unaffected, so CI lints and tests it
+exactly as before.
 
 ## 4. The page becomes a console
 
@@ -319,12 +328,12 @@ Four changes, each of which stands alone and lands separately:
 1. **Serve the page, with the signalling URL filled in as it is served.** Deletes the python
    instruction and the warning block. Small, and everything else is nicer on top of it.
 2. **Producer `meta`.** Smaller still, and independent.
-3. **The tool becomes `duckctl` (§3),** then gains **`ip` and `open`.** Client-side only, touches
-   no daemon. The move first so the two commands are documented once; `ip` before `open`, since
-   `ip` stands on its own for ssh and `open` is a port number on top of it.
+3. **`duckctl` gains `ip` and `open`.** Client-side only, touches no daemon. The rename it needed
+   first (§3) is done. `ip` before `open`, since `ip` stands on its own for ssh and `open` is a
+   port number on top of it.
 4. **The console.** The large one, done last, on a page that is already reachable.
 
-Then, separately, `dev-push.sh` switching to `duck-btctl ip` (§2.4).
+Then, separately, `dev-push.sh` switching to `duckctl ip` (§2.4).
 
 ## 8. Not doing
 
@@ -335,4 +344,4 @@ Then, separately, `dev-push.sh` switching to `duck-btctl ip` (§2.4).
   a client that needs npm is a client nobody runs. Still true at four times the size.
 - **Serving over TLS in this change.** §1.3 says when, and why it is not now.
 - **Teaching the advertisement a port.** Four bytes of IPv4 is what it carries; a robot on a
-  non-default `--web-port` is a `--port` on `duck-btctl open`, not a wire-format change.
+  non-default `--web-port` is a `--port` on `duckctl open`, not a wire-format change.
