@@ -200,7 +200,11 @@ fn permits(call: &proto::Call) -> bool {
         // Harmless and rather charming from a phone — but it rides the same refusal as the
         // rest of robot.* until the app path exists to want it: opening one call to the
         // radio ahead of a client that can use it buys nothing and widens the surface.
-        RobotSound(_) => false,
+        //
+        // The theremin sits here rather than with motor control even though it moves the
+        // mouth, because what it is is a sound: the mouth is following the note. Same
+        // refusal either way, and the same reason to lift it — an app that can play the duck.
+        RobotSound(_) | RobotTheremin(_) => false,
 
         // Powering the machine off from a phone in the room is `system.reboot` without the
         // coming back. The sit-then-power-off flow wants whoever asked to be watching the

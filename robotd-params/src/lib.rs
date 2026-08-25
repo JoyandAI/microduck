@@ -38,6 +38,67 @@ pub struct Params {
     pub policy: PolicyParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
+    pub theremin: ThereminParams,
+}
+
+/// `[theremin]` — the ToF theremin: what counts as a hand, and where the depth frames come
+/// from.
+///
+/// The interesting field is `statuses`, and it is the reason this section exists at all. ST
+/// documents 5 and 9 as "range valid", and a build that believes only those stops seeing a
+/// hand at about 30 cm on this sensor — past that a moving hand comes back as 4 or 13,
+/// *consistency failed*, carrying a distance that is fine for a pitch. That took a bench
+/// session to find, so the set is configurable: a duck whose theremin has a short reach wants
+/// more codes in, and one that plays phantom notes at nothing wants fewer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ThereminParams {
+    /// Master switch. On by default: the instrument still has to be picked up with
+    /// `robot.theremin`, so what this turns off is the *ability* to, on a duck where the
+    /// feature is unwanted or the sensor is known bad.
+    pub enabled: bool,
+    /// `tofd`'s depth stream.
+    pub socket: PathBuf,
+    /// Nearest playable range, metres.
+    pub near_m: f64,
+    /// Farthest playable range, metres.
+    pub far_m: f64,
+    /// Fewest zones that make a hand.
+    pub min_zones: usize,
+    /// ST status bytes whose distance is believed. See the section docs — this is the one
+    /// that decides how far the instrument reaches.
+    pub statuses: Vec<u8>,
+    /// How long a note is held through a sensor dropout, milliseconds. This is what keeps a
+    /// flickering zone from chopping a note into gravel.
+    pub hold_ms: u64,
+}
+
+impl Default for ThereminParams {
+    fn default() -> Self {
+        let hand = kinematics::hand::Config::default();
+        Self {
+            enabled: true,
+            socket: PathBuf::from(duck_ipc_proto::socket::TOF),
+            near_m: hand.near_m,
+            far_m: hand.far_m,
+            min_zones: hand.min_zones,
+            statuses: hand.statuses,
+            hold_ms: hand.hold.as_millis() as u64,
+        }
+    }
+}
+
+impl ThereminParams {
+    /// The hand-detection config these params describe.
+    pub fn hand(&self) -> kinematics::hand::Config {
+        kinematics::hand::Config {
+            near_m: self.near_m,
+            far_m: self.far_m,
+            min_zones: self.min_zones,
+            statuses: self.statuses.clone(),
+            hold: std::time::Duration::from_millis(self.hold_ms),
+        }
+    }
 }
 
 /// `[audio]` — the voice and the microphone. All optional equipment: a robot without a

@@ -21,6 +21,7 @@
 mod math;
 mod mjcf;
 
+pub mod hand;
 pub mod head;
 pub mod tof;
 

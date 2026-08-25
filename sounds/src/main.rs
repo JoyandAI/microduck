@@ -57,6 +57,24 @@ enum Cmd {
         #[arg(long, default_value = "plughw:aic3104")]
         device: String,
     },
+    /// Audition the live theremin voice: a scripted hand sweep through the streaming synth.
+    ///
+    /// The theremin's pitch is a hand's distance and there is no hand on a bench, so this
+    /// plays the gesture instead — approach, hold, wobble, retreat — driving
+    /// [`sounds::Stream`] exactly as `robotd` does at the frame rate the ToF actually
+    /// delivers. It is the only way to hear a voice change without a robot in front of you.
+    Theremin {
+        /// Write a wav here instead of playing it.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        seed: Option<u32>,
+        #[arg(long, default_value_t = 0)]
+        variant: u32,
+        /// ALSA device; the robot's codec by default.
+        #[arg(long, default_value = "plughw:aic3104")]
+        device: String,
+    },
     /// Make sure this robot's voice bank exists and is current — render it if not.
     ///
     /// Idempotent: a marker records the seed and bank version, and a matching bank is left
@@ -107,6 +125,79 @@ fn show(p: &Personality) {
     println!("  speed              {:.2}", p.speed);
 }
 
+/// Pipe a rendered buffer into `aplay`, falling back to the default device off the robot.
+fn play_pcm(buf: &[f32], device: &str) -> Result<()> {
+    let play = |device: Option<&str>| -> Result<bool> {
+        let mut cmd = Command::new("aplay");
+        cmd.args(["-q", "-t", "raw", "-f", "S16_LE", "-c", "1", "-r"])
+            .arg(sounds::SR.to_string());
+        if let Some(d) = device {
+            cmd.args(["-D", d]);
+        }
+        let mut child = cmd.stdin(Stdio::piped()).spawn().context("running aplay")?;
+        let pcm: Vec<u8> = sounds::synth::to_i16(buf)
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(&pcm)?;
+        }
+        Ok(child.wait()?.success())
+    };
+    if !play(Some(device))? && !play(None)? {
+        bail!("aplay failed on both {device} and the default device");
+    }
+    Ok(())
+}
+
+/// A scripted hand gesture, rendered through the live synth at the real frame rate.
+///
+/// Every parameter update happens on a 15 Hz boundary and every block is one frame long,
+/// because that is what `robotd` will do: auditioning at audio rate would hide exactly the
+/// stair-stepping the stream's slews exist to smooth. `closeness` is what
+/// `kinematics::hand` reports — 0 at the far end of the playable band, 1 at the near end —
+/// and it drives pitch, level and mouth together, the same one gesture.
+fn theremin_sweep(p: &Personality, variant: u32) -> Vec<f32> {
+    /// The ToF's frame rate: how often a real hand's distance arrives.
+    const FRAME_HZ: f64 = 15.0;
+    // (seconds, closeness at the end of the leg, hand present) — an approach, a held note,
+    // a hand wobbling around one spot, a retreat, and a hand leaving the frame entirely.
+    const LEGS: [(f64, f64, bool); 6] = [
+        (1.5, 0.05, true),
+        (2.5, 0.95, true),
+        (1.5, 0.95, true),
+        (2.0, 0.55, true),
+        (1.5, 0.05, true),
+        (1.0, 0.0, false),
+    ];
+
+    let mut stream = sounds::Stream::wheee(p, variant);
+    let samples_per_frame = (f64::from(sounds::SR) / FRAME_HZ) as usize;
+    let mut out = Vec::new();
+    let mut from = 0.0f64;
+    let mut wobble_phase = 0.0f64;
+    for (seconds, to, present) in LEGS {
+        let frames = (seconds * FRAME_HZ).round() as usize;
+        for frame in 0..frames {
+            let progress = (frame as f64 + 1.0) / frames as f64;
+            let mut closeness = from + (to - from) * progress;
+            // The held leg gets a real hand's tremor, so the slews are auditioned against
+            // something that moves the way a hand does rather than a clean ramp.
+            if (to - from).abs() < 1e-9 {
+                wobble_phase += std::f64::consts::TAU * 0.8 / FRAME_HZ;
+                closeness += 0.04 * wobble_phase.sin();
+            }
+            let level = if present { 1.0 } else { 0.0 };
+            stream.set(stream.hz_at(closeness), level, closeness);
+            let mut block = vec![0.0f32; samples_per_frame];
+            stream.block(&mut block);
+            out.extend(block);
+        }
+        from = to;
+    }
+    out
+}
+
 fn main() -> Result<()> {
     match Args::parse().command {
         Cmd::Show { seed } => {
@@ -135,27 +226,22 @@ fn main() -> Result<()> {
             device,
         } => {
             let p = Personality::from_seed(resolve_seed(seed)?);
-            let buf = render(&tag, &p, variant)?;
-            // Pipe raw PCM into aplay; fall back to the default device off the robot.
-            let play = |device: Option<&str>| -> Result<bool> {
-                let mut cmd = Command::new("aplay");
-                cmd.args(["-q", "-t", "raw", "-f", "S16_LE", "-c", "1", "-r"])
-                    .arg(sounds::SR.to_string());
-                if let Some(d) = device {
-                    cmd.args(["-D", d]);
+            play_pcm(&render(&tag, &p, variant)?, &device)?;
+        }
+        Cmd::Theremin {
+            out,
+            seed,
+            variant,
+            device,
+        } => {
+            let p = Personality::from_seed(resolve_seed(seed)?);
+            let buf = theremin_sweep(&p, variant);
+            match out {
+                Some(path) => {
+                    to_wav(&buf, &path)?;
+                    println!("wrote {}", path.display());
                 }
-                let mut child = cmd.stdin(Stdio::piped()).spawn().context("running aplay")?;
-                let pcm: Vec<u8> = sounds::synth::to_i16(&buf)
-                    .iter()
-                    .flat_map(|s| s.to_le_bytes())
-                    .collect();
-                if let Some(stdin) = child.stdin.as_mut() {
-                    stdin.write_all(&pcm)?;
-                }
-                Ok(child.wait()?.success())
-            };
-            if !play(Some(&device))? && !play(None)? {
-                bail!("aplay failed on both {device} and the default device");
+                None => play_pcm(&buf, &device)?,
             }
         }
         Cmd::EnsureBank { dir, force, seed } => {

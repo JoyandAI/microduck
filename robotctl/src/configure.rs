@@ -235,6 +235,23 @@ impl Model {
                 input.into()
             }
             Kind::Text | Kind::OptionalPath => input.into(),
+            Kind::IntegerList => {
+                let mut array = toml_edit::Array::new();
+                for word in input.split(',') {
+                    let word = word.trim();
+                    if word.is_empty() {
+                        continue;
+                    }
+                    let number: i64 = word
+                        .parse()
+                        .map_err(|_| format!("{word:?} is not a whole number"))?;
+                    array.push(number);
+                }
+                if array.is_empty() {
+                    return Err("an empty list — give comma-separated numbers".to_owned());
+                }
+                array.into()
+            }
         };
         self.pending.insert(entry.key, Edit::Set(value));
         Ok(())
@@ -1027,7 +1044,15 @@ mod tests {
         let s = sections();
         assert_eq!(
             s,
-            vec!["bus", "control", "update_gate", "policy", "safety", "audio"]
+            vec![
+                "bus",
+                "control",
+                "update_gate",
+                "policy",
+                "safety",
+                "theremin",
+                "audio"
+            ]
         );
     }
 }

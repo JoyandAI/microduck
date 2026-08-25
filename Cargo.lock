@@ -3327,6 +3327,8 @@ dependencies = [
 name = "robotd-params"
 version = "0.9.1"
 dependencies = [
+ "duck-ipc-proto",
+ "kinematics",
  "serde",
  "serde_json",
  "tempfile",

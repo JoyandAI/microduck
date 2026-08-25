@@ -12,6 +12,10 @@ robotd-params = { path = "../robotd-params" }
 kinematics = { path = "../kinematics" }
 odometry = { path = "../odometry" }
 pet-detect = { path = "../pet-detect" }
+# The voice, for the live synth the theremin plays through. The bank's wavs cover every
+# sound whose whole shape is known in advance; a theremin's pitch is a hand's distance and
+# is not, so `robotd` renders that one itself. Pure Rust, no vendored anything.
+sounds = { path = "../sounds" }
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -45,7 +49,6 @@ arc-swap = "1"
 # so the test silently ran a stale robotd. That produced a confidently wrong result once
 # already.
 [dev-dependencies]
-sounds = { path = "../sounds" }
 updater = { path = "../updater" }
 # `start_paused` for the startup-retry tests: the retry interval is a second of real time,
 # which is right on a robot and far too slow in a test. Dev-only — `cargo build` does not

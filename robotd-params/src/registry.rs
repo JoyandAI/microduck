@@ -36,6 +36,8 @@ pub enum Kind {
     /// A filesystem path, or absent meaning the release's own copy; the literal `"none"`
     /// disables the slot outright.
     OptionalPath,
+    /// A list of whole numbers, edited as comma-separated text ("4, 5, 9").
+    IntegerList,
 }
 
 /// One key of `robotd.toml`.
@@ -282,6 +284,38 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
+    // ── [theremin] ───────────────────────────────────────────────────────────
+    feature(
+        "theremin.enabled",
+        Kind::Bool,
+        "The ToF theremin may be picked up at all (robot.theremin still starts it)",
+    ),
+    entry("theremin.socket", Kind::Text, "tofd's depth stream"),
+    entry(
+        "theremin.near_m",
+        Kind::Float,
+        "Nearest playable range, metres",
+    ),
+    entry(
+        "theremin.far_m",
+        Kind::Float,
+        "Farthest playable range, metres",
+    ),
+    entry(
+        "theremin.min_zones",
+        Kind::Integer,
+        "Fewest zones that make a hand",
+    ),
+    entry(
+        "theremin.statuses",
+        Kind::IntegerList,
+        "ToF status bytes believed — this list decides how far the instrument reaches",
+    ),
+    entry(
+        "theremin.hold_ms",
+        Kind::Integer,
+        "How long a note rides over a sensor dropout, milliseconds",
+    ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
         "audio.enabled",
@@ -419,6 +453,7 @@ mod tests {
                 Kind::Text | Kind::OptionalPath => {
                     format!("[{section}]\n{key} = \"probe\"\n")
                 }
+                Kind::IntegerList => format!("[{section}]\n{key} = [1, 2]\n"),
             };
             let parsed: Result<Params, _> = toml::from_str(&probe);
             assert!(
@@ -478,6 +513,7 @@ mod tests {
                 "policy.voltage_adapt",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
+                "theremin.enabled",
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",

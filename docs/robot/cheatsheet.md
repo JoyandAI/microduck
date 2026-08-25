@@ -274,6 +274,48 @@ To audition a voice or regenerate the bank by hand, the release carries the gene
 sudo /opt/robot/daemon/current/bin/sounds ensure-bank --force
 ```
 
+`sounds theremin` auditions the *live* synth — the voice the theremin plays in, driven by a
+scripted hand sweep at the ToF's own frame rate. `--out sweep.wav` writes it instead of
+playing it, which is how you hear a voice change without a robot in front of you.
+
+### Play the duck (the ToF theremin)
+
+```
+robotctl theremin
+```
+
+The head's depth sensor becomes an instrument: a hand in front of the beak is the pitch —
+closer is higher — and the mouth opens with the note, wide at the top of the range. Runs
+until Ctrl-C and puts the instrument down on the way out. `--off` puts down one a client left
+up.
+
+An explicit mode with nothing clever inside it: while it is up, the nearest return inside the
+playable band is the hand. Point the duck at open space and it is silent; point it at a wall
+40 cm away and it plays a steady note. It plays sitting, standing or walking — the mouth is
+not part of any policy.
+
+The readout's last column is **what the sensor said about that frame**, and it is the answer
+to every "why did it stop playing":
+
+```
+  0.34 m    438.1 Hz   60% ██████    14 usable · 255:38 4*:9 5*:5 1:12
+```
+
+How many zones carry a status the robot believes, then the count per ST status code with a
+`*` on the believed ones. A `~` before the note means it is a *held* note bridging a sensor
+dropout rather than something measured right now.
+
+That column exists because of the bug it would have found in a minute: ST documents 5 and 9
+as "range valid", and a build believing only those **stops seeing a hand at about 30 cm** —
+past that a moving hand comes back as 4 or 13 (*consistency failed*, sigma too high) carrying
+a distance that is perfectly good for a pitch. If the reach is short, add codes to
+`[theremin] statuses` in `robotd.toml`; if it plays phantom notes at empty air, remove some.
+`hold_ms` is the anti-chop: it rides over a flickering zone.
+
+Note that `robotctl monitor`'s ToF grid is stricter than the theremin — it marks anything
+outside 5/9 as `x`, *could not measure*. A grid full of `x` does not mean the sensor is
+broken; it means it is being pessimistic about numbers it does have.
+
 ### The ToF sensor (`tofd`)
 
 An 8×8 depth matrix from the head sensor. `robotctl monitor`, then **`t`**:

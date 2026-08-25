@@ -61,7 +61,9 @@ fn permits(call: &proto::Call) -> bool {
         // transport". A datachannel is a control transport, so this is the transport those
         // refusals were pointing at.
         RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotPose(_) | RobotMouth(_) => true,
-        RobotDo(_) | RobotSound(_) => true,
+        // The theremin rides with the sounds: it is one, and a browser that can quack a duck
+        // may pick its instrument up too.
+        RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
         RobotHealth | RobotMode => true,
 
         // Telemetry at up to the control rate. BLE called this "a firehose into a 20-byte pipe",
