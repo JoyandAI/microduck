@@ -1,14 +1,14 @@
 //! What the advertisement carries besides the name: the robot's IPv4 address.
 //!
 //! Platform-independent, and here rather than in [`crate::bluez`] for [`crate::gatt`]'s reason —
-//! it is wire contract. The robot encodes with [`address_data`] and `duck-btctl` decodes with
+//! it is wire contract. The robot encodes with [`address_data`] and `duckctl` decodes with
 //! [`address_in`], so the two halves cannot disagree about the layout. A decoder written
 //! separately in the client would agree only with itself.
 //!
 //! ## Why the advertisement rather than a call
 //!
 //! `net.status` already reports the address, and reading it costs a connection, a bond and the
-//! PIN — per robot. `duck-btctl scan` deliberately connects to nothing, which is what makes it the
+//! PIN — per robot. `duckctl scan` deliberately connects to nothing, which is what makes it the
 //! command to reach for when a robot is unreachable, so a listing can only report what an
 //! advertisement carries. Broadcasting the address is therefore the only way `scan` can answer
 //! "where do I ssh?", and that is the question a listing is most often read to answer.
@@ -54,7 +54,7 @@ pub fn address_data(address: Option<Ipv4Addr>) -> Vec<u8> {
 /// `None` covers three cases that a listing renders differently and this function does not
 /// distinguish, because it cannot: no field at all, a field of the wrong length, and a field
 /// saying `0.0.0.0`. The caller has the advertisement and can tell the first from the third; see
-/// `duck-btctl`'s listing, which does.
+/// `duckctl`'s listing, which does.
 pub fn address_in(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<Ipv4Addr> {
     let bytes: [u8; 4] = manufacturer_data
         .get(&COMPANY_ID)?

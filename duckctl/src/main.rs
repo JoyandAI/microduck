@@ -1,9 +1,15 @@
-//! `duck-btctl` — talk to a robot over BLE from a laptop.
+//! `duckctl` — the robot from a laptop.
 //!
 //! The phone app's stand-in, and the only way to test `btd` against a real radio.
 //!
-//! An **example, not a binary**, so `btleplug` never reaches the robot: examples' dependencies
-//! are dev-dependencies, and nothing here is in the shipped artifact. `robotctl` is the tool
+//! **Bluetooth is how it reaches a robot today, not what it is.** `mediad` gives a robot a second
+//! transport that reaches a different set of methods by design — `robot.move` is refused over BLE
+//! and permitted over WebRTC, `net.connect` the other way round — so the name says which robot
+//! rather than which radio. It was called `duck-btctl` while BLE was the only answer.
+//!
+//! **Nothing on the robot depends on this crate**, which is what keeps `btleplug` out of a
+//! release. It used to be an example of `btd` for the same purpose, obtained as a side effect of
+//! the directory it sat in; a crate nobody depends on states it directly. `robotctl` is the tool
 //! that ships, and it speaks unix sockets on the robot itself.
 //!
 //! `btleplug` rather than `bluer`, because this runs on a developer's machine: CoreBluetooth on
@@ -15,12 +21,12 @@
 //! it a real test of the protocol rather than a reimplementation that could agree with itself.
 //!
 //! ```text
-//! cargo run -p btd --example duck-btctl -- scan          # robots in range, and their addresses
-//! cargo run -p btd --example duck-btctl -- status
-//! cargo run -p btd --example duck-btctl -- wifi scan
-//! cargo run -p btd --example duck-btctl -- wifi connect "Pollen" --psk secret
-//! cargo run -p btd --example duck-btctl -- name "Ducky"
-//! cargo run -p btd --example duck-btctl -- call robot.health
+//! cargo run -p duckctl -- scan          # robots in range, and their addresses
+//! cargo run -p duckctl -- status
+//! cargo run -p duckctl -- wifi scan
+//! cargo run -p duckctl -- wifi connect "Pollen" --psk secret
+//! cargo run -p duckctl -- name "Ducky"
+//! cargo run -p duckctl -- call robot.health
 //! ```
 //!
 //! `DUCK_ROBOT` and `DUCK_PIN` in the environment are the defaults for `--name` and `--pin`, for
@@ -231,7 +237,7 @@ const DEFAULT_PIN: &str = "000000";
 /// clap reads the variable with `env::var_os` and treats `DUCK_ROBOT=` as a value, so a variable
 /// exported in a shell profile could only be escaped by unsetting it — and the command that needs
 /// escaping is the one being typed now, on a bench that has somebody else's robot on it. Empty means
-/// unset, so `DUCK_ROBOT= duck-btctl scan` is the escape hatch, in the shape a shell already has.
+/// unset, so `DUCK_ROBOT= duckctl scan` is the escape hatch, in the shape a shell already has.
 ///
 /// **Provenance is carried rather than recomputed.** A default makes the tool *stricter*: it
 /// suppresses the already-connected fallback tier, and turns "the first robot found wins" into "no
@@ -295,7 +301,7 @@ impl Target {
         match &self.name {
             Some(name) if self.from_env => format!(
                 "\n\nNothing on this command line said {name:?} — `DUCK_ROBOT` in this shell's \
-                 environment did. `DUCK_ROBOT= duck-btctl …` ignores it for one command, and \
+                 environment did. `DUCK_ROBOT= duckctl …` ignores it for one command, and \
                  `unset DUCK_ROBOT` for the shell."
             ),
             _ => String::new(),
@@ -543,7 +549,7 @@ async fn listing(seen: &[Seen], verbose: bool, target: &Target) -> String {
     if silent > 0 {
         out.push_str(&format!(
             "\n\n{silent} of them broadcast no address, which is a release from before `btd` \
-             advertised one. `duck-btctl wifi status` still reports it; updating the robot puts it \
+             advertised one. `duckctl wifi status` still reports it; updating the robot puts it \
              in this list."
         ));
     }
@@ -667,7 +673,7 @@ async fn step<T>(
 #[command(
     // Spelled out because clap would otherwise take it from the crate, and `--version` on the
     // installed binary answered `btd 0.5.1` — the daemon's name, for the laptop-side client.
-    name = "duck-btctl",
+    name = "duckctl",
     version,
     about = "Talk to a robot over BLE — the phone app's stand-in",
     long_about = "Finds a robot advertising the duck GATT service and speaks the same JSON-RPC \
@@ -682,7 +688,7 @@ struct Cli {
     /// board that has never been renamed answers to its derived default, `duck-7f3a`.
     ///
     /// `export DUCK_ROBOT=duck-c51b` in a shell profile makes that the robot every command talks
-    /// to. `DUCK_ROBOT= duck-btctl …` ignores it for one command.
+    /// to. `DUCK_ROBOT= duckctl …` ignores it for one command.
     //
     // The id is spelled out rather than derived from the field, because clap keys arguments by id
     // and the `name` subcommand has a positional argument that derives the same one. With both
@@ -1266,7 +1272,7 @@ fn dropped(command: &Command) -> String {
 
     let next = if restarting {
         "An update restarts the robot's daemons, `btd` among them, so this is as likely to be the \
-         update finishing as failing. Reconnect and run `duck-btctl update status`: \
+         update finishing as failing. Reconnect and run `duckctl update status`: \
          `last_attempt` carries the outcome of what ran."
     } else {
         "Reconnect and try again. Anything the robot had already started — an update in \
@@ -1284,7 +1290,7 @@ fn silence(idle: Duration) -> String {
     format!(
         "nothing from the robot for {idle:?}, so it has stopped answering. Anything it had \
              already started — an update in particular — carries on without this connection: \
-             reconnect and run `duck-btctl update status`."
+             reconnect and run `duckctl update status`."
     )
 }
 
@@ -1547,7 +1553,7 @@ fn update_request_line(update: &Update) -> Result<(String, Duration), Box<dyn st
 
 /// One progress notification, as a line for a person.
 ///
-/// Progress goes to stderr like everything that is not an answer, so `duck-btctl … > reply.json`
+/// Progress goes to stderr like everything that is not an answer, so `duckctl … > reply.json`
 /// keeps the two apart — and printing it as pretty JSON, which is what this used to do, put a
 /// dozen lines of punctuation on stdout for every percent of a download.
 fn progress_line(params: &serde_json::Value) -> String {
@@ -1591,7 +1597,7 @@ fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static
         "applied" | "rolled_back" => Some(
             "note: the robot restarts its daemons now, and `btd` about five seconds after this \
              reply — so this connection drops. That is the update working. Reconnect and run \
-             `duck-btctl update status`: `last_attempt` carries the outcome of what just ran.",
+             `duckctl update status`: `last_attempt` carries the outcome of what just ran.",
         ),
         _ => None,
     }
@@ -1798,9 +1804,8 @@ mod tests {
     /// found nothing, and listed the robot it was talking to seconds earlier as merely in range.
     #[test]
     fn a_rename_still_selects_the_robot_by_the_name_it_has_now() {
-        let cli =
-            Cli::try_parse_from(["duck-btctl", "--name", "duck-c51b", "name", "leduckpierre"])
-                .expect("the rename form parses");
+        let cli = Cli::try_parse_from(["duckctl", "--name", "duck-c51b", "name", "leduckpierre"])
+            .expect("the rename form parses");
 
         assert_eq!(cli.name.as_deref(), Some("duck-c51b"), "which robot");
         let Command::Name { name } = &cli.command else {
@@ -1853,7 +1858,7 @@ mod tests {
     #[test]
     fn an_empty_value_is_no_default_at_all() {
         let escaped = Target::new(None, Some(String::new()));
-        assert_eq!(escaped.wanted(), None, "`DUCK_ROBOT= duck-btctl …`");
+        assert_eq!(escaped.wanted(), None, "`DUCK_ROBOT= duckctl …`");
         assert!(
             escaped.provenance().is_empty(),
             "no name, nothing to explain"
@@ -2022,7 +2027,7 @@ mod tests {
     #[test]
     fn apply_asks_for_the_target_the_flags_named() {
         let wire = |args: &[&str]| {
-            let mut argv = vec!["duck-btctl", "update", "apply"];
+            let mut argv = vec!["duckctl", "update", "apply"];
             argv.extend_from_slice(args);
             let cli = Cli::try_parse_from(argv).expect("parses");
             request_line(&cli.command).expect("a request").0
@@ -2057,7 +2062,7 @@ mod tests {
     fn a_ref_and_a_version_cannot_both_be_named() {
         assert!(
             Cli::try_parse_from([
-                "duck-btctl",
+                "duckctl",
                 "update",
                 "apply",
                 "--ref",
@@ -2082,7 +2087,7 @@ mod tests {
             (vec!["rollback"], "update.rollback"),
             (vec!["select", "0.5.1"], "update.select"),
         ] {
-            let mut argv = vec!["duck-btctl", "update"];
+            let mut argv = vec!["duckctl", "update"];
             argv.extend_from_slice(&args);
             let cli = Cli::try_parse_from(argv).expect("parses");
             let (line, _) = request_line(&cli.command).expect("a request");
@@ -2093,7 +2098,7 @@ mod tests {
     /// `select` sends the version as a version, and defaults the component like the rest.
     #[test]
     fn select_names_a_version_and_defaults_the_component() {
-        let cli = Cli::try_parse_from(["duck-btctl", "update", "select", "0.5.1"]).expect("parses");
+        let cli = Cli::try_parse_from(["duckctl", "update", "select", "0.5.1"]).expect("parses");
         let (line, _) = request_line(&cli.command).expect("a request");
         assert!(line.contains(r#""version":"0.5.1""#), "{line}");
         assert!(line.contains(r#""component":"daemon""#), "{line}");
@@ -2105,7 +2110,7 @@ mod tests {
     #[test]
     fn an_update_is_given_the_longest_silence() {
         let budget = |args: &[&str]| {
-            let mut argv = vec!["duck-btctl"];
+            let mut argv = vec!["duckctl"];
             argv.extend_from_slice(args);
             let cli = Cli::try_parse_from(argv).expect("parses");
             request_line(&cli.command).expect("a request").1
@@ -2154,7 +2159,7 @@ mod tests {
     /// update, so it has to be trustworthy.
     #[test]
     fn a_restart_is_announced_only_when_the_release_changed() {
-        let apply = Cli::try_parse_from(["duck-btctl", "update", "apply"])
+        let apply = Cli::try_parse_from(["duckctl", "update", "apply"])
             .expect("parses")
             .command;
 
@@ -2177,13 +2182,13 @@ mod tests {
         assert!(restart_note(&apply, &dry_run).is_none());
 
         // And nothing else announces one, however it answered.
-        let status = Cli::try_parse_from(["duck-btctl", "update", "status"])
+        let status = Cli::try_parse_from(["duckctl", "update", "status"])
             .expect("parses")
             .command;
         assert!(restart_note(&status, &applied).is_none());
 
         // Nor a component whose release does not ship `btd`.
-        let model = Cli::try_parse_from(["duck-btctl", "update", "apply", "--component", "model"])
+        let model = Cli::try_parse_from(["duckctl", "update", "apply", "--component", "model"])
             .expect("parses")
             .command;
         assert!(restart_note(&model, &applied).is_none());
@@ -2198,7 +2203,7 @@ mod tests {
     #[test]
     fn a_drop_during_an_apply_points_at_the_record() {
         let note = |argv: &[&str]| {
-            let mut full = vec!["duck-btctl"];
+            let mut full = vec!["duckctl"];
             full.extend_from_slice(argv);
             dropped(&Cli::try_parse_from(full).expect("parses").command)
         };

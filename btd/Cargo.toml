@@ -49,19 +49,6 @@ futures = "0.3"
 duck-ipc-proto = { path = "../duck-ipc-proto", features = ["test-support"] }
 tempfile = "3.27.0"
 
-# `duck-btctl`, the laptop-side client in examples/. A dev-dependency on purpose: an example's deps
-# never reach the shipped artifact, so btleplug is not on the robot.
-#
-# btleplug rather than bluer because this half runs on a developer's machine — CoreBluetooth on
-# macOS, BlueZ on Linux, WinRT on Windows. bluer would make the client Linux-only, which defeats
-# the point of having one.
-btleplug = "0.11"
-futures = "0.3"
-serde_json = "1"
-
-# Cargo builds an example under `cargo test` but does not run its `#[test]`s unless the target
-# asks for it, and the name matching in `duck-btctl` is worth pinning: the rule it encodes comes from
-# how btleplug reports names on macOS, which no compiler catches if it changes.
-[[example]]
-name = "duck-btctl"
-test = true
+# No examples here any more. The laptop-side client and the advertisement watcher both needed
+# `btleplug`, and both moved to `duckctl/` — see its manifest for what that bought and for how
+# the "never on the robot" guarantee survived the move.

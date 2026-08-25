@@ -21,7 +21,8 @@ Companion to [`architecture.md`](../design/architecture.md) (what we're building
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
-| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `duck-btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](../design/app-path-design.md) §5.5 |
+| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](../design/app-path-design.md) §5.5 |
+| `duckctl/` | The robot from a laptop. BLE today; named for the robot rather than the radio, because `mediad` is a second transport |
 | `configd/` | wifi over NetworkManager, robot name and the identity it derives from the SoC serial, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
 | tests | **458 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | missing | `mediad`, app, SDK |
@@ -220,7 +221,7 @@ provisioning step the pairing PIN now depends on (below). It also means the app 
 talk to before the app exists, which is the right order for finding out that an API is wrong.
 
 **The update path over Bluetooth is now driven rather than merely routed**, which is what that
-order was for: `update-over-ble.md` records what driving it from `duck-btctl` turned up, including
+order was for: `update-over-ble.md` records what driving it from `duckctl` turned up, including
 one defect that made "start an update and watch it" an update the robot silently never performed.
 `update.rollback` and `update.select` are reachable from a phone as of that work.
 
@@ -244,7 +245,8 @@ robotctl/       CLI
 robotd/         control, gait, safety — no kinematics yet
 padd/           gamepad → intents; a client, with no privilege the app will not have
 mediad/         camera, encode, perception, WebRTC gateway  (not built yet)
-btd/            BLE transport adapter + duck-btctl (dev client)
+btd/            BLE transport adapter
+duckctl/        the client, from a laptop (dev tool, never shipped)
 xtask/          build/publish tooling — never ships
 ```
 

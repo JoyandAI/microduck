@@ -9,7 +9,7 @@ Read-only commands need no privilege. Anything that **changes** the robot needs 
 
 Branch builds, release candidates and the restart traps after an update are in
 [`cheatsheet-dev.md`](cheatsheet-dev.md) — they need a dev board. The same robot over Bluetooth from
-a laptop, with no network and no ssh, is [`duck-btctl.md`](duck-btctl.md).
+a laptop, with no network and no ssh, is [`duckctl.md`](duckctl.md).
 
 ## On the robot — `robotctl`
 

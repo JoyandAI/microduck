@@ -82,7 +82,7 @@ done
 # nobody can keep in a shell profile: `DUCK_BOARD=radxa@192.168.1.42` goes stale, and the way
 # that reads is a push that hangs until ssh times out.
 #
-# A robot's *name* does not move. `duck-btctl` finds it over BLE by that name and `net.status`
+# A robot's *name* does not move. `duckctl` finds it over BLE by that name and `net.status`
 # answers with the address it currently has — which makes the radio the way out of exactly the
 # situation the network cannot help with, and needs nothing on the LAN to be known or guessed.
 #
@@ -92,24 +92,26 @@ done
 BOARD_USER="${DUCK_BOARD_USER:-radxa}"
 CACHE_DIR="${DUCK_BOARD_CACHE:-$HOME/.cache/duck/boards}"
 
-# The installed client if there is one, the example in this clone otherwise. `duck-btctl` is an
-# example rather than a binary, so it reaches a PATH only via `cargo install --path btd --example
-# duck-btctl`, and plenty of clones have never run that.
-btctl() {
-    if command -v duck-btctl >/dev/null 2>&1; then
-        duck-btctl "$@"
+# The installed client if there is one, this clone's otherwise. `cargo install --path duckctl` is
+# what puts it on a PATH, and plenty of clones have never run it.
+#
+# Not named `duckctl`: a function by that name would match its own `duckctl "$@"` below and
+# recurse until the shell gives up.
+client() {
+    if command -v duckctl >/dev/null 2>&1; then
+        duckctl "$@"
     else
-        cargo run -q -p btd --example duck-btctl -- "$@"
+        cargo run -q -p duckctl -- "$@"
     fi
 }
 
 # `net.status` for one robot, JSON on stdout.
 #
-# Only `--name` is passed. A robot with a PIN of its own needs `DUCK_PIN`, which `duck-btctl`
-# reads for itself (`docs/robot/duck-btctl.md`) — repeating it here would be a second place to
+# Only `--name` is passed. A robot with a PIN of its own needs `DUCK_PIN`, which `duckctl`
+# reads for itself (`docs/robot/duckctl.md`) — repeating it here would be a second place to
 # keep in step, and passing its factory default unconditionally would override the real one.
 ble_status() {
-    btctl --name "$1" wifi status
+    client --name "$1" wifi status
 }
 
 # A robot name in, `user@address` out. Everything else goes to stderr, so the substitution that
@@ -134,7 +136,7 @@ resolve_board() {
     echo "==> asking $robot_name over Bluetooth where it is" >&2
     reply="$(ble_status "$robot_name")" || {
         echo "could not reach $robot_name over Bluetooth" >&2
-        echo "  duck-btctl scan                                  # is it advertising?" >&2
+        echo "  duckctl scan                                  # is it advertising?" >&2
         echo "  scripts/dev-push.sh $BOARD_USER@<address>        # or say where it is" >&2
         return 1
     }
@@ -149,7 +151,7 @@ print((r.get("result") or {}).get("ip4") or "")')" || return 1
     if [ -z "$address" ]; then
         echo "$robot_name answered over Bluetooth but has no wifi address" >&2
         echo "Join it to a network first — over the same radio, so this needs no ssh:" >&2
-        echo "  duck-btctl --name '$robot_name' wifi connect <ssid> --psk <passphrase>" >&2
+        echo "  duckctl --name '$robot_name' wifi connect <ssid> --psk <passphrase>" >&2
         return 1
     fi
 
@@ -172,9 +174,9 @@ print((r.get("result") or {}).get("ip4") or "")')" || return 1
 }
 
 # The command line beats the environment, and an address beats a name: an address needs no radio.
-# `DUCK_ROBOT` is the same variable `duck-btctl` defaults `--name` to, so one exported name serves
+# `DUCK_ROBOT` is the same variable `duckctl` defaults `--name` to, so one exported name serves
 # both tools — and empty means unset in both, so `DUCK_ROBOT= scripts/dev-push.sh radxa@…` works.
-# `--name` here is `duck-btctl`'s sense of it: which robot to talk to. `provision-board.sh --name`
+# `--name` here is `duckctl`'s sense of it: which robot to talk to. `provision-board.sh --name`
 # means the opposite way round — the name to *give* a board — because provisioning is the one place
 # a name is assigned rather than used to find something.
 if [ -z "$BOARD" ] && [ -z "$ROBOT" ]; then

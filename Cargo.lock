@@ -448,7 +448,6 @@ name = "btd"
 version = "0.9.1"
 dependencies = [
  "bluer",
- "btleplug",
  "clap",
  "dbus",
  "duck-ipc-proto",
@@ -1049,6 +1048,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "duckctl"
+version = "0.9.1"
+dependencies = [
+ "btd",
+ "btleplug",
+ "clap",
+ "duck-ipc-proto",
+ "futures",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
