@@ -25,7 +25,22 @@ Wants=robotd.service
 
 [Service]
 Type=exec
-ExecStart=/opt/robot/daemon/current/bin/mediad
+# `--camera`, so a robot streams its camera rather than a test pattern nobody asked for.
+#
+# **The consequence, stated because it is not obvious:** the control datachannel is bundled with
+# the video track, so a robot whose camera is absent — unplugged, or the device-tree overlay not
+# enabled — fails to start this service and loses its WebRTC control surface along with its video.
+# BLE and the local pad are unaffected, and there is no `[Install]` section here, so nothing
+# auto-enables this. `--camera` can be dropped through a drop-in for a board with no camera:
+#
+#     /etc/systemd/system/mediad.service.d/test-pattern.conf
+#     [Service]
+#     ExecStart=
+#     ExecStart=/opt/robot/daemon/current/bin/mediad
+#
+# A drop-in rather than editing this file, because the release installer rewrites this file and
+# `systemctl edit --full` puts the edit exactly where it will be overwritten.
+ExecStart=/opt/robot/daemon/current/bin/mediad --camera
 
 # Unprivileged, with two supplementary groups and nothing else.
 #
