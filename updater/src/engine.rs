@@ -935,8 +935,9 @@ impl Engine {
     /// What a revert achieved: the release now live, and whatever went wrong after it was.
     ///
     /// Two facts rather than one, because they have different urgencies and used to be collapsed into
-    /// a single `RollbackFailed`. The version is the recovery; `apply_error` is a daemon that is down
-    /// on a robot which is otherwise back where it was.
+    /// a single `RollbackFailed`. The version is the recovery; `apply_error` is a unit that would not
+    /// restart on command, on a robot which is otherwise back where it was — not, despite what this
+    /// once said, a daemon that is down. [`Reverted::describe`] has the difference and why it bit.
     async fn rollback_to(
         &self,
         component: &str,
@@ -995,13 +996,15 @@ impl Engine {
             }
         };
         if let Some(detail) = &apply_error {
-            // At error, because a reverted robot with a dead daemon needs someone to look at it even
-            // though the operation it belongs to reports an outcome rather than a failure.
-            tracing::error!(
+            // At warn rather than error, and the wording changed with it. This is a restart that
+            // did not take on command, which `Restart=always` may already have undone; asserting an
+            // outage here is what made the reverted-board report contradict the health line next to
+            // it. See [`Reverted::describe`].
+            tracing::warn!(
                 component,
                 reverted_to = %previous,
                 error = %detail,
-                "reverted, but a unit did not restart — the release is back and something is down"
+                "reverted, but a unit refused to restart on command — check whether it came back"
             );
         }
 
@@ -1939,7 +1942,8 @@ impl Engine {
 /// The outcome of a revert: where the robot ended up, and what did not come back with it.
 struct Reverted {
     version: semver::Version,
-    /// The apply action's failure, when the swap succeeded and it did not.
+    /// The apply action's failure, when the swap succeeded and it did not. Names the unit — see
+    /// [`try_restart`].
     apply_error: Option<String>,
 }
 
@@ -1948,12 +1952,22 @@ impl Reverted {
     ///
     /// Appended rather than replacing: why the update failed is what someone is looking for, and a
     /// unit that then failed to restart is a second thing to act on, not a correction of the first.
+    ///
+    /// **What this deliberately no longer claims is that something is down.** It used to, and on a
+    /// bench board that sentence was false by the time anyone could read it: every daemon here runs
+    /// `Restart=always`, so a unit that refuses a restart *on command* is usually back seconds
+    /// later on its own. Reporting the refusal as an outage sent a reader looking for a dead daemon
+    /// on a robot whose own health line, printed directly above this one, said `robot healthy`.
+    ///
+    /// So it reports what it observed — a restart that did not take — and names the command that
+    /// answers the question it cannot. [`restart_one`] has already cleared the start-rate counter
+    /// and tried a second time by the time this runs, so reaching here means two refusals, not one.
     fn describe(&self, why: &str) -> String {
         match &self.apply_error {
             None => why.to_owned(),
             Some(detail) => format!(
-                "{why}; the release was reverted but a unit did not restart ({detail}), so \
-                 something on this robot is down"
+                "{why}; the release was reverted, but {detail}. `Restart=` may have brought it back \
+                 since — `robotctl health` says whether it did."
             ),
         }
     }
@@ -2345,11 +2359,26 @@ fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
     units
 }
 
+/// Restart one unit, with the two failures that are not what they look like handled here.
+///
+/// **The rate limit is the interesting one, and it is the common case rather than a race.** systemd
+/// defaults to `StartLimitBurst=5` per `StartLimitIntervalSec=10s`; `robotd` sets `RestartSec=2s`.
+/// So a daemon that exits immediately — a bad config file, a missing library — burns its five
+/// starts in ten seconds and systemd refuses further ones with `Start request repeated too
+/// quickly`. The health gate then waits another twenty, and the rollback's restart lands squarely
+/// inside that refusal. It fails, and the robot is reported as having a daemon down when the
+/// release it is now on would start perfectly.
+///
+/// That is not hypothetical: it is what a board did on the bench, reporting "so something on this
+/// robot is down" while `robotctl health` two lines above said `robot healthy`. The counter is
+/// cleared and the restart tried once more, which is what `reset-failed` is for.
+///
+/// Unconditional rather than matched on the error text: `reset-failed` is a no-op on a unit that is
+/// not failed, and the alternative is grepping systemd's prose in whatever locale it was built
+/// with. The cost is one extra pair of calls on a path that has already failed; a unit that
+/// genuinely cannot start fails the second time too and is reported then.
 async fn restart_one(systemctl: &str, unit: &str) -> Result<(), Error> {
-    let mut c = tokio::process::Command::new(systemctl);
-    c.arg("restart").arg(unit);
-
-    match run_systemctl(c, "restart").await {
+    match try_restart(systemctl, unit).await {
         Ok(()) => Ok(()),
         Err(e) => {
             if unit_is_absent(systemctl, unit).await {
@@ -2361,12 +2390,34 @@ async fn restart_one(systemctl: &str, unit: &str) -> Result<(), Error> {
                      release that introduces a new daemon; install its unit file and it will \
                      restart on the next update."
                 );
-                Ok(())
-            } else {
-                Err(e)
+                return Ok(());
             }
+
+            tracing::warn!(
+                unit,
+                error = %e,
+                "restart refused; clearing the start-rate counter and trying once more"
+            );
+            let mut c = tokio::process::Command::new(systemctl);
+            c.arg("reset-failed").arg(unit);
+            // Ignored: a unit that was never failed makes this exit non-zero on some systemd
+            // versions, and that must not replace the restart's own error with a worse one.
+            let _ = run_systemctl(c, "reset-failed").await;
+
+            try_restart(systemctl, unit).await
         }
     }
+}
+
+/// One `systemctl restart`, with the unit named in the error.
+///
+/// Named, because the caller restarts up to six of them and the bare message — systemd's own
+/// "Job for X.service failed because the control process exited" wrapped in "restart failed" —
+/// reached the update log without ever saying which unit the job was for.
+async fn try_restart(systemctl: &str, unit: &str) -> Result<(), Error> {
+    let mut c = tokio::process::Command::new(systemctl);
+    c.arg("restart").arg(unit);
+    run_systemctl(c, &format!("restarting {unit}")).await
 }
 
 /// Does systemd know this unit at all?
@@ -2861,7 +2912,83 @@ esac
         let err = restart_one(path.to_str().unwrap(), "robotd")
             .await
             .unwrap_err();
-        assert!(format!("{err:?}").contains("restart failed"), "{err:?}");
+        // Named, so a reader of the update log knows which of six units the job was for.
+        assert!(
+            format!("{err:?}").contains("restarting robotd failed"),
+            "{err:?}"
+        );
+    }
+
+    /// The bench incident, reproduced. A daemon that exits immediately burns systemd's five starts
+    /// in ten seconds (`StartLimitBurst=5`, `robotd` at `RestartSec=2s`), and every restart after
+    /// that is refused with `Start request repeated too quickly` — including the rollback's, which
+    /// arrives while the gate's thirty seconds are still running down. The board then reported a
+    /// daemon down while `robotctl health` said `robot healthy`.
+    ///
+    /// The stub refuses the first restart the way systemd does and accepts one after `reset-failed`,
+    /// which is the sequence being asserted.
+    #[tokio::test]
+    async fn a_rate_limited_unit_is_reset_and_restarted_rather_than_reported_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("systemctl");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+echo "$@" >> "$(dirname "$0")/calls"
+if [ "$1" = show ]; then echo loaded; exit 0; fi
+if [ "$1" = reset-failed ]; then : > "$(dirname "$0")/cleared"; exit 0; fi
+[ -f "$(dirname "$0")/cleared" ] && exit 0
+echo 'Failed to restart robotd.service: Start request repeated too quickly.' >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        restart_one(path.to_str().unwrap(), "robotd")
+            .await
+            .expect("a rate-limited unit must be reset and retried, not reported as a failure");
+
+        let calls = calls(dir.path());
+        assert!(
+            calls.contains("reset-failed robotd"),
+            "the start-rate counter was never cleared: {calls}"
+        );
+    }
+
+    /// The other half, so the retry cannot become "ignore the first failure". A unit that is
+    /// genuinely broken refuses both times and is reported, with `reset-failed` having been tried.
+    #[tokio::test]
+    async fn a_unit_that_refuses_twice_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("systemctl");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\nif [ \"$1\" = show ]; then echo loaded; exit 0; fi\nif [ \"$1\" = reset-failed ]; then exit 0; fi\necho 'job failed' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let err = restart_one(path.to_str().unwrap(), "robotd")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("restarting robotd failed"),
+            "{err:?}"
+        );
+        assert_eq!(
+            calls(dir.path()).matches("restart robotd").count(),
+            2,
+            "the second attempt is the whole point of clearing the counter"
+        );
     }
 
     /// A stub that records its whole argument list and nothing else. `stub_systemctl` above answers

@@ -393,11 +393,21 @@ keeps its meaning — the robot could not be put back at all — and a failed ap
 is carried into the reported outcome and logged at `error`:
 
 ```text
-not healthy within 30s: …; the release was reverted but a unit did not restart (…), so
-something on this robot is down
+not healthy within 30s: …; the release was reverted, but restarting robotd failed: …
+`Restart=` may have brought it back since — `robotctl health` says whether it did.
 ```
 
-Both facts, in the order someone needs them: why the update failed first, then what is still down.
+Both facts, in the order someone needs them: why the update failed first, then the unit that did not
+come back with the revert.
+
+The second half of that sentence used to read "so something on this robot is down", and it was wrong
+often enough to be worth naming. Every daemon here runs `Restart=always`, and a daemon that exits
+immediately burns systemd's five starts per ten seconds long before the health gate's thirty are up —
+so the revert's restart is routinely refused with `Start request repeated too quickly` and the unit is
+back on its own moments later. A bench board printed that outage claim directly beneath its own
+`robot healthy` line. `restart_one` now clears the counter with `reset-failed` and tries once more,
+which removes the cause; the outcome reports the refusal it observed and names the command that
+answers what it cannot.
 
 The two rejected alternatives, since neither is obviously wrong. Making `postinstall` reversible is the
 change the hook explicitly declined; it needs state outside the release and adds a failure mode to the
