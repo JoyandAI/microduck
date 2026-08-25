@@ -1207,12 +1207,14 @@ gate against. Both are now live:
 
 | | was | now | still pending |
 |---|---|---|---|
-| `on_apply` | `none` | `restart` with `["robotd"]` | `mediad` joins the list when it exists |
+| `on_apply` | `none` | `restart` with `["robotd", "configd"]` | — |
 | `health` | `none` | `socket`, 30s | timeout is a guess until M4 measures a real boot |
 
-`mediad` stays out for the original reason: naming a unit that is not installed makes
-`systemctl restart` fail, which fails the update, which rolls it back — so listing it
-today would revert every update.
+`mediad` needed an entry under the old authoritative list and needs none now: the restart
+set is derived from the units a release ships, skipping any without an `[Install]`
+section, and `mediad.service` has one. So an apply restarts it, and a robot that has
+never run it enables it on the next install — the rule is the unit file, not a name
+anybody maintains.
 
 **`health = none` was the weakest the design gets**: it commits as soon as the swap
 succeeds, so there was no auto-rollback at all, and the boot counter was the only

@@ -879,7 +879,8 @@ struct HealthReport {
     robot_error: Option<String>,
     software: VersionReport,
     /// What `mediad` last said about the camera, or `None` — not running, or built before it
-    /// published anything. Absence is not a fault: `mediad` ships disabled.
+    /// published anything. Absence is not a fault on its own: a board with no camera or no
+    /// GStreamer stack runs no `mediad`, and the units block is where that is reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     camera: Option<proto::CameraStats>,
 }
@@ -1074,8 +1075,8 @@ fn render_health(report: &HealthReport) -> String {
 
     // Between the robot verdict and the software block, because it is a fact about the hardware
     // rather than about which release is installed. Omitted entirely when `mediad` has published
-    // nothing — a line reading "camera unknown" on every robot that has never started `mediad`
-    // is noise, and `mediad` is disabled by default.
+    // nothing — "camera unknown" on a board with no camera is noise, and a `mediad` that is not
+    // running is already a line in the units block.
     if let Some(camera) = &report.camera {
         let rate = if camera.fps >= f64::from(camera.target_fps) * 0.9 {
             format!("{:.1} fps", camera.fps)

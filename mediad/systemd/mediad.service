@@ -30,8 +30,8 @@ Type=exec
 # **The consequence, stated because it is not obvious:** the control datachannel is bundled with
 # the video track, so a robot whose camera is absent — unplugged, or the device-tree overlay not
 # enabled — fails to start this service and loses its WebRTC control surface along with its video.
-# BLE and the local pad are unaffected, and there is no `[Install]` section here, so nothing
-# auto-enables this. `--camera` can be dropped through a drop-in for a board with no camera:
+# BLE and the local pad are unaffected. `--camera` can be dropped through a drop-in for a board
+# with no camera:
 #
 #     /etc/systemd/system/mediad.service.d/test-pattern.conf
 #     [Service]
@@ -107,22 +107,30 @@ StandardError=journal
 # identity claiming to be running.
 RuntimeDirectory=mediad
 
-# **No `[Install]` section, deliberately, and this is the line to add when there is one:**
+# **This section is what makes `mediad` a daemon rather than something to remember.**
 #
-#     [Install]
-#     WantedBy=multi-user.target
+# `hooks/postinstall` enables and starts every unit that ships with an `[Install]` section, and
+# `units_shipped` in `updater/src/engine.rs` restarts every such unit on an apply — one rule, read
+# off the unit files rather than a list anybody maintains. So this section is the whole of what
+# makes a release install a working camera and pick up the next one, and its absence was the whole
+# of why every push ended with somebody typing `systemctl restart mediad`.
 #
-# `hooks/postinstall` enables and starts every unit that ships *with* one, which is what makes a
-# newly added service arrive working. That is right for a daemon that has run somewhere, and wrong
-# for this one twice over: `mediad` has never started on a board, and it needs the GStreamer stack
-# `setup-gstreamer.sh` installs, which a board provisioned before that existed does not have. A
-# unit that fails and restarts every five seconds on every robot in the field is a worse outcome
-# than one somebody starts on purpose.
+# It was absent while `mediad` had never started on a board. It has, so it is here.
 #
-# So the release carries it — the binary, the unit and the account are all there — and starting it
-# is a decision:
+# **Two ways this unit can now fail on a robot nobody was looking at, and what each costs.** Both
+# are visible in `robotctl health` as a unit that is not running, and neither touches the control
+# loop, BLE, the pad or an update:
 #
-#     sudo systemctl enable --now mediad
+#   * **A board with no GStreamer stack.** `setup-gstreamer.sh` installs it and provisioning has
+#     run it by default since before `mediad` shipped — so this is a board provisioned earlier than
+#     that. The pipeline cannot start, `Restart=always` retries every five seconds, and the fix is
+#     one command: `sudo /usr/local/sbin/robot-setup-gstreamer`.
+#   * **A board with no camera**, because `ExecStart` carries `--camera`. Same shape, and the
+#     drop-in above is the fix.
 #
-# postinstall notices the missing section and says so rather than treating it as a failure; the
-# boot recovery net's oneshot ships the same way for its own reasons.
+# `WantedBy=multi-user.target` rather than a `.wants` symlink somebody adds: the release owns which
+# units exist and systemd owns whether they are enabled, and a robot whose enablement was done by
+# hand on one board is a robot nobody can reason about.
+
+[Install]
+WantedBy=multi-user.target
