@@ -496,6 +496,10 @@ echo "    current -> $want"
 # no socket at all, so for that one it is the only answer available.
 deadline=$(($(date +%s) + 30))
 stale=""
+# Daemons that are legitimately still on the old release. Reported separately from `stale` because
+# they are not a fault, and separately from silence because the closing line must not then claim
+# that everything is running this build.
+deferred=""
 for svc in robotd configd padd updaterd btd mediad; do
     while :; do
         if [ ! -f "/run/${svc}/identity.json" ]; then
@@ -535,6 +539,7 @@ for svc in robotd configd padd updaterd btd mediad; do
                 mediad)
                     echo "    [--] $svc is still on the previous release; nothing restarts it"
                     echo "         sudo systemctl restart mediad"
+                    deferred="${deferred} ${svc}"
                     ;;
                 *)
                     echo "    [FAIL] $svc is not running $want"
@@ -558,10 +563,22 @@ done
 # Answerable, not healthy. A bench board with no servo power reports degraded and that is a fact
 # about the bench, not about this build — the health gate draws the same distinction.
 robotctl health >/dev/null 2>&1 || echo "    [--] robotctl health did not answer cleanly; worth a look"
+
+# 3 rather than 0, so the closing line does not claim every daemon is running this build directly
+# under a line saying one of them is not. Which one is already named above, so the code is all the
+# caller needs.
+[ -z "$deferred" ] || exit 3
 REMOTE
 then
     echo "==> every daemon on $BOARD is running $VERSION"
 else
-    echo "==> the release is live but not everything is running it" >&2
-    exit 1
+    status=$?
+    if [ "$status" = 3 ]; then
+        # Deliberately not "every daemon": one is still on the old release, named above, and this
+        # line used to contradict it.
+        echo "==> $BOARD is running $VERSION, apart from the daemon marked [--] above"
+    else
+        echo "==> the release is live but not everything is running it" >&2
+        exit 1
+    fi
 fi
