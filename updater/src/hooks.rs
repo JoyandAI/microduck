@@ -94,8 +94,8 @@ impl HookContext {
 pub struct HookOutcome {
     pub ran: bool,
     pub exit_code: Option<i32>,
-    /// Captured output, truncated. Goes into the update log so a support ticket
-    /// can explain *why* a hook failed.
+    /// Captured output, truncated. Logged by [`run`] whatever the outcome, and
+    /// returned so a caller can put it in a reply too.
     pub output: String,
 }
 
@@ -191,6 +191,20 @@ pub async fn run(
         });
     }
 
+    // **Logged on success, not only on failure.** Both call sites take this outcome with `?` and
+    // drop it, so for a hook that worked the output went nowhere — and this is the hook that
+    // installs ONNX Runtime and the GStreamer stack, whose whole report is the answer to "can this
+    // board encode H.264 in hardware, at this release". A grep of `journalctl -u updaterd` for it
+    // came back empty on a board where the hook had plainly run, which is how this was found.
+    //
+    // Line by line rather than one entry: a multi-line message is one journal record, and what a
+    // reader does with this is grep it.
+    for line in text.lines() {
+        if !line.trim().is_empty() {
+            tracing::info!(hook = %hook_name, "{}", line.trim_end());
+        }
+    }
+
     Ok(HookOutcome {
         ran: true,
         exit_code: output.status.code(),
@@ -253,6 +267,93 @@ mod tests {
         .await
         .unwrap();
         assert!(!outcome.ran);
+    }
+
+    /// Collects whatever a `tracing` subscriber is handed, so a test can assert what reached the
+    /// journal rather than what a function returned.
+    #[derive(Clone, Default)]
+    struct Collected(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    /// The collector, installed once as the **global** default.
+    ///
+    /// A thread-local default (`set_default`) is not enough and the difference is not academic: it
+    /// passed run on its own and collected nothing under `cargo test`, because these events are
+    /// emitted wherever the runtime happens to poll the future rather than on the thread that
+    /// installed the guard. Global, once, and the assertions below are `contains` — so another
+    /// test's events landing in the same buffer are harmless.
+    fn log_collector() -> Collected {
+        static COLLECTED: std::sync::OnceLock<Collected> = std::sync::OnceLock::new();
+        COLLECTED
+            .get_or_init(|| {
+                let collected = Collected::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(collected.clone())
+                    .with_max_level(tracing::Level::INFO)
+                    .finish();
+                // Best effort: if something else in this binary got there first, the assertions
+                // below will say so rather than this failing obscurely here.
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                collected
+            })
+            .clone()
+    }
+
+    impl std::io::Write for Collected {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Collected {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A hook that *worked* must still say what it said.
+    ///
+    /// Both call sites take the outcome with `?` and drop it, so for a successful hook the returned
+    /// `output` reaches nobody — and the pre-install hook's report is the answer to "can this board
+    /// encode H.264 in hardware, at this release". A grep of `journalctl -u updaterd` for it came
+    /// back empty on a board where the hook had plainly run, which is what this test now holds.
+    #[tokio::test]
+    async fn a_successful_hook_reaches_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(
+            dir.path(),
+            HookKind::PreInstall,
+            "#!/bin/sh\necho 'plugins already at v3'\necho 'mpph264enc present' >&2\n",
+        );
+
+        let collected = log_collector();
+
+        run(
+            dir.path(),
+            HookKind::PreInstall,
+            &ctx(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        let logged = String::from_utf8(collected.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("plugins already at v3"),
+            "stdout did not reach the log: {logged}"
+        );
+        assert!(
+            logged.contains("mpph264enc present"),
+            "stderr did not reach the log: {logged}"
+        );
+        assert!(
+            logged.contains("preinstall"),
+            "the log does not name which hook said it: {logged}"
+        );
     }
 
     #[tokio::test]
