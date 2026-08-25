@@ -39,8 +39,52 @@ shape of bug this design invites rather than one-offs:
   debug log *and* the pipeline bus into the journal — without that, none of the above was visible
   at all.
 
-What is still untested: the control channel carrying an actual call, the camera as a source, and
-anything at all through a bridge.
+### The camera, and two independent causes of a 35% frame loss
+
+The head camera streams at **29.3 fps** through the hardware encoder. Getting there took two
+unrelated fixes, and the reason it took a while is that neither one alone moves the number —
+which made each look ineffective.
+
+**Capture pool depth.** rkisp implements no `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, so
+`gst_v4l2_object_decide_allocation` computes `own_min` from zero and lands on two buffers. Three
+is a cliff, not a slope: `v4l2-ctl --stream-mmap=N` on the main path gives 19.7 fps at two and
+29.2 at three or more. Raising it needs both a `GstVideoMeta` in the ALLOCATION query (or
+`can_share_own_pool` is false and the branch that reads the query's `min` is never taken) and a
+first pool whose `min` is non-zero (any downstream element proposing a pool sets `update` and
+forfeits the `+2` bonus — `GstVideoEncoder::propose_allocation` proposes exactly that).
+
+**The pixel format.** rkisp offers a non-contiguous two-plane `NM12` alongside single-plane
+formats. Both map to GStreamer `NV12`, `v4l2src` prefers the multi-plane one, and it cannot drive
+that at full rate here at any pool depth:
+
+| caps | 2 buffers | 4+ buffers |
+|---|---|---|
+| `NV12` (selects `NM12`) | 19.5 fps | 19.6 fps |
+| `UYVY` (single plane) | 19.7 fps | **29.3 fps** |
+
+`mpph264enc` lists `UYVY` on its sink pad and converts on the RGA, so the 4:2:2 to 4:2:0 step
+costs no CPU.
+
+**What was ruled out, by measurement rather than argument** — each of these was a plausible
+suspect: `v4l2-ctl` reaches 29.2 fps with either format on the same node; the sensor subdev
+reports a 1/30 interval; the driver implements no `S_PARM`; `mpph264enc` encodes 720p at 130 fps
+flat out; and the DMABuf caps `v4l2src` prefers when unconstrained are not the reason it is fast
+unconstrained.
+
+**The methodological lesson, which cost more than any of the above.** Four different rates were
+each taken for the capture rate and none of them was: `rkvenc` interrupts count what the *encoder*
+consumed, behind `webrtcsink`'s queue and the `videorate drop-only` in its converter bin;
+`v4l2src`'s `lost frames detected` counts gaps in driver sequence numbers and goes silent when the
+source is merely slow; a counter on the tee's raw branch sits behind a deliberately leaky
+one-buffer queue; and `/dev/video1` is the ISP's self path, not the main path the daemon uses.
+`mediad` now meters the pad before the tee, which is the only place with nothing lossy between it
+and the driver.
+
+Two things this exposed that are not fixed: `rtpgccbwe` costs about 40% of a core, and GStreamer's
+own `INFO`-level log never reaches the journal despite the bridge mapping it to `tracing::info!`,
+which is why several of these questions were answered the slow way.
+
+What is still untested: anything at all through a bridge.
 
 ## 1. What this is not
 
