@@ -282,11 +282,24 @@ pub fn start(
     // client knows which robot it found before it negotiates anything. [`crate::producer`] is what
     // goes in it and why. A structure name is required and is not what a peer reads; `meta` is
     // webrtcsink's own word for the property.
-    let mut meta = gst::Structure::builder("meta");
-    for (field, value) in producer.fields() {
-        meta = meta.field(field, value);
+    //
+    // **Checked before it is set, for the reason every signal in this file is checked**:
+    // `set_property` panics on a name the element does not have, and a panic here is a daemon that
+    // will not start — costing the video and the control channel to gain a producer's name. This is
+    // the newest thing this function touches, so it is the one most likely to be wrong about a
+    // spelling, and a producer that is merely anonymous is a far better failure.
+    if sink.has_property("meta") {
+        let mut meta = gst::Structure::builder("meta");
+        for (field, value) in producer.fields() {
+            meta = meta.field(field, value);
+        }
+        sink.set_property("meta", meta.build());
+    } else {
+        tracing::warn!(
+            "webrtcsink has no `meta` property on these plugins, so peers see a producer id and \
+             nothing else. Everything else is unaffected."
+        );
     }
-    sink.set_property("meta", meta.build());
 
     // Offer H.264 and nothing else. Left alone `webrtcsink` proposes everything it can encode:
     // `mppvp8enc`, `mpph265enc` and `mpph264enc` on the VPU, but `vp9enc` and `av1enc` in

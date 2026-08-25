@@ -72,10 +72,20 @@ const SCAN_POLL: Duration = Duration::from_millis(250);
 /// so gets its own budget below.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const SLOW_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
-/// An update's silences are longer than any other call's: a post-install hook may take two
-/// minutes, and the phase notification arrives before it rather than during it. So the budget is
-/// the longest gap an update can legitimately have, not the longest an update can take.
-const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// An update's silences are longer than any other call's: a hook's phase notification arrives
+/// *before* the hook rather than during it, so the budget is the longest gap an update can
+/// legitimately have, not the longest an update can take.
+///
+/// **The gap is the pre-install hook's ceiling**, which is why this is derived from
+/// [`duck_ipc_proto::UPDATE_MAX_SILENCE_SECONDS`] rather than being a number here. That hook
+/// installs what a release needs and a board may not have — ONNX Runtime, and around 100 MB of apt
+/// for `mediad`'s GStreamer stack on a board that never had it — and this was 180 seconds when that
+/// ceiling was two minutes. A budget below the ceiling reports a working update as a robot that
+/// stopped answering, and the operator's next move is to interrupt an update that was fine.
+///
+/// A minute of margin over it, for the reply that follows the hook.
+const UPDATE_IDLE_TIMEOUT: Duration =
+    Duration::from_secs(duck_ipc_proto::UPDATE_MAX_SILENCE_SECONDS + 60);
 /// `update watch` follows progress until interrupted, so it has no deadline worth naming. A day
 /// is an arbitrary bound that keeps the reply loop one shape instead of two.
 const FOLLOW_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
