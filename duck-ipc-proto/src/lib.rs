@@ -2984,6 +2984,62 @@ pub fn publish_identity(service: &str, build: BuildInfo) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// What `mediad`'s capture path is doing, published for `robotctl` to read.
+///
+/// A file rather than a query, for the same reason [`Identity`] is one: it needs no socket, no
+/// privilege and no protocol version, and it answers just as well when the daemon has stopped
+/// (systemd removes the runtime directory with the unit, so absence means "not running").
+///
+/// `mediad` is not a request/response service — it routes calls upstream rather than answering
+/// them — so adding a served call for this would mean giving it a socket it otherwise has no use
+/// for. If a WebRTC peer ever needs these numbers, that is the moment to reconsider.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraStats {
+    /// Measured delivery rate at the pad before the tee, frames per second.
+    ///
+    /// Measured *there* on purpose: every other place in that pipeline sits behind something that
+    /// drops — a leaky queue, the encoder's queue, a `videorate drop-only` — and reporting one of
+    /// those as the capture rate is a mistake this project has already made four times.
+    pub fps: f64,
+    /// What was asked for, so a reader can judge `fps` without knowing the configuration.
+    pub target_fps: u32,
+    pub width: u32,
+    pub height: u32,
+    /// GStreamer format name of what the capture path emits, e.g. `UYVY`.
+    pub format: String,
+    /// Frames delivered since start.
+    pub frames: u64,
+    /// Frames the *driver* captured and we never saw, counted from gaps in the sequence number
+    /// `v4l2src` leaves in each buffer's offset. Distinct from frames dropped downstream by our
+    /// own queues, which is a choice rather than a fault.
+    pub dropped: u64,
+    /// WebRTC peers currently being encoded for. Zero is normal — nothing encodes until someone
+    /// connects.
+    pub consumers: u32,
+}
+
+/// Where `mediad` publishes [`CameraStats`].
+fn camera_stats_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("/run/mediad/camera.json")
+}
+
+/// Publish [`CameraStats`]. Never fatal: a robot that cannot describe its camera still has one.
+pub fn publish_camera_stats(stats: &CameraStats) -> Result<(), String> {
+    let path = camera_stats_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut json = serde_json::to_vec(stats).map_err(|e| e.to_string())?;
+    json.push(b'\n');
+    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
+pub fn read_camera_stats() -> Option<CameraStats> {
+    serde_json::from_slice(&std::fs::read(camera_stats_path()).ok()?).ok()
+}
+
 /// What one daemon published, or `None` if it published nothing.
 ///
 /// `None` covers both "not running" — systemd removes the directory with the unit — and "too old to

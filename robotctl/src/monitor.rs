@@ -1390,7 +1390,8 @@ impl View {
                 .dim()
                 .right_aligned(),
             )
-            .title_bottom(Line::from(self.policy_caption()));
+            .title_bottom(Line::from(self.policy_caption()))
+            .title_bottom(Line::from(Self::camera_caption()).right_aligned());
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1738,6 +1739,58 @@ impl View {
     /// happens anywhere in this daemon path, so this is the sensor's own frame,
     /// not the robot's — which is exactly what someone debugging a mounting angle
     /// wants to see.
+    /// The camera, on the bottom border rather than in a block of its own.
+    ///
+    /// A block would cost rows the joints table needs, and the camera is two numbers — a rate and
+    /// a drop count — that only matter when one of them is wrong. On the border they are visible
+    /// at all times and cost nothing.
+    ///
+    /// Read from `mediad`'s published file on every redraw. That is a ~200-byte read from a tmpfs
+    /// at the redraw rate, which is cheaper than holding a socket open to a daemon that is
+    /// disabled on most robots.
+    ///
+    /// **`--json` output is deliberately untouched.** One line per tick is a scripted interface,
+    /// and adding a field to it would break `monitor | grep` for everyone. `robotctl health
+    /// --json` carries the same numbers for anything that wants to read them.
+    fn camera_caption() -> Vec<Span<'static>> {
+        let Some(camera) = duck_ipc_proto::read_camera_stats() else {
+            // Silent rather than "camera unknown": `mediad` is disabled on most robots, and a
+            // caption implying a fault on every one of them is worse than no caption.
+            return vec![];
+        };
+
+        let below_target = camera.fps < f64::from(camera.target_fps) * 0.9;
+        let rate = Span::styled(
+            format!("{:.1} fps", camera.fps),
+            if below_target {
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::Cyan)
+            },
+        );
+
+        let mut caption = vec![Span::raw(" camera · ").dim(), rate];
+        if below_target {
+            caption.push(Span::raw(format!(" of {} ", camera.target_fps)).dim());
+        }
+        if camera.dropped > 0 {
+            caption.push(Span::raw(" · ").dim());
+            caption.push(Span::styled(
+                format!("{} dropped", camera.dropped),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        caption.push(
+            Span::raw(match camera.consumers {
+                0 => " · no viewer ".to_owned(),
+                1 => " · 1 viewer ".to_owned(),
+                n => format!(" · {n} viewers "),
+            })
+            .dim(),
+        );
+        caption
+    }
+
     fn render_tof(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         let block = Block::bordered()
             .title(Line::from(self.tof_title()))

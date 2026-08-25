@@ -74,6 +74,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use duck_ipc_proto as proto;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -282,8 +283,9 @@ pub fn start(
     // first-frame, and both matter — see `wire_encoder_setup`.
     wire_encoder_setup(&sink)?;
 
+    let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
-    wire_consumers(&sink, channels_tx, runtime)?;
+    wire_consumers(&sink, channels_tx, runtime, consumers.clone())?;
 
     // ── the raw branch ──────────────────────────────────────────────────────
     //
@@ -328,7 +330,10 @@ pub fn start(
         &capsfilter
             .static_pad("src")
             .context("capsfilter has no src pad, which cannot happen")?,
+        width,
+        height,
         fps,
+        consumers.clone(),
     )?;
 
     gst::Element::link_many([&src, &capsfilter, &tee]).context(
@@ -893,47 +898,109 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
     Ok(())
 }
 
-/// Count frames where they enter the pipeline, not where they leave it.
+/// Live count of what the consumers see, so [`meter_capture_rate`] can report it.
+///
+/// An `AtomicU32` rather than a lock: it is written from `consumer-added`/`consumer-removed` on
+/// GStreamer threads and read from the capture probe on another, and neither may block the other.
+type Consumers = Arc<std::sync::atomic::AtomicU32>;
+
+/// Count frames where they enter the pipeline, not where they leave it, and publish what we see.
 ///
 /// **Placement is the whole point.** This lived on the tee's raw branch first, which sits behind a
-/// deliberately leaky one-buffer queue — so it measured what survived that queue and reported 19.6
-/// fps for a source that may well have been delivering 30. The other two rates available are just
-/// as misleading in the same direction: `rkvenc` interrupts count what the *encoder* consumed
-/// (behind `webrtcsink`'s own queue and its `videorate drop-only`), and `v4l2src`'s
-/// `lost frames detected` counts gaps in the driver's sequence numbers, which stays silent when the
-/// source is simply slow. Every wrong turn in this bring-up came from one of those three.
+/// deliberately leaky one-buffer queue — so it measured what survived that queue. The other rates
+/// available are misleading in the same direction: `rkvenc` interrupts count what the *encoder*
+/// consumed (behind `webrtcsink`'s own queue and its `videorate drop-only`), and `v4l2src`'s
+/// `lost frames detected` warning counts gaps in the driver's sequence numbers, which stays silent
+/// when the source is merely slow. Every wrong turn in this bring-up came from one of those.
 ///
 /// On the pad *before* the tee there is nothing between here and the driver.
-fn meter_capture_rate(pad: &gst::Pad, fps: u32) -> Result<()> {
+///
+/// **Driver-level drops come from the buffer offset**, where `v4l2src` leaves the V4L2 sequence
+/// number. A gap there is a frame the driver captured and we never got, which is the number worth
+/// reporting — as opposed to what our own leaky queue discards, which is a choice.
+fn meter_capture_rate(
+    pad: &gst::Pad,
+    width: u32,
+    height: u32,
+    fps: u32,
+    consumers: Consumers,
+) -> Result<()> {
     let target = fps as f64;
-    // (frames this window, when the window started, whether the last report said healthy)
-    let state = Mutex::new((0u64, std::time::Instant::now(), Option::<bool>::None));
+    struct Meter {
+        window_frames: u64,
+        window_start: std::time::Instant,
+        frames: u64,
+        dropped: u64,
+        last_offset: Option<u64>,
+        healthy: Option<bool>,
+    }
+    let meter = Mutex::new(Meter {
+        window_frames: 0,
+        window_start: std::time::Instant::now(),
+        frames: 0,
+        dropped: 0,
+        last_offset: None,
+        healthy: None,
+    });
 
-    pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
         // Must not panic: this is a GStreamer thread, and a panic crossing the C closure boundary
         // aborts the process rather than unwinding.
-        if let Ok(mut state) = state.lock() {
-            let (ref mut count, ref mut since, ref mut was_healthy) = *state;
-            *count += 1;
-            let elapsed = since.elapsed();
-            if elapsed >= std::time::Duration::from_secs(10) {
-                let measured = *count as f64 / elapsed.as_secs_f64();
-                *count = 0;
-                *since = std::time::Instant::now();
+        let offset = match info.data {
+            Some(gst::PadProbeData::Buffer(ref buffer)) => buffer.offset(),
+            _ => gst::ClockTime::NONE.map_or(u64::MAX, |_| u64::MAX),
+        };
+
+        if let Ok(mut meter) = meter.lock() {
+            meter.frames += 1;
+            meter.window_frames += 1;
+
+            // `u64::MAX` is `GST_BUFFER_OFFSET_NONE`, which is what a source that does not set one
+            // leaves behind — `videotestsrc`, for instance. No offset, no gap detection.
+            if offset != u64::MAX {
+                if let Some(last) = meter.last_offset
+                    && offset > last + 1
+                {
+                    meter.dropped += offset - last - 1;
+                }
+                meter.last_offset = Some(offset);
+            }
+
+            let elapsed = meter.window_start.elapsed();
+            if elapsed >= std::time::Duration::from_secs(1) {
+                let measured = meter.window_frames as f64 / elapsed.as_secs_f64();
+                meter.window_frames = 0;
+                meter.window_start = std::time::Instant::now();
+
+                let stats = proto::CameraStats {
+                    fps: (measured * 10.0).round() / 10.0,
+                    target_fps: fps,
+                    width,
+                    height,
+                    format: CAPTURE_FORMAT.to_owned(),
+                    frames: meter.frames,
+                    dropped: meter.dropped,
+                    consumers: consumers.load(std::sync::atomic::Ordering::Relaxed),
+                };
+                // Ignored on purpose: a robot that cannot describe its camera still has one, and
+                // this runs every second — a warning here would be a warning every second.
+                let _ = proto::publish_camera_stats(&stats);
 
                 // 90% rather than equality: a sensor's clock is not the CPU's, and a frame landing
-                // either side of a window boundary is not a fault.
+                // either side of a window boundary is not a fault. Logged only on a crossing,
+                // because a line a second forever gets grepped out.
                 let healthy = measured >= target * 0.9;
-                if was_healthy.is_none_or(|previous| previous != healthy) {
+                if meter.healthy.is_none_or(|previous| previous != healthy) {
                     if healthy {
                         tracing::info!(fps = %format!("{measured:.1}"), target = fps, "capture rate");
                     } else {
                         tracing::warn!(
                             fps = %format!("{measured:.1}"), target = fps,
+                            dropped = meter.dropped,
                             "capture is below its target rate"
                         );
                     }
-                    *was_healthy = Some(healthy);
+                    meter.healthy = Some(healthy);
                 }
             }
         }
@@ -952,9 +1019,33 @@ fn wire_consumers(
     sink: &gst::Element,
     channels: mpsc::Sender<Channel>,
     runtime: tokio::runtime::Handle,
+    consumers: Consumers,
 ) -> Result<()> {
+    // Counted here rather than inferred from the log, so `robotctl health` can say whether anyone
+    // is actually watching. `consumer-removed` is guarded the same way `consumer-added` is: a
+    // signal that has moved upstream should degrade the count, not abort the daemon.
+    if glib::subclass::signal::SignalId::lookup("consumer-removed", sink.type_()).is_some() {
+        let leaving = consumers.clone();
+        sink.connect("consumer-removed", false, move |_| {
+            // `fetch_update` rather than `fetch_sub`, so a spurious removal cannot wrap the count
+            // around to four billion viewers.
+            let _ = leaving.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| Some(current.saturating_sub(1)),
+            );
+            None
+        });
+    } else {
+        tracing::warn!(
+            "webrtcsink has no consumer-removed signal; the consumer count will only ever rise"
+        );
+    }
+
+    let arriving = consumers;
     let channels = Arc::new(channels);
     sink.connect("consumer-added", false, move |values| {
+        arriving.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // (webrtcsink, peer_id, webrtcbin). A signature change upstream shows up here as a
         // warning naming what arrived, rather than a panic in a signal handler.
         let Some(webrtcbin) = values.get(2).and_then(|v| v.get::<gst::Element>().ok()) else {
