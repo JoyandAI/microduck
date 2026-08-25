@@ -7,11 +7,12 @@
 //! ## Shape
 //!
 //! ```text
-//!                                    ┌─ queue ─ mpph264enc ─ h264parse ─ webrtcsink
-//! videotestsrc | camera ─ NV12 ─ tee ┤                                        │
-//!                                    └─ queue ─ appsink        run-signalling-server=true
-//!                                       (leaky)                               │
-//!                                          │              consumer-added → "control" channel
+//!                                    ┌─ queue ─ webrtcsink ── encoder-setup → mpph264enc
+//! videotestsrc | camera ─ NV12 ─ tee ┤              │
+//!                                    └─ queue ─     │  run-signalling-server=true
+//!                                       (leaky)     │
+//!                                          │        └─ consumer-added → "control" channel
+//!                                      appsink
 //!                                     latest frame
 //! ```
 //!
@@ -35,12 +36,19 @@
 //! never has to be built or shipped — what we ship from that upstream is a `.so`.
 //! `remote-webrtc.md` §3.
 //!
-//! **The encoder is fed pre-encoded H.264**, which `webrtcsink` accepts on its sink pad, so the
-//! encoder never reaches negotiation. The four properties that are decisions rather than defaults
-//! are set here and explained in `media-bringup.md`: `profile=baseline` — which produces a stream
-//! `h264parse` reports as `constrained-baseline`, WebRTC's interoperable floor — and
-//! `header-mode=each-idr`, without which SPS/PPS appear in the first frame only and a peer that
-//! joins late decodes nothing.
+//! **`webrtcsink` owns the encoder, and is handed raw video.** It briefly did not — the pipeline
+//! was `mpph264enc ! h264parse ! webrtcsink`, which worked and quietly gave up two things: with
+//! pre-encoded input `webrtcsink` cannot reach the encoder, so its congestion control cannot adapt
+//! the bitrate to the link, and a peer's PLI cannot produce a keyframe, leaving a viewer that lost
+//! one broken until the next periodic GOP.
+//!
+//! That costs a software `videoconvert ! videoscale` in front of any encoder `webrtcsink` does not
+//! recognise, and it does not recognise `mpph264enc` — so **the plugin we ship carries a patch**
+//! adding that arm. Without the patch this arrangement is slower than pre-encoding rather than
+//! faster; the two belong together. See `patches/` in `pollen-robotics/microduck-gst-plugins`.
+//!
+//! The encoder settings survive through `encoder-setup` — see [`wire_encoder_setup`], which is
+//! also where a fallback to software encoding gets noticed.
 //!
 //! ## A test pattern before a camera
 //!
@@ -175,33 +183,27 @@ pub fn start(
 
     let tee = make("tee")?;
 
-    // ── the encoded branch ──────────────────────────────────────────────────
+    // ── the video branch ────────────────────────────────────────────────────
     //
     // Its own queue, so this branch runs on its own thread. Without one, `tee` pushes to both
     // branches from a single thread and whichever is slower holds up the other.
-    let enc_queue = make("queue")?;
+    let video_queue = make("queue")?;
 
-    // The one element that is not in Debian. If it is missing the message has to say why, because
-    // "no element mpph264enc" has three separate causes and only one of them is a missing package:
-    // see `media-bringup.md` on the plugin, its two libraries, and /dev/mpp_service's group.
-    let enc = gst::ElementFactory::make("mpph264enc")
-        .build()
-        .map_err(|_| {
-            anyhow!(
-                "no mpph264enc. Either the plugin is absent (run setup-gstreamer.sh), or its \
-             libraries are (librockchip-mpp1, librga2 — ldd the plugin), or /dev/mpp_service is \
-             root-only and the encoders silently did not register. GST_PLUGIN_PATH must also \
-             include /usr/local/lib/gstreamer-1.0."
-            )
-        })?;
-    // WebRTC's interoperable floor, and the SPS/PPS repetition without which a late peer decodes
-    // nothing. `media-bringup.md` has the measurements behind both.
-    enc.set_property_from_str("profile", "baseline");
-    enc.set_property_from_str("header-mode", "each-idr");
-    enc.set_property("bps", bitrate);
-
-    let parse = make("h264parse")?;
-
+    // **Raw video in, and `webrtcsink` owns the encoder.** This used to be
+    // `mpph264enc ! h264parse ! webrtcsink`, which worked and gave up two things quietly: with
+    // pre-encoded input `webrtcsink` cannot reach the encoder, so its congestion control cannot
+    // adapt the bitrate to the link, and a peer's PLI cannot produce a keyframe — a viewer that
+    // loses one stays broken until the next periodic GOP.
+    //
+    // Handing it raw video costs a software `videoconvert ! videoscale` in front of whatever
+    // encoder it picks, unless it knows the encoder. It does not know `mpph264enc`, so the
+    // plugin we ship carries a patch adding that arm — see `patches/` in
+    // pollen-robotics/microduck-gst-plugins. Without it this is *slower* than pre-encoding, not
+    // faster, so the two changes belong together.
+    //
+    // Which encoder it picks is by rank: `mpph264enc` registers at primary+1 (257), above
+    // `x264enc`. Worth confirming with `GST_DEBUG=webrtcsink:4` rather than trusting, because the
+    // failure mode is a robot quietly encoding in software.
     let sink = gst::ElementFactory::make("webrtcsink")
         .build()
         .map_err(|_| {
@@ -214,6 +216,18 @@ pub fn start(
     sink.set_property("run-signalling-server", true);
     sink.set_property("signalling-server-host", host);
     sink.set_property("signalling-server-port", port);
+
+    // The starting bitrate. `webrtcsink` moves it from here as congestion control learns the
+    // link — which is the whole point of letting it own the encoder, so this is a starting
+    // point rather than the setting it was when we encoded ourselves.
+    sink.set_property("start-bitrate", bitrate);
+
+    // The encoder settings, applied through the hook that exists for it.
+    //
+    // Handing `webrtcsink` the encoder would otherwise *lose* them, which would make this change a
+    // regression rather than an improvement: `profile` defaults to High and `header-mode` to
+    // first-frame, and both matter — see `wire_encoder_setup`.
+    wire_encoder_setup(&sink)?;
 
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
     wire_consumers(&sink, channels_tx, runtime)?;
@@ -248,9 +262,7 @@ pub fn start(
             &src,
             &capsfilter,
             &tee,
-            &enc_queue,
-            &enc,
-            &parse,
+            &video_queue,
             &sink,
             &raw_queue,
             appsink.upcast_ref(),
@@ -261,16 +273,14 @@ pub fn start(
         "could not link the source to the tee. A caps failure here means the source cannot \
          produce NV12 at the requested size and rate.",
     )?;
-    gst::Element::link_many([&enc_queue, &enc, &parse, &sink]).context(
-        "could not link queue → mpph264enc → h264parse → webrtcsink. A caps failure here is \
-         usually the encoder's sink pad, which takes NV12 and friends.",
-    )?;
+    gst::Element::link_many([&video_queue, &sink])
+        .context("could not link the video queue to webrtcsink")?;
     gst::Element::link_many([&raw_queue, appsink.upcast_ref()])
         .context("could not link the raw branch to its appsink")?;
 
     // `tee`'s source pads are request pads: they do not exist until asked for, which is why these
     // two links are separate from the `link_many` chains above.
-    link_tee_branch(&tee, &enc_queue).context("could not attach the encoded branch to the tee")?;
+    link_tee_branch(&tee, &video_queue).context("could not attach the video branch to the tee")?;
     link_tee_branch(&tee, &raw_queue).context("could not attach the raw branch to the tee")?;
 
     pipeline
@@ -335,6 +345,66 @@ fn make(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make(name)
         .build()
         .map_err(|_| anyhow!("no {name} element; a GStreamer package is missing"))
+}
+
+/// Configure each encoder `webrtcsink` builds, before it runs.
+///
+/// `webrtcsink` emits `encoder-setup` once per encoder — per consumer, plus one for the discovery
+/// pass it uses to work out caps — with the element in hand. It is the only place these can be set
+/// now that it owns the encoder rather than us.
+///
+/// Both settings are measured, and both fail in ways that do not look like encoder settings:
+///
+/// - **`profile=baseline`** produces a stream `h264parse` reports as `constrained-baseline`, which
+///   is WebRTC's interoperable floor (`profile-level-id 42e01f`). The default is High: current
+///   browsers negotiate it, older peers do not.
+/// - **`header-mode=each-idr`** repeats SPS/PPS on every IDR. The default puts them in the first
+///   frame only, so a peer that joins late — or loses that one packet — never decodes anything.
+///
+/// Returns `false`, so `webrtcsink` still applies its own configuration on top: it owns the
+/// bitrate now, and congestion control moving it is the reason for this whole arrangement.
+fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
+    if glib::subclass::signal::SignalId::lookup("encoder-setup", sink.type_()).is_none() {
+        return Err(anyhow!(
+            "webrtcsink has no encoder-setup signal; without it the encoder cannot be configured \
+             and the stream would be High profile with SPS/PPS only in its first frame"
+        ));
+    }
+
+    sink.connect("encoder-setup", false, move |values| {
+        // (webrtcsink, consumer_id, stream_name, encoder).
+        let Some(encoder) = values.get(3).and_then(|v| v.get::<gst::Element>().ok()) else {
+            tracing::warn!(
+                arity = values.len(),
+                "encoder-setup did not carry an encoder; it will run unconfigured"
+            );
+            return Some(false.to_value());
+        };
+        let name = encoder
+            .factory()
+            .map(|f| f.name().to_string())
+            .unwrap_or_default();
+
+        // Only ours has these properties, and setting a property an element lacks panics — which
+        // in a signal handler aborts the process. So this is keyed on the factory rather than
+        // attempted hopefully.
+        if name == "mpph264enc" {
+            encoder.set_property_from_str("profile", "baseline");
+            encoder.set_property_from_str("header-mode", "each-idr");
+            tracing::info!(encoder = %name, "configured for WebRTC");
+        } else {
+            // The visible symptom of the patched converter arm not being present, or of
+            // `mpph264enc` not being registered: webrtcsink falls back to software H.264 and the
+            // robot cooks the cores robotd's control loop shares. Worth a warning rather than
+            // silence.
+            tracing::warn!(
+                encoder = %name,
+                "webrtcsink did not choose mpph264enc — this is software encoding"
+            );
+        }
+        Some(false.to_value())
+    });
+    Ok(())
 }
 
 /// Give every consumer a `control` datachannel, and hand its ends to the caller.
