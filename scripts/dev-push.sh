@@ -244,51 +244,32 @@ if [ ! -f "$KEY" ]; then
     exit 1
 fi
 
-# ── the one C dependency, and why this is not `apt-get install libudev-dev:arm64` ──────
+# ── the C dependencies, and where the target's copies come from ────────────────────────
 #
-# `padd` needs libudev (via `gilrs`), which is the only C library anything reaching the board
-# links against — `scripts/cross-sysroot.sh` unpacks it for the target, along with GStreamer, on a
-# CI runner. That script is Debian-only and cannot help here, and a Mac has no way to install
-# an aarch64 Linux library through a package manager.
+# This used to `scp` libudev.so.1 off the board and hand-write a `.pc` beside it, which worked
+# because `libudev-sys` asks for no particular version and the linker records the SONAME rather
+# than the filename. GStreamer ended that: `mediad` needs seven pkg-config modules with real
+# `Cflags` and `Requires`, and hand-writing those is not a thing to do.
 #
-# So take it from the board, which by definition runs the exact library the binary will load
-# there. The linker records the SONAME (`libudev.so.1`), not the filename it was given, so a
-# copy named `libudev.so` next to a hand-written `.pc` is all `-ludev` needs. Cached: it is one
-# `scp` on first use, and `rm -rf` the directory to refresh it.
+# Two things got better rather than merely different. The sysroot comes from Debian trixie — the
+# same archive the board installs from — so the versions match by construction instead of by
+# having copied one file off one board. And **building no longer needs a reachable board at all**:
+# the old path failed with "no libudev.so.1 on $BOARD" when the board you wanted to set up was the
+# board you needed to build, which is the wrong way round.
 #
-# One difference from CI worth knowing about, and it is inert: `libudev-sys`'s build script
-# also probes for `udev_hwdb_new` by linking a test binary with the *host* toolchain, which
-# fails on a Mac and leaves its `hwdb` cfg off. `gilrs` calls nothing under that cfg.
+# One quirk carried over from the old path, and it is inert: `libudev-sys`'s build script probes
+# for `udev_hwdb_new` by linking a test binary with the *host* toolchain, which fails on a Mac and
+# leaves its `hwdb` cfg off. `gilrs` calls nothing under that cfg.
 #
-# `--docker` needs none of this — see `scripts/dev-build.Dockerfile`. It is also the way out if
-# the board you would take libudev from is a board you have not set up yet.
-SYSROOT="${DUCK_CROSS_SYSROOT:-$HOME/.cache/duck-cross/aarch64}"
-if [ "$DOCKER" = no ] && [ ! -f "$SYSROOT/lib/libudev.so" ]; then
-    echo "==> fetching libudev from $BOARD for cross-linking (once)"
-    remote_lib="$(ssh "$BOARD" 'ls /usr/lib/aarch64-linux-gnu/libudev.so.1 /lib/aarch64-linux-gnu/libudev.so.1 2>/dev/null | head -1')"
-    if [ -z "$remote_lib" ]; then
-        echo "no libudev.so.1 on $BOARD; padd cannot be linked for it" >&2
-        exit 1
-    fi
-    mkdir -p "$SYSROOT/lib" "$SYSROOT/pkgconfig"
-    scp -q "$BOARD:$remote_lib" "$SYSROOT/lib/libudev.so"
-    # `find_library` in libudev-sys asks for no particular version, so this only has to parse.
-    cat > "$SYSROOT/pkgconfig/libudev.pc" <<EOF
-libdir=$SYSROOT/lib
-Name: libudev
-Description: libudev, copied from a board by scripts/dev-push.sh
-Version: 0
-Libs: -L\${libdir} -ludev
-Cflags:
-EOF
-fi
+# `--docker` needs none of this — see `scripts/dev-build.Dockerfile`.
 if [ "$DOCKER" = no ]; then
-    # Prepended rather than replacing: on a Linux host with the multiarch package installed,
-    # both are then visible and this one still wins.
-    PKG_CONFIG_PATH="$SYSROOT/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-    export PKG_CONFIG_PATH
-    # pkg-config refuses to answer for another architecture unless told to.
-    export PKG_CONFIG_ALLOW_CROSS=1
+    sysroot_env="$(sh "$(dirname "$0")/cross-sysroot.sh" | grep '^export')" || {
+        echo "could not build the aarch64 sysroot; see scripts/cross-sysroot.sh" >&2
+        exit 1
+    }
+    # `eval` rather than sourcing a file: the script prints the exports for a human to read first,
+    # and this is the same four lines it prints.
+    eval "$sysroot_env"
 fi
 
 SHA="$(git rev-parse HEAD)"
