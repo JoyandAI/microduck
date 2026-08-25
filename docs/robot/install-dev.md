@@ -178,7 +178,7 @@ Nothing to do — the rest of the run is addressed there.
 
 Three things stop it working, and it says which:
 
-- It needs `cargo` and this clone, because `duck-btctl` is an example rather than an installed binary.
+- It needs `cargo` and this clone, because `duckctl` is an example rather than an installed binary.
 - It can only ask once `btd` is running, which on a board being provisioned for the first time is a
   few minutes into phase 2.
 - The robot reports its **wifi** address, so a board you reach over ethernet is not covered.

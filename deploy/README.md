@@ -60,7 +60,7 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ```
 
 ```bash
-curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/provision.sh -o /tmp/provision.sh && sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/provision.sh
+curl -fsSL -H "Authorization: Bearer $DUCK_TOKEN" https://raw.githubusercontent.com/pollen-robotics/microduck/main/scripts/provision.sh -o /tmp/provision.sh && sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/provision.sh
 ```
 
 `provision.sh` runs `setup-board.sh`, `migrate-network.sh` and `install.sh` in order, warns for
@@ -99,7 +99,7 @@ group is created before the reboot, so the session you log back into already has
 No token and no dev key.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/provision.sh -o /tmp/provision.sh && sudo sh /tmp/provision.sh
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck/main/scripts/provision.sh -o /tmp/provision.sh && sudo sh /tmp/provision.sh
 ```
 
 ```bash

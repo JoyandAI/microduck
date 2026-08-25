@@ -1,6 +1,6 @@
 //! `advwatch` — how often does a robot's advertisement actually arrive?
 //!
-//! `duck-btctl` scans for eight seconds and either finds a robot or does not, which makes a slow
+//! `duckctl` scans for eight seconds and either finds a robot or does not, which makes a slow
 //! advertiser look like a broken one. This watches continuously instead and prints the arrival
 //! pattern, so "found it on the second try" can be read as a number.
 //!
@@ -11,11 +11,11 @@
 //! suffering from range or interference.
 //!
 //! ```text
-//! cargo run -p btd --example advwatch -- <robot-name>
+//! cargo run -p duckctl --example advwatch -- <robot-name>
 //! ```
 //!
 //! Reads as: arrivals per device with signal strength, then a one-character-per-second timeline for
-//! the robot, then the gaps. A gap as long as `duck-btctl`'s scan window is a run that reports no robot.
+//! the robot, then the gaps. A gap as long as `duckctl`'s scan window is a run that reports no robot.
 
 use std::time::{Duration, Instant};
 
@@ -184,7 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // One character per second: '#' is a second with at least one report, '.' is silence. The gap
-    // structure is the whole question — 8s of '.' is a failed `duck-btctl` run.
+    // structure is the whole question — 8s of '.' is a failed `duckctl` run.
     let seconds = WATCH.as_secs() as usize;
     let mut timeline = vec![b'.'; seconds];
     for hit in &hits {
@@ -235,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let over_scan = gaps.iter().filter(|g| **g >= 8.0).count();
     println!(
-        "{over_scan} gap(s) of 8s or more — each one is a `duck-btctl` run that would report no robot"
+        "{over_scan} gap(s) of 8s or more — each one is a `duckctl` run that would report no robot"
     );
     Ok(())
 }
