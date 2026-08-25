@@ -4213,6 +4213,7 @@ mod tests {
             targets: vec![0.0; proto::JOINT_NAMES.len()],
             odom: proto::OdomState::default(),
             theremin: None,
+            chorale: None,
         }
     }
 }

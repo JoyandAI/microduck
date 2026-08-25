@@ -82,6 +82,19 @@ const FLOOR_MTU: usize = 20;
 const ADV_INTERVAL_MIN: Duration = Duration::from_millis(100);
 const ADV_INTERVAL_MAX: Duration = Duration::from_millis(150);
 
+/// A task that does not outlive the bring-up that started it.
+///
+/// The advertisement, the GATT application and the agent all deregister on drop, and the chorale's
+/// radio task has to follow the same rule — a task left running against an adapter that is gone
+/// would reconnect to `robotd` forever and advertise on nothing.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// How long to wait between attempts to find a usable adapter.
 ///
 /// Measured on the board: `hci0` does not exist until roughly 73 seconds after power-on —
@@ -260,6 +273,26 @@ async fn serve_on_an_adapter(
         address: ask_address(&sockets, None).await,
     };
     let handle = Some(advertise(&adapter, &advertised).await?);
+
+    // The chorale's radio, on its own connection to `robotd` and its own advertising instance. A
+    // task rather than part of the session loop: it is not serving a client, and it must not be
+    // able to hold up the one thing this daemon exists for. Its failures are its own — a `robotd`
+    // that is not up yet is the ordinary case at boot.
+    let chorale = {
+        let adapter = adapter.clone();
+        let robot_socket = sockets.robot.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = crate::chorale::run(&adapter, &robot_socket).await {
+                    tracing::debug!(error = %e, "chorale: robotd is not answering");
+                }
+                tokio::time::sleep(ADAPTER_RETRY).await;
+            }
+        })
+    };
+    // Aborted when this bring-up ends, so a new adapter gets a new connection rather than one
+    // pointing at a radio that has gone.
+    let _chorale = AbortOnDrop(chorale);
 
     // **One session per subscription**, not one per daemon.
     //

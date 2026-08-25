@@ -6,12 +6,12 @@
 //! ships, regenerate a bank by hand, print the personality behind a voice.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use sounds::{BANK_VERSION, Personality, hardware_seed, render, render_all, to_wav};
+use sounds::{BANK_VERSION, Personality, chorale, hardware_seed, render, render_all, to_wav};
 
 #[derive(Parser)]
 #[command(
@@ -71,6 +71,44 @@ enum Cmd {
         seed: Option<u32>,
         #[arg(long, default_value_t = 0)]
         variant: u32,
+        /// ALSA device; the robot's codec by default.
+        #[arg(long, default_value = "plughw:aic3104")]
+        device: String,
+    },
+    /// The duck chorale, on a laptop: several ducks singing one piece in four parts.
+    ///
+    /// Renders the ensemble offline and mixes it down, so the arrangement can be judged before
+    /// any two ducks have to agree on a clock. Each duck keeps its own timbre; the *notes* are
+    /// absolute, because four ducks each singing a chord in their own tuning is four ducks out
+    /// of tune with each other.
+    Chorale {
+        /// How many ducks. 2 takes the outer voices, 3 drops the tenor, 4 is full SATB.
+        #[arg(long, default_value_t = 4)]
+        voices: usize,
+        /// The ducks' seeds, comma-separated. Defaults to a spread that casts cleanly.
+        #[arg(long, value_delimiter = ',')]
+        seeds: Option<Vec<u32>>,
+        /// A score to sing: a `.duckscore` text file, or a `.mid` exported from a notation
+        /// editor. Defaults to the built-in piece.
+        #[arg(long)]
+        score: Option<PathBuf>,
+        /// Write a wav here instead of playing it.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Override the tempo, beats per minute.
+        #[arg(long)]
+        bpm: Option<f64>,
+        /// Transpose, semitones. Default fits the piece to the cast's registers.
+        #[arg(long)]
+        transpose: Option<i32>,
+        /// How much room, 0..1. Real ducks get this free by being objects in a room; a dry
+        /// preview is harsher than the hardware will actually sound.
+        #[arg(long, default_value_t = 0.25)]
+        room: f64,
+        /// Where the playback speaker stops reproducing, hertz. Defaults to the duck's own
+        /// driver, which is the target; `--rolloff 0` renders for a full-range system instead.
+        #[arg(long, default_value_t = 300.0)]
+        rolloff: f64,
         /// ALSA device; the robot's codec by default.
         #[arg(long, default_value = "plughw:aic3104")]
         device: String,
@@ -198,6 +236,48 @@ fn theremin_sweep(p: &Personality, variant: u32) -> Vec<f32> {
     out
 }
 
+/// Read a score from either front end, chosen by extension.
+///
+/// `.mid`/`.midi` goes through the MIDI importer, anything else through the text parser. The
+/// import reports what it decided and what it dropped, on stdout, because "why is the tenor
+/// singing the bass line" is a question about that decision and it is otherwise invisible.
+fn load_score(path: &Path) -> Result<chorale::Score> {
+    let is_midi = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("mid") || e.eq_ignore_ascii_case("midi"));
+    if !is_midi {
+        let source =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        return chorale::text::parse(&source)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()));
+    }
+
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let import =
+        chorale::midi::parse(&bytes).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    println!(
+        "imported {} — {} tracks: {}",
+        path.display(),
+        import.tracks.len(),
+        import.tracks.join(", ")
+    );
+    for (part, why) in &import.casting {
+        println!("  {:8} {why}", part.as_str());
+    }
+    for dropped in &import.dropped {
+        println!("  dropped: {dropped}");
+    }
+    let mut score = import.score;
+    // A MIDI file's name is the file's name; the importer has nothing better to call it.
+    score.name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("imported")
+        .to_owned();
+    Ok(score)
+}
+
 fn main() -> Result<()> {
     match Args::parse().command {
         Cmd::Show { seed } => {
@@ -242,6 +322,93 @@ fn main() -> Result<()> {
                     println!("wrote {}", path.display());
                 }
                 None => play_pcm(&buf, &device)?,
+            }
+        }
+        Cmd::Chorale {
+            voices,
+            seeds,
+            score: score_path,
+            out,
+            bpm,
+            transpose,
+            room,
+            rolloff,
+            device,
+        } => {
+            // A spread of seeds that casts to four clearly different registers, so the default
+            // invocation demonstrates the thing rather than four ducks that sound alike.
+            const DEFAULT_SEEDS: [u32; 8] = [100, 7, 313, 42, 9001, 1234, 55, 777];
+            let seeds: Vec<u32> = match seeds {
+                Some(given) => given,
+                None => DEFAULT_SEEDS
+                    .iter()
+                    .copied()
+                    .take(voices.clamp(1, DEFAULT_SEEDS.len()))
+                    .collect(),
+            };
+            let personalities: Vec<Personality> =
+                seeds.iter().copied().map(Personality::from_seed).collect();
+            let singers = chorale::cast(&personalities);
+
+            // Either front end, chosen by extension: a hand-written text score, or anything a
+            // notation editor exported. Both land on the same `Score`.
+            let mut score = match score_path.as_deref() {
+                None => chorale::Score::wistful(),
+                Some(path) => load_score(path)?,
+            };
+            if let Some(bpm) = bpm {
+                score.bpm = bpm;
+            }
+            let shift = transpose.unwrap_or(0);
+
+            println!(
+                "{} · {} ducks · {:.0} bpm · {shift:+} semitones · {:.0}s",
+                score.name,
+                singers.len(),
+                score.bpm,
+                score.duration_s()
+            );
+            // Which parts the score actually has, against how many ducks turned up: a four-part
+            // piece sung by two ducks is missing two lines, and that is worth saying rather than
+            // leaving someone to wonder where the harmony went.
+            let sung: Vec<chorale::Part> = singers.iter().map(|s| s.part).collect();
+            let missing: Vec<&str> = score
+                .parts()
+                .into_iter()
+                .filter(|p| !sung.contains(p))
+                .map(|p| p.as_str())
+                .collect();
+            if !missing.is_empty() {
+                println!("  (not sung by anyone: {})", missing.join(", "));
+            }
+            // Print the casting: which duck got which part is the first thing to sanity-check,
+            // and on real hardware it is decided this same way with nobody in charge.
+            let mut seated = singers.clone();
+            seated.sort_by_key(|s| s.part);
+            for singer in &seated {
+                println!(
+                    "  {:8} seed {:<6} centre {:5.1} Hz  {:+.1} cents  {:+.0} ms",
+                    singer.part.as_str(),
+                    singer.personality.seed,
+                    singer.personality.pitch_center_hz,
+                    singer.detune_cents,
+                    singer.onset_offset_s * 1000.0,
+                );
+            }
+
+            let options = chorale::Options {
+                transpose: shift,
+                room,
+                speaker_rolloff_hz: Some(rolloff).filter(|hz| *hz > 0.0),
+                ..chorale::Options::default()
+            };
+            let mix = chorale::render(&score, &singers, &options);
+            match out {
+                Some(path) => {
+                    to_wav(&mix, &path)?;
+                    println!("wrote {}", path.display());
+                }
+                None => play_pcm(&mix, &device)?,
             }
         }
         Cmd::EnsureBank { dir, force, seed } => {

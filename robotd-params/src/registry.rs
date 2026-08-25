@@ -284,6 +284,12 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
+    // ── [chorale] ────────────────────────────────────────────────────────────
+    feature(
+        "chorale.accept",
+        Kind::Bool,
+        "Sing with nearby ducks — off means silent AND invisible on the air",
+    ),
     // ── [theremin] ───────────────────────────────────────────────────────────
     feature(
         "theremin.enabled",
@@ -332,7 +338,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "audio.pet_detect",
         Kind::TriBool,
-        "Coo when petted; unset resolves per mode (walk on, roller off)",
+        "Coo when petted; unset means off — an opt-in",
     ),
     entry(
         "audio.pet_model",
@@ -513,6 +519,7 @@ mod tests {
                 "policy.voltage_adapt",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
+                "chorale.accept",
                 "theremin.enabled",
                 "audio.enabled",
                 "audio.greet",

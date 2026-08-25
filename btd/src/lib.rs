@@ -33,6 +33,7 @@
 pub mod adv;
 #[cfg(target_os = "linux")]
 pub mod bluez;
+pub mod chorale;
 pub mod framing;
 pub mod gatt;
 pub mod link;

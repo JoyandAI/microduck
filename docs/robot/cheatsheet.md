@@ -278,6 +278,66 @@ sudo /opt/robot/daemon/current/bin/sounds ensure-bank --force
 scripted hand sweep at the ToF's own frame rate. `--out sweep.wav` writes it instead of
 playing it, which is how you hear a voice change without a robot in front of you.
 
+### The duck chorale
+
+```
+robotctl chorale
+```
+
+Two ducks in a room sing a four-part piece together; more join what they find already going. Runs
+until Ctrl-C. `--off` stops one.
+
+**Off by default** — `[chorale] accept` in `robotd.toml`, and it has to be set on every duck that
+should take part. A chorale moves the mouth and the head, so a duck that started animating because
+another duck walked in would be doing motion nobody asked for. Off also means *invisible*: a duck
+that has not opted in puts nothing on the air, rather than politely declining.
+
+How it works, in the order the questions come up:
+
+- **Nobody is in charge.** Both ducks see the same beacons and the lower id conducts, so there is no
+  election to lose and no message that has to arrive.
+- **There is no shared clock.** The boards have no NTP and no RTC agreement, so the conductor's beat
+  counter *is* the timebase: it bumps a byte in a BLE advertisement once per beat, and the arrival of
+  a new value is the downbeat. Followers average the phase over about 25 beats, which brings the
+  radio's jitter inside the ±20 ms an ensemble needs.
+- **Parts are worked out, not assigned.** The lowest duck sings bass. The conductor broadcasts the
+  roster and everyone replays the same seating over it — which is what stops two ducks singing the
+  same line when they can each see a different subset of the room.
+- **Joining changes nobody's part.** A duck arriving takes the part that is free. A duck that leaves
+  keeps its *seat* — its line simply goes unsung, exactly as in a choir somebody walked out of —
+  because reseating the survivors is the one thing worth avoiding mid-piece.
+
+The readout names the part as soon as it is settled, so what a duck ended up singing survives in the
+scrollback:
+
+```
+listening for other ducks — Ctrl-C to stop
+  singing tenor    with 3 voices
+  tenor    bar   12  beat  45.2  3 voices
+```
+
+The conductor picks the piece per performance, and a performance *ends* — after the last
+note everyone goes back to listening, re-settles, and sings something else after a breath.
+`robotctl chorale --piece 2` pins what this robot picks **if it conducts** (a follower sings
+what the beacon names, so set it on every duck to guarantee the song); unknown ids are
+refused with the robot's catalogue. Ids: 1 wistful, 2 duck-strut, 3 outer-wilds (test asset,
+not for release). `DUCK_CHORALE_PIECE=<id>` in `robotd`'s environment is the standing
+fallback — note it must be on **robotd**, not on the `robotctl` command line.
+
+To hear the arrangement without any ducks, one machine can render the whole ensemble:
+
+```
+sounds chorale --voices 4                 # or --seeds 100,7,42 for particular ducks
+sounds chorale --score my-piece.mid       # anything a notation editor exported
+sounds chorale --rolloff 0                # for a full-range speaker, not a duck's
+```
+
+Scores come from either `sounds/scores/*.duckscore` — a line-oriented text format, documented in
+`wistful.duckscore`, which is also the shipped piece — or a MIDI file, which is the path worth using:
+**MuseScore is the score editor.** One instrument per voice rather than one piano staff, name the
+parts, and export MIDI. Parts are matched by mean pitch, so a score written top-staff-first still
+puts the bass on the bass; a track *named* "Soprano" is believed over its pitches.
+
 ### Play the duck (the ToF theremin)
 
 ```

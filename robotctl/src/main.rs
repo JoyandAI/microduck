@@ -136,6 +136,26 @@ enum Namespace {
     /// its own — is the one you're SSH'd into.
     Quack,
 
+    /// Sing with other ducks: two in a room start a piece between themselves, and more join.
+    ///
+    /// Starts *listening* — the robot goes on the air saying it is willing and watches for others.
+    /// Nobody is in charge: the lower id conducts, which both ducks work out from the same beacons,
+    /// so there is no election to lose. There is no shared clock either — the conductor's beat
+    /// counter is the timebase.
+    ///
+    /// Refused by a robot whose config has not opted in (`[chorale] accept` in robotd.toml, false
+    /// by default), because a chorale moves the mouth and the head.
+    Chorale {
+        /// Stop and fall silent instead of starting.
+        #[arg(long)]
+        off: bool,
+        /// Pin which piece this robot picks if it ends up conducting. A follower sings what
+        /// the conductor's beacon names regardless, so to guarantee a song set it on every
+        /// duck. Unknown ids are refused with the robot's catalogue.
+        #[arg(long)]
+        piece: Option<u8>,
+    },
+
     /// Play the duck: the head's depth sensor becomes a theremin, and a hand in front of the
     /// beak is the pitch — closer is higher, and the mouth opens with the note.
     ///
@@ -528,6 +548,124 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
     let outcome = ask(&mut client, false)?;
     if outcome.accepted {
         println!("theremin put down");
+    }
+    Ok(())
+}
+
+/// `robotctl chorale` — go looking for other ducks to sing with, and watch what happens.
+///
+/// A live view for the same reason the theremin's is: every question about this feature is about
+/// what it is doing *now* — has it found anyone, is it conducting or following, what part did it end
+/// up with. All of it is in `robot.state`'s chorale block.
+fn run_chorale(socket: &Path, off: bool, piece: Option<u8>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+
+    let ask = |client: &mut Client, active: bool| -> Result<proto::ChoraleResult, Failure> {
+        let result = result_of(
+            client.call(&proto::Call::RobotChorale(proto::ChoraleParams {
+                active,
+                piece: piece.filter(|_| active),
+            }))?,
+        )?;
+        decode(&result)
+    };
+
+    if off {
+        let outcome = ask(&mut client, false)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        println!("chorale stopped");
+        return Ok(());
+    }
+
+    let outcome = ask(&mut client, true)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused the chorale".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
+
+    // SAFETY: installing a handler whose whole body is one relaxed atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    println!("listening for other ducks — Ctrl-C to stop");
+
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+    ))?;
+
+    let mut part = None;
+    let mut line = String::new();
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                let _ = ask(&mut client, false);
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        let Some(chorale) = state.chorale else {
+            println!("\rthe robot stopped singing                                    ");
+            return Ok(());
+        };
+        // The part is the news: announce it once rather than in the live line, so "what did this
+        // duck end up singing" survives in the scrollback.
+        if chorale.part != part {
+            part = chorale.part.clone();
+            match &part {
+                Some(part) => println!(
+                    "\r  singing {part:<8} with {} voices          ",
+                    chorale.voices
+                ),
+                None => println!("\r  waiting for company                            "),
+            }
+        }
+        match (chorale.part.as_deref(), chorale.beats) {
+            (Some(part), Some(beats)) => print!(
+                "\r  {part:<8} bar {:>4.0}  beat {:>5.1}  {} voices    ",
+                beats / 4.0 + 1.0,
+                beats,
+                chorale.voices
+            ),
+            // Two different silences, and the difference is the whole diagnosis: "listening"
+            // means no conductor found, "joining" means found one and the phase lock is still
+            // filling — which stuck at "joining" points at beat delivery, not discovery.
+            _ if chorale.joining => {
+                print!(
+                    "\r  joining — locking onto the beat ({} voices)   ",
+                    chorale.voices
+                )
+            }
+            _ => print!("\r  listening — {} ducks in range      ", chorale.voices),
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    println!();
+    if ask(&mut client, false)?.accepted {
+        println!("chorale stopped");
     }
     Ok(())
 }
@@ -2672,6 +2810,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
+        }
+        Namespace::Chorale { off, piece } => {
+            return run_chorale(&cli.robot_socket, off, piece);
         }
         Namespace::Configure { file } => {
             return configure::run(&file).map_err(|e| Failure::new(exit::FAILED, e));

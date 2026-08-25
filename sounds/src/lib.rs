@@ -22,6 +22,7 @@
 //! Not ported: the `parrot` module (mic → learned-phrase squawks) — an experiment nothing
 //! in the runtime shipped; it can follow if it ever graduates.
 
+pub mod chorale;
 pub mod personality;
 pub mod rng;
 pub mod stream;

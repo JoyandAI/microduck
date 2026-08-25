@@ -991,8 +991,8 @@ mod tests {
         assert_eq!(hint(&m, "policy.legs_lowpass").as_deref(), Some("0.7"));
         assert_eq!(
             hint(&m, "audio.pet_detect").as_deref(),
-            Some("true"),
-            "walking mode listens for petting"
+            Some("false"),
+            "petting is an opt-in now, in every mode"
         );
         // Flip the mode and the hints follow — they are resolved through the pending state.
         m.edit(entry("policy.mode"), "roller").expect("edits");
@@ -1050,6 +1050,7 @@ mod tests {
                 "update_gate",
                 "policy",
                 "safety",
+                "chorale",
                 "theremin",
                 "audio"
             ]

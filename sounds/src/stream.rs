@@ -53,6 +53,15 @@ const OPEN_TAU_S: f64 = 0.060;
 /// The jitter filter's time constant — the offline `jitter`'s 64-sample window at 22.05 kHz.
 const JITTER_TAU_S: f64 = 64.0 / 22_050.0;
 
+/// How far a vowel may move the formant, in harmonics.
+///
+/// The synth has no filter — the formant is a boost on one harmonic of seven
+/// ([`Personality::harmonics`]) — so a "vowel" here is that boost moving up and down the
+/// series, plus the mouth opening. Crude against a real vocal tract, and enough: `oo` and
+/// `ee` are unmistakably different sounds, which is the whole requirement for a chorale that
+/// should sound like it is singing *something* rather than humming.
+const FORMANT_RANGE: f64 = 3.0;
+
 /// How much a wide-open mouth lifts the harmonic tilt.
 ///
 /// The weights fall off as `n^-tilt`, so subtracting from the exponent raises every harmonic
@@ -62,7 +71,31 @@ const JITTER_TAU_S: f64 = 64.0 / 22_050.0;
 const OPEN_TILT_LIFT: f64 = 0.8;
 
 /// Headroom under full scale for the static gain, before the soft clip.
-const PEAK: f32 = 0.75;
+///
+/// The worst case it bounds is every harmonic in phase, which is rare — so the *typical* peak sits
+/// well below this and there is real headroom for the AM and the breath that go on top. Deliberately
+/// under the bank's own −4 dBFS: a synthesized voice can be asked for a level a recorded one cannot.
+const PEAK: f32 = 0.62;
+
+/// How steeply a small speaker falls away below its useful range, in dB per octave.
+///
+/// A sealed driver the size of a coin rolls off at about this, and the exact figure matters less
+/// than the shape: the point is that amplitude spent below it is not merely quiet, it is *gone*,
+/// and spending it there is worse than not spending it.
+const ROLLOFF_DB_PER_OCTAVE: f64 = 12.0;
+
+/// The most [`Stream::set_speaker_rolloff`] may amplify what is left after it has given up on the
+/// low harmonics.
+///
+/// A note whose *whole* series sits below the rolloff has nothing to redistribute to, and
+/// renormalising it would turn a note the speaker cannot make into a loud note the speaker cannot
+/// make. Clamped, so a bass note off the bottom of the instrument stays quiet instead of becoming
+/// distortion.
+///
+/// Was 4×, which on the robot sounded saturated: a full redistribution piles the whole note onto
+/// harmonics two to four, and that much upper-harmonic energy through a small driver is harsh rather
+/// than loud. 2× recovers most of the audibility for a fraction of the harshness.
+const MAX_BASS_LIFT: f64 = 2.0;
 
 /// How often the harmonic weights are recomputed, in samples (~5 ms).
 ///
@@ -101,18 +134,40 @@ pub struct Stream {
     open: f64,
     open_target: f64,
 
+    /// Formant offset in harmonics, from the vowel being sung. See [`FORMANT_RANGE`].
+    formant_shift: f64,
+    formant_shift_target: f64,
+    /// Where the speaker stops reproducing, if the caller has said. See
+    /// [`Stream::set_speaker_rolloff`].
+    speaker_rolloff_hz: Option<f64>,
     /// Harmonic weights for the current `open`, and the `open` they were computed at — 7
     /// `powf`s are not worth spending while the mouth has not moved.
     weights: Vec<f64>,
     weights_open: f64,
+    /// The formant offset the weights were computed at, for the same reason.
+    weights_formant: f64,
+    /// And the frequency, which matters once a speaker rolloff is in play: the weights then depend
+    /// on where the harmonics *land*, not only on their relative sizes.
+    weights_freq: f64,
     /// Samples until the next weight refresh. See [`REFRESH_SAMPLES`].
     refresh_in: u32,
     /// Static gain, from the weights' worst-case sum.
     gain: f32,
 
-    /// The joy-ride softening (see [`Stream::wheee`]) folded into the modulation depths.
+    /// Per-voice softening (see [`Stream::wheee`], [`Stream::choral`]) folded into the
+    /// modulation depths, rather than read off the personality — the ensemble voice needs
+    /// less of all of these than the solo one.
     vibrato_depth: f64,
     quackiness: f64,
+    jitter_depth: f64,
+    /// Noise mix for this voice. A choir member breathes less audibly than a soloist.
+    breath: f64,
+    /// How much of the breath survives the speaker-rolloff rebalance, 0..1.
+    ///
+    /// The rolloff takes voiced energy away from a deep note; the noise, being broadband,
+    /// would keep all of its — so an already-quiet bass note would be *proportionally*
+    /// noisier. The breath is cut by the same fraction the harmonics lost.
+    breath_rolloff: f64,
     /// Excitement wobble: the wheee's own, at full swell.
     wobble_hz: f64,
     wobble_depth: f64,
@@ -140,13 +195,21 @@ impl Stream {
             level_target: 0.0,
             open: 0.0,
             open_target: 0.0,
+            formant_shift: 0.0,
+            formant_shift_target: 0.0,
+            speaker_rolloff_hz: None,
             weights: Vec::new(),
             // Not any reachable `open`, so the first sample computes the weights.
             weights_open: f64::NAN,
+            weights_formant: f64::NAN,
+            weights_freq: f64::NAN,
             refresh_in: 0,
             gain: 1.0,
             vibrato_depth: p.vibrato_depth,
             quackiness: p.quackiness,
+            jitter_depth: p.jitter_depth,
+            breath: p.breath * 0.5,
+            breath_rolloff: 1.0,
             wobble_hz,
             wobble_depth: 0.0,
         };
@@ -167,6 +230,27 @@ impl Stream {
         s
     }
 
+    /// The ensemble voice: this duck's timbre with its tuning-wrecking modulation tamed.
+    ///
+    /// A solo duck's charm is partly that it wavers — vibrato, random jitter, the quack-buzz
+    /// AM. In a chord all three fight the *tuning*: two voices wobbling independently around
+    /// the same note beat against each other, and a chord that beats sounds sour rather than
+    /// lush. So they are scaled down hard rather than off — the duck must still be
+    /// recognisable, and a chorus of perfectly steady tones sounds like an organ.
+    ///
+    /// What is *not* touched is everything that makes this duck this duck: the harmonic
+    /// weights, the formant, the nasality, the breath. Identity is timbre here; the pitch
+    /// belongs to the score.
+    pub fn choral(p: &Personality, variant: u32) -> Self {
+        let mut s = Self::new(p, "chorale", variant);
+        s.vibrato_depth = p.vibrato_depth * 0.30;
+        s.quackiness = p.quackiness * 0.35;
+        s.jitter_depth = p.jitter_depth * 0.30;
+        s.breath = p.breath * 0.15;
+        s.wobble_depth = 0.0;
+        s
+    }
+
     /// This duck's playable range — [`range_hz`], for the voice this stream is in.
     pub fn range_hz(&self) -> (f64, f64) {
         range_hz(&self.p)
@@ -175,6 +259,45 @@ impl Stream {
     /// Frequency for a 0..1 position in this stream's range — [`hz_at`].
     pub fn hz_at(&self, position: f64) -> f64 {
         hz_at(&self.p, position)
+    }
+
+    /// Tell the voice what the speaker can actually reproduce, in hertz — or `None` for a
+    /// full-range one.
+    ///
+    /// **This makes low notes louder by making the fundamental quieter**, which sounds backwards
+    /// and is the whole trick. A duck's speaker is a coin-sized driver that produces very little
+    /// below a few hundred hertz, so a bass line's fundamental is not quiet — it is absent, and
+    /// the amplitude allocated to it is spent on nothing while eating the headroom the rest of the
+    /// note needs. Worse, pushing harder at it is how a small driver is made to distort.
+    ///
+    /// So the weight is taken *off* the harmonics the driver cannot produce and given to the ones
+    /// it can. The pitch survives because pitch does not live in the fundamental: a series spaced
+    /// 130 Hz apart is heard as a 130 Hz note whether or not there is anything at 130 Hz — the
+    /// residue pitch every small speaker has always relied on.
+    ///
+    /// Off by default: on a laptop the fundamental is real and there is nothing to work around.
+    pub fn set_speaker_rolloff(&mut self, hz: Option<f64>) {
+        self.speaker_rolloff_hz = hz.filter(|hz| *hz > 0.0);
+        // The weights depend on it, and it is set rarely enough that recomputing now is free.
+        self.refresh_weights();
+    }
+
+    /// Set the vowel being sung: which harmonic the formant boosts, relative to this duck's
+    /// own [`Personality::formant_n`].
+    ///
+    /// Separate from [`Stream::set`] because it is a different *kind* of parameter — the
+    /// theremin has no vowels and passes only pitch, level and mouth. Slewed like the rest, so
+    /// a change of syllable is a movement rather than a click.
+    pub fn set_formant_shift(&mut self, harmonics: f64) {
+        self.formant_shift_target = harmonics.clamp(-FORMANT_RANGE, FORMANT_RANGE);
+    }
+
+    /// Silence the voice without moving its pitch — a note ending, rather than a note falling over.
+    ///
+    /// The pitch is left where it was because a fade at the note you were singing is a release, and
+    /// a fade on the way somewhere else is a slide out of a chord.
+    pub fn set_level(&mut self, level: f64) {
+        self.level_target = level.clamp(0.0, 1.0);
     }
 
     /// Set the targets the stream glides toward.
@@ -208,15 +331,27 @@ impl Stream {
         let a_open = pole(OPEN_TAU_S);
         let a_jitter = pole(JITTER_TAU_S) as f32;
         // The offline pink noise's pole, rescaled to 48 kHz the same way.
-        let a_pink = 0.985f64.powf(22_050.0 / f64::from(SR)) as f32;
+        let a_pink_f32 = 0.985f64.powf(22_050.0 / f64::from(SR)) as f32;
 
         let am_depth = self.p.am_depth * 0.5 * self.quackiness;
-        let breath = self.p.breath * 0.5;
+        let breath = self.breath * self.breath_rolloff;
+        // The integrator below has a steady-state deviation of 1/sqrt(1 - a²) ≈ 8.5, and the
+        // first version scaled it by a guessed 0.15 — leaving the streamed breath five times
+        // louder than the offline voice's, which a listener reported as a bass duck full of
+        // white noise (that seed happened to roll a breathy personality). Normalised properly:
+        // to unit deviation, then to the ~0.25 RMS the offline peak-normalised noise has.
+        let a_pink = 0.985f64.powf(22_050.0 / f64::from(SR));
+        let pink_gain = ((1.0 - a_pink * a_pink).sqrt() * 0.25) as f32;
 
         for sample in out.iter_mut() {
             // Timbre, on its own cadence — see `REFRESH_SAMPLES` for why not per block.
             if self.refresh_in == 0 {
-                if (self.open - self.weights_open).abs() > 0.005 {
+                let moved_a_lot = |from: f64, to: f64| (to - from).abs() > from.abs() * 0.01;
+                if (self.open - self.weights_open).abs() > 0.005
+                    || (self.formant_shift - self.weights_formant).abs() > 0.02
+                    || (self.speaker_rolloff_hz.is_some()
+                        && moved_a_lot(self.weights_freq, self.freq))
+                {
                     self.refresh_weights();
                 }
                 self.refresh_in = REFRESH_SAMPLES;
@@ -227,6 +362,7 @@ impl Stream {
             self.freq += (self.freq_target - self.freq) * a_pitch;
             self.level += (self.level_target - self.level) * a_level;
             self.open += (self.open_target - self.open) * a_open;
+            self.formant_shift += (self.formant_shift_target - self.formant_shift) * a_open;
 
             // Pitch modulation: this duck's vibrato, its jitter, and the ride's wobble.
             let vib = semitones(
@@ -234,7 +370,7 @@ impl Stream {
                     * (std::f64::consts::TAU * self.p.vibrato_rate_hz * self.t).sin(),
             );
             self.jitter += (self.rng.standard_normal() - self.jitter) * a_jitter;
-            let jit = semitones(self.p.jitter_depth * f64::from(self.jitter));
+            let jit = semitones(self.jitter_depth * f64::from(self.jitter));
             let wob = semitones(
                 self.wobble_depth * (std::f64::consts::TAU * self.wobble_hz * self.t).sin(),
             );
@@ -262,10 +398,8 @@ impl Stream {
                 v *= am as f32;
             }
             if breath > 0.0 {
-                self.pink = a_pink * self.pink + self.rng.standard_normal();
-                // The offline pink noise is peak-normalised over the whole buffer; the
-                // integrator's steady-state spread stands in for that here.
-                v += breath as f32 * self.pink * 0.15;
+                self.pink = a_pink_f32 * self.pink + self.rng.standard_normal();
+                v += breath as f32 * self.pink * pink_gain;
             }
 
             // Level last, so a fade takes the breath and the buzz with it, and a soft clip
@@ -281,10 +415,50 @@ impl Stream {
         // A wider mouth is a shallower rolloff. Floored, so an extreme personality tilt
         // plus a wide mouth cannot invert into a weight set with no fundamental.
         p.tilt = (p.tilt - OPEN_TILT_LIFT * self.open.clamp(0.0, 1.0)).max(0.8);
+        // The vowel moves the formant along the series. Rounded, because `harmonics` boosts
+        // one whole harmonic and there is nothing between them to boost.
+        p.formant_n =
+            ((p.formant_n as f64 + self.formant_shift).round() as i64).clamp(1, 7) as usize;
         self.weights = p.harmonics();
         self.weights_open = self.open;
+        self.weights_formant = self.formant_shift;
+        self.weights_freq = self.freq;
+
+        // The gain is set from the weights **before** the rolloff touches them. It used to be
+        // set after — which silently renormalised whatever the rolloff had removed straight
+        // back in, making `MAX_BASS_LIFT` a no-op and every deep note exactly as loud as a
+        // high one, with all of that loudness piled onto the few harmonics the driver keeps.
+        // Anchoring the gain first means the rolloff genuinely costs a deep note level, the
+        // lift genuinely gives some back, and the cap genuinely caps it.
         let sum: f64 = self.weights.iter().sum();
         self.gain = PEAK / (sum.max(1e-6) as f32);
+        self.breath_rolloff = 1.0;
+
+        if let Some(rolloff) = self.speaker_rolloff_hz {
+            // What the driver does to each harmonic, as a plain amplitude factor. Above the
+            // rolloff it does nothing; below, the response falls at `ROLLOFF_DB_PER_OCTAVE`.
+            let exponent = ROLLOFF_DB_PER_OCTAVE / 6.0206;
+            let before: f64 = self.weights.iter().sum();
+            for (n, weight) in self.weights.iter_mut().enumerate() {
+                let harmonic_hz = self.freq * (n + 1) as f64;
+                let response = (harmonic_hz / rolloff).min(1.0).powf(exponent);
+                *weight *= response;
+            }
+            // Give back some of what was taken — so the note keeps most of its loudness while
+            // its *balance* moves to harmonics the driver can make. Clamped: a note whose whole
+            // series is under the rolloff has nothing to give it to, and must stay quiet
+            // rather than become distortion.
+            let after: f64 = self.weights.iter().sum();
+            if after > 1e-9 {
+                let lift = (before / after).min(MAX_BASS_LIFT);
+                for weight in &mut self.weights {
+                    *weight *= lift;
+                }
+                // The breath loses what the voice lost: noise is broadband and the driver
+                // keeps it, so an uncut breath would leave the quietest notes the noisiest.
+                self.breath_rolloff = (after * lift / before).clamp(0.0, 1.0);
+            }
+        }
     }
 }
 
@@ -436,6 +610,198 @@ mod tests {
             open > closed * 1.1,
             "an open mouth must be brighter: upper/f0 {closed} -> {open}"
         );
+    }
+
+    /// The bass fix, and it has to be checked the way the ear works rather than the way a level
+    /// meter does: the compensation must move energy *above* the speaker's rolloff while leaving
+    /// the harmonic spacing — and so the perceived pitch — exactly where it was.
+    #[test]
+    fn a_speaker_rolloff_moves_the_bass_into_the_harmonics() {
+        const F0: f64 = 130.81; // C3, the shipped score's bass
+        const ROLLOFF: f64 = 300.0;
+        let p = Personality::from_seed(100);
+
+        // Energy at n * F0, and the total below the rolloff, for a settled note.
+        let measure = |rolloff: Option<f64>| {
+            let mut s = Stream::choral(&p, 0);
+            s.set_speaker_rolloff(rolloff);
+            s.set(F0, 1.0, 0.6);
+            let mut block = vec![0.0f32; 48_000];
+            s.block(&mut block);
+            s.block(&mut block);
+            let magnitude = |hz: f64| {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, &v) in block.iter().enumerate() {
+                    let ph = std::f64::consts::TAU * hz * i as f64 / f64::from(SR);
+                    re += f64::from(v) * ph.cos();
+                    im += f64::from(v) * ph.sin();
+                }
+                (re * re + im * im).sqrt() / block.len() as f64
+            };
+            let harmonics: Vec<f64> = (1..=6).map(|n| magnitude(F0 * n as f64)).collect();
+            let below: f64 = harmonics
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| (F0 * (n + 1) as f64) < ROLLOFF)
+                .map(|(_, m)| m)
+                .sum();
+            let above: f64 = harmonics
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| (F0 * (n + 1) as f64) >= ROLLOFF)
+                .map(|(_, m)| m)
+                .sum();
+            (harmonics, below, above)
+        };
+
+        let (plain, plain_below, plain_above) = measure(None);
+        let (lifted, lifted_below, lifted_above) = measure(Some(ROLLOFF));
+
+        // Less under the rolloff, more over it — the trade the whole thing is.
+        assert!(
+            lifted_below < plain_below * 0.8,
+            "energy below {ROLLOFF} Hz barely moved: {plain_below} -> {lifted_below}"
+        );
+        assert!(
+            lifted_above > plain_above * 1.2,
+            "energy above {ROLLOFF} Hz barely moved: {plain_above} -> {lifted_above}"
+        );
+        // The pitch is unchanged, because it never lived in the fundamental: the series is still
+        // spaced F0 apart, with every harmonic still present.
+        for (n, magnitude) in lifted.iter().enumerate() {
+            assert!(
+                *magnitude > 0.0,
+                "harmonic {} vanished, which would change the perceived pitch",
+                n + 1
+            );
+        }
+        // And it is a rebalance, not a volume knob: the note is not wildly louder overall.
+        let plain_total: f64 = plain.iter().sum();
+        let lifted_total: f64 = lifted.iter().sum();
+        assert!(
+            (lifted_total / plain_total) < 2.0,
+            "the note got {:.1}x louder, which is a gain and not a rebalance",
+            lifted_total / plain_total
+        );
+    }
+
+    /// The breath at the scale the offline voice has — the streamed version was five times
+    /// louder (a guessed constant where the integrator's steady-state deviation of ~8.5
+    /// belonged), reported from the robot as a bass full of white noise.
+    ///
+    /// Measured by differencing against a zero-breath twin of the same personality, because a
+    /// first-order high-pass cannot separate noise from harmonics — everything else about the
+    /// two renders is identical, so what the breath adds in the band above the harmonics is
+    /// the noise alone.
+    #[test]
+    fn the_breath_is_a_whisper_and_not_a_hiss() {
+        // The breathiest personality in the first few hundred seeds, so the bound is tested
+        // where the bug was audible.
+        let breathiest = (0..500u32)
+            .map(Personality::from_seed)
+            .max_by(|a, b| a.breath.partial_cmp(&b.breath).expect("finite"))
+            .expect("seeds");
+        let mut silent_twin = breathiest;
+        silent_twin.breath = 0.0;
+
+        let high_band_rms = |p: &Personality| {
+            let mut s = Stream::choral(p, 0);
+            s.set(261.6, 1.0, 0.6);
+            let mut block = vec![0.0f32; 48_000];
+            s.block(&mut block);
+            s.block(&mut block);
+            let alpha = (-std::f64::consts::TAU * 4_000.0 / f64::from(SR)).exp() as f32;
+            let (mut low, mut energy, mut total) = (0.0f32, 0.0f64, 0.0f64);
+            for &v in &block {
+                low = alpha * low + (1.0 - alpha) * v;
+                let high = v - low;
+                energy += f64::from(high) * f64::from(high);
+                total += f64::from(v) * f64::from(v);
+            }
+            let n = block.len() as f64;
+            ((energy / n).sqrt(), (total / n).sqrt())
+        };
+        let (with_breath, body) = high_band_rms(&breathiest);
+        let (leakage, _) = high_band_rms(&silent_twin);
+        // The noise is what the breath added over the twin's harmonic leakage.
+        let noise = (with_breath * with_breath - leakage * leakage)
+            .max(0.0)
+            .sqrt();
+        assert!(
+            noise < body * 0.05,
+            "breath noise {noise:.4} against a body of {body:.4} — the hiss is back"
+        );
+        // And it is not silence either: a duck with no breath at all is a different voice.
+        assert!(
+            noise > body * 0.001,
+            "{noise:.5} — the breath vanished entirely"
+        );
+    }
+
+    /// The speaker rolloff's lift cap genuinely caps now. It used to be renormalised straight
+    /// back out — a note off the bottom of the driver came back exactly as loud as any other,
+    /// all of it piled into the few harmonics the driver keeps, which is the saturation the
+    /// robot run reported.
+    #[test]
+    fn the_bass_lift_cap_actually_caps() {
+        let p = Personality::from_seed(100);
+        let rms_at = |hz: f64, rolloff: Option<f64>| {
+            let mut s = Stream::choral(&p, 0);
+            s.set_speaker_rolloff(rolloff);
+            s.set(hz, 1.0, 0.6);
+            let mut block = vec![0.0f32; 48_000];
+            s.block(&mut block);
+            s.block(&mut block);
+            (block
+                .iter()
+                .map(|v| f64::from(*v) * f64::from(*v))
+                .sum::<f64>()
+                / block.len() as f64)
+                .sqrt()
+        };
+        // A moderately deep note (the chorale's bass range) keeps its loudness: the lift
+        // restores what the driver takes, inside the cap. That is the design, not a bug —
+        // only the *balance* moves.
+        let plain = rms_at(130.8, None);
+        let through = rms_at(130.8, Some(300.0));
+        assert!(
+            through < plain * 1.1,
+            "{through} vs {plain}: louder through a rolloff?"
+        );
+        assert!(
+            through > plain * 0.5,
+            "{through} vs {plain}: the bass vanished"
+        );
+        // A note far below the driver hits the cap and is genuinely quieter — the case the
+        // cap exists for, and the assertion the old renormalisation failed.
+        let deep_plain = rms_at(55.0, None);
+        let deep_through = rms_at(55.0, Some(300.0));
+        assert!(
+            deep_through < deep_plain * 0.8,
+            "{deep_through} vs {deep_plain}: the cap is being renormalised away again"
+        );
+        // A note above the rolloff is untouched.
+        let high_plain = rms_at(500.0, None);
+        let high_through = rms_at(500.0, Some(300.0));
+        assert!(
+            (high_through / high_plain) > 0.9,
+            "{high_through} vs {high_plain}"
+        );
+    }
+
+    /// A note the driver cannot make at all must stay quiet rather than become distortion: there is
+    /// nothing to redistribute to, so the lift is clamped.
+    #[test]
+    fn a_note_below_everything_is_not_amplified_into_distortion() {
+        let p = Personality::from_seed(100);
+        let mut s = Stream::choral(&p, 0);
+        // A rolloff above the whole seven-harmonic series of a 40 Hz note.
+        s.set_speaker_rolloff(Some(2000.0));
+        s.set(40.0, 1.0, 0.5);
+        let mut block = vec![0.0f32; 24_000];
+        s.block(&mut block);
+        s.block(&mut block);
+        assert!(block.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
     }
 
     /// The pitch map must be geometric and anchored on the duck: the same interval for the
