@@ -30,6 +30,14 @@ shape of bug this design invites rather than one-offs:
 - **The client could not reach the signalling port from a `file://` page.** An opaque origin to a
   private IP is what Chrome's Private Network Access blocks; serving the page over
   `http://localhost` fixes it.
+- **A codec that fails negotiation is dropped with a warning, not an error.** Moving from
+  pre-encoded H.264 to raw video (§2) puts the encoder inside `webrtcsink`, and its discovery pass
+  demands `profile=constrained-baseline` — which `mpph264enc`'s pad template did not list, so H.264
+  vanished from the offer, VP8 was negotiated instead, and the session died. Every symptom pointed
+  somewhere else: the visible error came from a `videorate` four elements upstream, complaining
+  about NV12. This needs plugins release `v3` or later, and it is why `mediad` bridges GStreamer's
+  debug log *and* the pipeline bus into the journal — without that, none of the above was visible
+  at all.
 
 What is still untested: the control channel carrying an actual call, the camera as a source, and
 anything at all through a bridge.

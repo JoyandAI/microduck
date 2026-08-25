@@ -220,15 +220,23 @@ pub fn start(
     sink.set_property("signalling-server-host", host);
     sink.set_property("signalling-server-port", port);
 
-    // **H.264 is not being offered at all**, and until that is understood this cannot restrict
-    // the offer to it. `video-caps` would be the way — "Governs what video codecs will be
-    // proposed" — and it is wanted, because left alone `webrtcsink` proposes everything it can
-    // encode: `mppvp8enc`, `mpph265enc` and `mpph264enc` on the VPU, but `vp9enc` and `av1enc` in
-    // software. A browser preferring AV1 would have this robot software-encoding AV1 on four
+    // Offer H.264 and nothing else. Left alone `webrtcsink` proposes everything it can encode:
+    // `mppvp8enc`, `mpph265enc` and `mpph264enc` on the VPU, but `vp9enc` and `av1enc` in
+    // *software*. A browser preferring AV1 would have this robot software-encoding AV1 on four
     // Cortex-A55s, which is not a degraded stream but a dead control loop.
     //
-    // Setting it now would offer a codec that is currently missing from the offer, leaving no
-    // codecs at all. It goes in once H.264 discovery works.
+    // **No `profile` field here, deliberately.** `webrtcsink` reads one off these caps and does
+    // `H264_PROFILES_COMPAT.iter().position(..).expect("Unsupported H264 profile")` — a panic, in
+    // a plugin, for a value it does not know. Omitting the field skips that path, and the profile
+    // is set on the encoder itself in `wire_encoder_setup` where it belongs.
+    //
+    // This restriction was held back for a while because H.264 was missing from the offer, and
+    // restricting to a codec that fails discovery leaves *no* codecs. The cause was
+    // `mpph264enc`'s pad template omitting `constrained-baseline`, which is the one profile
+    // `webrtcsink`'s discovery pass demands; the plugins release carries a patch for it from `v3`.
+    // If a robot on older plugins reaches here it now fails loudly — no producer at all — rather
+    // than quietly serving VP8.
+    sink.set_property("video-caps", gst::Caps::builder("video/x-h264").build());
 
     // The starting bitrate. `webrtcsink` moves it from here as congestion control learns the
     // link — which is the whole point of letting it own the encoder, so this is a starting
