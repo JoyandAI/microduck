@@ -595,10 +595,25 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
         .static_pad("src")
         .context("v4l2src has no src pad, which cannot happen")?;
 
-    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
+    // The query passes here twice — once outbound, once with downstream's answer — and the second
+    // pass is the one that matters. Logged for the first few, because "our rewrite was overwritten"
+    // and "our rewrite stuck and was ignored" are different bugs and the frame rate cannot tell
+    // them apart. Four passes is two negotiations' worth.
+    let passes = std::sync::atomic::AtomicU32::new(0);
+
+    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, move |_, info| {
         if let Some(gst::PadProbeData::Query(query)) = info.data.as_mut()
             && let gst::QueryViewMut::Allocation(allocation) = query.view_mut()
         {
+            let pass = passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let before: Vec<(u32, u32, u32)> = allocation
+                .allocation_pools()
+                .map(|(_, size, min, max)| (size, min, max))
+                .collect();
+            let meta_before = allocation
+                .find_allocation_meta::<gst_video::VideoMeta>()
+                .is_some();
+
             if allocation
                 .find_allocation_meta::<gst_video::VideoMeta>()
                 .is_none()
@@ -625,6 +640,20 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
                     );
                 }
                 Some(_) => {}
+            }
+
+            if pass < 4 {
+                let after: Vec<(u32, u32, u32)> = allocation
+                    .allocation_pools()
+                    .map(|(_, size, min, max)| (size, min, max))
+                    .collect();
+                tracing::info!(
+                    pass,
+                    meta_before,
+                    pools_before = ?before,
+                    pools_after = ?after,
+                    "capture allocation query"
+                );
             }
         }
         gst::PadProbeReturn::Ok
