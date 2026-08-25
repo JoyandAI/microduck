@@ -153,10 +153,14 @@ pub fn start(
     height: u32,
     fps: u32,
 ) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
-    // GStreamer's own log has to be bridged before `init`, or the first thing it says is lost.
-    bridge_gstreamer_log();
+    // `GST_DEBUG` has to be in the environment before `init`, which is when GStreamer parses it.
+    set_gstreamer_log_threshold();
 
     gst::init().context("gstreamer would not initialise")?;
+
+    // And the log functions have to be swapped *after* it, which is the fix for INFO and below
+    // never arriving — see [`bridge_gstreamer_log`].
+    bridge_gstreamer_log();
 
     // **A GStreamer signal handler runs on a GStreamer thread, which is not inside the tokio
     // runtime.** `tokio::spawn` there panics with "there is no reactor running", and a panic
@@ -415,6 +419,18 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
     );
 }
 
+/// Put a default `GST_DEBUG` in the environment, before `gst::init` reads it.
+///
+/// Honoured if already set, so raising a category still works the usual way. Unset, `WARNING` is
+/// enough to catch a codec being dropped or an element refusing, and quiet enough for a journal.
+fn set_gstreamer_log_threshold() {
+    if std::env::var_os("GST_DEBUG").is_none() {
+        // SAFETY: single-threaded here — this runs before `gst::init` and before any task is
+        // spawned, which is the only point at which setting an env var is sound.
+        unsafe { std::env::set_var("GST_DEBUG", "*:WARNING") };
+    }
+}
+
 /// Send GStreamer's own log into `tracing`, so the journal shows what it says.
 ///
 /// **The bus is not enough.** `webrtcsink` drops a codec whose discovery pipeline fails with a
@@ -423,16 +439,19 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
 /// a robot offering VP8 instead of H.264 said nothing at all about why, and it had been saying it
 /// the whole time to a log nobody was reading.
 ///
-/// `GST_DEBUG` is honoured if set, so raising a category still works the usual way. Unset, the
-/// threshold is `WARNING`: enough to catch a codec being dropped or an element refusing, quiet
-/// enough for a journal.
+/// **Called after `gst::init`, and that is the point of splitting this in two.** It ran before
+/// `init` originally, on the reasoning that anything said earlier would be lost. That cost more
+/// than it saved: `WARNING` and `ERROR` arrived but `INFO` and below never did, whatever
+/// `GST_DEBUG` said — so `GST_DEBUG=v4l2bufferpool:4` produced nothing at all, and two capture
+/// questions that `gst_v4l2_object_decide_allocation` answers in its own `GST_INFO` log had to be
+/// inferred from frame rates instead. Both inferences were wrong.
+///
+/// What is lost by moving it is a handful of registry-scan lines from before `init`, which said
+/// nothing anyone wanted.
+///
+/// The effective threshold is reported once at startup: a logger that cannot say what it will and
+/// will not forward is what made this expensive.
 fn bridge_gstreamer_log() {
-    if std::env::var_os("GST_DEBUG").is_none() {
-        // SAFETY: single-threaded here — this runs before `gst::init` and before any task is
-        // spawned, which is the only point at which setting an env var is sound.
-        unsafe { std::env::set_var("GST_DEBUG", "*:WARNING") };
-    }
-
     // Otherwise every message is printed to stderr by GStreamer *and* logged by us, which in a
     // journal is the same line twice with different formatting.
     gst::log::remove_default_log_function();
@@ -458,6 +477,15 @@ fn bridge_gstreamer_log() {
             _ => tracing::debug!(target: "gst", %cat, %src, "{text}"),
         }
     });
+
+    // Not the same question as what `GST_DEBUG` says: a per-category threshold only takes effect
+    // if the global minimum lets the message reach a log function at all. Printed so the next
+    // person raising a category can see whether it took.
+    tracing::info!(
+        gst_debug = %std::env::var("GST_DEBUG").unwrap_or_else(|_| "(unset)".into()),
+        default_threshold = ?gst::log::get_default_threshold(),
+        "gstreamer log bridged"
+    );
 }
 
 /// Forward what the pipeline says about itself into the journal.
