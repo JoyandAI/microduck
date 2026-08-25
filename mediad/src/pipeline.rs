@@ -52,10 +52,16 @@
 //!
 //! ## What is not verified
 //!
-//! The signal wiring below has never run. It is written from `webrtcsink`'s properties and from
-//! `reachy_mini`'s working equivalent, and the first board run is its first test — so every step
-//! that can fail says which one it was, and the daemon refuses to start rather than running half a
-//! pipeline.
+//! **Nothing in a signal handler here may panic.** These closures are invoked from C, so a panic
+//! does not unwind — it aborts the process, and the journal shows `thread caused non-unwinding
+//! panic` with a backtrace through `g_closure_invoke` and nothing about what was actually wrong.
+//! The first board run died exactly that way, from `tokio::spawn` on a GStreamer thread that has
+//! no runtime. So: the runtime handle is captured where one exists and spawned onto explicitly,
+//! and every signal is checked to exist before it is connected or emitted — `emit_by_name` and
+//! `connect` both panic on an absent name.
+//!
+//! What is left of that risk is a signature that exists but differs, which shows up as a warning
+//! naming the arity rather than as an abort.
 
 use std::sync::{Arc, Mutex};
 
@@ -127,6 +133,16 @@ pub fn start(
     fps: u32,
 ) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
     gst::init().context("gstreamer would not initialise")?;
+
+    // **A GStreamer signal handler runs on a GStreamer thread, which is not inside the tokio
+    // runtime.** `tokio::spawn` there panics with "there is no reactor running", and a panic
+    // crossing the C closure boundary is a non-unwinding abort — the whole daemon dies with
+    // SIGABRT from inside `g_closure_invoke`, which is exactly what the first board run did. So
+    // the handle is captured here, where there *is* a runtime, and the handler spawns onto it.
+    let runtime = tokio::runtime::Handle::try_current().context(
+        "pipeline::start must be called from inside a tokio runtime: the datachannel writer is \
+         spawned onto it from a GStreamer signal thread, which has no runtime of its own",
+    )?;
 
     let pipeline = gst::Pipeline::new();
 
@@ -200,7 +216,7 @@ pub fn start(
     sink.set_property("signalling-server-port", port);
 
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
-    wire_consumers(&sink, channels_tx)?;
+    wire_consumers(&sink, channels_tx, runtime)?;
 
     // ── the raw branch ──────────────────────────────────────────────────────
     //
@@ -326,7 +342,11 @@ fn make(name: &str) -> Result<gst::Element> {
 /// The robot creates the channel rather than waiting for the peer to, which is what
 /// `reachy_mini`'s working equivalent does. It means a peer that connects and creates nothing
 /// still gets a control surface.
-fn wire_consumers(sink: &gst::Element, channels: mpsc::Sender<Channel>) -> Result<()> {
+fn wire_consumers(
+    sink: &gst::Element,
+    channels: mpsc::Sender<Channel>,
+    runtime: tokio::runtime::Handle,
+) -> Result<()> {
     let channels = Arc::new(channels);
     sink.connect("consumer-added", false, move |values| {
         // (webrtcsink, peer_id, webrtcbin). A signature change upstream shows up here as a
@@ -343,7 +363,7 @@ fn wire_consumers(sink: &gst::Element, channels: mpsc::Sender<Channel>) -> Resul
             .and_then(|v| v.get::<String>().ok())
             .unwrap_or_else(|| "?".into());
 
-        match open_control_channel(&webrtcbin, &peer) {
+        match open_control_channel(&webrtcbin, &peer, &runtime) {
             Ok(channel) => {
                 // A full queue means nobody is accepting sessions, which is a bug rather than
                 // backpressure — say so instead of blocking a GStreamer signal handler.
@@ -359,7 +379,22 @@ fn wire_consumers(sink: &gst::Element, channels: mpsc::Sender<Channel>) -> Resul
 }
 
 /// Create the `control` datachannel on one peer's `webrtcbin` and bridge it to channels.
-fn open_control_channel(webrtcbin: &gst::Element, peer: &str) -> Result<Channel> {
+fn open_control_channel(
+    webrtcbin: &gst::Element,
+    peer: &str,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Channel> {
+    // `emit_by_name` panics when the signal is absent or its signature differs — and a panic here
+    // aborts the process rather than unwinding, because this runs inside a C closure. Checked
+    // first so an upstream change becomes a logged refusal to open a control channel, with the
+    // video track still working.
+    for signal in ["create-data-channel"] {
+        if glib::subclass::signal::SignalId::lookup(signal, webrtcbin.type_()).is_none() {
+            return Err(anyhow!(
+                "webrtcbin has no {signal} signal; gst-plugins-rs may have changed it"
+            ));
+        }
+    }
     // Reliable and ordered, which is the default and is what §2 wants for `control` —
     // `remote-webrtc.md` §6 covers why the first version opens only this one.
     // Typed as `WebRTCDataChannel` rather than `glib::Object`, and that is load-bearing rather
@@ -371,6 +406,17 @@ fn open_control_channel(webrtcbin: &gst::Element, peer: &str) -> Result<Channel>
             &[&"control", &None::<gst::Structure>],
         )
         .ok_or_else(|| anyhow!("webrtcbin returned no data channel"))?;
+
+    // Same reasoning for the channel's own signals: `connect` and `emit_by_name` both panic when a
+    // name is absent, and both run where a panic aborts. Checked together so the failure is one
+    // clear message rather than whichever fires first.
+    for signal in ["on-message-string", "send-string"] {
+        if glib::subclass::signal::SignalId::lookup(signal, channel.type_()).is_none() {
+            return Err(anyhow!(
+                "the data channel has no {signal} signal; gst-plugins-rs may have changed it"
+            ));
+        }
+    }
 
     let (inbound_tx, inbound) = mpsc::channel::<String>(64);
     let (outbound, mut outbound_rx) = mpsc::channel::<String>(64);
@@ -391,7 +437,7 @@ fn open_control_channel(webrtcbin: &gst::Element, peer: &str) -> Result<Channel>
     // nothing in the session has to know about GStreamer.
     let writer = channel.clone();
     let peer_label = peer.to_owned();
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         while let Some(line) = outbound_rx.recv().await {
             writer.emit_by_name::<()>("send-string", &[&line]);
         }
