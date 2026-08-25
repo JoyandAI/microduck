@@ -2,7 +2,7 @@
 #
 # Install the robot daemon on a fresh board, from nothing.
 #
-#   curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh | sudo sh
+#   curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck/main/scripts/install.sh | sudo sh
 #
 # Target: 64-bit Debian userland on aarch64 — Armbian 26.2.x on the Radxa Zero 3, and
 # whatever else Debian 12/13 arm64 you point it at. Needs `curl` and coreutils and
@@ -49,7 +49,7 @@ set -eu
 # ── knobs ────────────────────────────────────────────────────────────────────
 
 # The repository releases are published from. Override for a fork or a test repo.
-REPO="${DUCK_REPO:-pollen-robotics/microduck_daemon}"
+REPO="${DUCK_REPO:-pollen-robotics/microduck}"
 
 # Branch the trusted keys are read from. Pin to a tag for a reproducible provisioning run.
 #
@@ -758,6 +758,21 @@ install_units() {
   The robot works without it — only the gamepad is unavailable."
     fi
 
+    # mediad last of the daemons, since it forwards calls to three of the ones above and its unit
+    # says `After=` them. It is safe to have running with nobody connected — `webrtcsink` listens
+    # and the pipeline sits at PLAYING.
+    #
+    # Allowed to fail like btd and padd, and for a sharper reason than either: `ExecStart` carries
+    # `--camera`, and it needs the GStreamer stack `setup-gstreamer.sh` installs. A board missing
+    # either has no WebRTC gateway and is still a robot that updates, walks and pairs.
+    if [ -f "${UNIT_DIR}/mediad.service" ]; then
+        enable_unit mediad.service || warn "mediad did not start; check:
+    journalctl -u mediad -b
+  A board with no camera, or provisioned before the GStreamer stack existed, is the usual cause:
+    sudo /usr/local/sbin/robot-setup-gstreamer
+  The robot works without it — only the camera and the WebRTC console are unavailable."
+    fi
+
     # The boot-time recovery net: three minutes into each boot, ask whether this release brought
     # its daemons up, and fall back to golden if it did not.
     #
@@ -780,6 +795,7 @@ install_units() {
     for unit in $shipped; do
         case "$unit" in
             updaterd.service|robotd.service|configd.service|btd.service|padd.service) ;;
+            mediad.service) ;;
             robot-boot-check.timer) ;;
             # Started by its timer, never enabled. See above.
             robot-boot-check.service) ;;

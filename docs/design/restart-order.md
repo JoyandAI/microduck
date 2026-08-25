@@ -102,7 +102,15 @@ live path.
 | 4 | download to `releases/.staging-<ver>/dl/` | no |
 | 5 | verify sha256, then verify the artifact signature | no |
 | 6 | extract to `releases/.staging-<ver>/root/`, write `.updater-manifest.json` | no |
-| 7 | **`hooks/preinstall`** (cwd = the staged tree) — installs ONNX Runtime if below the floor | no |
+| 7 | **`hooks/preinstall`** (cwd = the staged tree) — installs ONNX Runtime if below the floor, then runs the release's `scripts/setup-gstreamer.sh` for `mediad`'s stack | no |
+
+**The hook script comes from the incoming release; the code that runs it does not.** `updaterd`
+never restarts itself mid-update (§1), so every step in this table is executed by the `updaterd`
+that was already running — the *previous* release's. A change to how hooks are run, logged or
+bounded therefore takes effect one apply later, on the first apply after `updaterd` has restarted
+onto the release carrying it. This cost a confused round of "the hook ran and logged nothing" once;
+`cat /run/updaterd/identity.json` is what tells you which build is about to run your hook.
+
 | 8 | `rename` the staged tree to `releases/<ver>/` | no |
 | 9 | arm the boot counter (`pending.json`), *before* the swap | no |
 | 10 | swap `current` → `releases/<ver>` | no |

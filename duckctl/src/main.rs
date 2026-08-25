@@ -1,9 +1,15 @@
-//! `duck-btctl` — talk to a robot over BLE from a laptop.
+//! `duckctl` — the robot from a laptop.
 //!
 //! The phone app's stand-in, and the only way to test `btd` against a real radio.
 //!
-//! An **example, not a binary**, so `btleplug` never reaches the robot: examples' dependencies
-//! are dev-dependencies, and nothing here is in the shipped artifact. `robotctl` is the tool
+//! **Bluetooth is how it reaches a robot today, not what it is.** `mediad` gives a robot a second
+//! transport that reaches a different set of methods by design — `robot.move` is refused over BLE
+//! and permitted over WebRTC, `net.connect` the other way round — so the name says which robot
+//! rather than which radio. It was called `duck-btctl` while BLE was the only answer.
+//!
+//! **Nothing on the robot depends on this crate**, which is what keeps `btleplug` out of a
+//! release. It used to be an example of `btd` for the same purpose, obtained as a side effect of
+//! the directory it sat in; a crate nobody depends on states it directly. `robotctl` is the tool
 //! that ships, and it speaks unix sockets on the robot itself.
 //!
 //! `btleplug` rather than `bluer`, because this runs on a developer's machine: CoreBluetooth on
@@ -15,12 +21,12 @@
 //! it a real test of the protocol rather than a reimplementation that could agree with itself.
 //!
 //! ```text
-//! cargo run -p btd --example duck-btctl -- scan          # robots in range, and their addresses
-//! cargo run -p btd --example duck-btctl -- status
-//! cargo run -p btd --example duck-btctl -- wifi scan
-//! cargo run -p btd --example duck-btctl -- wifi connect "Pollen" --psk secret
-//! cargo run -p btd --example duck-btctl -- name "Ducky"
-//! cargo run -p btd --example duck-btctl -- call robot.health
+//! cargo run -p duckctl -- scan          # robots in range, and their addresses
+//! cargo run -p duckctl -- status
+//! cargo run -p duckctl -- wifi scan
+//! cargo run -p duckctl -- wifi connect "Pollen" --psk secret
+//! cargo run -p duckctl -- name "Ducky"
+//! cargo run -p duckctl -- call robot.health
 //! ```
 //!
 //! `DUCK_ROBOT` and `DUCK_PIN` in the environment are the defaults for `--name` and `--pin`, for
@@ -66,13 +72,32 @@ const SCAN_POLL: Duration = Duration::from_millis(250);
 /// so gets its own budget below.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const SLOW_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
-/// An update's silences are longer than any other call's: a post-install hook may take two
-/// minutes, and the phase notification arrives before it rather than during it. So the budget is
-/// the longest gap an update can legitimately have, not the longest an update can take.
-const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// An update's silences are longer than any other call's: a hook's phase notification arrives
+/// *before* the hook rather than during it, so the budget is the longest gap an update can
+/// legitimately have, not the longest an update can take.
+///
+/// **The gap is the pre-install hook's ceiling**, which is why this is derived from
+/// [`duck_ipc_proto::UPDATE_MAX_SILENCE_SECONDS`] rather than being a number here. That hook
+/// installs what a release needs and a board may not have — ONNX Runtime, and around 100 MB of apt
+/// for `mediad`'s GStreamer stack on a board that never had it — and this was 180 seconds when that
+/// ceiling was two minutes. A budget below the ceiling reports a working update as a robot that
+/// stopped answering, and the operator's next move is to interrupt an update that was fine.
+///
+/// A minute of margin over it, for the reply that follows the hook.
+const UPDATE_IDLE_TIMEOUT: Duration =
+    Duration::from_secs(duck_ipc_proto::UPDATE_MAX_SILENCE_SECONDS + 60);
 /// `update watch` follows progress until interrupted, so it has no deadline worth naming. A day
 /// is an arbitrary bound that keeps the reply loop one shape instead of two.
 const FOLLOW_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
+/// How often the wait checks that the link is still up.
+///
+/// Without it a dropped connection is indistinguishable from a robot gone quiet: the notification
+/// stream simply stops yielding, so the wait runs to its idle budget and then reports a robot that
+/// has "stopped answering". After an `update apply` that is wrong twice over — the robot answered,
+/// and the link is what went away — and it takes `UPDATE_IDLE_TIMEOUT` to say so. Two seconds is
+/// far below every budget here and costs one cheap CoreBluetooth query each time.
+const LINK_POLL: Duration = Duration::from_secs(2);
 
 /// Every step before the first reply gets its own budget and its own message.
 ///
@@ -222,7 +247,7 @@ const DEFAULT_PIN: &str = "000000";
 /// clap reads the variable with `env::var_os` and treats `DUCK_ROBOT=` as a value, so a variable
 /// exported in a shell profile could only be escaped by unsetting it — and the command that needs
 /// escaping is the one being typed now, on a bench that has somebody else's robot on it. Empty means
-/// unset, so `DUCK_ROBOT= duck-btctl scan` is the escape hatch, in the shape a shell already has.
+/// unset, so `DUCK_ROBOT= duckctl scan` is the escape hatch, in the shape a shell already has.
 ///
 /// **Provenance is carried rather than recomputed.** A default makes the tool *stricter*: it
 /// suppresses the already-connected fallback tier, and turns "the first robot found wins" into "no
@@ -286,7 +311,7 @@ impl Target {
         match &self.name {
             Some(name) if self.from_env => format!(
                 "\n\nNothing on this command line said {name:?} — `DUCK_ROBOT` in this shell's \
-                 environment did. `DUCK_ROBOT= duck-btctl …` ignores it for one command, and \
+                 environment did. `DUCK_ROBOT= duckctl …` ignores it for one command, and \
                  `unset DUCK_ROBOT` for the shell."
             ),
             _ => String::new(),
@@ -384,6 +409,60 @@ fn choose<T>(found: Vec<(T, String)>, target: &Target) -> Result<(T, String), St
             target.provenance(),
         )
     })
+}
+
+/// Deliver a resolved address the way the command asked for it.
+///
+/// **`ip` prints the address and nothing else**, because the tool's split is diagnostics on stderr
+/// and data on stdout: `ssh radxa@$(duckctl ip)` only works if that is the whole of what stdout
+/// carries. Every note this command emits goes to stderr for the same reason.
+fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Command::Ip => {
+            println!("{address}");
+            Ok(())
+        }
+        Command::Open { print, port } => {
+            let url = console_url(address, *port);
+            if *print {
+                println!("{url}");
+                return Ok(());
+            }
+            eprintln!("opening {url}");
+            webbrowser::open(&url).map_err(|e| {
+                format!(
+                    "could not open a browser: {e}\nThe robot is at {url} — `duckctl open --print` \
+                     gives the URL without launching anything."
+                )
+                .into()
+            })
+        }
+        // `run` only calls this for the two above; every other command's answer is its JSON.
+        _ => Err("this command does not resolve an address".into()),
+    }
+}
+
+/// Where the console is, given where the robot is.
+///
+/// Plain `http`, because a robot on a LAN has no certificate to offer and `ws://` from an `https`
+/// page is blocked outright as mixed content. `webrtc-console.md` §1.3 says what that costs — a
+/// microphone, and on some browsers a gamepad, both being secure-context APIs — and when it changes.
+fn console_url(address: &str, port: u16) -> String {
+    format!("http://{address}:{port}/")
+}
+
+/// What to say when the robot is right there and has no address.
+///
+/// Two ways to arrive here and they are the same situation: an advertisement that carried `0.0.0.0`,
+/// and a `net.status` with no `ip4`. The fix is over the radio in both cases, and it has to be —
+/// `net.connect` is refused over WebRTC by design, because a robot that has never seen a network
+/// cannot be configured over that network.
+fn no_address(name: &str) -> String {
+    format!(
+        "{name} is in range and has no network address. Join it to a network over the same radio, \
+         which needs no network of its own:\n  duckctl --name '{name}' wifi connect <ssid> --psk \
+         <passphrase>\nThen `duckctl ip` again. `duckctl wifi status` says what the wifi is doing."
+    )
 }
 
 /// Has discovery found what it came for, or should it keep listening until the deadline?
@@ -534,7 +613,7 @@ async fn listing(seen: &[Seen], verbose: bool, target: &Target) -> String {
     if silent > 0 {
         out.push_str(&format!(
             "\n\n{silent} of them broadcast no address, which is a release from before `btd` \
-             advertised one. `duck-btctl wifi status` still reports it; updating the robot puts it \
+             advertised one. `duckctl wifi status` still reports it; updating the robot puts it \
              in this list."
         ));
     }
@@ -658,12 +737,12 @@ async fn step<T>(
 #[command(
     // Spelled out because clap would otherwise take it from the crate, and `--version` on the
     // installed binary answered `btd 0.5.1` — the daemon's name, for the laptop-side client.
-    name = "duck-btctl",
+    name = "duckctl",
     version,
     about = "Talk to a robot over BLE — the phone app's stand-in",
     long_about = "Finds a robot advertising the duck GATT service and speaks the same JSON-RPC \
-                  lines every other transport uses. This is a development tool: it is an example \
-                  rather than a binary, so it never ships to a robot."
+                  lines every other transport uses. This is a development tool, and nothing on a \
+                  robot depends on it, so it never ships to one."
 )]
 struct Cli {
     /// Connect to this robot by advertised name. Without it, `DUCK_ROBOT`; without that, the first
@@ -673,7 +752,7 @@ struct Cli {
     /// board that has never been renamed answers to its derived default, `duck-7f3a`.
     ///
     /// `export DUCK_ROBOT=duck-c51b` in a shell profile makes that the robot every command talks
-    /// to. `DUCK_ROBOT= duck-btctl …` ignores it for one command.
+    /// to. `DUCK_ROBOT= duckctl …` ignores it for one command.
     //
     // The id is spelled out rather than derived from the field, because clap keys arguments by id
     // and the `name` subcommand has a positional argument that derives the same one. With both
@@ -708,6 +787,30 @@ struct Cli {
 enum Command {
     /// List robots in range with the address each one broadcast, and stop.
     Scan,
+    /// The robot's IPv4 address on stdout, and nothing else.
+    ///
+    /// `ssh radxa@$(duckctl ip)`. Read from the advertisement `btd` already broadcasts, so no
+    /// connection is made, no bond is needed and no PIN can be wrong — and it costs about a second
+    /// rather than the tens `wifi status` does. A robot that is bonded to this machine and has
+    /// stopped advertising the service to it is asked over BLE instead, which is slower and always
+    /// answers.
+    Ip,
+    /// Open the robot's console in a browser.
+    ///
+    /// The page `mediad` serves: the camera, and the controls a WebRTC peer is allowed to drive.
+    /// Finds the robot the way `ip` above does.
+    Open {
+        /// Print the URL instead of opening it — for a machine with no browser, or a script.
+        #[arg(long)]
+        print: bool,
+        /// The console's port, for a robot started with a non-default `--web-port`.
+        //
+        // The same default as `mediad --web-port`, and the reason this command exists rather than a
+        // documented `open "http://$(duckctl ip):8080"`: the port belongs in one place that nobody
+        // has to read.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
     /// Version handshake plus update status.
     Status,
     /// What the robot is running: the API version, the release, and the revision it was built from.
@@ -869,6 +972,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // what makes it the safe command to reach for when a robot cannot be reached, and it is also why
     // it can only report what an advertisement carries.
     let list_only = matches!(cli.command, Command::Scan);
+    // `ip` and `open` want one field out of an advertisement, so they read it the way `scan` does —
+    // and unlike `scan` they connect after all when no advertisement carried one. Cheap read first,
+    // call second: without the fallback these two commands would fail on exactly the laptops that
+    // use them most, because a robot bonded to this Mac often stops advertising the service to it.
+    let resolving = matches!(cli.command, Command::Ip | Command::Open { .. });
 
     let manager = Manager::new().await?;
     let adapter = manager
@@ -902,6 +1010,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the latter broke as soon as the Mac bonded with the robot. The authoritative test is whether
     // it serves our characteristic, which is only knowable after connecting.
     let mut advertised: Vec<(Peripheral, String)> = Vec::new();
+    // What each robot said about its address, beside the name it said it under — the two fields
+    // `choose` needs, so `ip` inherits the collision rule every other command follows rather than
+    // picking whichever robot the radio reported first.
+    let mut addresses: Vec<(Address, String)> = Vec::new();
     let mut named: Vec<(Peripheral, String)> = Vec::new();
     let mut connected: Vec<(Peripheral, String)> = Vec::new();
     // Everything the Mac reported, kept only so a failure can say what was in range. `configd`
@@ -912,6 +1024,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         advertised.clear();
+        addresses.clear();
         named.clear();
         connected.clear();
         // Cleared with the tiers, and rebuilt from the same sweep: `peripherals()` reports
@@ -929,13 +1042,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| properties.address.to_string());
 
             let duck = properties.services.contains(&SERVICE_UUID);
+            let address = Address::read(&properties, duck);
+            if duck {
+                addresses.push((address, name.clone()));
+            }
             seen.push(Seen {
                 peripheral: peripheral.clone(),
                 identity: identity(&peripheral, properties.address),
                 local_name: properties.local_name.clone(),
                 services: properties.services.len(),
                 duck,
-                address: Address::read(&properties, duck),
+                address,
             });
 
             if list_only {
@@ -978,6 +1095,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("{}", listing(&seen, cli.verbose, &target).await);
         return Ok(());
+    }
+
+    // The advertisement, before anything connects. An address here costs no bond, no PIN and about a
+    // second — and it is not stale: `btd` re-reads `net.status` every five seconds and re-advertises
+    // when the answer moves, so this is that call with a five-second lag, well inside the window in
+    // which a new lease has already broken ssh.
+    if resolving {
+        match choose(std::mem::take(&mut addresses), &target) {
+            Ok((Address::At(address), _)) => return deliver(&cli.command, &address.to_string()),
+            // The robot broadcast `0.0.0.0`, which is a robot with no network rather than a robot
+            // that did not say. Asking `net.status` over a connection would return the same nothing
+            // more slowly, so this answers now.
+            Ok((Address::Unassigned, name)) => return Err(no_address(&name).into()),
+            // A release from before `btd` advertised an address. The fallback answers anyway;
+            // updating makes it fast.
+            Ok((Address::Unsaid, name)) => eprintln!(
+                "{name} advertises no address — a release from before robots broadcast one. Asking \
+                 it over Bluetooth instead, which takes longer; `duckctl update apply` makes this \
+                 fast."
+            ),
+            // Nothing advertised the service, or nothing answering to the name did. Both are the
+            // fallback's case, and the tiers below have their own answer for each: this is the
+            // bonded-Mac situation the fallback exists for, and its failure message is better than
+            // anything that could be said here.
+            Err(_) => {
+                if cli.verbose {
+                    eprintln!(
+                        "no advertisement carried an address; connecting to ask net.status instead"
+                    );
+                }
+            }
+        }
     }
 
     let mut found = advertised;
@@ -1140,14 +1289,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut deadline = tokio::time::Instant::now() + timeout;
 
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(silence(timeout).into());
-        }
-
-        let Ok(Some(notification)) = tokio::time::timeout(remaining, notifications.next()).await
-        else {
-            return Err(silence(timeout).into());
+        let notification = match next_chunk(&peripheral, &mut notifications, deadline).await {
+            Waited::Chunk(notification) => notification,
+            Waited::Dropped => return Err(dropped(&cli.command).into()),
+            Waited::Silent => return Err(silence(timeout).into()),
         };
         deadline = tokio::time::Instant::now() + timeout;
 
@@ -1171,6 +1316,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
 
+            // `ip` and `open` asked `net.status` for one field, so the reply is not the answer:
+            // stdout carries an address or a URL, or nothing at all. Before the JSON is printed,
+            // because printing it would be the bug — `$(duckctl ip)` would carry the whole object.
+            if resolving {
+                let _ = peripheral.disconnect().await;
+                if let Some(error) = value.get("error") {
+                    return Err(format!(
+                        "the robot answered and refused net.status: {error}\nA wrong PIN is the \
+                         usual cause — `robotctl system pin` on the robot says what it is."
+                    )
+                    .into());
+                }
+                return match value["result"]["ip4"].as_str().filter(|ip| !ip.is_empty()) {
+                    Some(address) => deliver(&cli.command, address),
+                    None => Err(no_address(&name).into()),
+                };
+            }
+
             println!("{}", serde_json::to_string_pretty(&value)?);
             let _ = peripheral.disconnect().await;
             // A JSON-RPC error is the robot answering, not this tool failing — so it is
@@ -1192,15 +1355,94 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// How a wait for the next notification ended.
+///
+/// Three outcomes rather than two, because "nothing arrived" hides the one that is diagnosable:
+/// a robot that is connected and not talking wants a different next move from a robot this Mac is
+/// no longer connected to.
+enum Waited {
+    /// Bytes arrived. Whether they complete a line is the reassembler's business.
+    Chunk(btleplug::api::ValueNotification),
+    /// The link is gone, so no budget is worth waiting out.
+    Dropped,
+    /// The budget expired with the link still up.
+    Silent,
+}
+
+/// Wait for the next notification, giving up when the deadline passes *or* the link goes.
+///
+/// The stream alone cannot report the second: on macOS a peripheral that disconnects mid-call
+/// leaves `notifications()` pending rather than ending it, so the only way to learn the link is
+/// gone is to ask. Hence the poll — [`LINK_POLL`] at a time, until one of the three answers.
+async fn next_chunk(
+    peripheral: &Peripheral,
+    notifications: &mut (impl futures::Stream<Item = btleplug::api::ValueNotification> + Unpin),
+    deadline: tokio::time::Instant,
+) -> Waited {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Waited::Silent;
+        }
+
+        match tokio::time::timeout(remaining.min(LINK_POLL), notifications.next()).await {
+            Ok(Some(notification)) => return Waited::Chunk(notification),
+            // The stream ended: btleplug has given up on the peripheral, which is the same news
+            // the poll below goes looking for.
+            Ok(None) => return Waited::Dropped,
+            // Nothing yet, so ask whether there ever will be. Only a definite "no" ends the
+            // wait: an adapter that errors on the question has not said the link is down, and
+            // treating that as a drop would end a working call early — whereas believing a link
+            // that is gone costs at most the silence this already tolerated.
+            Err(_) => {
+                if matches!(peripheral.is_connected().await, Ok(false)) {
+                    return Waited::Dropped;
+                }
+            }
+        }
+    }
+}
+
+/// What to say when the link goes before the reply does.
+///
+/// A different diagnosis from [`silence`], and the difference matters most for an update: `btd` is
+/// restarted about five seconds after an apply answers (`docs/design/restart-order.md` §1), so a
+/// drop is one of the shapes a *successful* update has. Calling that "the robot has stopped
+/// answering" describes a robot that is working perfectly as a robot that is dead.
+fn dropped(command: &Command) -> String {
+    // The transitions that restart daemons, and only for the release that ships `btd` — the same
+    // two conditions as `restart_note`, because they describe the same event: that one predicts
+    // the drop before it happens, and this one explains it afterwards.
+    let restarting = matches!(
+        command,
+        Command::Update(
+            Update::Apply { component, .. }
+            | Update::Rollback { component }
+            | Update::Select { component, .. },
+        ) if component == "daemon"
+    );
+
+    let next = if restarting {
+        "An update restarts the robot's daemons, `btd` among them, so this is as likely to be the \
+         update finishing as failing. Reconnect and run `duckctl update status`: \
+         `last_attempt` carries the outcome of what ran."
+    } else {
+        "Reconnect and try again. Anything the robot had already started — an update in \
+         particular — carries on without this connection."
+    };
+    format!("the link to the robot dropped before it answered. {next}")
+}
+
 /// What to say when the robot stops talking, which depends on what was expected of it.
 ///
 /// The budget is a silence rather than a total, so "no reply within 180s" would be a lie about an
-/// update that had been running for ten minutes and then stalled.
+/// update that had been running for ten minutes and then stalled. Reached only with the link still
+/// up: a drop is [`dropped`], and answered as soon as [`LINK_POLL`] notices it.
 fn silence(idle: Duration) -> String {
     format!(
         "nothing from the robot for {idle:?}, so it has stopped answering. Anything it had \
              already started — an update in particular — carries on without this connection: \
-             reconnect and run `duck-btctl update status`."
+             reconnect and run `duckctl update status`."
     )
 }
 
@@ -1315,6 +1557,10 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // request: there is no method to send, and connecting is the thing it exists not to do.
         Command::Scan => unreachable!("scan returns before anything connects"),
         Command::Status => ("update.status", serde_json::json!({}), REPLY_TIMEOUT),
+        // The fallback, reached only when no advertisement carried an address. `net.status` is what
+        // the advertisement is made of — `btd` re-reads it every five seconds — so this asks the
+        // same question over a connection that costs a bond and a PIN.
+        Command::Ip | Command::Open { .. } => ("net.status", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Version => (
             "hello",
             serde_json::json!({ "api_version": duck_ipc_proto::API_VERSION }),
@@ -1463,7 +1709,7 @@ fn update_request_line(update: &Update) -> Result<(String, Duration), Box<dyn st
 
 /// One progress notification, as a line for a person.
 ///
-/// Progress goes to stderr like everything that is not an answer, so `duck-btctl … > reply.json`
+/// Progress goes to stderr like everything that is not an answer, so `duckctl … > reply.json`
 /// keeps the two apart — and printing it as pretty JSON, which is what this used to do, put a
 /// dozen lines of punctuation on stdout for every percent of a download.
 fn progress_line(params: &serde_json::Value) -> String {
@@ -1507,7 +1753,7 @@ fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static
         "applied" | "rolled_back" => Some(
             "note: the robot restarts its daemons now, and `btd` about five seconds after this \
              reply — so this connection drops. That is the update working. Reconnect and run \
-             `duck-btctl update status`: `last_attempt` carries the outcome of what just ran.",
+             `duckctl update status`: `last_attempt` carries the outcome of what just ran.",
         ),
         _ => None,
     }
@@ -1714,9 +1960,8 @@ mod tests {
     /// found nothing, and listed the robot it was talking to seconds earlier as merely in range.
     #[test]
     fn a_rename_still_selects_the_robot_by_the_name_it_has_now() {
-        let cli =
-            Cli::try_parse_from(["duck-btctl", "--name", "duck-c51b", "name", "leduckpierre"])
-                .expect("the rename form parses");
+        let cli = Cli::try_parse_from(["duckctl", "--name", "duck-c51b", "name", "leduckpierre"])
+            .expect("the rename form parses");
 
         assert_eq!(cli.name.as_deref(), Some("duck-c51b"), "which robot");
         let Command::Name { name } = &cli.command else {
@@ -1769,7 +2014,7 @@ mod tests {
     #[test]
     fn an_empty_value_is_no_default_at_all() {
         let escaped = Target::new(None, Some(String::new()));
-        assert_eq!(escaped.wanted(), None, "`DUCK_ROBOT= duck-btctl …`");
+        assert_eq!(escaped.wanted(), None, "`DUCK_ROBOT= duckctl …`");
         assert!(
             escaped.provenance().is_empty(),
             "no name, nothing to explain"
@@ -1854,6 +2099,72 @@ mod tests {
     }
 
     /// The whole point of the change: a listing says where to reach the robot, with no connection.
+    /// The one thing `open` adds over `ip`, and the reason it is a command rather than a documented
+    /// `open "http://$(duckctl ip):8080"`: the port has one home.
+    #[test]
+    fn the_console_url_is_the_address_and_the_port() {
+        assert_eq!(
+            console_url("192.168.1.42", 8080),
+            "http://192.168.1.42:8080/"
+        );
+        assert_eq!(
+            console_url("192.168.1.42", 9000),
+            "http://192.168.1.42:9000/"
+        );
+    }
+
+    /// `ip` picks a robot the same way every other command does. Two robots on one bench, one of
+    /// them named — the address that comes back has to be that robot's, not whichever advertisement
+    /// arrived first.
+    #[test]
+    fn an_advertised_address_is_chosen_by_name() {
+        let found = vec![
+            (
+                Address::At("192.168.1.7".parse().unwrap()),
+                "duck-aaaa".to_owned(),
+            ),
+            (
+                Address::At("192.168.1.42".parse().unwrap()),
+                "duck-c51b".to_owned(),
+            ),
+        ];
+        let (address, name) = choose(found, &asked_for("duck-c51b")).expect("one robot answers");
+        assert_eq!(name, "duck-c51b");
+        assert_eq!(address, Address::At("192.168.1.42".parse().unwrap()));
+    }
+
+    /// A robot that broadcast `0.0.0.0` is a robot with no network, and the fix is over the radio —
+    /// so the message names the command that does it rather than the field that was empty.
+    #[test]
+    fn a_robot_with_no_network_is_told_how_to_get_one() {
+        let message = no_address("duck-c51b");
+        assert!(message.contains("duck-c51b"));
+        assert!(message.contains("wifi connect"));
+    }
+
+    /// `--print` and `--port` are the two things `open` takes, and neither is positional.
+    #[test]
+    fn open_takes_a_port_and_can_print_instead() {
+        let cli = Cli::try_parse_from(["duckctl", "open", "--print", "--port", "9000"])
+            .expect("open --print --port parses");
+        assert!(matches!(
+            cli.command,
+            Command::Open {
+                print: true,
+                port: 9000
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["duckctl", "open"]).expect("open parses on its own");
+        assert!(matches!(
+            cli.command,
+            Command::Open {
+                print: false,
+                port: 8080
+            }
+        ));
+    }
+
     #[test]
     fn a_robot_broadcasts_where_it_is() {
         let (properties, duck) = advertised(
@@ -1938,7 +2249,7 @@ mod tests {
     #[test]
     fn apply_asks_for_the_target_the_flags_named() {
         let wire = |args: &[&str]| {
-            let mut argv = vec!["duck-btctl", "update", "apply"];
+            let mut argv = vec!["duckctl", "update", "apply"];
             argv.extend_from_slice(args);
             let cli = Cli::try_parse_from(argv).expect("parses");
             request_line(&cli.command).expect("a request").0
@@ -1973,7 +2284,7 @@ mod tests {
     fn a_ref_and_a_version_cannot_both_be_named() {
         assert!(
             Cli::try_parse_from([
-                "duck-btctl",
+                "duckctl",
                 "update",
                 "apply",
                 "--ref",
@@ -1998,7 +2309,7 @@ mod tests {
             (vec!["rollback"], "update.rollback"),
             (vec!["select", "0.5.1"], "update.select"),
         ] {
-            let mut argv = vec!["duck-btctl", "update"];
+            let mut argv = vec!["duckctl", "update"];
             argv.extend_from_slice(&args);
             let cli = Cli::try_parse_from(argv).expect("parses");
             let (line, _) = request_line(&cli.command).expect("a request");
@@ -2009,7 +2320,7 @@ mod tests {
     /// `select` sends the version as a version, and defaults the component like the rest.
     #[test]
     fn select_names_a_version_and_defaults_the_component() {
-        let cli = Cli::try_parse_from(["duck-btctl", "update", "select", "0.5.1"]).expect("parses");
+        let cli = Cli::try_parse_from(["duckctl", "update", "select", "0.5.1"]).expect("parses");
         let (line, _) = request_line(&cli.command).expect("a request");
         assert!(line.contains(r#""version":"0.5.1""#), "{line}");
         assert!(line.contains(r#""component":"daemon""#), "{line}");
@@ -2021,7 +2332,7 @@ mod tests {
     #[test]
     fn an_update_is_given_the_longest_silence() {
         let budget = |args: &[&str]| {
-            let mut argv = vec!["duck-btctl"];
+            let mut argv = vec!["duckctl"];
             argv.extend_from_slice(args);
             let cli = Cli::try_parse_from(argv).expect("parses");
             request_line(&cli.command).expect("a request").1
@@ -2070,7 +2381,7 @@ mod tests {
     /// update, so it has to be trustworthy.
     #[test]
     fn a_restart_is_announced_only_when_the_release_changed() {
-        let apply = Cli::try_parse_from(["duck-btctl", "update", "apply"])
+        let apply = Cli::try_parse_from(["duckctl", "update", "apply"])
             .expect("parses")
             .command;
 
@@ -2093,15 +2404,63 @@ mod tests {
         assert!(restart_note(&apply, &dry_run).is_none());
 
         // And nothing else announces one, however it answered.
-        let status = Cli::try_parse_from(["duck-btctl", "update", "status"])
+        let status = Cli::try_parse_from(["duckctl", "update", "status"])
             .expect("parses")
             .command;
         assert!(restart_note(&status, &applied).is_none());
 
         // Nor a component whose release does not ship `btd`.
-        let model = Cli::try_parse_from(["duck-btctl", "update", "apply", "--component", "model"])
+        let model = Cli::try_parse_from(["duckctl", "update", "apply", "--component", "model"])
             .expect("parses")
             .command;
         assert!(restart_note(&model, &applied).is_none());
+    }
+
+    /// A drop during an apply is sent to the record, because the apply may well have worked.
+    ///
+    /// This is the message that replaces `silence` for the case it used to describe wrongly, and
+    /// it is worth the same care as the note that predicts the drop: it must send someone to
+    /// `last_attempt` when the update was restarting daemons, and not invent a restart when
+    /// nothing was being installed.
+    #[test]
+    fn a_drop_during_an_apply_points_at_the_record() {
+        let note = |argv: &[&str]| {
+            let mut full = vec!["duckctl"];
+            full.extend_from_slice(argv);
+            dropped(&Cli::try_parse_from(full).expect("parses").command)
+        };
+
+        for argv in [
+            vec!["update", "apply"],
+            vec!["update", "rollback"],
+            vec!["update", "select", "0.5.1"],
+        ] {
+            let said = note(&argv);
+            assert!(said.contains("update status"), "{argv:?}: {said}");
+        }
+
+        // A poll is not a transition, so nothing was restarting.
+        let said = note(&["update", "status"]);
+        assert!(!said.contains("restarts"), "{said}");
+
+        // Nor is anything else, and a component whose release does not ship `btd` restarts
+        // `robotd` and leaves this link alone.
+        for argv in [
+            vec!["wifi", "status"],
+            vec!["update", "apply", "--component", "model"],
+        ] {
+            let said = note(&argv);
+            assert!(!said.contains("restarts"), "{argv:?}: {said}");
+        }
+    }
+
+    /// The link is checked long before the budget it interrupts expires.
+    ///
+    /// The relationship is the whole point: a poll as long as the budget notices a dropped link
+    /// exactly when giving up would have, which is the three-minute silence this exists to end.
+    #[test]
+    fn the_link_is_checked_long_before_a_wait_gives_up() {
+        assert!(LINK_POLL < REPLY_TIMEOUT);
+        assert!(LINK_POLL * 10 < UPDATE_IDLE_TIMEOUT);
     }
 }

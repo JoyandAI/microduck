@@ -127,9 +127,9 @@ manifest_asset = "manifest.json"
 # updaterd start checks that happened (docs/design/restart-order.md §1 and §5). This is
 # why the updater must be resident and separate from `btd` (architecture.md §1.1).
 #
-# `mediad` is absent because it does not exist yet: naming a unit that isn't installed
-# makes `systemctl restart` fail, which fails the update, which rolls it back. Add it in
-# the same change that first ships it.
+# `mediad` is absent because it needs no entry: it ships in the release with an `[Install]`
+# section, so the derived set below already carries it. Name a unit here only when the
+# release does not ship it.
 # The restart set is derived from the units the release ships (`systemd/*.service`), minus `updaterd`
 # and `btd`, which must never be restarted by an update they are carrying. Anything named here is
 # *added* to that set — use it only for a unit the release does not ship.

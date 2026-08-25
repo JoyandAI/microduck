@@ -111,7 +111,7 @@ The result is an ordinary gated update, so the restart traps above still apply.
 [`dev-push.md`](dev-push.md) has the setup, the container build, `--dry-run`, the first push to a
 board below 0.5.0, and what to do when it fails.
 
-## From a laptop — `duck-btctl`
+## From a laptop — `duckctl`
 
 Reaching the robot over Bluetooth LE, with no network and no ssh:
-[`duck-btctl.md`](duck-btctl.md) has every command.
+[`duckctl.md`](duckctl.md) has every command.

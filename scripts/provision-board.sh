@@ -44,6 +44,9 @@
 #                     `Privacy`**. This is what a board wants when a pad pairs and then flaps with
 #                     `PIN or Key Missing`: that is `Privacy = device` on a board that needed only
 #                     the pause. Try this before `--weird-ble`.
+#   --no-gstreamer    skip the GStreamer stack `mediad` needs. Installed by default, with a
+#                     report of what this board can encode. It needs no reboot, so it can also
+#                     be added or re-run later:  sudo /usr/local/sbin/robot-setup-gstreamer
 #   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all, even with
 #                     `btd` paused. Implies `--pause-btd-on-pair`, and additionally sets
 #                     `Privacy = device`.
@@ -78,7 +81,7 @@
 # which is read off the board before the reboot while ssh still works. Adopting an address means
 # ssh'ing somewhere new, and doing that to a robot chosen by scan order is worse than waiting.
 #
-# It needs `cargo` and this clone, because `duck-btctl` is an example rather than an installed
+# It needs `cargo` and this clone, because `duckctl` is an example rather than an installed
 # binary. Without either, the wait is exactly what it was before and says so. Three more things it
 # cannot do:
 #
@@ -105,6 +108,7 @@ NO_DEV_KEY=""
 USE_LOCAL=""
 NO_BLE=""
 WEIRD_BLE=""
+NO_GSTREAMER=""
 PAUSE_BTD=""
 # The name to give the robot. Not `BLE_NAME` below, which points the other way: the name this board
 # already answers to, used to find it again after the reboot.
@@ -112,7 +116,7 @@ ROBOT_NAME=""
 
 # ── the Bluetooth fallback ───────────────────────────────────────────────────
 #
-# `duck-btctl` is an example rather than a binary — deliberately, so `btleplug` never reaches a
+# `duckctl` is an example rather than a binary — deliberately, so `btleplug` never reaches a
 # robot — which means the only way to run it is `cargo` against this clone.
 BLE_MANIFEST="$(dirname "$0")/../Cargo.toml"
 
@@ -179,6 +183,7 @@ while [ $# -gt 0 ]; do
         --dev-key)    DEV_KEY="${2:?--dev-key needs a path}"; shift 2 ;;
         --no-dev-key) NO_DEV_KEY=1; shift ;;
         --no-ble)     NO_BLE=1; shift ;;
+        --no-gstreamer) NO_GSTREAMER=1; shift ;;
         --weird-ble)  WEIRD_BLE=1; shift ;;
         --pause-btd-on-pair) PAUSE_BTD=1; shift ;;
         --local)      USE_LOCAL=1; shift ;;
@@ -400,7 +405,7 @@ ble_probe_start() {
     [ -z "$BLE_PID" ] || return 0
 
     {
-        if cargo run -q --manifest-path "$BLE_MANIFEST" -p btd --example duck-btctl -- \
+        if cargo run -q --manifest-path "$BLE_MANIFEST" -p duckctl -- \
             --name "$BLE_NAME" --pin "$BLE_PIN" wifi status \
             >"${BLE_DIR}/out" 2>"${BLE_DIR}/err"
         then
@@ -437,7 +442,7 @@ ble_verdict() {
     rm -f "${BLE_DIR}/verdict"
 }
 
-# Why the last probe failed, as `duck-btctl` put it.
+# Why the last probe failed, as `duckctl` put it.
 #
 # Its own words rather than a paraphrase, and not matched on either: it explains a name nobody
 # answers to, two robots answering to one, a missing adapter and a refused PIN, each differently and
@@ -609,7 +614,7 @@ elif ! command -v cargo >/dev/null 2>&1; then
   address changes across the reboot. Not fatal — the board finishes on its own either way, and
   the wait below is what it always was. Install Rust to get the fallback."
 elif [ ! -f "$BLE_MANIFEST" ]; then
-    warn "${BLE_MANIFEST} is not there, so this is not being run from a clone and duck-btctl
+    warn "${BLE_MANIFEST} is not there, so this is not being run from a clone and duckctl
   cannot be built — no Bluetooth fallback if the board's address changes across the reboot."
 else
     BLE_NAME="$(learn_ble_name)"
@@ -663,7 +668,7 @@ if [ -n "$USE_LOCAL" ]; then
     say "sending this clone's provision.sh"
     scp -q "$_local" "$(scp_target /tmp/provision.sh)" || die "could not copy provision.sh"
 else
-    _raw="https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/${REF:-main}/scripts/provision.sh"
+    _raw="https://raw.githubusercontent.com/pollen-robotics/microduck/${REF:-main}/scripts/provision.sh"
     say "having the board fetch provision.sh from ${REF:-main}"
     # Fetched by the board rather than by this machine and copied over: the board is the one
     # that has to be able to reach GitHub with that token, and finding out here would prove
@@ -684,6 +689,7 @@ _env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
 [ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
 [ -z "$PAUSE_BTD" ]  || _env="${_env} DUCK_PAUSE_BTD=1"
+[ -z "$NO_GSTREAMER" ] || _env="${_env} DUCK_GSTREAMER=0"
 
 # The name is a flag rather than one more `DUCK_*`, because on the board it goes no further than
 # `robotctl system set-name`. Single-quoted with any quote of its own escaped: a name is free text,

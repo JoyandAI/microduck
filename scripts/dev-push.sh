@@ -82,7 +82,7 @@ done
 # nobody can keep in a shell profile: `DUCK_BOARD=radxa@192.168.1.42` goes stale, and the way
 # that reads is a push that hangs until ssh times out.
 #
-# A robot's *name* does not move. `duck-btctl` finds it over BLE by that name and `net.status`
+# A robot's *name* does not move. `duckctl` finds it over BLE by that name and `net.status`
 # answers with the address it currently has — which makes the radio the way out of exactly the
 # situation the network cannot help with, and needs nothing on the LAN to be known or guessed.
 #
@@ -92,24 +92,26 @@ done
 BOARD_USER="${DUCK_BOARD_USER:-radxa}"
 CACHE_DIR="${DUCK_BOARD_CACHE:-$HOME/.cache/duck/boards}"
 
-# The installed client if there is one, the example in this clone otherwise. `duck-btctl` is an
-# example rather than a binary, so it reaches a PATH only via `cargo install --path btd --example
-# duck-btctl`, and plenty of clones have never run that.
-btctl() {
-    if command -v duck-btctl >/dev/null 2>&1; then
-        duck-btctl "$@"
+# The installed client if there is one, this clone's otherwise. `cargo install --path duckctl` is
+# what puts it on a PATH, and plenty of clones have never run it.
+#
+# Not named `duckctl`: a function by that name would match its own `duckctl "$@"` below and
+# recurse until the shell gives up.
+client() {
+    if command -v duckctl >/dev/null 2>&1; then
+        duckctl "$@"
     else
-        cargo run -q -p btd --example duck-btctl -- "$@"
+        cargo run -q -p duckctl -- "$@"
     fi
 }
 
 # `net.status` for one robot, JSON on stdout.
 #
-# Only `--name` is passed. A robot with a PIN of its own needs `DUCK_PIN`, which `duck-btctl`
-# reads for itself (`docs/robot/duck-btctl.md`) — repeating it here would be a second place to
+# Only `--name` is passed. A robot with a PIN of its own needs `DUCK_PIN`, which `duckctl`
+# reads for itself (`docs/robot/duckctl.md`) — repeating it here would be a second place to
 # keep in step, and passing its factory default unconditionally would override the real one.
 ble_status() {
-    btctl --name "$1" wifi status
+    client --name "$1" wifi status
 }
 
 # A robot name in, `user@address` out. Everything else goes to stderr, so the substitution that
@@ -134,7 +136,7 @@ resolve_board() {
     echo "==> asking $robot_name over Bluetooth where it is" >&2
     reply="$(ble_status "$robot_name")" || {
         echo "could not reach $robot_name over Bluetooth" >&2
-        echo "  duck-btctl scan                                  # is it advertising?" >&2
+        echo "  duckctl scan                                  # is it advertising?" >&2
         echo "  scripts/dev-push.sh $BOARD_USER@<address>        # or say where it is" >&2
         return 1
     }
@@ -149,7 +151,7 @@ print((r.get("result") or {}).get("ip4") or "")')" || return 1
     if [ -z "$address" ]; then
         echo "$robot_name answered over Bluetooth but has no wifi address" >&2
         echo "Join it to a network first — over the same radio, so this needs no ssh:" >&2
-        echo "  duck-btctl --name '$robot_name' wifi connect <ssid> --psk <passphrase>" >&2
+        echo "  duckctl --name '$robot_name' wifi connect <ssid> --psk <passphrase>" >&2
         return 1
     fi
 
@@ -172,9 +174,9 @@ print((r.get("result") or {}).get("ip4") or "")')" || return 1
 }
 
 # The command line beats the environment, and an address beats a name: an address needs no radio.
-# `DUCK_ROBOT` is the same variable `duck-btctl` defaults `--name` to, so one exported name serves
+# `DUCK_ROBOT` is the same variable `duckctl` defaults `--name` to, so one exported name serves
 # both tools — and empty means unset in both, so `DUCK_ROBOT= scripts/dev-push.sh radxa@…` works.
-# `--name` here is `duck-btctl`'s sense of it: which robot to talk to. `provision-board.sh --name`
+# `--name` here is `duckctl`'s sense of it: which robot to talk to. `provision-board.sh --name`
 # means the opposite way round — the name to *give* a board — because provisioning is the one place
 # a name is assigned rather than used to find something.
 if [ -z "$BOARD" ] && [ -z "$ROBOT" ]; then
@@ -244,51 +246,32 @@ if [ ! -f "$KEY" ]; then
     exit 1
 fi
 
-# ── the one C dependency, and why this is not `apt-get install libudev-dev:arm64` ──────
+# ── the C dependencies, and where the target's copies come from ────────────────────────
 #
-# `padd` needs libudev (via `gilrs`), which is the only C library anything reaching the board
-# links against — `scripts/ci-cross-deps.sh` exists solely to install it for the target on a
-# CI runner. That script is Debian-only and cannot help here, and a Mac has no way to install
-# an aarch64 Linux library through a package manager.
+# This used to `scp` libudev.so.1 off the board and hand-write a `.pc` beside it, which worked
+# because `libudev-sys` asks for no particular version and the linker records the SONAME rather
+# than the filename. GStreamer ended that: `mediad` needs seven pkg-config modules with real
+# `Cflags` and `Requires`, and hand-writing those is not a thing to do.
 #
-# So take it from the board, which by definition runs the exact library the binary will load
-# there. The linker records the SONAME (`libudev.so.1`), not the filename it was given, so a
-# copy named `libudev.so` next to a hand-written `.pc` is all `-ludev` needs. Cached: it is one
-# `scp` on first use, and `rm -rf` the directory to refresh it.
+# Two things got better rather than merely different. The sysroot comes from Debian trixie — the
+# same archive the board installs from — so the versions match by construction instead of by
+# having copied one file off one board. And **building no longer needs a reachable board at all**:
+# the old path failed with "no libudev.so.1 on $BOARD" when the board you wanted to set up was the
+# board you needed to build, which is the wrong way round.
 #
-# One difference from CI worth knowing about, and it is inert: `libudev-sys`'s build script
-# also probes for `udev_hwdb_new` by linking a test binary with the *host* toolchain, which
-# fails on a Mac and leaves its `hwdb` cfg off. `gilrs` calls nothing under that cfg.
+# One quirk carried over from the old path, and it is inert: `libudev-sys`'s build script probes
+# for `udev_hwdb_new` by linking a test binary with the *host* toolchain, which fails on a Mac and
+# leaves its `hwdb` cfg off. `gilrs` calls nothing under that cfg.
 #
-# `--docker` needs none of this — see `scripts/dev-build.Dockerfile`. It is also the way out if
-# the board you would take libudev from is a board you have not set up yet.
-SYSROOT="${DUCK_CROSS_SYSROOT:-$HOME/.cache/duck-cross/aarch64}"
-if [ "$DOCKER" = no ] && [ ! -f "$SYSROOT/lib/libudev.so" ]; then
-    echo "==> fetching libudev from $BOARD for cross-linking (once)"
-    remote_lib="$(ssh "$BOARD" 'ls /usr/lib/aarch64-linux-gnu/libudev.so.1 /lib/aarch64-linux-gnu/libudev.so.1 2>/dev/null | head -1')"
-    if [ -z "$remote_lib" ]; then
-        echo "no libudev.so.1 on $BOARD; padd cannot be linked for it" >&2
-        exit 1
-    fi
-    mkdir -p "$SYSROOT/lib" "$SYSROOT/pkgconfig"
-    scp -q "$BOARD:$remote_lib" "$SYSROOT/lib/libudev.so"
-    # `find_library` in libudev-sys asks for no particular version, so this only has to parse.
-    cat > "$SYSROOT/pkgconfig/libudev.pc" <<EOF
-libdir=$SYSROOT/lib
-Name: libudev
-Description: libudev, copied from a board by scripts/dev-push.sh
-Version: 0
-Libs: -L\${libdir} -ludev
-Cflags:
-EOF
-fi
+# `--docker` needs none of this — see `scripts/dev-build.Dockerfile`.
 if [ "$DOCKER" = no ]; then
-    # Prepended rather than replacing: on a Linux host with the multiarch package installed,
-    # both are then visible and this one still wins.
-    PKG_CONFIG_PATH="$SYSROOT/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-    export PKG_CONFIG_PATH
-    # pkg-config refuses to answer for another architecture unless told to.
-    export PKG_CONFIG_ALLOW_CROSS=1
+    sysroot_env="$(sh "$(dirname "$0")/cross-sysroot.sh" | grep '^export')" || {
+        echo "could not build the aarch64 sysroot; see scripts/cross-sysroot.sh" >&2
+        exit 1
+    }
+    # `eval` rather than sourcing a file: the script prints the exports for a human to read first,
+    # and this is the same four lines it prints.
+    eval "$sysroot_env"
 fi
 
 SHA="$(git rev-parse HEAD)"
@@ -359,6 +342,9 @@ cp "$BIN"/robotd staged/
 cp "$BIN"/configd staged/
 cp "$BIN"/btd staged/
 cp "$BIN"/padd staged/
+# The WebRTC gateway. Its unit ships with an `[Install]` section, so postinstall enables and starts
+# it and `on_apply` restarts it, exactly as for every other daemon here.
+cp "$BIN"/mediad staged/
 # The voice generator (postinstall renders the per-robot bank with it) and the
 # mic classifier pair — pet-detect for live listening, pet-features for training.
 cp "$BIN"/sounds staged/
@@ -385,6 +371,7 @@ cargo run -p xtask -- package \
     --include "updater/systemd/sysusers.d/robot.conf=systemd/sysusers.d/robot.conf" \
     --include "robotd/systemd/robotd.service=systemd/robotd.service" \
     --include "hooks/postinstall=hooks/postinstall" \
+    --include "scripts/setup-gstreamer.sh=scripts/setup-gstreamer.sh" \
     --include "scripts/robot-rescue=scripts/robot-rescue" \
     --include "scripts/robot-boot-check=scripts/robot-boot-check" \
     --include "updater/systemd/robot-boot-check.service=systemd/robot-boot-check.service" \
@@ -394,6 +381,8 @@ cargo run -p xtask -- package \
     --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
     --include "padd/systemd/padd.service=systemd/padd.service" \
     --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+    --include "mediad/systemd/mediad.service=systemd/mediad.service" \
+    --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
     --include "tof/systemd/tofd.service=systemd/tofd.service" \
     --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
     --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
@@ -510,7 +499,7 @@ echo "    current -> $want"
 # no socket at all, so for that one it is the only answer available.
 deadline=$(($(date +%s) + 30))
 stale=""
-for svc in robotd configd padd updaterd btd; do
+for svc in robotd configd padd updaterd btd mediad; do
     while :; do
         if [ ! -f "/run/${svc}/identity.json" ]; then
             state="silent"
@@ -519,8 +508,8 @@ for svc in robotd configd padd updaterd btd; do
         else
             state="stale"
         fi
-        # Only the two deferred ones are worth waiting for; the rest restarted before the reply, so
-        # a mismatch there is already a fault rather than a race.
+        # Only `updaterd` and `btd` are worth waiting for — they restart five seconds after the
+        # reply. The rest restarted before it, so a mismatch there is a fault rather than a race.
         case "$state:$svc" in
             ok:*) break ;;
             stale:updaterd|stale:btd|silent:updaterd|silent:btd)
@@ -535,7 +524,10 @@ for svc in robotd configd padd updaterd btd; do
         ok) echo "    [ok] $svc" ;;
         silent)
             # Not treated as a failure: systemd removes the runtime directory when a unit stops, so
-            # this is also what a deliberately disabled `padd` looks like.
+            # this is what a deliberately disabled `padd` looks like, and what `mediad` looks like on
+            # a board with no camera. The GStreamer stack is not a cause any more — the preinstall
+            # hook this push just ran installs it — so a silent `mediad` here is worth
+            # `journalctl -u mediad -b` rather than a command to type.
             echo "    [--] $svc published nothing — stopped, or a build too old to say"
             ;;
         stale)

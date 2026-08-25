@@ -49,7 +49,7 @@ impl std::fmt::Display for FramingError {
 }
 
 // A real error, not just a Debug-able enum: this crate is a library, and a client using it — the
-// `duck-btctl` example is the first — wants `?` to work.
+// `duckctl` example is the first — wants `?` to work.
 impl std::error::Error for FramingError {}
 
 impl Reassembler {

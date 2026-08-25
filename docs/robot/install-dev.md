@@ -30,7 +30,9 @@ ssh-copy-id radxa@192.168.1.42
 ## What you need
 
 - The board's **IP address**. mDNS on this image is unreliable, so a `.local` name resolves when
-  it feels like it — use the address from your router's DHCP lease.
+  it feels like it. `duckctl ip` asks the robot over Bluetooth, which needs no network of your own
+  and no DHCP lease to read; your router's lease table is the fallback if the board is not
+  advertising yet.
 - **ssh key access**, from the step above. Provisioning reboots the board and reconnects by
   itself, and a password prompt cannot survive that.
 - A **GitHub token**. This repository is private, so its release assets are unreachable without
@@ -178,7 +180,7 @@ Nothing to do — the rest of the run is addressed there.
 
 Three things stop it working, and it says which:
 
-- It needs `cargo` and this clone, because `duck-btctl` is an example rather than an installed binary.
+- It needs `cargo` and this clone, because `duckctl` is an example rather than an installed binary.
 - It can only ask once `btd` is running, which on a board being provisioned for the first time is a
   few minutes into phase 2.
 - The robot reports its **wifi** address, so a board you reach over ethernet is not covered.

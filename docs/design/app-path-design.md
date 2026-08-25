@@ -144,7 +144,7 @@ them. Nothing across it checks the number — `configd` gates no `net.*` or `sys
 version, `updaterd` requires no handshake before `update.status`, and `updaterd`'s `hello` no longer
 refuses on it either. So a client that refuses on skew refuses calls the robot would have answered —
 and it refuses them on the transport that exists for a robot with no network, where `net.connect` is
-the way out of the skew. `duck-btctl` warns and proceeds, and an app should do the same: surface the
+the way out of the skew. `duckctl` warns and proceeds, and an app should do the same: surface the
 mismatch, let the call go, and report the JSON-RPC error if a method whose shape changed is actually
 reached. Those errors name themselves — `METHOD_NOT_FOUND` for a route this release does not have,
 `INVALID_PARAMS` for a parameter it does not know — which is what makes proceeding safe rather than
@@ -276,7 +276,7 @@ is nowhere to send the answer.
 
 ### 3.3 One thing the mobile app will hit: do not scan with a service filter  · **measured**
 
-`duck-btctl` is a test tool and deliberately not much more — the real client is a phone app. But one of its
+`duckctl` is a test tool and deliberately not much more — the real client is a phone app. But one of its
 bugs is a property of CoreBluetooth rather than of the tool, so it is worth writing down before
 someone rediscovers it on iOS.
 
@@ -290,7 +290,7 @@ could only match peripherals the filtered scan had already returned.
 The app should scan unfiltered and discriminate its own candidates, strongest evidence first:
 advertised UUID, then a known name or a stored peripheral identifier, and treat "serves our
 characteristic" as the only authoritative identity test — it is knowable solely after connecting. An
-iOS app has a better third tier than `duck-btctl` does, `retrievePeripherals(withIdentifiers:)`, which
+iOS app has a better third tier than `duckctl` does, `retrievePeripherals(withIdentifiers:)`, which
 `btleplug` does not expose; storing the identifier after a first successful connection is the right
 move there and removes the guesswork entirely.
 
@@ -300,7 +300,7 @@ appears.
 
 ### 3.4 The robot has to advertise often enough to be caught  · **measured**
 
-`duck-btctl` reported `no robot found` on roughly half its runs, and for a while that was read as flakiness
+`duckctl` reported `no robot found` on roughly half its runs, and for a while that was read as flakiness
 in the tool — or as the gamepad, whose LE link shares the radio. It was neither. `btd` registered its
 advertisement without an interval, so BlueZ used the kernel's default of **1.28 s**, and a central
 scanning at a low duty cycle does not catch a 1.28 s advertiser reliably.
@@ -332,7 +332,7 @@ nothing for the first connection, which is the one that matters most.
 carries this, the gamepad's LE link and wifi, and airtime spent shouting comes out of what the robot
 is for.
 
-`btd/examples/advwatch.rs` is the measurement, kept because the claim is only checkable by re-running
+`duckctl/examples/advwatch.rs` is the measurement, kept because the claim is only checkable by re-running
 it: arrivals per device with signal strength, then the robot's silences.
 
 **Confirmed on the board.** With 100-150 ms installed, the same two-minute watch from the same Mac:
@@ -342,7 +342,7 @@ it: arrivals per device with signal strength, then the robot's silences.
 | 1.28 s, the default | 16 | 7.5 s | 30.8 s | 7 |
 | 100-150 ms | 151 | 0.8 s | 3.8 s | **0** |
 
-Nine times as often, and — the part that matters — nothing left within a factor of two of `duck-btctl`'s
+Nine times as often, and — the part that matters — nothing left within a factor of two of `duckctl`'s
 eight-second window, so the failure it was diagnosed from cannot occur. The robot went from 34th of
 106 devices heard to 7th of 74.
 
@@ -570,7 +570,7 @@ rather than 1, a PIN keeping its leading zero, and no passphrase in the log. Plu
 which is a real cross-link check: `btd` is the only binary pulling C beyond `zstd`, because `bluer`
 links libdbus built from vendored source by `zig cc`.
 
-`duck-btctl` (`cargo run -p btd --example duck-btctl`) is the phone's stand-in and the only way to exercise
+`duckctl` (`cargo run -p duckctl`) is the phone's stand-in and the only way to exercise
 the radio. An **example, not a binary**, so `btleplug` never reaches the robot; `btleplug` rather
 than `bluer` because it must run on a developer's Mac. It reuses `btd::framing`, so the chunking is
 genuinely the client half of the robot's own code rather than a reimplementation free to agree with
@@ -688,7 +688,7 @@ of the robot has not.
 
 #### The advertisement carries the robot's IPv4 address
 
-`duck-btctl scan` connects to nothing, which is what makes it the command to reach for when a robot
+`duckctl scan` connects to nothing, which is what makes it the command to reach for when a robot
 is unreachable — and it is why a listing can only report what an advertisement carries. So the
 question a listing is most often read to answer, *where do I ssh?*, had no answer in it: the address
 is in `net.status`, and reading that costs a connection, a bond and the PIN, per robot.
@@ -778,7 +778,7 @@ line (`serving BLE ... address=`):
 - `50:37:CD:16:2B:EC` — two `btd` starts within one boot, 10:04 and 10:05
 - `50:37:CD:16:1B:92` — every boot after, 10:18 onward, fifteen of them
 
-Between them: no reflash. Nothing done to the board but BLE connections through `duck-btctl` and gamepad
+Between them: no reflash. Nothing done to the board but BLE connections through `duckctl` and gamepad
 pairing. The top four bytes held; only the low two moved, which fits a driver that generates an
 address once behind a vendor prefix and caches it rather than reading one out of the module. `configd`
 never power-cycles the adapter — it only powers one on that is off — so pad pairing has no obvious

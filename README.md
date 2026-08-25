@@ -160,9 +160,13 @@ named: `deadman — no intent arrived recently, velocity zeroed`.
 
 Also on the frame: every joint measured against what it was commanded, the IMU's projected
 gravity and the fall verdict drawn from it, and the achieved loop rate as a trace so a stutter
-that has already recovered is still visible. The bottom border names the policy that is loaded,
-because `walk` is a mode two releases with different gaits both report — and "which network is
-this?" is the first question when comparing them.
+that has already recovered is still visible. The last row of the header is the robot's condition —
+the pack's charge, the hottest servo, the board temperature, and whatever `robot.health` says is
+wrong. 0% is where `robotd` sits down and cuts power, so the charge is a countdown; the row is
+there even when no state is arriving at all, which is what a board with its servo power off looks
+like. The bottom border names the policy that is loaded, because `walk` is a mode two releases
+with different gaits both report — and "which network is this?" is the first question when
+comparing them.
 
 `p` opens the gamepad's raw input: every evdev report from the pad `padd` is driving from, the
 sticks and buttons as the kernel delivered them, and the gaps between reports as a trace. That last
@@ -199,7 +203,7 @@ Your paths survive updates. Delete the lines to go back to the policy the releas
 
 A policy that could not be loaded reports **unhealthy** — `robotctl health` and the bottom of
 `monitor` both name the reason. The shape a policy has to have, and what else is checked at
-load, are in [`docs/design/robotd-design.md`](docs/design/robotd-design.md) §5.3.
+load, are in [`docs/design/robotd-design.md`](docs/design/robotd-design.md) §2.3.
 
 ## Keep it up to date
 
@@ -337,7 +341,7 @@ robots off a bad release — are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing)
 |---|---|
 | [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: wifi, updates, rollback, pinning, logs. |
 | [Dev board cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, and the restart traps after an update. |
-| [`duck-btctl` cheat sheet](docs/robot/duck-btctl.md) | Every `duck-btctl` command: the robot over Bluetooth, from a laptop, with no network. |
+| [`duckctl` cheat sheet](docs/robot/duckctl.md) | Every `duckctl` command: the robot over Bluetooth, from a laptop, with no network. |
 | [Setting up a dev board](docs/robot/install-dev.md) | From nothing, and the fix when `--ref` is refused. |
 | [How it works](docs/design/architecture.md) | The whole system on one page — five daemons, one bus, how an update reaches the robot — then a page per part. |
 

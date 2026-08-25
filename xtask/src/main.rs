@@ -921,6 +921,66 @@ mod tests {
         }
     }
 
+    /// Every script a hook runs out of the release must be packaged.
+    ///
+    /// The pre-install hook installs what the release needs and cannot have — ONNX Runtime, and the
+    /// GStreamer stack — and for the second it runs `scripts/setup-gstreamer.sh` from the release
+    /// rather than carrying a second copy of the package list, the pinned plugins version and the
+    /// udev rule. A script that is referenced and not packaged makes that step a no-op that says so
+    /// in a log nobody reads, on exactly the boards it exists for: the hook skips it and `mediad`
+    /// then fails to start with a missing plugin.
+    ///
+    /// The same drift `every_unit_install_sh_expects_is_packaged` guards, one directory over.
+    #[test]
+    fn every_script_the_hooks_run_is_packaged() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+
+        let mut scripts: Vec<String> = Vec::new();
+        for hook in ["hooks/preinstall.in", "hooks/postinstall"] {
+            let text =
+                std::fs::read_to_string(root.join(hook)).unwrap_or_else(|e| panic!("{hook}: {e}"));
+            // `script=scripts/<name>` — an assignment, which is how a hook names a path it runs,
+            // rather than every mention of the word in a comment.
+            for line in text.lines() {
+                let Some((_, rest)) = line.split_once("=scripts/") else {
+                    continue;
+                };
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || "._-".contains(*c))
+                    .collect();
+                if !name.is_empty() {
+                    scripts.push(format!("scripts/{name}"));
+                }
+            }
+        }
+        scripts.sort();
+        scripts.dedup();
+        assert!(
+            !scripts.is_empty(),
+            "no scripts/… path found in the hooks; this test is watching nothing"
+        );
+
+        for script in &scripts {
+            assert!(
+                root.join(script).exists(),
+                "a hook runs {script}, which does not exist"
+            );
+            for workflow in PACKAGING_SITES {
+                let text = std::fs::read_to_string(root.join(workflow))
+                    .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+                let expected = format!("={script}");
+                assert!(
+                    text.contains(&expected),
+                    "{workflow} does not package {script}, but a hook runs it. \
+                     Add:  --include \"{script}={script}\""
+                );
+            }
+        }
+    }
+
     /// Every policy file in `policies/` must be packaged, at every packaging site.
     ///
     /// The `--include` list exists in three copies (the two workflows and `dev-push.sh`), and
@@ -1210,6 +1270,31 @@ mod tests {
         );
     }
 
+    /// Same trap, same shape: `scripts/setup-gstreamer.sh` is fetched standalone with `curl`, so
+    /// it carries a literal plugin version and cannot read Cargo.toml. A drift here is a board
+    /// running plugins nobody can name — which is exactly what building them ourselves, from
+    /// pinned sources, was for.
+    #[test]
+    fn setup_gstreamer_pins_the_same_plugin_version() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let meta = &manifest["workspace"]["metadata"]["gst-plugins"];
+        let version = meta["version"].as_str().unwrap();
+        let repo = meta["repo"].as_str().unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-gstreamer.sh")).unwrap();
+        for expected in [
+            format!("PLUGINS_VERSION=\"${{PLUGINS_VERSION:-{version}}}\""),
+            format!("PLUGINS_REPO=\"${{PLUGINS_REPO:-{repo}}}\""),
+        ] {
+            assert!(
+                script.contains(&expected),
+                "setup-gstreamer.sh must carry the line {expected:?}"
+            );
+        }
+    }
+
     /// The shipped hook must be fully substituted. A placeholder reaching a board would be
     /// compared against a version number and silently fail every board the same way.
     #[test]
@@ -1292,6 +1377,7 @@ mod tests {
         for name in [
             "setup-board.sh",
             "migrate-network.sh",
+            "setup-gstreamer.sh",
             "install.sh",
             "provision.sh",
             "provision-board.sh",
