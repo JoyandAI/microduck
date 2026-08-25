@@ -1722,23 +1722,6 @@ impl View {
         )
     }
 
-    // ── the depth matrix ────────────────────────────────────────────────────
-
-    /// The ToF frame as an 8×8 heatmap, one cell per zone.
-    ///
-    /// **Three classes, drawn three ways**, because the sensor answers three
-    /// different things and a distance-only grid hides two of them:
-    ///
-    ///  - a range: the distance in metres, coloured near-to-far
-    ///  - nothing in range: `·`, dim — the sensor looked and the space is empty,
-    ///    which is information a map wants
-    ///  - a failed measurement: `x` — it could not tell, which is *not* the same
-    ///    as empty and must never look like it
-    ///
-    /// Row 0 is the sensor's first row as the driver reports it. No reprojection
-    /// happens anywhere in this daemon path, so this is the sensor's own frame,
-    /// not the robot's — which is exactly what someone debugging a mounting angle
-    /// wants to see.
     /// The camera, on the bottom border rather than in a block of its own.
     ///
     /// A block would cost rows the joints table needs, and the camera is two numbers — a rate and
@@ -1791,6 +1774,23 @@ impl View {
         caption
     }
 
+    // ── the depth matrix ────────────────────────────────────────────────────
+
+    /// The ToF frame as an 8×8 heatmap, one cell per zone.
+    ///
+    /// **Three classes, drawn three ways**, because the sensor answers three
+    /// different things and a distance-only grid hides two of them:
+    ///
+    ///  - a range: the distance in metres, coloured near-to-far
+    ///  - nothing in range: `·`, dim — the sensor looked and the space is empty,
+    ///    which is information a map wants
+    ///  - a failed measurement: `x` — it could not tell, which is *not* the same
+    ///    as empty and must never look like it
+    ///
+    /// Row 0 is the sensor's first row as the driver reports it. No reprojection
+    /// happens anywhere in this daemon path, so this is the sensor's own frame,
+    /// not the robot's — which is exactly what someone debugging a mounting angle
+    /// wants to see.
     fn render_tof(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         let block = Block::bordered()
             .title(Line::from(self.tof_title()))
