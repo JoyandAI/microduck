@@ -77,6 +77,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
 
@@ -361,6 +362,13 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                 let Some(buffer) = sample.buffer() else {
                     return Ok(gst::FlowSuccess::Ok);
                 };
+                // **Mapping a camera buffer merges its planes.** rkisp hands out `NM12` — two
+                // non-contiguous planes — so this copies rather than borrowing. That is correct
+                // here because neither plane is padded (`bytesperline` is 1280 for both, and
+                // 921600 + 460800 is exactly tight NV12), so the merged block is what `Frame`
+                // promises. A driver that padded a stride would need `VideoFrameRef` and a
+                // per-row copy instead; the `GstVideoMeta` this branch now receives is where that
+                // stride would be read from.
                 let Ok(map) = buffer.map_readable() else {
                     // A buffer that will not map is not worth failing the pipeline over — the next
                     // one is a frame away, and this branch is advisory by design.
@@ -482,28 +490,14 @@ fn make(name: &str) -> Result<gst::Element> {
         .map_err(|_| anyhow!("no {name} element; a GStreamer package is missing"))
 }
 
-/// How many capture buffers to ask the driver for.
+/// The head camera as a `v4l2src`, with the one adjustment this driver needs.
 ///
-/// **Three is the cliff, and it is a cliff rather than a slope.** Measured on an RK3566 against
-/// rkisp's main path, 1280x720 NV12, 300 frames:
-///
-/// | buffers | 2 | 3 | 4 | 6 |
-/// |---|---|---|---|---|
-/// | seconds for 300 frames | 15.2 | 10.3 | 10.3 | 10.3 |
-///
-/// So two buffers is 19.7 fps from a 30 fps sensor and three is 29.2. `v4l2src` asks for the
-/// driver's minimum, which is two — nothing about `io-mode` changes it, and there is no property
-/// for it. Four rather than three so a late requeue has somewhere to go.
-const CAPTURE_BUFFERS: u32 = 4;
-
-/// The head camera as a `v4l2src`, with the two adjustments this driver needs.
-///
-/// `v4l2src` rather than a hand-written V4L2 loop, and that is a reversal worth recording: the
-/// case for our own capture was that the driver drops every third frame and that raw bytes
-/// through `fdsrc` need `rawvideoparse blocksize=…`, which is silently wrong the moment stride
-/// padding appears. Both belong to the *subprocess* shape rather than to `v4l2src` — the frame
-/// loss is a buffer count (see [`CAPTURE_BUFFERS`]), and `v4l2src` attaches a `GstVideoMeta`
-/// carrying the driver's real strides, so nothing downstream has to assume a layout.
+/// `v4l2src` rather than a hand-written V4L2 loop. The case for our own capture was that this
+/// driver drops every third frame, and that raw bytes through `fdsrc` need
+/// `rawvideoparse blocksize=…`, which is silently wrong the moment stride padding appears. Both
+/// belong to the *subprocess* shape: `v4l2src` attaches a `GstVideoMeta` describing the real
+/// layout, and the frame loss has a cause with a fifteen-line fix — see
+/// [`advertise_video_meta`].
 fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
     pin_sensor_mode(fps)?;
 
@@ -525,29 +519,44 @@ fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
             )
         })?;
 
-    raise_capture_buffers(&src)?;
+    advertise_video_meta(&src)?;
 
     tracing::info!(
         device = %camera.device,
         exposure = camera.exposure,
         analogue_gain = camera.analogue_gain,
-        buffers = CAPTURE_BUFFERS,
         "head camera"
     );
     Ok(src)
 }
 
-/// Ask the driver for [`CAPTURE_BUFFERS`] buffers instead of its minimum of two.
+/// Tell `v4l2src` that downstream understands `GstVideoMeta`, so it stops copying every frame.
 ///
-/// There is no property for this, so it goes through the one channel that decides it:
-/// `gst_v4l2_object_decide_allocation` reads `min` out of the first pool in the ALLOCATION query,
-/// and falls back to the driver minimum when the query carries none. `basesrc` builds that query,
-/// sends it downstream, and then reads it back — **keeping the same query object even when the
-/// peer query fails** — so a pool added on the way out is still there when the decision is made.
+/// **This is worth 10 fps and a memcpy per frame, and nothing in the pipeline says so.** rkisp
+/// offers both a single-plane `NV12` and a two-plane, non-contiguous `NM12`, and both map to
+/// GStreamer's `NV12` — so `v4l2src` picks `NM12` and the buffers it gets are two separate
+/// planes. Only a `GstVideoMeta` can describe that, which makes `obj->need_video_meta` true, and
+/// then:
 ///
-/// If this ever stops working the symptom is 20 fps from a 30 fps sensor and nothing else, which
-/// is why the frame rate is checked at startup rather than trusted.
-fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
+/// ```text
+/// can_share_own_pool = (has_video_meta || !obj->need_video_meta);
+/// ```
+///
+/// With nothing downstream advertising the meta, `can_share_own_pool` is false, so `v4l2src`
+/// cannot hand out its own buffers. It falls into "no usable pool, copying to generic pool" and
+/// allocates `min_buffers + 1` instead of `min_buffers + 4` — a full copy of every frame plus a
+/// pool too shallow to absorb a late requeue. Measured: 20.3 fps from a 30 fps sensor, with
+/// `lost frames detected: count = 1` roughly every other frame.
+///
+/// The elements downstream do handle the meta; they were simply never asked. Adding it to the
+/// ALLOCATION query is what a sink's `propose_allocation` would do, and a probe is how we do it
+/// without an element of our own to put there.
+///
+/// **A pool is deliberately *not* added alongside it.** Doing so sets `update = TRUE` in
+/// `decide_allocation`, which drops the `+ 2` buffer bonus *and* turns off copy-at-threshold — the
+/// mechanism that keeps the source from starving when downstream is briefly slow. An earlier
+/// version of this function added a pool with `min = 4` and made things worse for both reasons.
+fn advertise_video_meta(src: &gst::Element) -> Result<()> {
     let pad = src
         .static_pad("src")
         .context("v4l2src has no src pad, which cannot happen")?;
@@ -555,13 +564,11 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
         if let Some(gst::PadProbeData::Query(query)) = info.data.as_mut()
             && let gst::QueryViewMut::Allocation(allocation) = query.view_mut()
+            && allocation
+                .find_allocation_meta::<gst_video::VideoMeta>()
+                .is_none()
         {
-            allocation.add_allocation_pool(
-                None::<&gst::BufferPool>,
-                0,
-                CAPTURE_BUFFERS,
-                0,
-            );
+            allocation.add_allocation_meta::<gst_video::VideoMeta>(None);
         }
         gst::PadProbeReturn::Ok
     })

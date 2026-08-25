@@ -40,6 +40,10 @@ gstreamer = { version = "0.24", features = ["v1_22"] }
 # and taking them off the encoded branch would mean decoding what was just encoded.
 gstreamer-app = { version = "0.24", features = ["v1_22"] }
 gstreamer-webrtc = { version = "0.24", features = ["v1_22"] }
+# `GstVideoMeta`, which the camera source has to advertise in the ALLOCATION query or v4l2src
+# copies every frame — see `advertise_video_meta`. Typed, so the meta API type comes from the
+# bindings rather than a hand-written GType lookup.
+gstreamer-video = { version = "0.24", features = ["v1_22"] }
 glib = "0.21"
 
 [dev-dependencies]
