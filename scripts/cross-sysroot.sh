@@ -2,8 +2,8 @@
 # Build the aarch64 sysroot that `mediad` cross-compiles against.
 #
 # `cargo board` links one C dependency today — libudev, for `gilrs` in `padd` — and
-# `scripts/ci-cross-deps.sh` says plainly that it "is the cost of that one exception, and it is
-# worth reading before adding another". GStreamer is the second, and it is much larger: the
+# The multiarch script this replaced said plainly that it "is the cost of that one exception, and
+# it is worth reading before adding another". GStreamer is the second, and it is much larger: the
 # `gstreamer-rs` crates are pkg-config crates, so cross-compiling them needs the *target's* headers,
 # `.pc` files and shared libraries on this machine.
 #
@@ -45,7 +45,7 @@ TRIPLE=aarch64-linux-gnu
 # `PKG_CONFIG_LIBDIR` *replaces* pkg-config's search path rather than adding to it, so a sysroot
 # that carries only GStreamer breaks `padd`, whose `gilrs` needs libudev — `cargo board` then fails
 # in `libudev-sys`, nowhere near anything about media. Replacing is nonetheless the right choice:
-# `PKG_CONFIG_PATH` is additive to the host's, and `ci-cross-deps.sh` records what that costs —
+# `PKG_CONFIG_PATH` is additive to the host's, and that costs exactly what you would fear —
 # pkg-config answering with the *host's* library and producing a binary that cannot run on the
 # robot. So this sysroot serves the whole workspace rather than one crate of it.
 MODULES="gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-audio-1.0

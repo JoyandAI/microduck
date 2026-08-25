@@ -8,6 +8,84 @@ backend at all. Reaching a robot from outside the LAN is the same design with a 
 it (§7) — deliberately not the first thing built, because the local case is the one every other
 case is defined in terms of.
 
+## 0. Status: working on hardware
+
+A Radxa Zero 3W streams `videotestsrc` through the hardware encoder to a browser on the LAN, and
+the browser gets a `control` datachannel alongside it. Proven end to end on 2026-08-25:
+
+| | |
+|---|---|
+| signalling | `mediad` runs the server in-process; producer registers, consumer lists and starts a session |
+| video | `mpph264enc` → `webrtcsink` → browser, negotiated as `profile-level-id=42e01f` — constrained baseline, which is §2's whole point |
+| bundling | `a=group:BUNDLE video0 application1`, `a=sctp-port:5000` — one transport for media and data |
+| datachannel | `control` arrives at the peer |
+
+Two things that had never run and both bit on the first attempt, recorded because they are the
+shape of bug this design invites rather than one-offs:
+
+- **`tokio::spawn` from a GStreamer signal thread aborts the process.** That thread is not in the
+  runtime, and a panic crossing a C closure does not unwind. The journal said `thread caused
+  non-unwinding panic` with a backtrace through `g_closure_invoke` and nothing about the cause.
+  Nothing in those handlers may panic — see `mediad::pipeline`'s header.
+- **The client could not reach the signalling port from a `file://` page.** An opaque origin to a
+  private IP is what Chrome's Private Network Access blocks; serving the page over
+  `http://localhost` fixes it.
+- **A codec that fails negotiation is dropped with a warning, not an error.** Moving from
+  pre-encoded H.264 to raw video (§2) puts the encoder inside `webrtcsink`, and its discovery pass
+  demands `profile=constrained-baseline` — which `mpph264enc`'s pad template did not list, so H.264
+  vanished from the offer, VP8 was negotiated instead, and the session died. Every symptom pointed
+  somewhere else: the visible error came from a `videorate` four elements upstream, complaining
+  about NV12. This needs plugins release `v3` or later, and it is why `mediad` bridges GStreamer's
+  debug log *and* the pipeline bus into the journal — without that, none of the above was visible
+  at all.
+
+### The camera, and two independent causes of a 35% frame loss
+
+The head camera streams at **29.3 fps** through the hardware encoder. Getting there took two
+unrelated fixes, and the reason it took a while is that neither one alone moves the number —
+which made each look ineffective.
+
+**Capture pool depth.** rkisp implements no `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, so
+`gst_v4l2_object_decide_allocation` computes `own_min` from zero and lands on two buffers. Three
+is a cliff, not a slope: `v4l2-ctl --stream-mmap=N` on the main path gives 19.7 fps at two and
+29.2 at three or more. Raising it needs both a `GstVideoMeta` in the ALLOCATION query (or
+`can_share_own_pool` is false and the branch that reads the query's `min` is never taken) and a
+first pool whose `min` is non-zero (any downstream element proposing a pool sets `update` and
+forfeits the `+2` bonus — `GstVideoEncoder::propose_allocation` proposes exactly that).
+
+**The pixel format.** rkisp offers a non-contiguous two-plane `NM12` alongside single-plane
+formats. Both map to GStreamer `NV12`, `v4l2src` prefers the multi-plane one, and it cannot drive
+that at full rate here at any pool depth:
+
+| caps | 2 buffers | 4+ buffers |
+|---|---|---|
+| `NV12` (selects `NM12`) | 19.5 fps | 19.6 fps |
+| `UYVY` (single plane) | 19.7 fps | **29.3 fps** |
+
+`mpph264enc` lists `UYVY` on its sink pad and converts on the RGA, so the 4:2:2 to 4:2:0 step
+costs no CPU.
+
+**What was ruled out, by measurement rather than argument** — each of these was a plausible
+suspect: `v4l2-ctl` reaches 29.2 fps with either format on the same node; the sensor subdev
+reports a 1/30 interval; the driver implements no `S_PARM`; `mpph264enc` encodes 720p at 130 fps
+flat out; and the DMABuf caps `v4l2src` prefers when unconstrained are not the reason it is fast
+unconstrained.
+
+**The methodological lesson, which cost more than any of the above.** Four different rates were
+each taken for the capture rate and none of them was: `rkvenc` interrupts count what the *encoder*
+consumed, behind `webrtcsink`'s queue and the `videorate drop-only` in its converter bin;
+`v4l2src`'s `lost frames detected` counts gaps in driver sequence numbers and goes silent when the
+source is merely slow; a counter on the tee's raw branch sits behind a deliberately leaky
+one-buffer queue; and `/dev/video1` is the ISP's self path, not the main path the daemon uses.
+`mediad` now meters the pad before the tee, which is the only place with nothing lossy between it
+and the driver.
+
+Two things this exposed that are not fixed: `rtpgccbwe` costs about 40% of a core, and GStreamer's
+own `INFO`-level log never reaches the journal despite the bridge mapping it to `tracing::info!`,
+which is why several of these questions were answered the slow way.
+
+What is still untested: anything at all through a bridge.
+
 ## 1. What this is not
 
 `webrtcbin` is not used. `mediad` uses **`webrtcsink`** from `gst-plugins-rs`, and the difference
@@ -37,10 +115,31 @@ takes the newest.
 **The first version opens `control` only.** Teleop is not the near-term priority, and leaving it
 out is not merely deferral — §6 is about what it removes.
 
-**`webrtcsink` takes pre-encoded H.264 on its sink pad**, so the pipeline is
-`appsrc ! mpph264enc ! h264parse ! webrtcsink` and the encoder never reaches negotiation. Verified
-on hardware; the four encoder properties that are decisions rather than defaults are in
-[`media-bringup.md`](../project/media-bringup.md).
+**`webrtcsink` takes pre-encoded H.264 on its sink pad**, so the encoder never reaches
+negotiation. Verified on hardware; the four encoder properties that are decisions rather than
+defaults are in [`media-bringup.md`](../project/media-bringup.md).
+
+**The pipeline tees raw NV12 before the encoder**, and that placement is deliberate:
+
+```text
+                              ┌─ queue ─ mpph264enc ─ h264parse ─ webrtcsink
+capture ─ NV12 ─ capsfilter ─ tee
+                              └─ queue(leaky, 1) ─ appsink ─ latest frame
+```
+
+§5.3 wants a frame on demand for a server-side program — "it wants a frame every second or two plus
+a state blob", not a 30 fps H.264 track to decode — and `architecture.md` §2 wants perception next
+to the sensor, deriving features rather than shipping pixels to `robotd`. Both need *pixels*, and
+taking them off the encoded branch would mean decoding what was just encoded.
+
+NV12 throughout, because that is what the rkisp path emits and what `mpph264enc` accepts, so
+nothing converts anywhere. Each branch has its own `queue` — a `tee` without them runs both from
+one thread, so a slow reader would stall the video track — and the raw one is leaky and one buffer
+deep, which is the last-value-wins, non-blocking snapshot `architecture.md` §2 asks for. A stalled
+reader costs frames, never the encoder.
+
+The branch exists from the start rather than being added when something reads it: inserting a tee
+into a live pipeline is a materially harder problem than having one that was always there.
 
 ## 3. `mediad` runs the signalling server itself
 
@@ -51,7 +150,9 @@ ship is a `.so` while `gst-webrtc-signalling-server` is a separate Rust binary f
 upstream crate. Not shipping it is a real simplification, not a shortcut.
 
 `webrtcsink`'s own signaller defaults to `ws://127.0.0.1:8443` and connects to the server it just
-started. A LAN client connects to the same server directly.
+started. A LAN client connects to the same server directly — `mediad/webclient/index.html` is one,
+in a single file with no build step, which speaks this protocol by hand rather than through
+`gst-plugins-rs`'s JS library so that trying it needs nothing installed.
 
 **Bind address is a decision, not a default.** Loopback only would mean a LAN peer cannot reach it
 at all and every session goes through a bridge, which defeats the point of a local mode. So it
@@ -302,9 +403,11 @@ wrong one.
 
 The `gstreamer-rs` crates are pkg-config crates, so cross-compiling them needs the *target's*
 headers, `.pc` files and shared libraries on the developer's machine. `cargo board` cross-builds
-from macOS with `cargo-zigbuild`, and `scripts/ci-cross-deps.sh` says of the one C dependency it
-already has that it "is the cost of that one exception, and it is worth reading before adding
-another". This is the second, and much larger.
+from macOS with `cargo-zigbuild`, and the multiarch script that used to supply its one C
+dependency said of it that it "is the cost of that one exception, and it is worth reading before
+adding another". This is the second, and much larger — and it replaced that script outright,
+because Ubuntu multiarch can serve libudev but cannot honestly serve GStreamer: it would give
+Ubuntu's while the robot runs Debian trixie's.
 
 **`scripts/cross-sysroot.sh` unpacks the robot's own Debian packages into a sysroot** — proven:
 the full workspace cross-builds against it, and `gstreamer`, `gstreamer-app` and
