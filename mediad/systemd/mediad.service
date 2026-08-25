@@ -92,5 +92,22 @@ StandardError=journal
 # identity claiming to be running.
 RuntimeDirectory=mediad
 
-[Install]
-WantedBy=multi-user.target
+# **No `[Install]` section, deliberately, and this is the line to add when there is one:**
+#
+#     [Install]
+#     WantedBy=multi-user.target
+#
+# `hooks/postinstall` enables and starts every unit that ships *with* one, which is what makes a
+# newly added service arrive working. That is right for a daemon that has run somewhere, and wrong
+# for this one twice over: `mediad` has never started on a board, and it needs the GStreamer stack
+# `setup-gstreamer.sh` installs, which a board provisioned before that existed does not have. A
+# unit that fails and restarts every five seconds on every robot in the field is a worse outcome
+# than one somebody starts on purpose.
+#
+# So the release carries it — the binary, the unit and the account are all there — and starting it
+# is a decision:
+#
+#     sudo systemctl enable --now mediad
+#
+# postinstall notices the missing section and says so rather than treating it as a failure; the
+# boot recovery net's oneshot ships the same way for its own reasons.

@@ -247,7 +247,7 @@ fi
 # ── the one C dependency, and why this is not `apt-get install libudev-dev:arm64` ──────
 #
 # `padd` needs libudev (via `gilrs`), which is the only C library anything reaching the board
-# links against — `scripts/ci-cross-deps.sh` exists solely to install it for the target on a
+# links against — `scripts/cross-sysroot.sh` unpacks it for the target, along with GStreamer, on a
 # CI runner. That script is Debian-only and cannot help here, and a Mac has no way to install
 # an aarch64 Linux library through a package manager.
 #
@@ -359,6 +359,9 @@ cp "$BIN"/robotd staged/
 cp "$BIN"/configd staged/
 cp "$BIN"/btd staged/
 cp "$BIN"/padd staged/
+# The WebRTC gateway. Staged so a board *can* run it; its unit ships with no [Install], so
+# nothing starts it until someone does — see mediad/systemd/mediad.service for why.
+cp "$BIN"/mediad staged/
 # The voice generator (postinstall renders the per-robot bank with it) and the
 # mic classifier pair — pet-detect for live listening, pet-features for training.
 cp "$BIN"/sounds staged/
@@ -394,6 +397,8 @@ cargo run -p xtask -- package \
     --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
     --include "padd/systemd/padd.service=systemd/padd.service" \
     --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+    --include "mediad/systemd/mediad.service=systemd/mediad.service" \
+    --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
     --include "tof/systemd/tofd.service=systemd/tofd.service" \
     --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
     --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \

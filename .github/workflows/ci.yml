@@ -72,7 +72,7 @@ jobs:
       # would catch a typo in one until someone tried to provision a board. shellcheck is on the
       # runner already.
       #
-      # `ci-release-notes.sh` is here despite running only in CI, unlike `ci-cross-deps.sh`: it runs
+      # `ci-release-notes.sh` is here despite running only in CI: it runs
       # *during a release*, which is the worst moment to find a typo in a shell script.
       #
       # `migrate-network.sh` was missing from this list while being the riskiest of them —
@@ -162,19 +162,14 @@ jobs:
       #   - "latest" would let the glibc floor move under us between runs. The floor is
       #     the whole point of building with zig (see .cargo/config.toml), so the
       #     toolchain that sets it must be a fixed input.
-      # libudev for the *target* architecture, so gilrs can be cross-compiled. zig supplies
-      # the compiler but not the target's C libraries, and libudev-sys resolves those
-      # through pkg-config — hence multiarch plus the cross hints on the build step.
-      #
-      # This is the price of keeping gilrs, and it is worth naming: the same expense returns
-      # for the next C dependency that has to reach the board.
-      - name: Cross-compilation C dependencies
-        run: ./scripts/ci-cross-deps.sh
 
-      # And GStreamer for the *target*, which multiarch does not solve the same way: it would give
-      # Ubuntu's GStreamer while the robot runs Debian trixie's. `cross-sysroot.sh` unpacks the
-      # robot's own packages, and the result serves the whole workspace — libudev included, since
-      # PKG_CONFIG_LIBDIR replaces pkg-config's search path rather than adding to it.
+      # GStreamer and libudev for the *target*, unpacked from the robot's own Debian packages.
+      #
+      # This replaced Ubuntu multiarch from ports.ubuntu.com, which served libudev alone and could
+      # not serve GStreamer honestly: it would give Ubuntu's while the robot runs Debian trixie's.
+      # One sysroot covers both, because PKG_CONFIG_LIBDIR *replaces* pkg-config's search path
+      # rather than adding to it — so a sysroot carrying only GStreamer would break `padd`, inside
+      # libudev-sys, nowhere near anything about media.
       #
       # Cached on the script, because the package list lives in it: edit the list and the cache
       # misses, which is exactly when it should.
@@ -184,7 +179,7 @@ jobs:
           path: ~/.cache/duck-sysroot
           key: duck-sysroot-${{ hashFiles('scripts/cross-sysroot.sh') }}
 
-      - name: Target GStreamer, as a sysroot
+      - name: Target GStreamer and libudev, as a sysroot
         run: |
           set -eu
           export DUCK_SYSROOT="$HOME/.cache/duck-sysroot"

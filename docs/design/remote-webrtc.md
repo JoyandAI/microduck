@@ -325,9 +325,11 @@ wrong one.
 
 The `gstreamer-rs` crates are pkg-config crates, so cross-compiling them needs the *target's*
 headers, `.pc` files and shared libraries on the developer's machine. `cargo board` cross-builds
-from macOS with `cargo-zigbuild`, and `scripts/ci-cross-deps.sh` says of the one C dependency it
-already has that it "is the cost of that one exception, and it is worth reading before adding
-another". This is the second, and much larger.
+from macOS with `cargo-zigbuild`, and the multiarch script that used to supply its one C
+dependency said of it that it "is the cost of that one exception, and it is worth reading before
+adding another". This is the second, and much larger — and it replaced that script outright,
+because Ubuntu multiarch can serve libudev but cannot honestly serve GStreamer: it would give
+Ubuntu's while the robot runs Debian trixie's.
 
 **`scripts/cross-sysroot.sh` unpacks the robot's own Debian packages into a sysroot** — proven:
 the full workspace cross-builds against it, and `gstreamer`, `gstreamer-app` and
