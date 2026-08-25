@@ -109,7 +109,10 @@ pub struct Camera {
 pub struct Frame {
     pub width: u32,
     pub height: u32,
-    /// NV12, tightly packed as the caps describe it.
+    /// The GStreamer format name — [`CAPTURE_FORMAT`], carried rather than assumed so a consumer
+    /// reading this cannot silently misinterpret the bytes if the capture format changes again.
+    pub format: &'static str,
+    /// Tightly packed as the caps describe it, in `format`.
     pub data: Vec<u8>,
 }
 
@@ -178,12 +181,28 @@ pub fn start(
         Source::Camera(camera) => camera_source(camera, fps)?,
     };
 
-    // Pinned rather than negotiated, because both branches of the tee depend on the answer. NV12
-    // is what the rkisp capture path emits and what `mpph264enc` takes, so this costs no
-    // conversion — and a raw consumer that has to guess the format is a consumer that gets it
-    // wrong the first time the source changes.
+    // Pinned rather than negotiated, because both branches of the tee depend on the answer, and a
+    // raw consumer that has to guess the format is one that gets it wrong the first time the
+    // source changes.
+    //
+    // **`UYVY` rather than `NV12`, and that is a measurement rather than a preference.** rkisp
+    // offers a two-plane, non-contiguous `NM12` alongside single-plane formats, and asking for
+    // GStreamer `NV12` selects `NM12` — which `v4l2src` cannot push at full rate on this driver
+    // whatever the buffer depth. 300 frames of 720p off the ISP main path:
+    //
+    // | caps | 2 buffers | 4+ buffers |
+    // |---|---|---|
+    // | `NV12` (selects `NM12`, 2 planes) | 19.5 fps | 19.6 fps |
+    // | `UYVY` (1 plane) | 19.7 fps | **29.3 fps** |
+    //
+    // The buffer depth alone is not enough and neither is the format — see
+    // [`raise_capture_buffers`] for the other half. `v4l2-ctl` reaches 29.2 fps with either
+    // format, so this is `v4l2src`'s multi-plane path rather than the driver.
+    //
+    // `mpph264enc` lists `UYVY` on its sink pad and converts on the SoC's 2D accelerator, so the
+    // 4:2:2 to 4:2:0 step costs no CPU — the RGA was already doing one operation per frame.
     let caps = gst::Caps::builder("video/x-raw")
-        .field("format", "NV12")
+        .field("format", CAPTURE_FORMAT)
         .field("width", width as i32)
         .field("height", height as i32)
         .field("framerate", gst::Fraction::new(fps as i32, 1))
@@ -371,13 +390,10 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                 let Some(buffer) = sample.buffer() else {
                     return Ok(gst::FlowSuccess::Ok);
                 };
-                // **Mapping a camera buffer merges its planes.** rkisp hands out `NM12` — two
-                // non-contiguous planes — so this copies rather than borrowing. That is correct
-                // here because neither plane is padded (`bytesperline` is 1280 for both, and
-                // 921600 + 460800 is exactly tight NV12), so the merged block is what `Frame`
-                // promises. A driver that padded a stride would need `VideoFrameRef` and a
-                // per-row copy instead; the `GstVideoMeta` this branch now receives is where that
-                // stride would be read from.
+                // `UYVY` is a single plane, so this maps without merging anything — unlike the
+                // `NM12` this used to carry, where mapping silently copied two non-contiguous
+                // planes into one block. The `to_vec` below is still a copy, and still the only
+                // one on this branch.
                 let Ok(map) = buffer.map_readable() else {
                     // A buffer that will not map is not worth failing the pipeline over — the next
                     // one is a frame away, and this branch is advisory by design.
@@ -387,6 +403,7 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                 let frame = Frame {
                     width,
                     height,
+                    format: CAPTURE_FORMAT,
                     data: map.as_slice().to_vec(),
                 };
                 // Replaced, not queued: last-value-wins is the contract.
@@ -538,6 +555,12 @@ fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
     );
     Ok(src)
 }
+
+/// What the tee carries, and what both branches therefore see.
+///
+/// Single-plane on purpose: `v4l2src` cannot drive rkisp's two-plane `NM12` at full rate, and
+/// asking for GStreamer `NV12` is what selects it. The table in [`start`] has the numbers.
+pub const CAPTURE_FORMAT: &str = "UYVY";
 
 /// How many capture buffers to ask for. Three is the cliff; four leaves one spare.
 ///
