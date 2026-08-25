@@ -217,6 +217,16 @@ pub fn start(
     sink.set_property("signalling-server-host", host);
     sink.set_property("signalling-server-port", port);
 
+    // **H.264 is not being offered at all**, and until that is understood this cannot restrict
+    // the offer to it. `video-caps` would be the way — "Governs what video codecs will be
+    // proposed" — and it is wanted, because left alone `webrtcsink` proposes everything it can
+    // encode: `mppvp8enc`, `mpph265enc` and `mpph264enc` on the VPU, but `vp9enc` and `av1enc` in
+    // software. A browser preferring AV1 would have this robot software-encoding AV1 on four
+    // Cortex-A55s, which is not a degraded stream but a dead control loop.
+    //
+    // Setting it now would offer a codec that is currently missing from the offer, leaving no
+    // codecs at all. It goes in once H.264 discovery works.
+
     // The starting bitrate. `webrtcsink` moves it from here as congestion control learns the
     // link — which is the whole point of letting it own the encoder, so this is a starting
     // point rather than the setting it was when we encoded ourselves.
@@ -385,21 +395,35 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
             .map(|f| f.name().to_string())
             .unwrap_or_default();
 
-        // Only ours has these properties, and setting a property an element lacks panics — which
-        // in a signal handler aborts the process. So this is keyed on the factory rather than
-        // attempted hopefully.
+        // `"discovery"` for the startup pass in which `webrtcsink` builds one encoder per codec it
+        // could offer, purely to learn its caps. A real peer id otherwise.
+        let consumer = values
+            .get(1)
+            .and_then(|v| v.get::<String>().ok())
+            .unwrap_or_default();
+        let discovering = consumer == "discovery";
+
+        // Only `mpph264enc` has these properties, and setting a property an element lacks panics —
+        // which in a signal handler aborts. So this is keyed on the factory rather than attempted
+        // hopefully.
         if name == "mpph264enc" {
             encoder.set_property_from_str("profile", "baseline");
             encoder.set_property_from_str("header-mode", "each-idr");
-            tracing::info!(encoder = %name, "configured for WebRTC");
-        } else {
-            // The visible symptom of the patched converter arm not being present, or of
-            // `mpph264enc` not being registered: webrtcsink falls back to software H.264 and the
-            // robot cooks the cores robotd's control loop shares. Worth a warning rather than
-            // silence.
+            if !discovering {
+                tracing::info!(encoder = %name, %consumer, "hardware H.264, configured for WebRTC");
+            }
+        } else if !discovering {
+            // Only meaningful for a real consumer. During discovery this fires once per codec —
+            // including `mppvp8enc` and `mpph265enc`, which are *hardware* — so warning there
+            // called two VPU encoders software on every startup, crying wolf about the one thing
+            // it exists to catch.
+            //
+            // For a real peer it is worth saying loudly: `video-caps` restricts the offer to
+            // H.264, so anything else arriving here means that restriction stopped working, and
+            // something is encoding on the cores `robotd`'s control loop shares.
             tracing::warn!(
-                encoder = %name,
-                "webrtcsink did not choose mpph264enc — this is software encoding"
+                encoder = %name, %consumer,
+                "a consumer negotiated something other than hardware H.264"
             );
         }
         Some(false.to_value())
