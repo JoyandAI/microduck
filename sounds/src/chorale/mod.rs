@@ -149,14 +149,19 @@ pub enum Vowel {
 
 impl Vowel {
     /// How far the beak opens on it, 0..1.
+    /// Phonetically honest values were tried and looked broken on the robot: the shipped
+    /// piece opens with six beats of `oo`, and an `oo` of 0.15 is a duck audibly singing
+    /// through a closed beak. These are stage vowels — exaggerated open, ordered the same —
+    /// because on a robot the mouth is *performance* first and phonetics second. Only the
+    /// hum stays closed: humming through a shut beak is correct, and rather charming.
     pub fn open(&self) -> f64 {
         match self {
             Vowel::Ah => 0.90,
-            Vowel::Eh => 0.60,
-            Vowel::Ee => 0.35,
-            Vowel::Oh => 0.45,
-            Vowel::Oo => 0.15,
-            Vowel::Mm => 0.02,
+            Vowel::Eh => 0.65,
+            Vowel::Ee => 0.45,
+            Vowel::Oh => 0.55,
+            Vowel::Oo => 0.35,
+            Vowel::Mm => 0.05,
         }
     }
 

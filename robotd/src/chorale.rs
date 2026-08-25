@@ -446,6 +446,35 @@ impl Chorale {
     }
 }
 
+/// Expressive head offsets while singing: `[neck_pitch, head_pitch, head_yaw, head_roll]`.
+///
+/// Driven by the **score position**, not by local time — and that is the trick: every duck in
+/// the ensemble computes this from the same shared beat, so the whole group sways in phase
+/// with nobody coordinating anything. Choreography falls out of the sync work for free.
+///
+/// `reach` is where the current note sits in this duck's own line (0 low, 1 high): the head
+/// lifts on the high notes, which is what a singer actually does.
+///
+/// Amplitudes are deliberately small — the head carries the ToF and the policy's balance has
+/// opinions about mass this high up. The pitch sign assumes negative is up, as `robot.look`'s
+/// examples suggest; if hardware says otherwise, flip `REACH_LIFT`.
+pub fn head_expression(beats: f64, reach: f64) -> [f64; 4] {
+    const SWAY_ROLL: f64 = 0.08;
+    const DRIFT_YAW: f64 = 0.05;
+    const REACH_LIFT: f64 = -0.10;
+    const BOB_PITCH: f64 = 0.025;
+    let bar = std::f64::consts::TAU * beats / 4.0;
+    let phrase = std::f64::consts::TAU * beats / 8.0;
+    let beat = std::f64::consts::TAU * beats;
+    [
+        0.0,
+        REACH_LIFT * reach + BOB_PITCH * beat.sin(),
+        DRIFT_YAW * phrase.sin(),
+        SWAY_ROLL * bar.sin(),
+    ]
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +582,30 @@ mod tests {
                 .and_then(|a| a.beacon.as_ref())
                 .is_none_or(|b| !b.singing()),
             "the higher id must not also conduct: {tick:?}"
+        );
+    }
+
+    /// The head expression is a function of the shared beat alone, so every duck computes the
+    /// same sway — group choreography with no coordination. And it stays small: the head
+    /// carries a sensor, and the policy balances the mass up there.
+    #[test]
+    fn the_head_sways_in_phase_and_stays_small() {
+        for step in 0..200 {
+            let beats = f64::from(step) * 0.13;
+            let a = head_expression(beats, 0.3);
+            let b = head_expression(beats, 0.3);
+            assert_eq!(a, b, "same beat, same sway, on every duck");
+            for (joint, offset) in a.iter().enumerate() {
+                assert!(offset.abs() <= 0.15, "joint {joint} at {offset} rad");
+            }
+        }
+        // The sway actually moves, and the high note actually lifts.
+        assert_ne!(head_expression(0.0, 0.0), head_expression(1.0, 0.0));
+        let low = head_expression(2.0, 0.0)[1];
+        let high = head_expression(2.0, 1.0)[1];
+        assert!(
+            (high - low).abs() > 0.05,
+            "reach must be visible: {low} vs {high}"
         );
     }
 

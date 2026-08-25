@@ -1228,6 +1228,8 @@ async fn control_loop<T: RobotIo>(
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
     // How far the beak is open for the chorale, slewed across ticks — see where it is written.
     let mut chorale_mouth = 0.0f64;
+    // And how the head sways while singing, applied to the next tick's command.
+    let mut chorale_head = [0.0f64; 4];
 
     // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
     // the note at its own pitch instead of gliding to the bottom of the range on its way out.
@@ -1643,7 +1645,15 @@ async fn control_loop<T: RobotIo>(
         }
         let command = PolicyCommand {
             twist: twist_ema,
-            head: head_ema,
+            // The chorale's sway rides on top of whatever the head was asked to do, computed
+            // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
+            // singing stops so the head settles rather than snaps.
+            head: [
+                head_ema[0] + chorale_head[0],
+                head_ema[1] + chorale_head[1],
+                head_ema[2] + chorale_head[2],
+                head_ema[3] + chorale_head[3],
+            ],
             body: BodyPose {
                 z: body_ema[0],
                 roll: body_ema[1],
@@ -1936,6 +1946,7 @@ async fn control_loop<T: RobotIo>(
             // bug: owning the mouth whenever `[chorale] accept` was true meant the trigger could
             // not open it any more, on a robot that was not singing and might never sing. Opting in
             // grants the chorale nothing until it is actually running.
+            let mut head_target = [0.0f64; 4];
             let mouth_target = match tick.singing {
                 Some((part, beats)) => {
                     if let Some(voice) = voice.as_mut()
@@ -1943,11 +1954,39 @@ async fn control_loop<T: RobotIo>(
                     {
                         voice.sing_at(beats, true);
                     }
-                    ensemble
-                        .score()
-                        .line(part)
-                        .find(|note| beats >= note.start_beat && beats < note.end_beat())
-                        .map_or(0.0, |note| note.vowel.open())
+                    let line = ensemble.score().line(part);
+                    let (mut low, mut high) = (127.0f64, 0.0f64);
+                    let mut current = None;
+                    for note in line {
+                        low = low.min(f64::from(note.midi));
+                        high = high.max(f64::from(note.midi));
+                        if beats >= note.start_beat && beats < note.end_beat() {
+                            current = Some(*note);
+                        }
+                    }
+                    match current {
+                        Some(note) => {
+                            // Where this note sits in the duck's own line, for the head lift.
+                            let reach = ((f64::from(note.midi) - low) / (high - low).max(1.0))
+                                .clamp(0.0, 1.0);
+                            head_target = chorale::head_expression(beats, reach);
+                            // The audio releases the last 8% of a note so a repeated pitch
+                            // re-articulates; the beak does the same, visibly — without this a
+                            // run of same-vowel notes reads as one long weird note.
+                            let sung = (beats - note.start_beat) / note.beats;
+                            if sung < 0.92 {
+                                note.vowel.open()
+                            } else {
+                                note.vowel.open() * 0.2
+                            }
+                        }
+                        // Between notes: beak closed, but keep swaying — a singer breathing is
+                        // still part of the choir.
+                        None => {
+                            head_target = chorale::head_expression(beats, 0.0);
+                            0.0
+                        }
+                    }
                 }
                 None => {
                     if let Some(voice) = voice.as_mut() {
@@ -1957,10 +1996,15 @@ async fn control_loop<T: RobotIo>(
                 }
             };
             if ensemble.active() {
-                // Slewed, not snapped. A vowel is a step — `ah` is 0.90 and `mm` is 0.02 — and a
+                // Slewed, not snapped. A vowel is a step — `ah` is 0.90 and `mm` is 0.05 — and a
                 // servo asked to jump between them on a 20 ms tick twitches rather than sings.
+                // The head rides the same slew: the sway targets are already smooth sinusoids,
+                // and the slew is what makes the *start and stop* of singing gentle.
                 let alpha = (period.as_secs_f64() / CHORALE_MOUTH_TAU_S).clamp(0.0, 1.0);
                 chorale_mouth += (mouth_target - chorale_mouth) * alpha;
+                for (offset, target) in chorale_head.iter_mut().zip(head_target) {
+                    *offset += (target - *offset) * alpha;
+                }
                 if snapshot.enabled && bringup == Bringup::Ready {
                     targets[duck_control::model::MOUTH_INDEX] =
                         duck_control::model::mouth_target(chorale_mouth);
@@ -1973,8 +2017,13 @@ async fn control_loop<T: RobotIo>(
                 });
             } else {
                 // Nothing on the wire and nothing on the servo: the mouth belongs to whoever else
-                // wants it, which is the trigger.
+                // wants it, which is the trigger — and the head settles back to where it was
+                // asked to look, through the same slew rather than a snap.
                 chorale_mouth = 0.0;
+                let alpha = (period.as_secs_f64() / CHORALE_MOUTH_TAU_S).clamp(0.0, 1.0);
+                for offset in chorale_head.iter_mut() {
+                    *offset += (0.0 - *offset) * alpha;
+                }
             }
         }
 

@@ -156,10 +156,18 @@ pub struct Stream {
 
     /// Per-voice softening (see [`Stream::wheee`], [`Stream::choral`]) folded into the
     /// modulation depths, rather than read off the personality — the ensemble voice needs
-    /// less of all three than the solo one.
+    /// less of all of these than the solo one.
     vibrato_depth: f64,
     quackiness: f64,
     jitter_depth: f64,
+    /// Noise mix for this voice. A choir member breathes less audibly than a soloist.
+    breath: f64,
+    /// How much of the breath survives the speaker-rolloff rebalance, 0..1.
+    ///
+    /// The rolloff takes voiced energy away from a deep note; the noise, being broadband,
+    /// would keep all of its — so an already-quiet bass note would be *proportionally*
+    /// noisier. The breath is cut by the same fraction the harmonics lost.
+    breath_rolloff: f64,
     /// Excitement wobble: the wheee's own, at full swell.
     wobble_hz: f64,
     wobble_depth: f64,
@@ -200,6 +208,8 @@ impl Stream {
             vibrato_depth: p.vibrato_depth,
             quackiness: p.quackiness,
             jitter_depth: p.jitter_depth,
+            breath: p.breath * 0.5,
+            breath_rolloff: 1.0,
             wobble_hz,
             wobble_depth: 0.0,
         };
@@ -236,6 +246,7 @@ impl Stream {
         s.vibrato_depth = p.vibrato_depth * 0.30;
         s.quackiness = p.quackiness * 0.35;
         s.jitter_depth = p.jitter_depth * 0.30;
+        s.breath = p.breath * 0.15;
         s.wobble_depth = 0.0;
         s
     }
@@ -320,10 +331,17 @@ impl Stream {
         let a_open = pole(OPEN_TAU_S);
         let a_jitter = pole(JITTER_TAU_S) as f32;
         // The offline pink noise's pole, rescaled to 48 kHz the same way.
-        let a_pink = 0.985f64.powf(22_050.0 / f64::from(SR)) as f32;
+        let a_pink_f32 = 0.985f64.powf(22_050.0 / f64::from(SR)) as f32;
 
         let am_depth = self.p.am_depth * 0.5 * self.quackiness;
-        let breath = self.p.breath * 0.5;
+        let breath = self.breath * self.breath_rolloff;
+        // The integrator below has a steady-state deviation of 1/sqrt(1 - a²) ≈ 8.5, and the
+        // first version scaled it by a guessed 0.15 — leaving the streamed breath five times
+        // louder than the offline voice's, which a listener reported as a bass duck full of
+        // white noise (that seed happened to roll a breathy personality). Normalised properly:
+        // to unit deviation, then to the ~0.25 RMS the offline peak-normalised noise has.
+        let a_pink = 0.985f64.powf(22_050.0 / f64::from(SR));
+        let pink_gain = ((1.0 - a_pink * a_pink).sqrt() * 0.25) as f32;
 
         for sample in out.iter_mut() {
             // Timbre, on its own cadence — see `REFRESH_SAMPLES` for why not per block.
@@ -380,10 +398,8 @@ impl Stream {
                 v *= am as f32;
             }
             if breath > 0.0 {
-                self.pink = a_pink * self.pink + self.rng.standard_normal();
-                // The offline pink noise is peak-normalised over the whole buffer; the
-                // integrator's steady-state spread stands in for that here.
-                v += breath as f32 * self.pink * 0.15;
+                self.pink = a_pink_f32 * self.pink + self.rng.standard_normal();
+                v += breath as f32 * self.pink * pink_gain;
             }
 
             // Level last, so a fade takes the breath and the buzz with it, and a soft clip
@@ -408,6 +424,16 @@ impl Stream {
         self.weights_formant = self.formant_shift;
         self.weights_freq = self.freq;
 
+        // The gain is set from the weights **before** the rolloff touches them. It used to be
+        // set after — which silently renormalised whatever the rolloff had removed straight
+        // back in, making `MAX_BASS_LIFT` a no-op and every deep note exactly as loud as a
+        // high one, with all of that loudness piled onto the few harmonics the driver keeps.
+        // Anchoring the gain first means the rolloff genuinely costs a deep note level, the
+        // lift genuinely gives some back, and the cap genuinely caps it.
+        let sum: f64 = self.weights.iter().sum();
+        self.gain = PEAK / (sum.max(1e-6) as f32);
+        self.breath_rolloff = 1.0;
+
         if let Some(rolloff) = self.speaker_rolloff_hz {
             // What the driver does to each harmonic, as a plain amplitude factor. Above the
             // rolloff it does nothing; below, the response falls at `ROLLOFF_DB_PER_OCTAVE`.
@@ -418,20 +444,21 @@ impl Stream {
                 let response = (harmonic_hz / rolloff).min(1.0).powf(exponent);
                 *weight *= response;
             }
-            // Give back what was taken, to whatever is left — so the note keeps its loudness and
-            // only its *balance* changes. Clamped: a note whose whole series is under the rolloff
-            // has nothing to give it to, and must stay quiet rather than become distortion.
+            // Give back some of what was taken — so the note keeps most of its loudness while
+            // its *balance* moves to harmonics the driver can make. Clamped: a note whose whole
+            // series is under the rolloff has nothing to give it to, and must stay quiet
+            // rather than become distortion.
             let after: f64 = self.weights.iter().sum();
             if after > 1e-9 {
                 let lift = (before / after).min(MAX_BASS_LIFT);
                 for weight in &mut self.weights {
                     *weight *= lift;
                 }
+                // The breath loses what the voice lost: noise is broadband and the driver
+                // keeps it, so an uncut breath would leave the quietest notes the noisiest.
+                self.breath_rolloff = (after * lift / before).clamp(0.0, 1.0);
             }
         }
-
-        let sum: f64 = self.weights.iter().sum();
-        self.gain = PEAK / (sum.max(1e-6) as f32);
     }
 }
 
@@ -655,6 +682,110 @@ mod tests {
             (lifted_total / plain_total) < 2.0,
             "the note got {:.1}x louder, which is a gain and not a rebalance",
             lifted_total / plain_total
+        );
+    }
+
+    /// The breath at the scale the offline voice has — the streamed version was five times
+    /// louder (a guessed constant where the integrator's steady-state deviation of ~8.5
+    /// belonged), reported from the robot as a bass full of white noise.
+    ///
+    /// Measured by differencing against a zero-breath twin of the same personality, because a
+    /// first-order high-pass cannot separate noise from harmonics — everything else about the
+    /// two renders is identical, so what the breath adds in the band above the harmonics is
+    /// the noise alone.
+    #[test]
+    fn the_breath_is_a_whisper_and_not_a_hiss() {
+        // The breathiest personality in the first few hundred seeds, so the bound is tested
+        // where the bug was audible.
+        let breathiest = (0..500u32)
+            .map(Personality::from_seed)
+            .max_by(|a, b| a.breath.partial_cmp(&b.breath).expect("finite"))
+            .expect("seeds");
+        let mut silent_twin = breathiest;
+        silent_twin.breath = 0.0;
+
+        let high_band_rms = |p: &Personality| {
+            let mut s = Stream::choral(p, 0);
+            s.set(261.6, 1.0, 0.6);
+            let mut block = vec![0.0f32; 48_000];
+            s.block(&mut block);
+            s.block(&mut block);
+            let alpha = (-std::f64::consts::TAU * 4_000.0 / f64::from(SR)).exp() as f32;
+            let (mut low, mut energy, mut total) = (0.0f32, 0.0f64, 0.0f64);
+            for &v in &block {
+                low = alpha * low + (1.0 - alpha) * v;
+                let high = v - low;
+                energy += f64::from(high) * f64::from(high);
+                total += f64::from(v) * f64::from(v);
+            }
+            let n = block.len() as f64;
+            ((energy / n).sqrt(), (total / n).sqrt())
+        };
+        let (with_breath, body) = high_band_rms(&breathiest);
+        let (leakage, _) = high_band_rms(&silent_twin);
+        // The noise is what the breath added over the twin's harmonic leakage.
+        let noise = (with_breath * with_breath - leakage * leakage)
+            .max(0.0)
+            .sqrt();
+        assert!(
+            noise < body * 0.05,
+            "breath noise {noise:.4} against a body of {body:.4} — the hiss is back"
+        );
+        // And it is not silence either: a duck with no breath at all is a different voice.
+        assert!(
+            noise > body * 0.001,
+            "{noise:.5} — the breath vanished entirely"
+        );
+    }
+
+    /// The speaker rolloff's lift cap genuinely caps now. It used to be renormalised straight
+    /// back out — a note off the bottom of the driver came back exactly as loud as any other,
+    /// all of it piled into the few harmonics the driver keeps, which is the saturation the
+    /// robot run reported.
+    #[test]
+    fn the_bass_lift_cap_actually_caps() {
+        let p = Personality::from_seed(100);
+        let rms_at = |hz: f64, rolloff: Option<f64>| {
+            let mut s = Stream::choral(&p, 0);
+            s.set_speaker_rolloff(rolloff);
+            s.set(hz, 1.0, 0.6);
+            let mut block = vec![0.0f32; 48_000];
+            s.block(&mut block);
+            s.block(&mut block);
+            (block
+                .iter()
+                .map(|v| f64::from(*v) * f64::from(*v))
+                .sum::<f64>()
+                / block.len() as f64)
+                .sqrt()
+        };
+        // A moderately deep note (the chorale's bass range) keeps its loudness: the lift
+        // restores what the driver takes, inside the cap. That is the design, not a bug —
+        // only the *balance* moves.
+        let plain = rms_at(130.8, None);
+        let through = rms_at(130.8, Some(300.0));
+        assert!(
+            through < plain * 1.1,
+            "{through} vs {plain}: louder through a rolloff?"
+        );
+        assert!(
+            through > plain * 0.5,
+            "{through} vs {plain}: the bass vanished"
+        );
+        // A note far below the driver hits the cap and is genuinely quieter — the case the
+        // cap exists for, and the assertion the old renormalisation failed.
+        let deep_plain = rms_at(55.0, None);
+        let deep_through = rms_at(55.0, Some(300.0));
+        assert!(
+            deep_through < deep_plain * 0.8,
+            "{deep_through} vs {deep_plain}: the cap is being renormalised away again"
+        );
+        // A note above the rolloff is untouched.
+        let high_plain = rms_at(500.0, None);
+        let high_through = rms_at(500.0, Some(300.0));
+        assert!(
+            (high_through / high_plain) > 0.9,
+            "{high_through} vs {high_plain}"
         );
     }
 
