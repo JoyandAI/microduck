@@ -527,8 +527,20 @@ for svc in robotd configd padd updaterd btd mediad; do
             echo "    [--] $svc published nothing — stopped, or a build too old to say"
             ;;
         stale)
-            echo "    [FAIL] $svc is not running $want"
-            stale="${stale} ${svc}"
+            # `mediad` is the one daemon nothing restarts for us: it has no `[Install]` section and
+            # `updaterd` does not manage it, so after a push it goes on running the release it was
+            # started with. That is the design working, not a fix that did not take — so it is
+            # reported with what to do about it rather than failed.
+            case "$svc" in
+                mediad)
+                    echo "    [--] $svc is still on the previous release; nothing restarts it"
+                    echo "         sudo systemctl restart mediad"
+                    ;;
+                *)
+                    echo "    [FAIL] $svc is not running $want"
+                    stale="${stale} ${svc}"
+                    ;;
+            esac
             ;;
     esac
 done
