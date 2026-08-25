@@ -27,7 +27,7 @@ target = "1.28.0"
 # how a board ended up with an ONNX Runtime its `ort` panics on.
 [workspace.metadata.gst-plugins]
 repo    = "pollen-robotics/microduck-gst-plugins"
-version = "v1"
+version = "v3"
 
 [workspace.package]
 version = "0.9.1"

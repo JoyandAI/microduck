@@ -375,11 +375,50 @@ Keyframes should come from `min-force-key-unit-interval` rather than a periodic 
 drives them from the peer's PLI, and `gop` defaults to one IDR per second whether anybody needed
 one or not.
 
-One thing to verify once there is a stream rather than assume: the enum value is `baseline` (66),
-while WebRTC negotiates *Constrained* Baseline. A Baseline stream that avoids FMO, ASO and
-redundant slices is what a constrained-baseline decoder expects, and MPP has no reason to emit
-those — but the SPS constraint flags are worth reading off a real capture.
+### The constraint flags were worth reading, and the template was worse than the flags
 
-`webrtcsink` accepts pre-encoded H.264 on its sink pad, so the pipeline is
-`appsrc ! mpph264enc ! h264parse ! webrtcsink` and the encoder choice never reaches
-negotiation.
+This page used to end by asking someone to verify one thing rather than assume it: the `profile`
+enum says `baseline` (66) while WebRTC negotiates *Constrained* Baseline, and a Baseline stream
+that avoids FMO, ASO and redundant slices is what a constrained-baseline decoder expects. Read off
+the board:
+
+```
+gst-launch-1.0 -v videotestsrc num-buffers=60 ! video/x-raw,format=NV12,width=1280,height=720,framerate=30/1 ! mpph264enc profile=baseline ! h264parse ! fakesink
+```
+
+`h264parse` negotiates `profile=(string)constrained-baseline` on its src pad. So the stream is
+right: `profile=baseline` turns CABAC and the 8x8 transform off, MPP emits no FMO, ASO or
+redundant slices, and the SPS carries `profile_idc=66` with `constraint_set1_flag`.
+
+**What was wrong was the pad template, and it cost a day.** `mpph264enc`'s src template listed
+`profile = { baseline, main, high }` and omitted `constrained-baseline` — the one profile WebRTC
+asks for. That only matters once the encoder is inside `webrtcsink` rather than in front of it,
+which is why nothing saw it here first:
+
+1. `webrtcsink`'s codec discovery builds its encoding chain with no output caps, so `force_profile`
+   is true and it inserts a capsfilter demanding `profile=constrained-baseline`.
+2. `h264parse` strips `alignment`, `stream-format` and `parsed` from a caps query but **not
+   `profile`**, so the demand reaches the encoder's src pad.
+3. Empty intersection with the template. `GstVideoEncoder`'s sink getcaps returns nothing, and the
+   failure surfaces four elements upstream as `videorate` reporting it "could not transform NV12 …
+   in anything we support".
+4. Discovery drops H.264 with a `gst::warning!`, VP8 is negotiated instead, and the session dies
+   in `rtpvp8pay`. **No error anywhere names the profile.**
+
+Two lessons rather than one. The plugins repository now carries a one-word patch widening that
+template, released as `v3`. And `mediad` had to bridge GStreamer's log and the pipeline bus into
+the journal before any of this was visible — every media failure up to that point had been silent,
+including a session ending mid-negotiation.
+
+### Pre-encoding is no longer the shape
+
+This page used to close by noting that `webrtcsink` accepts pre-encoded H.264 on its sink pad, so
+`appsrc ! mpph264enc ! h264parse ! webrtcsink` keeps the encoder out of negotiation entirely. True,
+and it worked first — but it costs two things that are hard to add back. `webrtcsink` cannot reach
+an encoder it does not own, so congestion control cannot adapt the bitrate to the link, and a
+peer's PLI cannot produce a keyframe: a viewer that loses one stays broken until the next periodic
+GOP.
+
+So `mediad` hands it raw NV12 and lets it build the encoder, configuring each one through the
+`encoder-setup` signal — which is where the table above now applies. The cost is that the encoder
+*does* reach negotiation, which is how the template gap above was found.

@@ -66,7 +66,7 @@ GST_EXTRA_PLUGIN_DIR=/usr/local/lib/gstreamer-1.0
 # The repository is public on purpose: the download happens during provisioning and, later, from
 # the updater's preinstall hook, which runs with a cleared environment and no token.
 PLUGINS_REPO="${PLUGINS_REPO:-pollen-robotics/microduck-gst-plugins}"
-PLUGINS_VERSION="${PLUGINS_VERSION:-v1}"
+PLUGINS_VERSION="${PLUGINS_VERSION:-v3}"
 
 # What the encoder probe looks at. Variables rather than literals for the reason
 # `setup-board.sh` makes CMDLINE one: the interesting states of this check are a board that
