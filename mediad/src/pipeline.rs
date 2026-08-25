@@ -285,7 +285,7 @@ pub fn start(
         .max_buffers(1)
         .drop(true)
         .build();
-    wire_frames(&appsink, frames.clone(), width, height);
+    wire_frames(&appsink, frames.clone(), width, height, fps);
 
     pipeline
         .add_many([
@@ -354,7 +354,18 @@ fn link_tee_branch(tee: &gst::Element, branch: &gst::Element) -> Result<()> {
 }
 
 /// Keep [`Frames`] pointing at the most recent buffer off the raw branch.
-fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u32) {
+fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u32, fps: u32) {
+    // **The delivered frame rate, measured rather than assumed.** Every wrong turn in the capture
+    // bring-up came from inferring this: from `rkvenc` interrupts (which count what the *encoder*
+    // did), from `lost frames detected` warnings (which count sequence gaps, and go quiet when the
+    // source simply runs slow), or from a wall-clock `gst-launch`. This branch sees every frame the
+    // tee produces, so it is the honest place to count them.
+    //
+    // Quiet when healthy: the first window is reported, and after that only a crossing of the
+    // threshold in either direction. A daemon that logs six lines a minute forever gets grepped
+    // out, and then it may as well not log.
+    let target = fps as f64;
+    let rate = Mutex::new((0u64, std::time::Instant::now(), Option::<bool>::None));
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -382,6 +393,33 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                 };
                 // Replaced, not queued: last-value-wins is the contract.
                 *frames.0.lock().expect("frame lock") = Some(frame);
+
+                // Must not panic here: this runs on a GStreamer thread, and a panic crossing the
+                // C closure boundary aborts the process rather than unwinding.
+                if let Ok(mut state) = rate.lock() {
+                    let (ref mut count, ref mut since, ref mut was_healthy) = *state;
+                    *count += 1;
+                    let elapsed = since.elapsed();
+                    if elapsed >= std::time::Duration::from_secs(10) {
+                        let measured = *count as f64 / elapsed.as_secs_f64();
+                        *count = 0;
+                        *since = std::time::Instant::now();
+
+                        // 90%, not equality: a sensor's own clock is not the CPU's, and a frame
+                        // landing either side of a window boundary is not a fault.
+                        let healthy = measured >= target * 0.9;
+                        if was_healthy.is_none_or(|previous| previous != healthy) {
+                            if healthy {
+                                tracing::info!(fps = %format!("{measured:.1}"), target = fps,
+                                    "capture rate");
+                            } else {
+                                tracing::warn!(fps = %format!("{measured:.1}"), target = fps,
+                                    "capture is below its target rate");
+                            }
+                            *was_healthy = Some(healthy);
+                        }
+                    }
+                }
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),

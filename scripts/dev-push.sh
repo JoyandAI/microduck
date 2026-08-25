@@ -496,7 +496,7 @@ echo "    current -> $want"
 # no socket at all, so for that one it is the only answer available.
 deadline=$(($(date +%s) + 30))
 stale=""
-for svc in robotd configd padd updaterd btd; do
+for svc in robotd configd padd updaterd btd mediad; do
     while :; do
         if [ ! -f "/run/${svc}/identity.json" ]; then
             state="silent"
@@ -521,7 +521,9 @@ for svc in robotd configd padd updaterd btd; do
         ok) echo "    [ok] $svc" ;;
         silent)
             # Not treated as a failure: systemd removes the runtime directory when a unit stops, so
-            # this is also what a deliberately disabled `padd` looks like.
+            # this is also what a deliberately disabled `padd` looks like — and what `mediad` looks
+            # like on every board, since it ships with no `[Install]` section and is started by
+            # hand until it has proven itself over a few boots.
             echo "    [--] $svc published nothing — stopped, or a build too old to say"
             ;;
         stale)
