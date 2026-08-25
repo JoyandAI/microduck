@@ -285,7 +285,7 @@ pub fn start(
         .max_buffers(1)
         .drop(true)
         .build();
-    wire_frames(&appsink, frames.clone(), width, height, fps);
+    wire_frames(&appsink, frames.clone(), width, height);
 
     pipeline
         .add_many([
@@ -298,6 +298,15 @@ pub fn start(
             appsink.upcast_ref(),
         ])
         .context("could not add elements to the pipeline")?;
+
+    // On the capsfilter's src pad, which is the last point before the tee splits the stream —
+    // so this counts every frame the driver delivered, with nothing lossy in between.
+    meter_capture_rate(
+        &capsfilter
+            .static_pad("src")
+            .context("capsfilter has no src pad, which cannot happen")?,
+        fps,
+    )?;
 
     gst::Element::link_many([&src, &capsfilter, &tee]).context(
         "could not link the source to the tee. A caps failure here means the source cannot \
@@ -354,18 +363,7 @@ fn link_tee_branch(tee: &gst::Element, branch: &gst::Element) -> Result<()> {
 }
 
 /// Keep [`Frames`] pointing at the most recent buffer off the raw branch.
-fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u32, fps: u32) {
-    // **The delivered frame rate, measured rather than assumed.** Every wrong turn in the capture
-    // bring-up came from inferring this: from `rkvenc` interrupts (which count what the *encoder*
-    // did), from `lost frames detected` warnings (which count sequence gaps, and go quiet when the
-    // source simply runs slow), or from a wall-clock `gst-launch`. This branch sees every frame the
-    // tee produces, so it is the honest place to count them.
-    //
-    // Quiet when healthy: the first window is reported, and after that only a crossing of the
-    // threshold in either direction. A daemon that logs six lines a minute forever gets grepped
-    // out, and then it may as well not log.
-    let target = fps as f64;
-    let rate = Mutex::new((0u64, std::time::Instant::now(), Option::<bool>::None));
+fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u32) {
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -394,32 +392,6 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                 // Replaced, not queued: last-value-wins is the contract.
                 *frames.0.lock().expect("frame lock") = Some(frame);
 
-                // Must not panic here: this runs on a GStreamer thread, and a panic crossing the
-                // C closure boundary aborts the process rather than unwinding.
-                if let Ok(mut state) = rate.lock() {
-                    let (ref mut count, ref mut since, ref mut was_healthy) = *state;
-                    *count += 1;
-                    let elapsed = since.elapsed();
-                    if elapsed >= std::time::Duration::from_secs(10) {
-                        let measured = *count as f64 / elapsed.as_secs_f64();
-                        *count = 0;
-                        *since = std::time::Instant::now();
-
-                        // 90%, not equality: a sensor's own clock is not the CPU's, and a frame
-                        // landing either side of a window boundary is not a fault.
-                        let healthy = measured >= target * 0.9;
-                        if was_healthy.is_none_or(|previous| previous != healthy) {
-                            if healthy {
-                                tracing::info!(fps = %format!("{measured:.1}"), target = fps,
-                                    "capture rate");
-                            } else {
-                                tracing::warn!(fps = %format!("{measured:.1}"), target = fps,
-                                    "capture is below its target rate");
-                            }
-                            *was_healthy = Some(healthy);
-                        }
-                    }
-                }
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -841,6 +813,56 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
         }
         Some(false.to_value())
     });
+    Ok(())
+}
+
+/// Count frames where they enter the pipeline, not where they leave it.
+///
+/// **Placement is the whole point.** This lived on the tee's raw branch first, which sits behind a
+/// deliberately leaky one-buffer queue — so it measured what survived that queue and reported 19.6
+/// fps for a source that may well have been delivering 30. The other two rates available are just
+/// as misleading in the same direction: `rkvenc` interrupts count what the *encoder* consumed
+/// (behind `webrtcsink`'s own queue and its `videorate drop-only`), and `v4l2src`'s
+/// `lost frames detected` counts gaps in the driver's sequence numbers, which stays silent when the
+/// source is simply slow. Every wrong turn in this bring-up came from one of those three.
+///
+/// On the pad *before* the tee there is nothing between here and the driver.
+fn meter_capture_rate(pad: &gst::Pad, fps: u32) -> Result<()> {
+    let target = fps as f64;
+    // (frames this window, when the window started, whether the last report said healthy)
+    let state = Mutex::new((0u64, std::time::Instant::now(), Option::<bool>::None));
+
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        // Must not panic: this is a GStreamer thread, and a panic crossing the C closure boundary
+        // aborts the process rather than unwinding.
+        if let Ok(mut state) = state.lock() {
+            let (ref mut count, ref mut since, ref mut was_healthy) = *state;
+            *count += 1;
+            let elapsed = since.elapsed();
+            if elapsed >= std::time::Duration::from_secs(10) {
+                let measured = *count as f64 / elapsed.as_secs_f64();
+                *count = 0;
+                *since = std::time::Instant::now();
+
+                // 90% rather than equality: a sensor's clock is not the CPU's, and a frame landing
+                // either side of a window boundary is not a fault.
+                let healthy = measured >= target * 0.9;
+                if was_healthy.is_none_or(|previous| previous != healthy) {
+                    if healthy {
+                        tracing::info!(fps = %format!("{measured:.1}"), target = fps, "capture rate");
+                    } else {
+                        tracing::warn!(
+                            fps = %format!("{measured:.1}"), target = fps,
+                            "capture is below its target rate"
+                        );
+                    }
+                    *was_healthy = Some(healthy);
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .context("could not add the capture-rate probe")?;
     Ok(())
 }
 
