@@ -878,6 +878,10 @@ struct HealthReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     robot_error: Option<String>,
     software: VersionReport,
+    /// What `mediad` last said about the camera, or `None` — not running, or built before it
+    /// published anything. Absence is not a fault: `mediad` ships disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera: Option<proto::CameraStats>,
 }
 
 impl HealthReport {
@@ -912,6 +916,7 @@ fn run_health(
         robot: None,
         robot_error: None,
         software: collect_version_report(socket, robot_socket, config_socket),
+        camera: proto::read_camera_stats(),
     };
 
     match Client::connect_to("robotd", robot_socket) {
@@ -1065,6 +1070,33 @@ fn render_health(report: &HealthReport) -> String {
         (None, None) => {
             let _ = writeln!(out, "robot     unavailable");
         }
+    }
+
+    // Between the robot verdict and the software block, because it is a fact about the hardware
+    // rather than about which release is installed. Omitted entirely when `mediad` has published
+    // nothing — a line reading "camera unknown" on every robot that has never started `mediad`
+    // is noise, and `mediad` is disabled by default.
+    if let Some(camera) = &report.camera {
+        let rate = if camera.fps >= f64::from(camera.target_fps) * 0.9 {
+            format!("{:.1} fps", camera.fps)
+        } else {
+            // The target is only shown when it is being missed, which is when it matters.
+            format!("{:.1} fps (target {})", camera.fps, camera.target_fps)
+        };
+        let dropped = match camera.dropped {
+            0 => String::new(),
+            n => format!(", {n} dropped"),
+        };
+        let watching = match camera.consumers {
+            0 => "no viewer".to_owned(),
+            1 => "1 viewer".to_owned(),
+            n => format!("{n} viewers"),
+        };
+        let _ = writeln!(
+            out,
+            "camera    {rate}, {}x{} {}{dropped} — {watching}",
+            camera.width, camera.height, camera.format
+        );
     }
 
     let _ = writeln!(out, "\nsoftware");
@@ -3051,7 +3083,65 @@ mod tests {
             robot,
             robot_error: robot_error.map(str::to_owned),
             software: report(vec![service("robotd", "0.2.0")], Some("0.2.0")),
+            camera: None,
         }
+    }
+
+    fn camera_stats(fps: f64, dropped: u64, consumers: u32) -> proto::CameraStats {
+        proto::CameraStats {
+            fps,
+            target_fps: 30,
+            width: 1280,
+            height: 720,
+            format: "UYVY".into(),
+            frames: 900,
+            dropped,
+            consumers,
+        }
+    }
+
+    /// A camera meeting its target says so without repeating the target back, and says how many
+    /// people are watching — zero being the normal answer, since nothing encodes until a peer
+    /// connects.
+    #[test]
+    fn health_renders_a_working_camera() {
+        let mut report = health_report(None, Some("robotd is down"));
+        report.camera = Some(camera_stats(29.3, 0, 0));
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("camera    29.3 fps, 1280x720 UYVY — no viewer"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("target"),
+            "a healthy rate should not restate its target: {out}"
+        );
+        assert!(
+            !out.contains("dropped"),
+            "no drops should print no drop clause: {out}"
+        );
+    }
+
+    /// Below target, the target appears — that is the comparison a reader needs — and dropped
+    /// frames are named. Both were invisible for an afternoon of this project's history.
+    #[test]
+    fn health_renders_a_degraded_camera() {
+        let mut report = health_report(None, None);
+        report.camera = Some(camera_stats(19.6, 412, 2));
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("camera    19.6 fps (target 30), 1280x720 UYVY, 412 dropped — 2 viewers"),
+            "{out}"
+        );
+    }
+
+    /// No `mediad`, no line. A robot that has never started it should not read as having a fault.
+    #[test]
+    fn health_omits_the_camera_when_mediad_published_nothing() {
+        let out = render_health(&health_report(None, Some("robotd is down")));
+        assert!(!out.contains("camera"), "{out}");
     }
 
     /// A working robot, rendered whole: every section present, one line each.

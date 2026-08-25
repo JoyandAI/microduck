@@ -45,6 +45,8 @@ dbus = { version = "0.9", features = ["vendored"] }
 futures = "0.3"
 
 [dev-dependencies]
+# `every_call()`, shared rather than copied — see `src/route.rs`'s test module.
+duck-ipc-proto = { path = "../duck-ipc-proto", features = ["test-support"] }
 tempfile = "3.27.0"
 
 # `duck-btctl`, the laptop-side client in examples/. A dev-dependency on purpose: an example's deps
