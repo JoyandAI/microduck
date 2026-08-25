@@ -482,6 +482,22 @@ impl Score {
             .expect("the embedded default score must parse")
     }
 
+    /// The other piece: an upbeat one, through the MIDI front end.
+    ///
+    /// `scores/duck_strut.mid` is the source of truth and is deliberately a *MIDI file in the
+    /// repo* rather than more Rust or another text score: it opens in MuseScore, and editing
+    /// the arrangement there and committing the export is the whole workflow the importer was
+    /// built for. D major, 126 bpm, an oom-pah bass, tenor backbeats, and a middle section
+    /// where the tenor echoes the soprano an octave down — everything the wistful chorale
+    /// is not, including per-voice rhythm the text format cannot write.
+    pub fn duck_strut() -> Self {
+        let mut score = midi::parse(include_bytes!("../../scores/duck_strut.mid"))
+            .expect("the embedded MIDI score must parse")
+            .score;
+        score.name = "duck-strut".to_owned();
+        score
+    }
+
     /// Seconds per beat.
     pub fn beat_s(&self) -> f64 {
         60.0 / self.bpm.max(1.0)
@@ -924,6 +940,42 @@ mod tests {
             assert_eq!(singer.part, same.part, "seed {}", singer.personality.seed);
             assert_eq!(singer.detune_cents, same.detune_cents);
         }
+    }
+
+    /// The embedded upbeat piece must parse, be a full quartet, stay inside the duck part
+    /// ranges, and keep its tempo — the properties the ducks depend on, pinned so an edited
+    /// MuseScore export cannot silently break them.
+    #[test]
+    fn duck_strut_is_a_quartet_a_duck_can_sing() {
+        let score = Score::duck_strut();
+        assert_eq!(score.name, "duck-strut");
+        assert!((score.bpm - 126.0).abs() < 0.5, "{}", score.bpm);
+        assert_eq!(score.parts().len(), 4, "full SATB");
+        assert!(
+            (40.0..90.0).contains(&score.duration_s()),
+            "{}s",
+            score.duration_s()
+        );
+        // Bass A2..A3, tenor E3..E4, alto A3..A4, soprano D4..D5.
+        let bounds = [(45u8, 57u8), (52, 64), (57, 69), (62, 74)];
+        for note in &score.notes {
+            let (low, high) = bounds[note.part as usize];
+            assert!(
+                (low..=high).contains(&note.midi),
+                "{:?} sings {}, outside {low}..={high}",
+                note.part,
+                note.midi
+            );
+        }
+        // It is genuinely rhythmically independent — the thing the MIDI path exists for: the
+        // voices do not all move together.
+        let mut starts: Vec<f64> = score.notes.iter().map(|n| n.start_beat).collect();
+        starts.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        starts.dedup();
+        assert!(starts.len() > 60, "{} distinct onsets", starts.len());
+        // And the dynamics vary — velocity became level.
+        let levels: Vec<f64> = score.notes.iter().map(|n| n.level).collect();
+        assert!(levels.iter().any(|l| (*l - levels[0]).abs() > 0.05));
     }
 
     /// Joining a group that is already singing must not move anyone who is: the whole reason

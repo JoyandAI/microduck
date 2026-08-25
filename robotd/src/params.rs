@@ -116,9 +116,9 @@ pub struct AudioParams {
     /// Where the per-robot voice bank lives. The release's postinstall renders it there
     /// (`sounds ensure-bank`), seeded from the SoC serial.
     pub bank: PathBuf,
-    /// Listen for petting on the onboard mic. Absent resolves per mode, as the prototype's
-    /// launcher does: on for walking, off for the roller (its launch line dropped
-    /// `--pet-detect`).
+    /// Listen for petting on the onboard mic and coo about it. Absent means **off**: the
+    /// per-mode resolution the prototype shipped (on for walking) cooed at every incidental
+    /// head scratch, which wore thin fast. Set `true` to opt in.
     pub pet_detect: Option<bool>,
     /// The petting classifier. Absent means the release's copy; the literal `"none"`
     /// disables it outright.
@@ -144,8 +144,12 @@ impl Default for AudioParams {
 
 impl AudioParams {
     /// Whether the mic worker runs, resolved against the drive mode.
-    pub fn pet_detect_resolved(&self, mode: Mode) -> bool {
-        self.pet_detect.unwrap_or(mode == Mode::Walk)
+    pub fn pet_detect_resolved(&self, _mode: Mode) -> bool {
+        // Off unless asked for, in either mode. It used to resolve per mode as the prototype's
+        // launcher did (on for walking, off for the roller) — and cooing at every incidental
+        // head scratch turned out to be more annoying than charming in daily use. The mode is
+        // still passed so flipping this back is a one-line change, not a signature change.
+        self.pet_detect.unwrap_or(false)
     }
 
     /// The capture PCM for the mic worker: the playback device with subdevice 0. Only

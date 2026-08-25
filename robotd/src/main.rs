@@ -1243,7 +1243,6 @@ async fn control_loop<T: RobotIo>(
             Some(chorale::Chorale::new(
                 personality.pitch_center_hz,
                 personality.seed,
-                sounds::chorale::Score::wistful(),
             ))
         })
         .flatten();

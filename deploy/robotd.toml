@@ -261,10 +261,10 @@ mode = "walk"
 # Where the voice bank lives.
 # bank = "/var/lib/robot/sounds"
 
-# Listen for petting on the onboard mic and coo about it. Unset resolves per mode, as the
-# prototype's launcher did: on for walking, off for the roller. The model ships in the
-# release (models/pet_detect.onnx); "none" disables it outright; thresholds are the
-# classifier's hysteresis (enter above, leave below).
+# Listen for petting on the onboard mic and coo about it. Unset means off — the always-on
+# coo wore thin — so this is an opt-in. The model ships in the release
+# (models/pet_detect.onnx); thresholds are the classifier's hysteresis (enter above, leave
+# below).
 # pet_detect = true
 # pet_model = ".../current/models/pet_detect.onnx"
 # pet_enter_threshold = 0.95

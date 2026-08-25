@@ -50,9 +50,24 @@ const PEER_STALE: Duration = Duration::from_secs(3);
 /// alone.
 const SETTLE: Duration = Duration::from_millis(1500);
 
-/// Which piece. One for now; the field exists so a beacon can say what is being sung, and so a
-/// duck joining knows what to load.
+/// The pieces a duck can sing, by the id the beacon carries.
+///
+/// The registry is what makes the beacon's `piece` byte mean something: the conductor picks an
+/// id, followers load the same score by it, and a duck that does not know an id **keeps
+/// listening rather than joining** — it cannot sing a piece it does not have, and guessing one
+/// is how two ducks end up performing different songs at each other. That is also the right
+/// degradation for a mixed-version flock: an old duck near new ones stays politely quiet.
 const PIECE_WISTFUL: u8 = 1;
+const PIECE_DUCK_STRUT: u8 = 2;
+
+/// The score for a piece id, or `None` for one this build does not know.
+fn piece(id: u8) -> Option<Score> {
+    match id {
+        PIECE_WISTFUL => Some(Score::wistful()),
+        PIECE_DUCK_STRUT => Some(Score::duck_strut()),
+        _ => None,
+    }
+}
 
 /// How often an *idle* beacon changes, so that it is noticed at all.
 ///
@@ -134,7 +149,10 @@ pub struct Chorale {
     /// them has to convert. Doing it here keeps the beat maths free of anything platform-shaped,
     /// which is what lets it be tested against simulated jitter on a laptop.
     started: Instant,
+    /// The piece currently loaded — what [`Chorale::score`] serves the audio side, and what
+    /// [`Self::piece_id`] names on the air. Swapped when a performance starts or is joined.
     score: Score,
+    piece_id: u8,
     state: State,
     peers: Vec<Peer>,
     /// The beacon last handed to `btd`, so it is only resent when it changes.
@@ -145,14 +163,15 @@ pub struct Chorale {
 impl Chorale {
     /// `seed` is the robot's voice seed — the identity everything else is derived from, and which
     /// deliberately does not go on the air.
-    pub fn new(pitch_center_hz: f64, seed: u32, score: Score) -> Self {
+    pub fn new(pitch_center_hz: f64, seed: u32) -> Self {
         Self {
             register: proto::ChoraleBeacon::quantise_register(pitch_center_hz),
             // A byte of the seed, mixed. Enough to break a tie between two ducks that rolled the
             // same register, and not enough to identify a robot.
             id: (seed.wrapping_mul(2_654_435_761) >> 24) as u8,
             started: Instant::now(),
-            score,
+            score: Score::wistful(),
+            piece_id: PIECE_WISTFUL,
             state: State::Off,
             peers: Vec::new(),
             advertised: None,
@@ -277,24 +296,28 @@ impl Chorale {
             }
             State::Listening { since } => {
                 let since = *since;
-                // Somebody is already singing: join it rather than starting a second piece.
-                if let Some(peer) = self
+                // Somebody is already singing: join it rather than starting a second piece —
+                // but only a piece this build knows. An unknown id means a newer flock; the
+                // right move is to keep listening, not to guess at a song.
+                if let Some((peer, score)) = self
                     .peers
                     .iter()
-                    .find(|peer| peer.beacon.singing())
-                    .cloned()
+                    .filter(|peer| peer.beacon.singing())
+                    .find_map(|peer| piece(peer.beacon.piece).map(|score| (peer.clone(), score)))
                 {
                     tracing::warn!(
                         piece = peer.beacon.piece,
                         conductor = peer.beacon.id,
                         "chorale: joining"
                     );
+                    self.piece_id = peer.beacon.piece;
                     self.state = State::Following {
-                        follower: Follower::new(self.score.bpm),
+                        follower: Follower::new(score.bpm),
                         conductor: None,
                         roster: peer.beacon.roster.clone(),
                         last_beat: None,
                     };
+                    self.score = score;
                     // The address is not in the beacon, so the first `heard` from this conductor
                     // adopts it — until then this duck listens without a lock, which is what
                     // `Follower` does anyway for its first few beats.
@@ -307,7 +330,18 @@ impl Chorale {
                     let mut roster: Vec<(u8, u8)> = vec![(self.register, self.id)];
                     roster.extend(self.peers.iter().map(|p| (p.beacon.register, p.beacon.id)));
                     roster.truncate(proto::ChoraleBeacon::MAX_ROSTER);
-                    tracing::warn!(voices = roster.len(), "chorale: conducting");
+                    // The conductor picks the piece, from the clock's low bits at the moment
+                    // the performance starts — as good as a coin for something that happens
+                    // seconds after humans put ducks near each other, and deterministic under
+                    // a test that controls the clock.
+                    let pick = if ((self.seconds(now) * 997.0) as u64).is_multiple_of(2) {
+                        PIECE_WISTFUL
+                    } else {
+                        PIECE_DUCK_STRUT
+                    };
+                    self.piece_id = pick;
+                    self.score = piece(pick).expect("both built-in pieces exist");
+                    tracing::warn!(voices = roster.len(), piece = pick, "chorale: conducting");
                     let roster = roster;
                     self.state = State::Conducting {
                         conductor: Conductor::new(self.score.bpm, self.seconds(now)),
@@ -351,7 +385,7 @@ impl Chorale {
         let beat = conductor.wire_beat();
         let roster = roster.clone();
 
-        let beacon = self.beacon(PIECE_WISTFUL, beat, roster.clone());
+        let beacon = self.beacon(self.piece_id, beat, roster.clone());
         let advertise = self.publish(Some(beacon), true);
         Tick {
             advertise,
@@ -480,7 +514,7 @@ mod tests {
     use super::*;
 
     fn chorale() -> Chorale {
-        Chorale::new(214.4, 7, Score::wistful())
+        Chorale::new(214.4, 7)
     }
 
     /// A duck that hears nobody must not sing. A solo chorale is a duck quacking to itself.
@@ -606,6 +640,70 @@ mod tests {
         assert!(
             (high - low).abs() > 0.05,
             "reach must be visible: {low} vs {high}"
+        );
+    }
+
+    /// The beacon's piece byte decides the song: a duck joining a duck-strut performance loads
+    /// duck strut, not whatever it had loaded before — bpm and all, or the phase lock would be
+    /// counting the wrong beat length.
+    #[test]
+    fn a_joiner_sings_the_piece_the_beacon_names() {
+        let mut c = chorale();
+        let now = Instant::now();
+        c.set_active(true, now);
+        let mine = (c.register, c.id);
+        c.heard(&heard_from(9, 120, 2, 0, vec![(120, 9), mine]), now);
+        let _ = c.tick(now);
+        assert_eq!(c.score().name, "duck-strut", "loaded from the beacon's id");
+        assert!((c.score().bpm - 126.0).abs() < 0.5, "and its tempo with it");
+    }
+
+    /// A piece this build does not know is not joined and not guessed at: the duck keeps
+    /// listening, which is the right shape for a mixed-version flock — an old duck near newer
+    /// ones stays politely quiet instead of performing a different song at them.
+    #[test]
+    fn an_unknown_piece_is_declined_not_guessed() {
+        let mut c = chorale();
+        let now = Instant::now();
+        c.set_active(true, now);
+        c.heard(&heard_from(9, 120, 200, 4, vec![(120, 9)]), now);
+        for step in 0..50 {
+            let tick = c.tick(now + Duration::from_millis(100 * step));
+            assert_eq!(tick.singing, None, "step {step}");
+            // And it does not start a rival performance in the same room either: someone is
+            // singing, even if we cannot join them.
+            if let Some(beacon) = tick.advertise.and_then(|a| a.beacon) {
+                assert!(!beacon.singing(), "conducting over an ongoing piece");
+            }
+        }
+    }
+
+    /// The conductor names its pick on the air, and the pick is one of the pieces that exist.
+    #[test]
+    fn the_conductor_picks_a_real_piece_and_broadcasts_it() {
+        let mut c = chorale();
+        let now = Instant::now();
+        c.set_active(true, now);
+        c.heard(
+            &heard_from(
+                c.id.wrapping_add(1),
+                250,
+                proto::ChoraleBeacon::IDLE,
+                0,
+                vec![],
+            ),
+            now,
+        );
+        let beacon = c
+            .tick(now + SETTLE)
+            .advertise
+            .and_then(|a| a.beacon)
+            .expect("conducting");
+        assert!(piece(beacon.piece).is_some(), "picked {}", beacon.piece);
+        assert!(!c.score().name.is_empty());
+        assert!(
+            (c.score().bpm - piece(beacon.piece).expect("exists").bpm).abs() < 1e-9,
+            "the loaded score is the broadcast one"
         );
     }
 
