@@ -1191,8 +1191,13 @@ async fn control_loop<T: RobotIo>(
     };
 
     // Say hello in this robot's own voice as the control loop comes up, as the prototype
-    // does — the greet is also the audible "robotd is running" on a headless board.
-    if let Some(voice) = voice.as_mut() {
+    // does — the greet is also the audible "robotd is running" on a headless board. Its
+    // own switch, because the reason to want it gone (restarting the daemon all day) is
+    // not a reason to give up the triggers and the mic that `audio.enabled = false` takes
+    // with it.
+    if let Some(voice) = voice.as_mut()
+        && params.audio.greet
+    {
         voice.play("greet", false);
     }
 

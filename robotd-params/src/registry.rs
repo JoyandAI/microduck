@@ -291,6 +291,11 @@ pub const REGISTRY: &[Entry] = &[
     entry("audio.device", Kind::Text, "ALSA playback device"),
     entry("audio.bank", Kind::Text, "Voice bank directory"),
     feature(
+        "audio.greet",
+        Kind::Bool,
+        "Quack once at startup — the audible \"robotd is running\"",
+    ),
+    feature(
         "audio.pet_detect",
         Kind::TriBool,
         "Coo when petted; unset resolves per mode (walk on, roller off)",
@@ -463,6 +468,7 @@ mod tests {
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
                 "audio.enabled",
+                "audio.greet",
                 "audio.pet_detect",
             ]
         );
