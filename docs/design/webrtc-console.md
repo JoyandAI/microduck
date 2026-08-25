@@ -49,14 +49,13 @@ This deletes four problems at once rather than one:
 
 ### 1.1 Which HTTP server
 
-**`axum`.** It is already in `Cargo.lock` — `updater` uses it as a dev-dependency for its test
-mirror — so the crate is known-good against this toolchain and the cross build.
+**`axum`. Decided.** It is already in `Cargo.lock` — `updater` uses it as a dev-dependency for its
+test mirror — so the crate is known-good against this toolchain and the cross build.
 
-The alternative is a hand-rolled HTTP/1.1 responder: this serves one file over one method, so it
-is perhaps sixty lines. Rejected. Sixty lines of hand-written request parsing bound to
-`0.0.0.0` is a parser exposed to everyone on the network, written to avoid a dependency that the
-build already resolves — and `hyper` underneath `axum` is the most-read implementation of that
-parser in the language. The dependency count is not the thing to optimise here.
+The alternative was a hand-rolled HTTP/1.1 responder: this serves one file over one method, so it
+is perhaps sixty lines. Sixty lines of hand-written request parsing bound to `0.0.0.0` is a parser
+exposed to everyone on the network, written to avoid a dependency the build already resolves —
+and `hyper` underneath `axum` is the most-read implementation of that parser in the language.
 
 `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` in `mediad.service` already permits the
 listener; nothing in the unit changes.
@@ -75,20 +74,33 @@ question with two answers.
 Embedding costs a rebuild to change a stylesheet. That is the right trade for a page that is part
 of the daemon's interface.
 
-### 1.3 Two ports now, one port later — and why the later matters
+### 1.3 Two ports, and nobody has to know there are two
 
 `webrtcsink` owns the listener on 8443 (`run-signalling-server`, with only `-host` and `-port` to
 say about it), so the page cannot be a route on it. Two ports: 8080 serves the page, 8443 stays
-the signalling server. Nothing about the media path changes, which is the entire argument for
-doing it this way first.
+the signalling server. Nothing about the media path changes, which is the whole argument for doing
+it this way first.
+
+**Two ports is a fact about the implementation, and it must not become a step for a person.**
+Three things keep it there, and they are requirements on the change rather than hopes:
+
+- **One address is typed.** `http://<robot>:8080`. The 8443 is reached by the page's own
+  JavaScript and never by a human. `duck-btctl open` (§2) removes even that one.
+- **`mediad` fills the signalling URL in as it serves the page**, rather than the page carrying a
+  constant. It knows the host the request arrived on and it knows its own `--port`, so the page
+  gets the real answer — one `str::replace` over the embedded string at startup. This is what
+  makes `--port` safe to change: there is no second place holding a stale copy of it.
+- **The one failure two ports can produce is named in words.** If 8080 answers and 8443 does not
+  — a firewall between, most plausibly — the page must say *the page came from this robot, but its
+  signalling port did not answer*, not `websocket error`. That is the only route by which the
+  second port can ever reach a person, and it should reach them as a diagnosis.
 
 The one-port variant is to run the signalling server ourselves — upstream publishes it as a
-library alongside the plugin — and point `webrtcsink`'s signaller at
-`ws://127.0.0.1:8080/ws`. Then one `axum` server serves the page and the protocol on one origin.
-That is more work and a second copy of the protocol version to keep in step with the `.so` we
-ship, and it should not be in the first change.
+library alongside the plugin — and point `webrtcsink`'s signaller at `ws://127.0.0.1:8080/ws`.
+Then one `axum` server serves the page and the protocol on one origin. More work, and a second
+copy of the protocol version to keep in step with the `.so` we ship, so not in the first change.
 
-**But it is where this ends up, and §3.4 is why.** A browser gives a page served over plain http
+**But it is where this ends up, and here is why.** A browser gives a page served over plain http
 to a private address no microphone, and depending on the browser no gamepad either — those are
 secure-context APIs, and `http://192.168.1.42` is not a secure context (`http://localhost` is,
 which is precisely why nobody has hit this yet). Two-way audio is in `remote-webrtc.md` §2. The
@@ -98,32 +110,84 @@ our own signalling server when audio or a browser gamepad is wanted, TLS on the 
 
 Worth writing down now rather than discovering it while wiring a microphone.
 
-## 2. Finding the robot: `btd` already broadcasts the answer
+## 2. Finding the robot: two commands, and one of them is already hand-rolled
 
-The last mile is nearly built. `btd` files the robot's IPv4 in its advertisement under company id
-`0xFFFF`, and `duck-btctl` already parses it — `Address::At`, `Unassigned`, `Unsaid`, three
-answers rather than two, and `scan` prints it today.
+`btd` files the robot's IPv4 in its advertisement under company id `0xFFFF`, and `duck-btctl`
+already parses it — `Address::At`, `Unassigned`, `Unsaid`, three answers rather than two, and
+`scan` prints it today. So the work is a command, not a mechanism.
 
-So: **`duck-btctl ip`**, which resolves a robot by name (or `DUCK_ROBOT`) and prints the address
-on stdout and nothing else — matching the split the tool already keeps, diagnostics on stderr and
-data on stdout, so `open "http://$(duck-btctl ip):8080"` works. And **`duck-btctl open`**, which
-does that for you.
+### 2.1 `duck-btctl ip`
 
-Neither connects, bonds, or authenticates. It is an advertisement read, so it works on a robot
-this laptop has never paired with, and it costs a scan.
+The robot's address on stdout and nothing else, so `ssh radxa@$(duck-btctl ip)` works — the split
+the tool already keeps, diagnostics on stderr and data on stdout.
 
-The three-way `Address` already carries the right failure text, and this is where it pays:
+**This is not a new idea in this repo; it is one that has already been written badly once.**
+`scripts/dev-push.sh` needs exactly this and hand-rolls it: `resolve_board()` calls
+`duck-btctl wifi status` and pipes the JSON through a six-line Python program embedded in the
+shell script to pull `result.ip4`. That is the command, minus a home.
+
+Reading the advertisement rather than calling `net.status` is better on three counts, all of them
+visible in what `dev-push.sh` had to write around:
+
+- **No connection, so no bond and no PIN.** `resolve_board` carries a whole failure branch for
+  "the robot refused `net.status` — a wrong PIN, most often". An advertisement read cannot be
+  refused, so that branch stops existing.
+- **Seconds rather than tens of seconds.** `dev-push.sh` caches the address per robot precisely
+  because "BLE discovery costs ten to twenty seconds"; a scan that stops at the first matching
+  advertisement is about a second, because `duck-btctl` already polls until something appears
+  rather than sleeping out `SCAN_TIME`.
+- **It is not stale.** `btd`'s `reconcile_advertisement` re-reads `net.status` every `ADV_POLL`
+  (5s) and re-advertises when the answer moves, so the advertisement *is* `net.status` with a
+  five-second lag — well inside the window in which a new lease has already broken ssh.
+
+**With one fallback, which is not optional.** A robot bonded to this Mac often stops advertising
+the service to it — `duck-btctl`'s own scan tiers exist for that — so when no advertisement is
+seen, `ip` connects and asks `net.status`, which is what `dev-push.sh` does today. Cheap read
+first, call second. Without the fallback this command would fail on exactly the laptops that use
+it most.
+
+The three-way `Address` already carries the right failure text and this is where it pays:
 
 - `Unassigned` — the robot has no network. The fix is `duck-btctl wifi connect`, and it has to be
-  over BLE, because `net.connect` is refused over WebRTC by design (`route.rs`: "a robot that has
-  never seen a network cannot be configured over that network").
-- `Unsaid` — a release from before `btd` advertised an address. `duck-btctl wifi status` still
-  reports it; updating puts it in the list.
+  over BLE, because `net.connect` is refused over WebRTC by design ("a robot that has never seen a
+  network cannot be configured over that network").
+- `Unsaid` — a release from before `btd` advertised an address. The fallback answers anyway;
+  updating makes it fast.
 
-That closes a loop worth naming: **BLE provisions the network and then hands you the URL for it.**
-The two transports stop being alternatives and become a sequence.
+Its third caller is neither of the two above: `install-dev.md` opens by asking for "the board's
+**IP address**", with the note that mDNS on this image is unreliable, and offers no way to get it.
 
-`duck-btctl` is a stopgap for the phone app, so this stays thin — two commands, no new mechanism.
+### 2.2 `duck-btctl open`
+
+Resolve, then open `http://<address>:8080/` in the browser. `--print` prints the URL instead, for
+a machine with no browser or a script; `--port` for a robot started with a non-default
+`--web-port`.
+
+A command rather than a documented shell substitution, for one reason: **the port default should
+live in exactly one place that a person never has to read.** `open "http://$(duck-btctl ip):8080"`
+works, and it is the kind of line someone writes once and then looks up forever.
+
+### 2.3 Not these
+
+- **`duck-btctl url`.** That is `open --print`. A third command whose entire content is a port
+  number.
+- **A URL column on `scan`.** `scan` lists earbuds too, and the robot lines already carry the
+  address. One note under the list pointing at `open` is enough.
+- **Anything that has to connect.** Both commands are advertisement reads with a fallback. A
+  command here that *required* a bond would be a different kind of command, and it would belong
+  with `wifi` and `update` rather than with finding a robot.
+
+### 2.4 The loop this closes, and the one follow-on
+
+BLE provisions the network and then hands you the URL for it. The two transports stop being
+alternatives and become a sequence — which is worth saying because `route.rs` refuses `net.connect`
+over WebRTC deliberately, and this is the other half of that refusal.
+
+The follow-on, in its own change rather than these four: `dev-push.sh`'s `resolve_board` becomes
+`btctl --name "$1" ip`, deleting the embedded Python and the wrong-PIN branch. Separate because it
+touches the push path, and because it should land after `ip` has been used by hand a few times.
+
+`duck-btctl` is a stopgap for the phone app, so this stays at two commands and no new mechanism.
 The durable halves are the ones that outlive it: `btd` broadcasting the address, and `mediad`
 serving on a known port. The app will do the same two steps natively.
 
@@ -184,11 +248,14 @@ should be good.
 
 Four changes, each of which stands alone and lands separately:
 
-1. **Serve the page, default the URL to `location.hostname`.** Deletes the python instruction and
-   the warning block. Small, and everything else is nicer on top of it.
+1. **Serve the page, with the signalling URL filled in as it is served.** Deletes the python
+   instruction and the warning block. Small, and everything else is nicer on top of it.
 2. **Producer `meta`.** Smaller still, and independent.
-3. **`duck-btctl ip` / `open`.** Client-side only, touches no daemon.
+3. **`duck-btctl ip` and `open`.** Client-side only, touches no daemon. `ip` first: it stands on
+   its own for ssh, and `open` is a port number on top of it.
 4. **The console.** The large one, done last, on a page that is already reachable.
+
+Then, separately, `dev-push.sh` switching to `duck-btctl ip` (§2.4).
 
 ## 7. Not doing
 
@@ -198,3 +265,5 @@ Four changes, each of which stands alone and lands separately:
 - **A JS framework, a bundler, or `gstwebrtc-api`.** The page speaks the protocol by hand because
   a client that needs npm is a client nobody runs. Still true at four times the size.
 - **Serving over TLS in this change.** §1.3 says when, and why it is not now.
+- **Teaching the advertisement a port.** Four bytes of IPv4 is what it carries; a robot on a
+  non-default `--web-port` is a `--port` on `duck-btctl open`, not a wire-format change.
