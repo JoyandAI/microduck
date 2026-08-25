@@ -44,6 +44,9 @@
 #                     `Privacy`**. This is what a board wants when a pad pairs and then flaps with
 #                     `PIN or Key Missing`: that is `Privacy = device` on a board that needed only
 #                     the pause. Try this before `--weird-ble`.
+#   --no-gstreamer    skip the GStreamer stack `mediad` needs. Installed by default, with a
+#                     report of what this board can encode. It needs no reboot, so it can also
+#                     be added or re-run later:  sudo /usr/local/sbin/robot-setup-gstreamer
 #   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all, even with
 #                     `btd` paused. Implies `--pause-btd-on-pair`, and additionally sets
 #                     `Privacy = device`.
@@ -105,6 +108,7 @@ NO_DEV_KEY=""
 USE_LOCAL=""
 NO_BLE=""
 WEIRD_BLE=""
+NO_GSTREAMER=""
 PAUSE_BTD=""
 # The name to give the robot. Not `BLE_NAME` below, which points the other way: the name this board
 # already answers to, used to find it again after the reboot.
@@ -179,6 +183,7 @@ while [ $# -gt 0 ]; do
         --dev-key)    DEV_KEY="${2:?--dev-key needs a path}"; shift 2 ;;
         --no-dev-key) NO_DEV_KEY=1; shift ;;
         --no-ble)     NO_BLE=1; shift ;;
+        --no-gstreamer) NO_GSTREAMER=1; shift ;;
         --weird-ble)  WEIRD_BLE=1; shift ;;
         --pause-btd-on-pair) PAUSE_BTD=1; shift ;;
         --local)      USE_LOCAL=1; shift ;;
@@ -684,6 +689,7 @@ _env="DUCK_TOKEN='${DUCK_TOKEN:-}'"
 [ -z "$DEV_KEY" ] || _env="${_env} DUCK_DEV_KEY=/tmp/team.dev.pub"
 [ -z "$WEIRD_BLE" ] || _env="${_env} DUCK_WEIRD_BLE=1"
 [ -z "$PAUSE_BTD" ]  || _env="${_env} DUCK_PAUSE_BTD=1"
+[ -z "$NO_GSTREAMER" ] || _env="${_env} DUCK_GSTREAMER=0"
 
 # The name is a flag rather than one more `DUCK_*`, because on the board it goes no further than
 # `robotctl system set-name`. Single-quoted with any quote of its own escaped: a name is free text,

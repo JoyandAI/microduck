@@ -719,6 +719,54 @@ SUBSYSTEM=="i2c-dev", ATTR{name}=="i2c-gpio-pihat", SYMLINK+="i2c-pihat"'
     udevadm trigger --subsystem-match=i2c-dev 2>/dev/null || true
 }
 
+# ── the head camera's device-tree overlay ──────────────────────────────────────
+#
+# Without it the sensor is never probed: no /dev/videoN, and nothing in dmesg either, which
+# reads exactly like a camera that is not plugged in.
+#
+# **The overlay has to be mirrored under a prefixed name first, and that is the whole trick.**
+# Armbian ships it as `radxa-zero3-rpi-camera-v2.dtbo` with no `rk3568-` prefix, while this
+# board runs `overlay_prefix=rk3568` — so the loader resolves the `overlays=` word to
+# `rk3568-radxa-zero3-rpi-camera-v2.dtbo`, finds nothing, and boots happily with no camera.
+# Same silent class of failure as the wrong prefix in `configure_overlay`. The prototype hit
+# this and mirrors the file (`microduck_runtime/install.sh`); so does this.
+#
+# Copying rather than symlinking, matching the prototype: an Armbian package update replaces the
+# unprefixed file, and a stale mirror is at least a *working* camera rather than a dangling link.
+# Re-running refreshes it when the source changes.
+#
+# `DUCK_CAMERA_OVERLAY` selects another module — `radxa-zero3-rpi-camera-v1.3` is the Pi Cam
+# v1.3 / OV5647, which nothing here has tested.
+configure_camera() {
+    dtbo_dir="/boot/dtb-${1}/rockchip/overlay"
+    [ -d "$dtbo_dir" ] || dtbo_dir=$(find /boot -maxdepth 3 -type d -path '*/rockchip/overlay' 2>/dev/null | head -1)
+    if [ -z "$dtbo_dir" ]; then
+        warn "no rockchip overlay directory under /boot; camera overlay not installed"
+        return 0
+    fi
+
+    cam="${DUCK_CAMERA_OVERLAY:-radxa-zero3-rpi-camera-v2}"
+    src="${dtbo_dir}/${cam}.dtbo"
+    dst="${dtbo_dir}/rk3568-${cam}.dtbo"
+
+    if [ ! -f "$src" ]; then
+        warn "no ${src}; the head camera will not be probed.
+  Armbian ships one overlay per module — list them with
+      ls ${dtbo_dir} | grep -i cam
+  and set DUCK_CAMERA_OVERLAY to the right one. Everything else here is still done."
+        return 0
+    fi
+
+    if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
+        say "camera: mirroring ${cam}.dtbo under the rk3568- prefix"
+        cp "$src" "$dst"
+        needs_reboot=1
+    fi
+    # Only after the mirror exists — a word in `overlays=` naming a dtbo that is not on disk is
+    # skipped at boot with nothing said about it.
+    ensure_overlay_word "$cam"
+}
+
 configure_bluetooth() {
     if [ -z "$WEIRD_BLE" ] && [ -z "$PAUSE_BTD" ]; then
         # Reported rather than silent, because a board that needs either workaround and was
@@ -1013,6 +1061,10 @@ main() {
     configure_bluetooth
     configure_audio
     configure_tof
+    # After configure_audio, which is what installs the vendor kernel: the camera's MIPI-CSI
+    # capture driver lives only on that branch, and its overlay directory is the one to mirror
+    # into. `vendor_ver` is what configure_audio resolved it to, or empty.
+    configure_camera "${vendor_ver:-}"
     install_onnxruntime
     report
 }
