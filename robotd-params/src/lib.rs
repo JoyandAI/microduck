@@ -550,10 +550,38 @@ impl Params {
             }
         };
 
-        let params: Params = toml::from_str(&text).map_err(|source| ParamsError::Parse {
-            path: path.display().to_string(),
-            source,
-        })?;
+        // Strict first. A file this build fully understands parses exactly as it always has —
+        // one pass, serde's own spans, no second guess — and that is the overwhelmingly common
+        // case. The lenient path below only ever runs on a file that has already failed.
+        let params = match toml::from_str::<Params>(&text) {
+            Ok(params) => params,
+            // Not an unknown-key problem: a syntax error, or a value of the wrong type. The
+            // strict error is what gets reported, because it is the one carrying a line and a
+            // column.
+            Err(source) => {
+                let Some((reparsed, ignored)) = without_unknown_keys(&text) else {
+                    return Err(ParamsError::Parse {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                };
+                tracing::warn!(
+                    path = %path.display(),
+                    ignored = %ignored.join(", "),
+                    "this build has no such keys; they are ignored and their values do nothing"
+                );
+                // Pruned, and what is left still does not parse — a real error sharing a file
+                // with an inert one. This reports the real one, which costs the position: serde
+                // is now looking at a table rather than at the text. The alternative was worse.
+                // Returning the strict error here would name the key this release just declared
+                // harmless as the reason the daemon will not start, and send whoever reads it to
+                // delete a section that was never the problem.
+                reparsed.map_err(|source| ParamsError::Parse {
+                    path: path.display().to_string(),
+                    source,
+                })?
+            }
+        };
         params.validate(path)?;
         Ok(params)
     }
@@ -573,6 +601,72 @@ impl Params {
     pub fn period(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(1.0 / self.control.hz as f64)
     }
+}
+
+/// Re-parse a file that `deny_unknown_fields` rejected, dropping the keys this build has no
+/// place for, and say which they were. `None` when nothing was dropped — the parse failed for
+/// some other reason and the caller should report that instead.
+///
+/// **Why unknown keys are no longer fatal.** They were, and the reasoning was sound as far as it
+/// went: a silently ignored `min_acheived_hz` leaves an operator believing they moved a threshold
+/// they did not. What that argument missed is the other way a key becomes unknown — the build
+/// changed underneath a file nobody typed into. A robot running a branch had `[chorale]` in its
+/// `robotd.toml`; updating it to a `main` without that feature produced a `robotd` that would not
+/// start, four consecutive rollbacks, and a bench session spent on a robot that was fine. The
+/// section was inert. Refusing to run over it is a far larger penalty than the mistake it guards
+/// against, and it lands on exactly the transitions — a downgrade, a branch, a release that
+/// dropped a feature — where the operator did nothing wrong at all.
+///
+/// So the value is kept and the enforcement moved: every dropped key is named at `warn`, and
+/// `robotctl configure` writes only keys the registry knows. What is gone is a robot that will
+/// not walk because of a line in a config file that does nothing.
+///
+/// **The registry is the authority on what a key is**, not serde. It has to be: serde's answer
+/// arrives as prose inside an error, and this needs the question asked per key. That is safe
+/// because it is not a second copy of the schema —
+/// [`registry::tests::the_registry_covers_every_key_exactly`] pins it to [`Params`] in both
+/// directions, so a key the registry does not know is a key `Params` does not have.
+///
+/// `deny_unknown_fields` stays on the structs. It is what makes that test possible, and it is
+/// the backstop here: if the registry ever did drift, the pruned table would still be rejected
+/// rather than quietly deserialised into something else.
+#[allow(clippy::type_complexity)]
+fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, Vec<String>)> {
+    let mut table: toml::Table = text.parse().ok()?;
+    let mut ignored: Vec<String> = Vec::new();
+
+    table.retain(|section, value| {
+        let Some(fields) = value.as_table_mut() else {
+            // A bare value at the top level — `hz = 50` written outside any section, which is
+            // the shape a hand-edit takes when someone forgets the header. No registry key can
+            // name it, and reporting it by its bare name is what tells them why.
+            ignored.push(section.to_string());
+            return false;
+        };
+        if !registry::has_section(section) {
+            // Reported as the section rather than as each of its keys: `[chorale]` is one
+            // decision someone made, not four mistakes.
+            ignored.push(format!("[{section}]"));
+            return false;
+        }
+        fields.retain(|key, _| {
+            if registry::entry_for(&format!("{section}.{key}")).is_some() {
+                true
+            } else {
+                ignored.push(format!("{section}.{key}"));
+                false
+            }
+        });
+        true
+    });
+
+    if ignored.is_empty() {
+        // Nothing here was an unknown key, so the strict parse failed for a reason this cannot
+        // help with. `None` says exactly that, and keeps the caller's two cases apart.
+        return None;
+    }
+    ignored.sort();
+    Some((toml::Value::Table(table).try_into::<Params>(), ignored))
 }
 
 #[cfg(test)]
@@ -801,27 +895,101 @@ mod tests {
         );
     }
 
-    /// A typo in a key must fail loudly. Silently ignoring `min_acheived_hz` would leave
-    /// the update gate at a threshold the operator believes they changed.
+    /// A typo in a key is named and ignored, and the setting it was aimed at keeps its default.
+    ///
+    /// It used to be fatal, on the argument that silently ignoring `min_acheived_hz` leaves the
+    /// operator believing they moved a threshold they did not. The value of that is real and is
+    /// why the key is named at `warn`; what it does not justify is a robot that will not start.
+    /// See [`without_unknown_keys`].
     #[test]
-    fn an_unknown_key_is_rejected() {
+    fn a_typo_is_ignored_and_leaves_the_real_key_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "[update_gate]\nmin_acheived_hz = 10.0\n");
+        let p = Params::load(&path, true).expect("a typo must not stop the robot starting");
+        assert_eq!(
+            p.update_gate.min_achieved_hz,
+            UpdateGate::default().min_achieved_hz,
+            "the misspelt key must not have moved the real one"
+        );
+
+        let (_, ignored) = without_unknown_keys("[update_gate]\nmin_acheived_hz = 10.0\n")
+            .expect("an unknown key is what this file has");
+        assert_eq!(ignored, ["update_gate.min_acheived_hz"]);
+    }
+
+    /// The renamed section, reported as the section rather than as each key under it.
+    ///
+    /// `install.sh` never overwrites `robotd.toml`, so a board carrying `[health]` keeps it
+    /// across every update. That used to mean a `robotd` that would not start; it now means a
+    /// line in the journal naming the section and a robot that walks.
+    #[test]
+    fn the_old_health_section_name_is_ignored_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[health]\nmin_achieved_hz = 40.0\n");
+        assert!(Params::load(&path, true).is_ok());
+
+        let (_, ignored) = without_unknown_keys("[health]\nmin_achieved_hz = 40.0\n").unwrap();
+        assert_eq!(ignored, ["[health]"], "one decision, not one line per key");
+    }
+
+    /// The incident this came from. A robot running the `duck-chorale` branch had `[chorale]`
+    /// in its `robotd.toml`; `main` has no such feature, so the update to it produced a `robotd`
+    /// that exited on every start, a health gate that timed out, and four rollbacks in a row —
+    /// over a section that does nothing.
+    #[test]
+    fn a_section_from_another_branch_does_not_stop_the_robot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[control]\nhz = 50\n\n[chorale]\naccept = true\n",
+        );
+        let p = Params::load(&path, true).expect("an inert section must not be fatal");
+        assert_eq!(p.control.hz, 50, "the rest of the file must still be read");
+    }
+
+    /// The other half, so leniency cannot become "accept anything". A value of the wrong type is
+    /// still an error, with its position, exactly as before.
+    #[test]
+    fn a_bad_value_is_still_rejected_with_its_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[control]\nhz = \"fast\"\n");
+        let err = Params::load(&path, true)
+            .expect_err("a string where a number belongs is not something to warn about")
+            .to_string();
+        assert!(err.contains("line"), "{err}");
+    }
+
+    /// A real error sharing a file with an inert one. The error must be about `hz`, and must not
+    /// be about `[chorale]` — naming the section this release just declared harmless as the
+    /// reason the daemon will not start is how someone spends an afternoon deleting the wrong
+    /// thing.
+    #[test]
+    fn a_bad_value_beside_an_unknown_section_names_the_bad_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[chorale]\naccept = true\n\n[control]\nhz = \"fast\"\n",
+        );
+        let err = Params::load(&path, true)
+            .expect_err("the file still does not parse")
+            .to_string();
+        assert!(err.contains("hz"), "{err}");
+        assert!(!err.contains("chorale"), "{err}");
+    }
+
+    /// And a file that is not TOML at all fails as it always did, rather than being pruned into
+    /// something that parses.
+    #[test]
+    fn a_syntax_error_is_still_a_syntax_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[control\nhz = 50\n");
         assert!(Params::load(&path, true).is_err());
     }
 
-    /// The old section name must be *rejected*, not silently ignored.
-    ///
-    /// A board still carrying `[health]` gets a `robotd` that refuses to start and says why,
-    /// which is the honest outcome: `deny_unknown_fields` means the operator hears about the
-    /// file rather than running on defaults they did not choose while believing otherwise.
-    /// `install.sh` never overwrites `robotd.toml`, so the fix is to edit the section name —
-    /// and the parse error names it.
+    /// A file this build understands completely takes the strict path and reports nothing.
     #[test]
-    fn the_old_health_section_name_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write(dir.path(), "[health]\nmin_achieved_hz = 40.0\n");
-        assert!(Params::load(&path, true).is_err());
+    fn a_clean_file_has_nothing_to_report() {
+        assert!(without_unknown_keys("[control]\nhz = 50\n").is_none());
     }
 
     /// Zero would divide by zero when computing the period; absurdly high would spin.

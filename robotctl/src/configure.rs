@@ -19,8 +19,14 @@
 //! The file is parsed with `toml_edit`, which preserves everything it does not touch —
 //! comments, ordering, keys from releases this build does not know. Edits set or remove
 //! exactly the keys changed. Before anything is written, the candidate is re-parsed through
-//! `Params::load` — the daemon's own gate, unknown-key rejection and range checks included —
-//! so this tool cannot write a file `robotd` would refuse to start on.
+//! `Params::load` — the daemon's own gate, range checks included — so this tool cannot write a
+//! file `robotd` would refuse to start on.
+//!
+//! That preservation and that gate used to contradict each other, and the contradiction was
+//! reachable: a board carrying a section from a branch kept it here by design, and then `load`
+//! rejected the whole file, so no edit could be saved at all until someone deleted a section that
+//! did nothing. `load` now names unknown keys and ignores them, which makes both halves true at
+//! once. Typos are still caught, one layer up: this only ever writes keys the registry knows.
 //!
 //! Writes are atomic (temp file + rename beside the target), because half a config at the
 //! moment of a power cut is a robot that will not start.

@@ -322,6 +322,17 @@ pub fn entry_for(key: &str) -> Option<&'static Entry> {
     REGISTRY.iter().find(|entry| entry.key == key)
 }
 
+/// Does this build have a `[section]` at all?
+///
+/// Separate from [`entry_for`] because an unknown *section* and an unknown *key inside a known
+/// section* deserve different reports: one is a feature this build does not have, the other is
+/// almost always a typo of a key next to it. `Params::load` says so in those terms.
+pub fn has_section(section: &str) -> bool {
+    REGISTRY
+        .iter()
+        .any(|entry| entry.key.split_once('.').is_some_and(|(s, _)| s == section))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
