@@ -187,11 +187,79 @@ The follow-on, in its own change rather than these four: `dev-push.sh`'s `resolv
 `btctl --name "$1" ip`, deleting the embedded Python and the wrong-PIN branch. Separate because it
 touches the push path, and because it should land after `ip` has been used by hand a few times.
 
+Both commands are written here under today's name; §3 is the argument that it should be
+`duckctl` by the time they land.
+
 `duck-btctl` is a stopgap for the phone app, so this stays at two commands and no new mechanism.
 The durable halves are the ones that outlive it: `btd` broadcasting the address, and `mediad`
 serving on a known port. The app will do the same two steps natively.
 
-## 3. The page becomes a console
+## 3. The tool is named after a transport it is about to stop being
+
+`open` launches a browser at an http URL, and the name of the tool that does it says `bt`. Worth
+pulling on, because it turns out to point at something larger than one command.
+
+**`open` itself is not misplaced.** Its substance *is* Bluetooth: it scans for an advertisement to
+learn where the robot is, and the `xdg-open` on the end is one line. `duck-btctl open` reads as
+"use the radio to find the robot, then show me its console", which is exactly what it does — the
+same way `wifi connect` is a wifi command whose whole mechanism is BLE.
+
+**The name is still wrong, for a reason that arrives with `mediad` rather than with `open`.** There
+is about to be a second transport to this robot, and the two reach *different* method sets by
+design: `robot.move` is refused over BLE and permitted over WebRTC; `net.connect` is the other way
+round. So a person will need both, and the thing they actually want is not a choice of binary —
+it is a tool that knows which transport can serve a call and says so when neither can:
+
+> `wifi connect` is Bluetooth-only, and this robot is not advertising.
+
+That tool cannot be called `btctl`. And a tool called `btctl` quietly teaches everyone that
+Bluetooth is the way to reach a robot, at exactly the moment it stops being the only one.
+
+### 3.1 It is a move, not a rename, and that fixes two existing warts
+
+A transport-agnostic client cannot stay `btd/examples/duck-btctl.rs`. It would need `btleplug`
+*and* a WebSocket client, and `btd` is the BLE daemon — an example of it is the wrong home for
+half of that. So the honest shape is its own workspace member, and two things that are awkward
+today stop being awkward on the way:
+
+- **The install line.** `cargo install --path btd --example duck-btctl` is odd enough that
+  `dev-push.sh` carries a fallback for clones that never ran it — it shells out to
+  `cargo run -q -p btd --example duck-btctl` instead. `cargo install --path duckctl` needs no
+  fallback.
+- **The example-that-is-really-a-product.** The reason it is an example is to keep `btleplug` off
+  the robot, since an example's dev-dependencies never reach the shipped artifact. Its own crate
+  keeps that for free, by not being a dependency of any daemon — the same guarantee, stated
+  directly rather than as a side effect of where the file sits.
+
+### 3.2 `duckctl`
+
+It pairs with `robotctl` the way the two are actually used: `robotctl` on the robot, `duckctl` at
+it. It keeps the `duck-` family the repo is already named for, and it is short enough to type
+without an alias.
+
+`duck` alone is better to type and is taken: Cyberduck ships a CLI by that name, which is
+plausible on a Mac. `microduck` is the repository and too long for a command someone runs twenty
+times an hour.
+
+### 3.3 What not to rewrite
+
+196 references across about twenty files, and most are prose. **`docs/project/` is not among them.**
+Those are dated records that describe a moment — an update session in August, four install-path
+bugs and what closed them — and rewriting a tool name into an account of something that happened
+before the tool had that name makes the record slightly false. They keep saying `duck-btctl`.
+`docs/robot/`, `docs/design/`, the scripts and the code are the rename.
+
+**No compatibility shim, no alias.** One user and one robot: a `duck-btctl` that still works is a
+second name to keep in step and a reason for the old one to survive in someone's shell history for
+a year.
+
+### 3.4 When
+
+Before the console work adds commands under the old name, and ideally before `ip` and `open` are
+documented — otherwise `docs/robot/duck-btctl.md` gets those two entries written twice. It blocks
+nothing and nothing blocks it, so it is cheapest first and merely tidy later.
+
+## 4. The page becomes a console
 
 The permitted subset is large and almost none of it is reachable from the page. Reorganised
 around what a person came to do:
@@ -223,7 +291,7 @@ nothing has exercised: that the deadman stops the robot when a session drops (§
 ordering over `control` is enough to keep `intents.rs` honest (§6 again). Both are cheap to
 believe and expensive to be wrong about.
 
-## 4. The robot names itself before the session starts
+## 5. The robot names itself before the session starts
 
 `webrtcsink` takes a `meta` structure and the signalling server hands it to every peer in `list`
 — the page already logs it and it is empty. Fill it from `configd`: name, serial, release,
@@ -233,7 +301,7 @@ Small, and it pays three times: the page can name the robot before starting a se
 that finds two producers can say which is which, and the rendezvous service in §7 needs exactly
 this field to route on. Cheapest item here.
 
-## 5. What it opens, but is not
+## 6. What it opens, but is not
 
 `remote-webrtc.md` §11 defers "a WebSocket surface for server-side programs — same JSON-RPC, no
 media stack, `get_frame` returning a JPEG", and calls it a few dozen lines once §5's routing
@@ -244,20 +312,21 @@ nothing reads it yet.
 Named so the shape is visible, not proposed here. It is a second transport and the first one
 should be good.
 
-## 6. Order
+## 7. Order
 
 Four changes, each of which stands alone and lands separately:
 
 1. **Serve the page, with the signalling URL filled in as it is served.** Deletes the python
    instruction and the warning block. Small, and everything else is nicer on top of it.
 2. **Producer `meta`.** Smaller still, and independent.
-3. **`duck-btctl ip` and `open`.** Client-side only, touches no daemon. `ip` first: it stands on
-   its own for ssh, and `open` is a port number on top of it.
+3. **The tool becomes `duckctl` (§3),** then gains **`ip` and `open`.** Client-side only, touches
+   no daemon. The move first so the two commands are documented once; `ip` before `open`, since
+   `ip` stands on its own for ssh and `open` is a port number on top of it.
 4. **The console.** The large one, done last, on a page that is already reachable.
 
 Then, separately, `dev-push.sh` switching to `duck-btctl ip` (§2.4).
 
-## 7. Not doing
+## 8. Not doing
 
 - **A gate on the console.** §4 of `remote-webrtc.md` owns that decision and nothing here changes
   its terms. A `--no-web` flag to turn the page off is worth having for the home case that section
