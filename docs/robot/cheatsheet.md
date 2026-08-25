@@ -46,7 +46,22 @@ Also on the frame: every joint measured against what it was commanded, the IMU's
 and the fall verdict drawn from it, and the achieved loop rate as a trace so a stutter that has
 already recovered is still visible. Projected gravity is the only IMU quantity on this stream —
 upright is about `[0, 0, -1]`, and it is what `fallen` is decided from. The stale-read counters and
-the rest of the sensing live in `robotctl health`.
+the ratios they mean anything against live in `robotctl health`.
+
+The last row of the header is the robot's condition rather than its behaviour: the pack's charge in
+volts and as a fraction, the hottest servo and the board's own temperature. It comes from
+`robot.health`, polled every two seconds, because none of it is on the state stream — and it is
+where anything wrong gets named, whether that is `unhealthy: control loop at 43.9 Hz`, `degraded:
+no robot on the motor bus after 3 attempts` or `orientation frozen — 25 stale reads`. That last one
+is on this row and nowhere else on the frame: a board that has stopped fusing keeps answering the
+bus, so nothing errors and the gravity vector above holds a plausible attitude indefinitely.
+
+0% is `BATTERY_EMPTY_V`, which is where `robotd` sits the robot down and cuts power, so the figure
+is a countdown rather than a gauge — yellow at 30%, red at 15%. A reading that has not been taken
+says `batt not read yet` instead of `0.00 V`, which is what the first second of an uptime and a bus
+that cannot answer both look like. The row is drawn even when there is no state at all, and that is
+the case it matters most in: a board whose servo power is off never completes a control tick, so
+nothing arrives on the stream and the reason is only on the health answer.
 
 The bottom border names the policy that is loaded — the `.onnx` files, and whether a standing
 network is configured at all — because `walk` is a mode two releases with different gaits both

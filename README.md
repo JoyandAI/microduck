@@ -160,9 +160,13 @@ named: `deadman — no intent arrived recently, velocity zeroed`.
 
 Also on the frame: every joint measured against what it was commanded, the IMU's projected
 gravity and the fall verdict drawn from it, and the achieved loop rate as a trace so a stutter
-that has already recovered is still visible. The bottom border names the policy that is loaded,
-because `walk` is a mode two releases with different gaits both report — and "which network is
-this?" is the first question when comparing them.
+that has already recovered is still visible. The last row of the header is the robot's condition —
+the pack's charge, the hottest servo, the board temperature, and whatever `robot.health` says is
+wrong. 0% is where `robotd` sits down and cuts power, so the charge is a countdown; the row is
+there even when no state is arriving at all, which is what a board with its servo power off looks
+like. The bottom border names the policy that is loaded, because `walk` is a mode two releases
+with different gaits both report — and "which network is this?" is the first question when
+comparing them.
 
 `p` opens the gamepad's raw input: every evdev report from the pad `padd` is driving from, the
 sticks and buttons as the kernel delivered them, and the gaps between reports as a trace. That last
