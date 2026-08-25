@@ -65,6 +65,21 @@ const PIECE_OUTER_WILDS: u8 = 3;
 /// Every piece a conductor may pick from.
 const PIECES: [u8; 3] = [PIECE_WISTFUL, PIECE_DUCK_STRUT, PIECE_OUTER_WILDS];
 
+/// Whether this build can sing a piece — what `robot.chorale` validates a `--piece` pin
+/// against at the door.
+pub fn known_piece(id: u8) -> bool {
+    piece(id).is_some()
+}
+
+/// The catalogue, for the refusal that names what *is* on this robot.
+pub fn piece_catalogue() -> String {
+    PIECES
+        .iter()
+        .filter_map(|id| piece(*id).map(|score| format!("{id} ({})", score.name)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The score for a piece id, or `None` for one this build does not know.
 fn piece(id: u8) -> Option<Score> {
     match id {
@@ -105,7 +120,7 @@ enum State {
         conductor: Conductor,
         /// The roster, in seating order, as `(register, id)`. The conductor's own copy is the
         /// authority — everyone else reads it off the beacon.
-        roster: Vec<(u8, u8)>,
+        roster: Vec<(u8, u16)>,
     },
     /// Singing to somebody else's beat.
     Following {
@@ -121,8 +136,8 @@ enum State {
         /// carries `(register, id)` precisely so identity never comes from the radio layer.
         ///
         /// `None` until the first singing beacon names one.
-        conductor: Option<u8>,
-        roster: Vec<(u8, u8)>,
+        conductor: Option<u16>,
+        roster: Vec<(u8, u16)>,
         /// The counter last taken, so a repeated beacon is not counted as another beat.
         last_beat: Option<u8>,
     },
@@ -146,9 +161,9 @@ pub struct Tick {
 }
 
 pub struct Chorale {
-    /// This duck's own beacon identity: its register, quantised, and a tie-break byte.
+    /// This duck's own beacon identity: its register, quantised, and a sixteen-bit tie-break.
     register: u8,
-    id: u8,
+    id: u16,
     /// The epoch every time in this module is measured from.
     ///
     /// `sounds::chorale::beat` works in plain seconds and `robotd` works in `Instant`s, so one of
@@ -161,10 +176,14 @@ pub struct Chorale {
     piece_id: u8,
     state: State,
     peers: Vec<Peer>,
-    /// A piece the operator has pinned (`DUCK_CHORALE_PIECE`), overriding the conductor's
-    /// coin. Only consulted when *this* duck conducts — a follower sings what the beacon
-    /// names, because an ensemble where everyone insists on their own song is not one.
+    /// A piece the operator has pinned — `robotctl chorale --piece`, or the
+    /// `DUCK_CHORALE_PIECE` environment as the standing fallback. Only consulted when *this*
+    /// duck conducts — a follower sings what the beacon names, because an ensemble where
+    /// everyone insists on their own song is not one.
     forced_piece: Option<u8>,
+    /// The environment's standing pin, kept so a plain activation after a `--piece` one falls
+    /// back to it rather than to the coin.
+    env_piece: Option<u8>,
     /// The beacon last handed to `btd`, so it is only resent when it changes.
     advertised: Option<proto::ChoraleBeacon>,
     listening: bool,
@@ -173,16 +192,22 @@ pub struct Chorale {
 impl Chorale {
     /// `seed` is the robot's voice seed — the identity everything else is derived from, and which
     /// deliberately does not go on the air.
-    pub fn new(pitch_center_hz: f64, seed: u32, forced_piece: Option<u8>) -> Self {
+    pub fn new(pitch_center_hz: f64, seed: u32, env_piece: Option<u8>) -> Self {
         Self {
             register: proto::ChoraleBeacon::quantise_register(pitch_center_hz),
-            // A byte of the seed, mixed. Enough to break a tie between two ducks that rolled the
-            // same register, and not enough to identify a robot.
-            id: (seed.wrapping_mul(2_654_435_761) >> 24) as u8,
+            // Sixteen bits of the seed, mixed — not the eight it used to be: this id is also
+            // the own-reflection filter and the peer-merge key, and a real four-duck room
+            // collided a byte-sized pair on day one (the fourth duck rolled the conductor's
+            // byte, was merged into it by everyone, and could never join). Still not enough
+            // to identify a robot, which is the point of it not being the seed.
+            id: (seed.wrapping_mul(2_654_435_761) >> 16) as u16,
             started: Instant::now(),
             score: Score::wistful(),
             piece_id: PIECE_WISTFUL,
-            forced_piece: forced_piece.filter(|id| {
+            // Filtered once, here — the raw value must not survive anywhere, or an unknown id
+            // would resurface through the fallback and reach the pick as a panic.
+            forced_piece: env_piece.filter(|id| piece(*id).is_some()),
+            env_piece: env_piece.filter(|id| {
                 let known = piece(*id).is_some();
                 if !known {
                     tracing::warn!(
@@ -203,8 +228,19 @@ impl Chorale {
         !matches!(self.state, State::Off)
     }
 
-    /// Start listening for other ducks, or stop and fall silent.
-    pub fn set_active(&mut self, active: bool, now: Instant) {
+    /// Start listening for other ducks, or stop and fall silent. `piece_pin` pins what this
+    /// duck picks if it ends up conducting; `None` falls back to the environment's pin, then
+    /// the coin. Validated at the door by `robot.chorale`, so an unknown id never gets here.
+    pub fn set_active(&mut self, active: bool, now: Instant, piece_pin: Option<u8>) {
+        if active {
+            self.forced_piece = piece_pin
+                .filter(|id| piece(*id).is_some())
+                .or(self.env_piece);
+        }
+        self.set_active_inner(active, now);
+    }
+
+    fn set_active_inner(&mut self, active: bool, now: Instant) {
         match (active, &self.state) {
             (true, State::Off) => {
                 tracing::warn!(register = self.register, id = self.id, "chorale: listening");
@@ -386,7 +422,7 @@ impl Chorale {
                 let alone = self.peers.is_empty();
                 let lowest = self.peers.iter().all(|peer| self.id < peer.beacon.id);
                 if !alone && lowest && now.saturating_duration_since(since) >= SETTLE {
-                    let mut roster: Vec<(u8, u8)> = vec![(self.register, self.id)];
+                    let mut roster: Vec<(u8, u16)> = vec![(self.register, self.id)];
                     roster.extend(self.peers.iter().map(|p| (p.beacon.register, p.beacon.id)));
                     roster.truncate(proto::ChoraleBeacon::MAX_ROSTER);
                     // The conductor picks the piece — forced by the operator if they said so,
@@ -423,7 +459,7 @@ impl Chorale {
     fn conduct(&mut self, now: Instant) -> Tick {
         // Everyone in range who is willing, in join order: the roster grows as ducks arrive and
         // never reorders, which is what keeps anyone already singing on their own part.
-        let heard: Vec<(u8, u8)> = self
+        let heard: Vec<(u8, u16)> = self
             .peers
             .iter()
             .map(|p| (p.beacon.register, p.beacon.id))
@@ -443,6 +479,17 @@ impl Chorale {
         let beat = conductor.wire_beat();
         let roster = roster.clone();
 
+        // The piece ends. It used to not — position counted on past the last note forever,
+        // ducks reporting "bar 48" of a piece eleven bars long, singing nothing, holding the
+        // advertising instance. A finished performance goes back to listening (with the settle
+        // timer, so it is a breath, not a gap), and the next one picks a piece afresh.
+        let total = self.score.duration_s() / self.score.beat_s();
+        if position > total + 2.0 {
+            tracing::warn!(piece = self.piece_id, "chorale: the performance ended");
+            self.state = State::Listening { since: now };
+            return self.tick(now);
+        }
+
         let beacon = self.beacon(self.piece_id, beat, roster.clone());
         let advertise = self.publish(Some(beacon), true);
         Tick {
@@ -456,7 +503,7 @@ impl Chorale {
     ///
     /// The roster keeps a departed duck's seat so nobody else is reseated; this is the count that
     /// says how many are actually singing.
-    fn voices(&self, roster: &[(u8, u8)]) -> usize {
+    fn voices(&self, roster: &[(u8, u16)]) -> usize {
         roster
             .iter()
             .filter(|(register, id)| {
@@ -476,6 +523,15 @@ impl Chorale {
         let roster = roster.clone();
         let seconds = now.saturating_duration_since(self.started).as_secs_f64();
         let position = follower.position_beats(seconds);
+        // The follower's own end-of-piece, a few beats later than the conductor's so it is the
+        // conductor's restart that leads when both are healthy — this path is for a follower
+        // whose conductor vanished mid-final-chord.
+        let total = self.score.duration_s() / self.score.beat_s();
+        if position.is_some_and(|beats| beats > total + 6.0) {
+            tracing::warn!(piece = self.piece_id, "chorale: the performance ended");
+            self.state = State::Listening { since: now };
+            return self.tick(now);
+        }
         // A follower advertises an idle beacon: it is willing and findable, but it is not the one
         // holding the beat, and two beacons carrying a piece would be two conductors.
         let idle = self.beacon(proto::ChoraleBeacon::IDLE, self.heartbeat(now), Vec::new());
@@ -491,7 +547,7 @@ impl Chorale {
     ///
     /// `None` when it is not in the roster yet — which is not an error but the ordinary state of a
     /// duck that has just arrived. It keeps listening, and the conductor seats it on the next beat.
-    fn my_part(&self, roster: &[(u8, u8)]) -> Option<Part> {
+    fn my_part(&self, roster: &[(u8, u16)]) -> Option<Part> {
         let seat = roster
             .iter()
             .position(|(register, id)| *register == self.register && *id == self.id)?;
@@ -505,7 +561,7 @@ impl Chorale {
         seat_all(&registers).get(seat).copied()
     }
 
-    fn beacon(&self, piece: u8, beat: u8, roster: Vec<(u8, u8)>) -> proto::ChoraleBeacon {
+    fn beacon(&self, piece: u8, beat: u8, roster: Vec<(u8, u16)>) -> proto::ChoraleBeacon {
         proto::ChoraleBeacon {
             piece,
             beat,
@@ -580,7 +636,7 @@ mod tests {
     fn one_duck_alone_does_not_sing() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         for step in 0..200 {
             let tick = c.tick(now + Duration::from_millis(50 * step));
             assert_eq!(tick.singing, None, "step {step}");
@@ -588,7 +644,7 @@ mod tests {
         // But it is on the air, saying it is willing, and listening for company.
         let advertise = {
             let mut c = chorale();
-            c.set_active(true, now);
+            c.set_active(true, now, None);
             c.tick(now).advertise.expect("something to advertise")
         };
         assert!(advertise.listening);
@@ -616,11 +672,11 @@ mod tests {
     }
 
     fn heard_from(
-        id: u8,
+        id: u16,
         register: u8,
         piece: u8,
         beat: u8,
-        roster: Vec<(u8, u8)>,
+        roster: Vec<(u8, u16)>,
     ) -> proto::ChoraleHeard {
         proto::ChoraleHeard {
             beacon: proto::ChoraleBeacon {
@@ -630,7 +686,7 @@ mod tests {
                 id,
                 roster,
             },
-            from: format!("AA:BB:CC:DD:EE:{id:02X}"),
+            from: format!("AA:BB:CC:DD:{id:04X}"),
             age_us: 2_000,
         }
     }
@@ -646,7 +702,7 @@ mod tests {
         let lower = mine.wrapping_sub(1);
 
         let mut leads = chorale();
-        leads.set_active(true, now);
+        leads.set_active(true, now, None);
         leads.heard(
             &heard_from(higher, 200, proto::ChoraleBeacon::IDLE, 0, vec![]),
             now,
@@ -662,7 +718,7 @@ mod tests {
         assert_eq!(tick.voices, 2);
 
         let mut defers = chorale();
-        defers.set_active(true, now);
+        defers.set_active(true, now, None);
         defers.heard(
             &heard_from(lower, 200, proto::ChoraleBeacon::IDLE, 0, vec![]),
             now,
@@ -685,7 +741,7 @@ mod tests {
     fn a_conductor_restarting_with_a_new_piece_takes_its_followers_with_it() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         let mine = (c.register, c.id);
         // A performance of piece 1, followed properly: beats 10..15 from rotating addresses.
         for beat in 10..15u8 {
@@ -723,7 +779,7 @@ mod tests {
     fn a_beat_counter_going_backwards_is_a_new_performance() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         let mine = (c.register, c.id);
         for beat in 40..45u8 {
             let at = now + Duration::from_secs(u64::from(beat - 40));
@@ -764,7 +820,7 @@ mod tests {
     fn a_forced_piece_wins_the_coin_toss() {
         let now = Instant::now();
         let mut c = Chorale::new(214.4, 7, Some(3));
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         c.heard(
             &heard_from(
                 c.id.wrapping_add(1),
@@ -785,7 +841,7 @@ mod tests {
 
         // An unknown forced id falls back to the coin rather than wedging the chorale.
         let mut c = Chorale::new(214.4, 7, Some(200));
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         c.heard(
             &heard_from(
                 c.id.wrapping_add(1),
@@ -802,6 +858,148 @@ mod tests {
             .and_then(|a| a.beacon)
             .expect("conducting");
         assert!(piece(beacon.piece).is_some(), "picked {}", beacon.piece);
+    }
+
+    /// A performance ends. It used to not: position counted past the last note forever, ducks
+    /// reporting bar 48 of an eleven-bar piece, singing nothing, holding the advertising
+    /// instance. The conductor goes back to listening after the piece plus a breath — and
+    /// because listening re-settles and re-picks, the ducks then sing something else.
+    #[test]
+    fn a_performance_ends_and_the_ducks_go_back_to_listening() {
+        let mut c = chorale();
+        let now = Instant::now();
+        c.set_active(true, now, None);
+        c.heard(
+            &heard_from(
+                c.id.wrapping_add(1),
+                250,
+                proto::ChoraleBeacon::IDLE,
+                0,
+                vec![],
+            ),
+            now,
+        );
+        let tick = c.tick(now + SETTLE);
+        assert!(
+            tick.advertise
+                .and_then(|a| a.beacon)
+                .is_some_and(|b| b.singing()),
+            "conducting"
+        );
+        let total_beats = c.score().duration_s() / c.score().beat_s();
+        let done = now + SETTLE + Duration::from_secs_f64((total_beats + 5.0) * c.score().beat_s());
+        let tick = c.tick(done);
+        assert_eq!(tick.singing, None, "the piece is over: {tick:?}");
+        let beacon = tick.advertise.and_then(|a| a.beacon);
+        assert!(
+            beacon.is_none_or(|b| !b.singing()),
+            "back to an idle beacon after the last note"
+        );
+
+        // A follower whose conductor vanished mid-final-chord ends its own performance too,
+        // a few beats later, instead of free-running forever.
+        let mut f = chorale();
+        f.set_active(true, now, None);
+        let mine = (f.register, f.id);
+        for beat in 0..6u8 {
+            let at = now + Duration::from_secs(u64::from(beat));
+            f.heard(
+                &heard_from(9, 120, PIECE_WISTFUL, beat, vec![(120, 9), mine]),
+                at,
+            );
+            f.tick(at);
+        }
+        assert!(f.tick(now + Duration::from_secs(6)).singing.is_some());
+        let total = f.score().duration_s() / f.score().beat_s();
+        let after = now + Duration::from_secs_f64((total + 10.0) * f.score().beat_s());
+        assert_eq!(f.tick(after).singing, None, "the follower let go too");
+    }
+
+    /// The collision that hid a real duck: with byte-sized ids, the fourth duck rolled the
+    /// conductor's byte, dropped every conductor beacon as its own reflection, and could never
+    /// join. Ids are sixteen bits now, and a same-register different-id peer is a peer.
+    #[test]
+    fn a_duck_sharing_a_register_is_still_a_different_duck() {
+        let mut c = chorale();
+        let now = Instant::now();
+        c.set_active(true, now, None);
+        let mine = (c.register, c.id);
+        // A conductor with this duck's register and an id differing only above the old byte.
+        let near_id = c.id ^ 0x0100;
+        assert_ne!(near_id, c.id);
+        for beat in 0..6u8 {
+            let at = now + Duration::from_secs(u64::from(beat));
+            c.heard(
+                &heard_from(
+                    near_id,
+                    c.register,
+                    PIECE_WISTFUL,
+                    beat,
+                    vec![(c.register, near_id), mine],
+                ),
+                at,
+            );
+            c.tick(at);
+        }
+        assert!(
+            c.tick(now + Duration::from_secs(6)).singing.is_some(),
+            "an id one bit apart in the high byte is somebody else"
+        );
+        // Its own true reflection is still dropped.
+        let before = c.tick(now + Duration::from_secs(6)).voices;
+        c.heard(
+            &heard_from(c.id, c.register, proto::ChoraleBeacon::IDLE, 0, vec![]),
+            now + Duration::from_secs(6),
+        );
+        assert_eq!(c.tick(now + Duration::from_secs(6)).voices, before);
+    }
+
+    /// The `--piece` pin arrives with the activation and wins the coin; a plain activation
+    /// afterwards goes back to the coin rather than staying pinned forever.
+    #[test]
+    fn a_piece_pinned_at_activation_wins_and_expires() {
+        let now = Instant::now();
+        let mut c = Chorale::new(214.4, 7, None);
+        c.set_active(true, now, Some(PIECE_DUCK_STRUT));
+        c.heard(
+            &heard_from(
+                c.id.wrapping_add(1),
+                250,
+                proto::ChoraleBeacon::IDLE,
+                0,
+                vec![],
+            ),
+            now,
+        );
+        let beacon = c
+            .tick(now + SETTLE)
+            .advertise
+            .and_then(|a| a.beacon)
+            .expect("conducting");
+        assert_eq!(beacon.piece, PIECE_DUCK_STRUT);
+
+        // Deactivate, reactivate plain: the pin is gone and the coin is back (whatever it
+        // lands on, it is a real piece). The tick between flushes the beacon-down to btd, so
+        // the next performance's beacon registers as a change.
+        c.set_active(false, now, None);
+        c.tick(now + Duration::from_secs(8));
+        c.set_active(true, now + Duration::from_secs(9), None);
+        c.heard(
+            &heard_from(
+                c.id.wrapping_add(1),
+                250,
+                proto::ChoraleBeacon::IDLE,
+                0,
+                vec![],
+            ),
+            now + Duration::from_secs(9),
+        );
+        let beacon = c
+            .tick(now + Duration::from_secs(9) + SETTLE)
+            .advertise
+            .and_then(|a| a.beacon)
+            .expect("conducting");
+        assert!(piece(beacon.piece).is_some());
     }
 
     /// The head expression is a function of the shared beat alone, so every duck computes the
@@ -835,7 +1033,7 @@ mod tests {
     fn a_joiner_sings_the_piece_the_beacon_names() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         let mine = (c.register, c.id);
         c.heard(&heard_from(9, 120, 2, 0, vec![(120, 9), mine]), now);
         let _ = c.tick(now);
@@ -850,7 +1048,7 @@ mod tests {
     fn an_unknown_piece_is_declined_not_guessed() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         c.heard(&heard_from(9, 120, 200, 4, vec![(120, 9)]), now);
         for step in 0..50 {
             let tick = c.tick(now + Duration::from_millis(100 * step));
@@ -868,7 +1066,7 @@ mod tests {
     fn the_conductor_picks_a_real_piece_and_broadcasts_it() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         c.heard(
             &heard_from(
                 c.id.wrapping_add(1),
@@ -901,9 +1099,9 @@ mod tests {
     fn the_conductor_is_followed_across_its_rotating_addresses() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         let mine = (c.register, c.id);
-        let roster = vec![(120u8, 9u8), mine];
+        let roster = vec![(120u8, 9u16), mine];
 
         // Six beats, each from a brand-new address, one per second — exactly what the radio
         // does — with the loop ticking in between, as it does on the robot. The beat counter
@@ -942,7 +1140,7 @@ mod tests {
     fn an_idle_beacon_has_a_heartbeat() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         let first = c
             .tick(now)
             .advertise
@@ -966,10 +1164,10 @@ mod tests {
     fn a_duck_arriving_late_joins_what_it_finds() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         // A conductor already singing, with this duck already seated in its roster.
         let mine = (c.register, c.id);
-        let roster = vec![(120u8, 9u8), mine];
+        let roster = vec![(120u8, 9u16), mine];
         c.heard(&heard_from(9, 120, PIECE_WISTFUL, 4, roster.clone()), now);
         let tick = c.tick(now);
         assert_eq!(tick.voices, 2, "{tick:?}");
@@ -987,7 +1185,7 @@ mod tests {
     fn the_roster_grows_and_never_reorders() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         let mine = c.id;
         // Two ducks with higher ids, so this one conducts.
         c.heard(
@@ -1036,7 +1234,7 @@ mod tests {
     fn a_duck_that_leaves_stops_being_counted() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         c.heard(
             &heard_from(
                 c.id.wrapping_add(1),
@@ -1070,7 +1268,7 @@ mod tests {
     fn the_beacon_is_only_published_when_it_changes() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         assert!(
             c.tick(now).advertise.is_some(),
             "the first one has to go out"
@@ -1102,7 +1300,7 @@ mod tests {
     fn a_duck_not_yet_seated_waits_rather_than_guessing() {
         let mut c = chorale();
         let now = Instant::now();
-        c.set_active(true, now);
+        c.set_active(true, now, None);
         // A piece under way whose roster does not mention this duck.
         c.heard(
             &heard_from(9, 120, PIECE_WISTFUL, 4, vec![(120, 9), (250, 11)]),

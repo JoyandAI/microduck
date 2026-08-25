@@ -148,6 +148,11 @@ enum Namespace {
         /// Stop and fall silent instead of starting.
         #[arg(long)]
         off: bool,
+        /// Pin which piece this robot picks if it ends up conducting. A follower sings what
+        /// the conductor's beacon names regardless, so to guarantee a song set it on every
+        /// duck. Unknown ids are refused with the robot's catalogue.
+        #[arg(long)]
+        piece: Option<u8>,
     },
 
     /// Play the duck: the head's depth sensor becomes a theremin, and a hand in front of the
@@ -538,13 +543,17 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
 /// A live view for the same reason the theremin's is: every question about this feature is about
 /// what it is doing *now* — has it found anyone, is it conducting or following, what part did it end
 /// up with. All of it is in `robot.state`'s chorale block.
-fn run_chorale(socket: &Path, off: bool) -> Result<(), Failure> {
+fn run_chorale(socket: &Path, off: bool, piece: Option<u8>) -> Result<(), Failure> {
     let mut client = Client::connect_to("robotd", socket)?;
     client.hello()?;
 
     let ask = |client: &mut Client, active: bool| -> Result<proto::ChoraleResult, Failure> {
-        let result =
-            result_of(client.call(&proto::Call::RobotChorale(proto::ChoraleParams { active }))?)?;
+        let result = result_of(
+            client.call(&proto::Call::RobotChorale(proto::ChoraleParams {
+                active,
+                piece: piece.filter(|_| active),
+            }))?,
+        )?;
         decode(&result)
     };
 
@@ -2746,8 +2755,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
         }
-        Namespace::Chorale { off } => {
-            return run_chorale(&cli.robot_socket, off);
+        Namespace::Chorale { off, piece } => {
+            return run_chorale(&cli.robot_socket, off, piece);
         }
         Namespace::Update { command } => command,
     };

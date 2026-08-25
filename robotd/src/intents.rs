@@ -135,6 +135,9 @@ pub struct Intents {
     theremin: AtomicU8,
     /// The same, for the chorale.
     chorale: AtomicU8,
+    /// The piece pinned by the pending chorale request, 0 for none. Written before the
+    /// request flag, read after — the flag's swap is the synchronisation point.
+    chorale_piece: AtomicU8,
     /// Beacons `btd` has heard, waiting for the loop.
     ///
     /// A queue behind a mutex rather than an `ArcSwap` slot, unlike every other intent here, and
@@ -206,6 +209,7 @@ impl Intents {
             power: AtomicU8::new(POWER_NONE),
             theremin: AtomicU8::new(THEREMIN_NONE),
             chorale: AtomicU8::new(THEREMIN_NONE),
+            chorale_piece: AtomicU8::new(0),
             chorale_heard: std::sync::Mutex::new(Vec::new()),
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
@@ -362,8 +366,13 @@ impl Intents {
     /// Called once per tick by the loop. A later request replaces an unread earlier one, which is
     /// the right resolution: if someone asked to stand up and then to relax within 20 ms, the
     /// second is what they meant.
-    /// Ask for the chorale to start listening (`true`) or stop (`false`).
-    pub fn request_chorale(&self, active: bool) {
+    /// Ask for the chorale to start listening (`true`) or stop (`false`), optionally pinning
+    /// which piece this duck picks when it conducts.
+    pub fn request_chorale(&self, active: bool, piece: Option<u8>) {
+        // The pin first, so the loop that consumes the request on its next tick sees it. Piece
+        // ids start at 1, so zero is "no pin".
+        self.chorale_piece
+            .store(piece.unwrap_or(0), Ordering::Relaxed);
         self.chorale.store(
             if active { THEREMIN_UP } else { THEREMIN_DOWN },
             Ordering::Relaxed,
@@ -371,10 +380,14 @@ impl Intents {
     }
 
     /// The pending chorale request, cleared by the read.
-    pub fn take_chorale_request(&self) -> Option<bool> {
+    pub fn take_chorale_request(&self) -> Option<(bool, Option<u8>)> {
+        let piece = match self.chorale_piece.load(Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        };
         match self.chorale.swap(THEREMIN_NONE, Ordering::Relaxed) {
-            THEREMIN_UP => Some(true),
-            THEREMIN_DOWN => Some(false),
+            THEREMIN_UP => Some((true, piece)),
+            THEREMIN_DOWN => Some((false, None)),
             _ => None,
         }
     }

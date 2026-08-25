@@ -1930,8 +1930,8 @@ async fn control_loop<T: RobotIo>(
         // mouth, like the theremin, because while a duck is singing its beak is doing that.
         let mut chorale_state = None;
         if let Some(ensemble) = chorale.as_mut() {
-            if let Some(active) = intents.take_chorale_request() {
-                ensemble.set_active(active, tick_start);
+            if let Some((active, piece_pin)) = intents.take_chorale_request() {
+                ensemble.set_active(active, tick_start, piece_pin);
             }
             for heard in intents.take_chorale_heard() {
                 ensemble.heard(&heard, tick_start);
@@ -2706,8 +2706,18 @@ fn dispatch(
                     accepted: false,
                     reason: Some("this robot has no voice to sing with".to_owned()),
                 }
+            } else if let Some(id) = p.piece.filter(|id| !chorale::known_piece(*id)) {
+                // Refused at the door with the catalogue, rather than accepted into the coin:
+                // a pin that silently did not pin is exactly the confusion it exists to end.
+                proto::ChoraleResult {
+                    accepted: false,
+                    reason: Some(format!(
+                        "piece {id} is not on this robot — it has {}",
+                        chorale::piece_catalogue()
+                    )),
+                }
             } else {
-                intents.request_chorale(p.active);
+                intents.request_chorale(p.active, p.piece);
                 proto::ChoraleResult {
                     accepted: true,
                     reason: None,

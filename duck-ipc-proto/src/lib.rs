@@ -2729,6 +2729,11 @@ pub struct TofFrame {
 pub struct ChoraleParams {
     /// True starts listening for other ducks, false stops and falls silent. Idempotent both ways.
     pub active: bool,
+    /// Pin which piece this robot picks when *it* conducts. `None` lets it choose. A follower
+    /// sings what the conductor's beacon names regardless — an ensemble where everyone insists
+    /// on their own song is not one — so to guarantee a piece, set it on every duck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub piece: Option<u8>,
 }
 
 /// Answer to [`Call::RobotChorale`].
@@ -2812,9 +2817,13 @@ pub struct ChoraleBeacon {
     pub beat: u8,
     /// The advertiser's own register — its pitch centre, quantised. All casting needs.
     pub register: u8,
-    /// Tie-break, so two ducks rolled to the same register still order deterministically. Derived
-    /// from the seed rather than being it: one byte of a hash identifies nothing.
-    pub id: u8,
+    /// Tie-break and identity, derived from the seed rather than being it. Sixteen bits, and
+    /// that width is load-bearing: this id is also how a duck recognises its *own* beacon
+    /// reflected back, and how every duck merges sightings of the same peer. With one byte, a
+    /// four-duck room collided a pair on the first day — the fourth duck rolled the
+    /// conductor's byte, everyone merged the two into one duck, and it dropped the conductor's
+    /// beacons as its own reflection and could never join.
+    pub id: u16,
     /// Who is singing, in seating order — `(register, id)` per duck. Empty from a duck that is only
     /// listening.
     ///
@@ -2826,7 +2835,7 @@ pub struct ChoraleBeacon {
     ///
     /// There is room: the controller reports a 251-byte advertising budget and a full quartet's
     /// roster is eight bytes.
-    pub roster: Vec<(u8, u8)>,
+    pub roster: Vec<(u8, u16)>,
 }
 
 impl ChoraleBeacon {
@@ -2877,20 +2886,16 @@ impl ChoraleBeacon {
     /// hardware, this and the roster guard in `robotd`'s chorale are the two places that cap it.
     pub const MAX_ROSTER: usize = 4;
 
-    /// The manufacturer-data payload: tag, the fixed fields, then the roster length and its pairs.
+    /// The manufacturer-data payload: tag, the fixed fields, then the roster length and its
+    /// entries. Ids are big-endian u16 — see [`ChoraleBeacon::id`] for why they grew.
     pub fn to_bytes(&self) -> Vec<u8> {
         let roster = &self.roster[..self.roster.len().min(Self::MAX_ROSTER)];
-        let mut bytes = vec![
-            Self::TAG,
-            self.piece,
-            self.beat,
-            self.register,
-            self.id,
-            roster.len() as u8,
-        ];
+        let mut bytes = vec![Self::TAG, self.piece, self.beat, self.register];
+        bytes.extend(self.id.to_be_bytes());
+        bytes.push(roster.len() as u8);
         for (register, id) in roster {
             bytes.push(*register);
-            bytes.push(*id);
+            bytes.extend(id.to_be_bytes());
         }
         bytes
     }
@@ -2903,29 +2908,39 @@ impl ChoraleBeacon {
     /// a *longer* payload is rejected rather than read leniently: a future beacon with more in it
     /// is not this one.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let [Self::TAG, piece, beat, register, id, count, rest @ ..] = bytes else {
+        let [
+            Self::TAG,
+            piece,
+            beat,
+            register,
+            id_hi,
+            id_lo,
+            count,
+            rest @ ..,
+        ] = bytes
+        else {
             return None;
         };
         let count = usize::from(*count);
-        if count > Self::MAX_ROSTER || rest.len() != count * 2 {
+        if count > Self::MAX_ROSTER || rest.len() != count * 3 {
             return None;
         }
         Some(Self {
             piece: *piece,
             beat: *beat,
             register: *register,
-            id: *id,
+            id: u16::from_be_bytes([*id_hi, *id_lo]),
             roster: rest
-                .as_chunks::<2>()
+                .as_chunks::<3>()
                 .0
                 .iter()
-                .map(|pair| (pair[0], pair[1]))
+                .map(|entry| (entry[0], u16::from_be_bytes([entry[1], entry[2]])))
                 .collect(),
         })
     }
 
     /// This duck's index in the roster, if it is in there — which is how it learns its part.
-    pub fn seat_of(&self, register: u8, id: u8) -> Option<usize> {
+    pub fn seat_of(&self, register: u8, id: u16) -> Option<usize> {
         self.roster
             .iter()
             .position(|(r, i)| *r == register && *i == id)
@@ -3815,7 +3830,8 @@ mod tests {
         long.push(0);
         assert_eq!(ChoraleBeacon::from_bytes(&long), None);
         let mut lying = bytes.clone();
-        lying[5] = 4;
+        // The count byte sits after tag, piece, beat, register and the two id bytes.
+        lying[6] = 4;
         assert_eq!(ChoraleBeacon::from_bytes(&lying), None);
         // More ducks than there are parts is not a chorale.
         let crowd = ChoraleBeacon {
