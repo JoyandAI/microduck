@@ -69,7 +69,7 @@ ENV_FORCE="${DUCK_FORCE_REINSTALL:-}"
 ENV_WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
 ENV_GSTREAMER="${DUCK_GSTREAMER:-}"
 
-REPO="${ENV_REPO:-pollen-robotics/microduck_daemon}"
+REPO="${ENV_REPO:-pollen-robotics/microduck}"
 REF="${ENV_REF:-main}"
 RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
 

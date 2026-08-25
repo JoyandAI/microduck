@@ -668,7 +668,7 @@ if [ -n "$USE_LOCAL" ]; then
     say "sending this clone's provision.sh"
     scp -q "$_local" "$(scp_target /tmp/provision.sh)" || die "could not copy provision.sh"
 else
-    _raw="https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/${REF:-main}/scripts/provision.sh"
+    _raw="https://raw.githubusercontent.com/pollen-robotics/microduck/${REF:-main}/scripts/provision.sh"
     say "having the board fetch provision.sh from ${REF:-main}"
     # Fetched by the board rather than by this machine and copied over: the board is the one
     # that has to be able to reach GitHub with that token, and finding out here would prove

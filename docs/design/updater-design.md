@@ -473,7 +473,7 @@ done only when genuinely needed, never unconditionally on every update.
 
 ### 6.1 ⚠ A private repository cannot serve the fleet
 
-**Unresolved, and it constrains M4.** `pollen-robotics/microduck_daemon` is private, and a
+**Unresolved, and it constrains M4.** `pollen-robotics/microduck` is private, and a
 private repo's `releases/download/<tag>/<asset>` URL returns **404 — with or without a
 token**. Verified directly:
 
