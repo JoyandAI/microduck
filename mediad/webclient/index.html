@@ -5,8 +5,12 @@
   A test client for mediad. One file, no build step, no dependencies: open it from disk and point
   it at a robot.
 
-      open mediad/webclient/index.html          # macOS
-      xdg-open mediad/webclient/index.html      # Linux
+      cd mediad/webclient && python3 -m http.server 8080     # then http://localhost:8080/
+
+  **Serve it; do not open it from disk.** A file:// page has an opaque origin, and Chrome's
+  Private Network Access blocks requests from one to a private address like 192.168.x — which is
+  every robot. It fails as a websocket error with nothing useful in it. Firefox is more forgiving,
+  but serving costs one command and works everywhere.
 
   It speaks gst-plugins-rs's signalling protocol directly rather than using its gstwebrtc-api
   JS library, for one reason: a test client that needs npm is a test client nobody runs. The

@@ -8,6 +8,32 @@ backend at all. Reaching a robot from outside the LAN is the same design with a 
 it (§7) — deliberately not the first thing built, because the local case is the one every other
 case is defined in terms of.
 
+## 0. Status: working on hardware
+
+A Radxa Zero 3W streams `videotestsrc` through the hardware encoder to a browser on the LAN, and
+the browser gets a `control` datachannel alongside it. Proven end to end on 2026-08-25:
+
+| | |
+|---|---|
+| signalling | `mediad` runs the server in-process; producer registers, consumer lists and starts a session |
+| video | `mpph264enc` → `webrtcsink` → browser, negotiated as `profile-level-id=42e01f` — constrained baseline, which is §2's whole point |
+| bundling | `a=group:BUNDLE video0 application1`, `a=sctp-port:5000` — one transport for media and data |
+| datachannel | `control` arrives at the peer |
+
+Two things that had never run and both bit on the first attempt, recorded because they are the
+shape of bug this design invites rather than one-offs:
+
+- **`tokio::spawn` from a GStreamer signal thread aborts the process.** That thread is not in the
+  runtime, and a panic crossing a C closure does not unwind. The journal said `thread caused
+  non-unwinding panic` with a backtrace through `g_closure_invoke` and nothing about the cause.
+  Nothing in those handlers may panic — see `mediad::pipeline`'s header.
+- **The client could not reach the signalling port from a `file://` page.** An opaque origin to a
+  private IP is what Chrome's Private Network Access blocks; serving the page over
+  `http://localhost` fixes it.
+
+What is still untested: the control channel carrying an actual call, the camera as a source, and
+anything at all through a bridge.
+
 ## 1. What this is not
 
 `webrtcbin` is not used. `mediad` uses **`webrtcsink`** from `gst-plugins-rs`, and the difference
