@@ -574,24 +574,41 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
         .static_pad("src")
         .context("v4l2src has no src pad, which cannot happen")?;
 
-    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
+    // Logged once, at INFO, because three versions of this probe changed nothing measurable and
+    // "the probe never fired" and "GStreamer ignored what it added" want completely different
+    // fixes. Whichever it is, the next run says so instead of being inferred from a frame rate.
+    let reported = std::sync::atomic::AtomicBool::new(false);
+
+    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, move |_, info| {
         if let Some(gst::PadProbeData::Query(query)) = info.data.as_mut()
             && let gst::QueryViewMut::Allocation(allocation) = query.view_mut()
         {
-            if allocation
+            let pools_before = allocation.allocation_pools().len();
+            let had_meta = allocation
                 .find_allocation_meta::<gst_video::VideoMeta>()
-                .is_none()
-            {
+                .is_some();
+
+            if !had_meta {
                 allocation.add_allocation_meta::<gst_video::VideoMeta>(None);
             }
             // Size 0 because `decide_allocation` overwrites it with the driver's own frame size
             // for every io-mode we can end up in; max 0 means unlimited.
-            if allocation.allocation_pools().len() == 0 {
+            if pools_before == 0 {
                 allocation.add_allocation_pool(
                     None::<&gst::BufferPool>,
                     0,
                     CAPTURE_BUFFERS,
                     0,
+                );
+            }
+
+            if !reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    pools_before,
+                    had_meta,
+                    pools_after = allocation.allocation_pools().len(),
+                    asked_for = CAPTURE_BUFFERS,
+                    "allocation query seen; capture buffers requested"
                 );
             }
         }
