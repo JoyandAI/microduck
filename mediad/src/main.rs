@@ -47,6 +47,20 @@ struct Args {
     /// Stream the head camera instead of a test pattern. Not implemented yet.
     #[arg(long)]
     camera: bool,
+
+    /// Frame size and rate, pinned rather than negotiated.
+    ///
+    /// Both branches of the tee depend on the answer — the encoder and whatever reads raw NV12 —
+    /// so a consumer that had to guess would get it wrong the first time the source changed.
+    /// 1280x720 at 30 is what the hardware encoder was measured at.
+    #[arg(long, default_value_t = 1280)]
+    width: u32,
+
+    #[arg(long, default_value_t = 720)]
+    height: u32,
+
+    #[arg(long, default_value_t = 30)]
+    fps: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -79,17 +93,28 @@ fn main() -> ExitCode {
             mediad::pipeline::Source::Test
         };
 
-        let (_pipeline, mut channels) =
-            match mediad::pipeline::start(source, &args.host, args.port, args.bitrate) {
-                Ok(started) => started,
-                Err(e) => {
-                    // The message names which step failed and what usually causes it — a missing
-                    // plugin, a missing library, or a device node nobody can open. Those look
-                    // identical from a log line that only says "failed".
-                    tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
-                    return ExitCode::FAILURE;
-                }
-            };
+        // `_frames` is the raw NV12 tap off the tee. Nothing reads it yet — perception and the
+        // `get_frame` surface in `architecture.md` §5.3 are what it is for — but the branch runs
+        // from the start rather than being added later, because a tee inserted into a live
+        // pipeline is a different and much harder problem than a tee that was always there.
+        let (_pipeline, mut channels, _frames) = match mediad::pipeline::start(
+            source,
+            &args.host,
+            args.port,
+            args.bitrate,
+            args.width,
+            args.height,
+            args.fps,
+        ) {
+            Ok(started) => started,
+            Err(e) => {
+                // The message names which step failed and what usually causes it — a missing
+                // plugin, a missing library, or a device node nobody can open. Those look
+                // identical from a log line that only says "failed".
+                tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
+                return ExitCode::FAILURE;
+            }
+        };
 
         // One session per peer, each with its own connections to the services it talks to. Per
         // peer rather than shared, so one peer's minutes-long update cannot silence another's

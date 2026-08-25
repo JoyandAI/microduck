@@ -36,6 +36,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # plugin requires rather than at what the board happens to have means a build failure here would
 # name a real incompatibility rather than an accident of one robot's package versions.
 gstreamer = { version = "0.24", features = ["v1_22"] }
+# `appsink`, for the raw NV12 branch off the tee — perception and `get_frame` both want pixels,
+# and taking them off the encoded branch would mean decoding what was just encoded.
+gstreamer-app = { version = "0.24", features = ["v1_22"] }
 gstreamer-webrtc = { version = "0.24", features = ["v1_22"] }
 glib = "0.21"
 

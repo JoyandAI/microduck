@@ -7,12 +7,28 @@
 //! ## Shape
 //!
 //! ```text
-//! videotestsrc | camera  →  mpph264enc  →  h264parse  →  webrtcsink
-//!                                                            │
-//!                                          run-signalling-server=true
-//!                                                            │
-//!                                          consumer-added → "control" datachannel
+//!                                    ┌─ queue ─ mpph264enc ─ h264parse ─ webrtcsink
+//! videotestsrc | camera ─ NV12 ─ tee ┤                                        │
+//!                                    └─ queue ─ appsink        run-signalling-server=true
+//!                                       (leaky)                               │
+//!                                          │              consumer-added → "control" channel
+//!                                     latest frame
 //! ```
+//!
+//! **The tee is on raw NV12, before the encoder**, and that placement is the point of it.
+//! `architecture.md` §5.3 wants a frame on demand for a server-side program — "it wants a frame
+//! every second or two plus a state blob", not a 30 fps H.264 track to decode — and §2 wants
+//! perception next to the sensor, deriving features rather than shipping pixels to `robotd`. Both
+//! need pixels, and taking them off the encoded branch would mean decoding what we just encoded.
+//!
+//! NV12 because that is what the rkisp capture path emits and what `mpph264enc` takes, so nothing
+//! converts anywhere: no `videoconvert`, and no RGA pass, between capture and either consumer.
+//!
+//! **Each branch has its own `queue`, and the raw one is leaky.** A `tee` without queues runs its
+//! branches on one thread, so a slow consumer stalls the others — here that would mean a
+//! perception consumer pausing the video track. The raw branch drops old frames rather than
+//! applying backpressure, which is the semantics `architecture.md` §2 asks for: the *latest*
+//! snapshot, non-blocking, last-value-wins. A stalled reader costs frames, never the encoder.
 //!
 //! **`webrtcsink` runs the signalling server in this process** (`run-signalling-server`, with
 //! `signalling-server-host` and `-port`), so the separate `gst-webrtc-signalling-server` binary
@@ -41,11 +57,12 @@
 //! that can fail says which one it was, and the daemon refuses to start rather than running half a
 //! pipeline.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
 
@@ -61,6 +78,31 @@ pub enum Source {
     /// robot streaming a test pattern when someone asked for its camera is worse than one that
     /// says it cannot.
     Camera,
+}
+
+/// One raw frame off the tee, as the last one seen.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    /// NV12, tightly packed as the caps describe it.
+    pub data: Vec<u8>,
+}
+
+/// The most recent raw frame, or none yet.
+///
+/// Last-value-wins by construction: the appsink callback replaces whatever was here. A reader that
+/// is slow sees a newer frame next time rather than a queue of stale ones, which is what a
+/// perception consumer and a `get_frame` both want — and neither can slow the encoder down by
+/// being slow itself.
+#[derive(Clone, Default)]
+pub struct Frames(Arc<Mutex<Option<Frame>>>);
+
+impl Frames {
+    /// The latest frame, cloned. `None` until the first one arrives.
+    pub fn latest(&self) -> Option<Frame> {
+        self.0.lock().expect("frame lock").clone()
+    }
 }
 
 /// What a peer's control channel needs to talk to [`crate::session::run`].
@@ -80,7 +122,10 @@ pub fn start(
     host: &str,
     port: u32,
     bitrate: u32,
-) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>)> {
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
     gst::init().context("gstreamer would not initialise")?;
 
     let pipeline = gst::Pipeline::new();
@@ -96,6 +141,29 @@ pub fn start(
     };
     // `is-live` so the pipeline behaves like a camera does rather than racing ahead of the clock.
     src.set_property("is-live", true);
+
+    // Pinned rather than negotiated, because both branches of the tee depend on the answer. NV12
+    // is what the rkisp capture path emits and what `mpph264enc` takes, so this costs no
+    // conversion — and a raw consumer that has to guess the format is a consumer that gets it
+    // wrong the first time the source changes.
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", "NV12")
+        .field("width", width as i32)
+        .field("height", height as i32)
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", &caps)
+        .build()
+        .map_err(|_| anyhow!("no capsfilter element; gstreamer core is incomplete"))?;
+
+    let tee = make("tee")?;
+
+    // ── the encoded branch ──────────────────────────────────────────────────
+    //
+    // Its own queue, so this branch runs on its own thread. Without one, `tee` pushes to both
+    // branches from a single thread and whichever is slower holds up the other.
+    let enc_queue = make("queue")?;
 
     // The one element that is not in Debian. If it is missing the message has to say why, because
     // "no element mpph264enc" has three separate causes and only one of them is a missing package:
@@ -134,21 +202,117 @@ pub fn start(
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
     wire_consumers(&sink, channels_tx)?;
 
+    // ── the raw branch ──────────────────────────────────────────────────────
+    //
+    // Leaky downstream and one buffer deep: when the reader is behind, the *oldest* frame is
+    // dropped and the newest kept. That is last-value-wins, and it is what keeps a slow perception
+    // consumer from ever becoming the video track's problem.
+    let raw_queue = gst::ElementFactory::make("queue")
+        .property("max-size-buffers", 1u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .property_from_str("leaky", "downstream")
+        .build()
+        .map_err(|_| anyhow!("no queue element; gstreamer core is incomplete"))?;
+
+    let frames = Frames::default();
+    let appsink = gst_app::AppSink::builder()
+        .caps(&caps)
+        // `sync=false` so this branch never waits on the clock: a snapshot wants the newest frame
+        // as soon as it exists, and pacing it would only add latency to a consumer that is not
+        // rendering anything.
+        .sync(false)
+        .max_buffers(1)
+        .drop(true)
+        .build();
+    wire_frames(&appsink, frames.clone(), width, height);
+
     pipeline
-        .add_many([&src, &enc, &parse, &sink])
+        .add_many([
+            &src,
+            &capsfilter,
+            &tee,
+            &enc_queue,
+            &enc,
+            &parse,
+            &sink,
+            &raw_queue,
+            appsink.upcast_ref(),
+        ])
         .context("could not add elements to the pipeline")?;
-    gst::Element::link_many([&src, &enc, &parse, &sink]).context(
-        "could not link src → mpph264enc → h264parse → webrtcsink. A caps failure here is \
-         usually the encoder's sink pad: it takes NV12 and friends, not whatever the source \
-         negotiated.",
+
+    gst::Element::link_many([&src, &capsfilter, &tee]).context(
+        "could not link the source to the tee. A caps failure here means the source cannot \
+         produce NV12 at the requested size and rate.",
     )?;
+    gst::Element::link_many([&enc_queue, &enc, &parse, &sink]).context(
+        "could not link queue → mpph264enc → h264parse → webrtcsink. A caps failure here is \
+         usually the encoder's sink pad, which takes NV12 and friends.",
+    )?;
+    gst::Element::link_many([&raw_queue, appsink.upcast_ref()])
+        .context("could not link the raw branch to its appsink")?;
+
+    // `tee`'s source pads are request pads: they do not exist until asked for, which is why these
+    // two links are separate from the `link_many` chains above.
+    link_tee_branch(&tee, &enc_queue).context("could not attach the encoded branch to the tee")?;
+    link_tee_branch(&tee, &raw_queue).context("could not attach the raw branch to the tee")?;
 
     pipeline
         .set_state(gst::State::Playing)
         .context("the pipeline would not start")?;
 
-    tracing::info!(host, port, ?source, "signalling server listening");
-    Ok((pipeline, channels_rx))
+    tracing::info!(
+        host,
+        port,
+        ?source,
+        width,
+        height,
+        fps,
+        "signalling server listening"
+    );
+    Ok((pipeline, channels_rx, frames))
+}
+
+/// Request a source pad from the tee and link it to a branch's sink pad.
+fn link_tee_branch(tee: &gst::Element, branch: &gst::Element) -> Result<()> {
+    let src_pad = tee
+        .request_pad_simple("src_%u")
+        .ok_or_else(|| anyhow!("the tee would not give a source pad"))?;
+    let sink_pad = branch
+        .static_pad("sink")
+        .ok_or_else(|| anyhow!("the branch has no sink pad"))?;
+    src_pad
+        .link(&sink_pad)
+        .map_err(|e| anyhow!("linking a tee branch failed: {e:?}"))?;
+    Ok(())
+}
+
+/// Keep [`Frames`] pointing at the most recent buffer off the raw branch.
+fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u32) {
+    appsink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let Some(buffer) = sample.buffer() else {
+                    return Ok(gst::FlowSuccess::Ok);
+                };
+                let Ok(map) = buffer.map_readable() else {
+                    // A buffer that will not map is not worth failing the pipeline over — the next
+                    // one is a frame away, and this branch is advisory by design.
+                    tracing::debug!("a raw frame would not map");
+                    return Ok(gst::FlowSuccess::Ok);
+                };
+                let frame = Frame {
+                    width,
+                    height,
+                    data: map.as_slice().to_vec(),
+                };
+                // Replaced, not queued: last-value-wins is the contract.
+                *frames.0.lock().expect("frame lock") = Some(frame);
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
 }
 
 fn make(name: &str) -> Result<gst::Element> {

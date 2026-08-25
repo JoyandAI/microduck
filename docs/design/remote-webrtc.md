@@ -37,10 +37,31 @@ takes the newest.
 **The first version opens `control` only.** Teleop is not the near-term priority, and leaving it
 out is not merely deferral — §6 is about what it removes.
 
-**`webrtcsink` takes pre-encoded H.264 on its sink pad**, so the pipeline is
-`appsrc ! mpph264enc ! h264parse ! webrtcsink` and the encoder never reaches negotiation. Verified
-on hardware; the four encoder properties that are decisions rather than defaults are in
-[`media-bringup.md`](../project/media-bringup.md).
+**`webrtcsink` takes pre-encoded H.264 on its sink pad**, so the encoder never reaches
+negotiation. Verified on hardware; the four encoder properties that are decisions rather than
+defaults are in [`media-bringup.md`](../project/media-bringup.md).
+
+**The pipeline tees raw NV12 before the encoder**, and that placement is deliberate:
+
+```text
+                              ┌─ queue ─ mpph264enc ─ h264parse ─ webrtcsink
+capture ─ NV12 ─ capsfilter ─ tee
+                              └─ queue(leaky, 1) ─ appsink ─ latest frame
+```
+
+§5.3 wants a frame on demand for a server-side program — "it wants a frame every second or two plus
+a state blob", not a 30 fps H.264 track to decode — and `architecture.md` §2 wants perception next
+to the sensor, deriving features rather than shipping pixels to `robotd`. Both need *pixels*, and
+taking them off the encoded branch would mean decoding what was just encoded.
+
+NV12 throughout, because that is what the rkisp path emits and what `mpph264enc` accepts, so
+nothing converts anywhere. Each branch has its own `queue` — a `tee` without them runs both from
+one thread, so a slow reader would stall the video track — and the raw one is leaky and one buffer
+deep, which is the last-value-wins, non-blocking snapshot `architecture.md` §2 asks for. A stalled
+reader costs frames, never the encoder.
+
+The branch exists from the start rather than being added when something reads it: inserting a tee
+into a live pipeline is a materially harder problem than having one that was always there.
 
 ## 3. `mediad` runs the signalling server itself
 
