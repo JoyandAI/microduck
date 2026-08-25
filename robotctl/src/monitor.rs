@@ -56,10 +56,10 @@ const TRACE_SAMPLES: usize = 600;
 const IDLE_REDRAW: Duration = Duration::from_millis(250);
 
 /// Rows the robot block occupies: two borders, a four-row half for the command and the IMU
-/// side by side, then the limits, the head and the odometry. Fixed, because a header that
-/// grows when a limit appears would shift every joint row down at the moment the reader is
-/// staring at one.
-const HEADER_HEIGHT: u16 = 9;
+/// side by side, then the limits, the head, the odometry and the power row. Fixed, because a
+/// header that grows when a limit appears would shift every joint row down at the moment the
+/// reader is staring at one.
+const HEADER_HEIGHT: u16 = 10;
 
 /// Request id for the subscribe call, so its answer can be told apart from the stream that
 /// follows it on the same connection.
@@ -111,6 +111,33 @@ const GAP_SAMPLES: usize = 600;
 /// five seconds between attempts, so this will usually catch it on the second or third try — and
 /// short enough that a pad tap started after the monitor turns up while somebody is still watching.
 const PAD_RETRY: Duration = Duration::from_secs(2);
+
+/// How often `robotd` is asked how it is, and how long before a failed poll is retried.
+///
+/// A poll rather than a subscription because that is the shape `robot.health` has, and cheap
+/// enough to be one: the far side is a handful of atomic loads. Two seconds is chosen for the
+/// slowest thing on the answer — the battery, which `robotd` reports as a ~10 s EMA — so a
+/// faster poll would redraw the same number.
+const HEALTH_POLL: Duration = Duration::from_secs(2);
+
+/// How long a health answer may be the newest one before the row says how old it is.
+///
+/// Three polls. `robotd` closing the socket is reported by the poller itself; this catches the
+/// other shape — a daemon that accepts, answers once and then goes quiet — where the pack's
+/// charge would otherwise sit on screen looking current forever.
+const HEALTH_STALE: Duration = Duration::from_secs(6);
+
+/// Battery percentages the reading is coloured at.
+///
+/// Not display taste: 0% is `duck_control::model::BATTERY_EMPTY_V`, which is the voltage at
+/// which `robotd` sits the robot down and cuts power. The percentage is a countdown to that, so
+/// the last fifth of it is worth seeing from across a room.
+const BATTERY_LOW_PCT: f64 = 30.0;
+const BATTERY_CRITICAL_PCT: f64 = 15.0;
+
+/// Request id for the health poll. Its own connection, but matched rather than assumed: a
+/// `robotd` newer than this build may say things on it this one has no use for.
+const HEALTH_ID: u64 = 2;
 
 /// Columns the tables keep for themselves before the 3D robot view gets any: the joints
 /// table with its bar, plus borders and slack. The view only ever eats width the tables
@@ -229,6 +256,12 @@ enum Update {
     /// [`Self::PadLost`] is not: it is a third daemon on a third socket, and most
     /// ducks have no ToF fitted at all.
     TofLost(String),
+    /// One answer to `robot.health` — the battery, the temperatures, the bus counters and the
+    /// IMU's staleness, none of which is on the state stream.
+    Health(Box<proto::HealthResult>),
+    /// The health poll is not answering. Not fatal either: it is a connection of its own, and
+    /// the state stream ending is what [`Self::Ended`] is for.
+    HealthLost(String),
 }
 
 /// Subscribe to `robot.state` and render it until interrupted.
@@ -280,6 +313,7 @@ pub fn run(
     let (tx, rx) = mpsc::channel();
     let pad_tx = tx.clone();
     let tx_for_tof = tx.clone();
+    let health_tx = tx.clone();
     let pad_socket = pad_socket.to_path_buf();
 
     // Held for as long as the view lives, not dropped: it is the write half of the subscription,
@@ -302,6 +336,17 @@ pub fn run(
     let tof_tx = tx_for_tof;
     let tof_socket = tof_socket.to_path_buf();
     thread::spawn(move || read_tof(&tof_socket, &tof_tx));
+
+    // A fourth connection — to the daemon the first one is already streaming from. The battery,
+    // the temperatures and the bus counters answer `robot.health`, which is a *call*, and the
+    // stream's reader thread owns every line that arrives on its socket. So: its own connection,
+    // its own thread, polled.
+    //
+    // It runs even when there is no robot to stream from, which is the case it matters most in:
+    // a board whose servo power is off never completes a control tick, so no state ever arrives,
+    // and the reason why is on this answer and nowhere else.
+    let health_socket = robot_socket.to_path_buf();
+    thread::spawn(move || poll_health(&health_socket, &health_tx));
 
     let mut terminal = ratatui::init();
     let outcome = live(&mut terminal, &rx, hz, no_robot);
@@ -537,6 +582,85 @@ fn subscribe_to_tof(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), Stri
             }
         });
     }
+}
+
+/// Ask `robotd` how it is, for as long as the view lives.
+///
+/// Every way this ends is a sentence for the power row rather than an error for the process,
+/// exactly as [`read_pad`] treats the tap: this is a second connection to a daemon whose state
+/// stream is being rendered on the first, and a battery reading that stopped arriving is not a
+/// reason to tear down a monitor that is still showing the loop.
+///
+/// **It reconnects**, for the reason the pad reader does: `robotd` restarts during every update,
+/// and a session that outlived one would otherwise be permanently blind to the pack.
+fn poll_health(socket: &Path, tx: &mpsc::Sender<Update>) {
+    loop {
+        if let Err(why) = ask_health(socket, tx)
+            && tx.send(Update::HealthLost(why)).is_err()
+        {
+            return; // the UI is gone
+        }
+        thread::sleep(HEALTH_POLL);
+    }
+}
+
+/// One connection, polled until something ends it.
+///
+/// The connection is kept open across polls rather than reopened per poll: a connect, a
+/// handshake and an accept every two seconds for the length of a session is a lot of socket
+/// churn for a number that does not move.
+fn ask_health(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), String> {
+    let mut client = Client::connect_to("robotd", socket).map_err(|e| e.message)?;
+    let mut line = String::new();
+    loop {
+        client
+            .send(&proto::Request::call(
+                proto::Id::Number(HEALTH_ID),
+                &proto::Call::RobotHealth,
+            ))
+            .map_err(|e| e.message)?;
+
+        loop {
+            line.clear();
+            match client.reader.read_line(&mut line) {
+                Err(e) => return Err(format!("the health poll stopped: {e}")),
+                Ok(0) => return Err("robotd closed the connection".to_owned()),
+                // Anything that is not this poll's answer is skipped rather than treated as an
+                // end, for the same reason the state stream skips what it does not model.
+                Ok(_) => match decode_health(&line) {
+                    None => continue,
+                    // A refusal, or an answer this build cannot read. Reported once and then
+                    // retried from a fresh connection — an old `robotd` that does not serve
+                    // this call will say so again, which is the honest answer.
+                    Some(Err(why)) => return Err(why),
+                    Some(Ok(health)) => {
+                        if tx.send(Update::Health(Box::new(health))).is_err() {
+                            return Ok(()); // the UI is gone
+                        }
+                        break;
+                    }
+                },
+            }
+        }
+        thread::sleep(HEALTH_POLL);
+    }
+}
+
+/// The answer to one `robot.health`: `None` for anything else on the socket, `Err` for a
+/// refusal or a shape this build cannot read.
+fn decode_health(line: &str) -> Option<Result<proto::HealthResult, String>> {
+    let response = serde_json::from_str::<proto::Response>(line).ok()?;
+    if response.id != Some(proto::Id::Number(HEALTH_ID)) {
+        return None;
+    }
+    if let Some(error) = response.error {
+        return Some(Err(error.message));
+    }
+    Some(
+        response
+            .result_as::<proto::HealthResult>()
+            .map_err(|e| format!("robotd answered robot.health unreadably: {e}")),
+    )
 }
 
 // ── the depth matrix's cells ────────────────────────────────────────────────
@@ -1041,6 +1165,14 @@ struct View {
     tof_lost: Option<String>,
     /// Is the ToF block open? Closed to begin with — see [`TOF_HEIGHT`].
     show_tof: bool,
+    /// The last answer to `robot.health`: the battery, the temperatures, the bus counters and
+    /// how stale the IMU's reads are. None of it is on the state stream.
+    health: Option<proto::HealthResult>,
+    /// When that answer arrived. A charge reading is the one number on this screen somebody
+    /// plans around, and one that quietly stopped being refreshed is worse than none.
+    health_at: Option<Instant>,
+    /// Why the health poll is not answering, when it is not.
+    health_lost: Option<String>,
 }
 
 impl View {
@@ -1068,6 +1200,9 @@ impl View {
             tof_status: None,
             tof_lost: None,
             show_tof: false,
+            health: None,
+            health_at: None,
+            health_lost: None,
         }
     }
 
@@ -1144,6 +1279,20 @@ impl View {
                 self.pad.trouble = Some(why);
                 Ok(self.show_pad)
             }
+            Update::Health(health) => {
+                self.health = Some(*health);
+                self.health_at = Some(Instant::now());
+                self.health_lost = None;
+                Ok(true)
+            }
+            Update::HealthLost(why) => {
+                // The last reading is **kept**, not cleared: it was true when it arrived, and
+                // [`Self::health_at`] already says how long ago that was. Blanking the pack's
+                // charge because `robotd` restarted during an update throws away the last thing
+                // known about it and puts nothing in its place.
+                self.health_lost = Some(why);
+                Ok(true)
+            }
             Update::State(state) => {
                 if self.trace.len() == TRACE_SAMPLES {
                     self.trace.pop_back();
@@ -1204,10 +1353,19 @@ impl View {
                 }
                 None => "waiting for robot.state…".to_owned(),
             };
+            // The power row is drawn here as well, and this is the case that earns it: a board
+            // whose servo power is off never completes a control tick, so no state ever arrives
+            // and this panel is the whole screen — while `robot.health` answers, and its answer
+            // is what says why. Outside the dimmed sentences, because a flat pack is not a
+            // footnote.
+            let mut lines: Vec<Line<'static>> = waiting
+                .lines()
+                .map(|l| Line::from(l.to_owned()).dim())
+                .collect();
+            lines.push(Line::from(""));
+            lines.push(self.power(rest.width.saturating_sub(2)));
             frame.render_widget(
-                Paragraph::new(waiting)
-                    .block(Block::bordered().title(" monitor "))
-                    .dim(),
+                Paragraph::new(lines).block(Block::bordered().title(" monitor ")),
                 rest,
             );
             return;
@@ -1397,8 +1555,15 @@ impl View {
 
         // Command on the left, sensing on the right: two four-row columns rather than eight
         // stacked rows, because every row here is a row the joints table does not get.
-        let [top, bottom] =
-            Layout::vertical([Constraint::Length(4), Constraint::Length(3)]).areas::<2>(inner);
+        // The power row takes the header's last line, under the three that describe the
+        // command: it is the robot's *condition* rather than its behaviour, it comes from a
+        // different call, and it is the row somebody glances at without reading the rest.
+        let [top, bottom, power] = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .areas::<3>(inner);
         let [asked, felt] =
             Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
                 .areas::<2>(top);
@@ -1406,6 +1571,7 @@ impl View {
         frame.render_widget(self.movement(state), asked);
         frame.render_widget(self.imu(state), felt);
         frame.render_widget(self.limits_and_head(state), bottom);
+        frame.render_widget(Paragraph::new(self.power(power.width)), power);
     }
 
     /// Which network is driving this robot, from the subscribe acknowledgement.
@@ -1631,6 +1797,162 @@ impl View {
         ));
 
         Paragraph::new(vec![limits, Line::from(head), odom])
+    }
+
+    /// What the pack has left, what is hot, and what `robot.health` says is wrong — the numbers
+    /// `robot.state` does not carry, on the one row that is always on screen.
+    ///
+    /// **Two classes of content, not one row of equals.** The charge and anything wrong are
+    /// *said* — drawn whatever the width, and clipped by the terminal if it comes to that,
+    /// because a clipped sentence is one somebody can go and finish in `robotctl health` while a
+    /// dropped one is an alarm nobody knows fired. The temperatures are trimmings: drawn only
+    /// when they fit whole, and abandoned at the first one that does not, because half a number
+    /// is not a smaller number — ` · cpu 5` is a lie about a board at 52 °C.
+    fn power(&self, width: u16) -> Line<'static> {
+        let Some(health) = self.health.as_ref() else {
+            // Two absences, and they are different: nothing has answered yet, versus something
+            // answered and then stopped.
+            let sentence = match &self.health_lost {
+                Some(why) => format!(" power   no health from robotd — {}", brief(why)),
+                None => " power   asking robotd for the battery…".to_owned(),
+            };
+            return Line::from(Span::raw(sentence).dim());
+        };
+
+        // What gets said whatever the width, in the order it matters.
+        let mut said: Vec<Span<'static>> = Vec::new();
+
+        // The charge first, and unconditionally. 0% is `BATTERY_EMPTY_V`, which is where
+        // `robotd` sits the robot down and cuts power — so this is a countdown, not a gauge,
+        // and the last fifth of it is worth seeing from across a room.
+        said.push(match &health.battery {
+            Some(b) => Span::styled(
+                format!("batt {:.2} V {:.0}%", b.volts, b.percent),
+                if b.percent <= BATTERY_CRITICAL_PCT {
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else if b.percent <= BATTERY_LOW_PCT {
+                    Style::new().fg(Color::Yellow)
+                } else {
+                    Style::new().fg(Color::Green)
+                },
+            ),
+            // Absent means *not measured* — the first second of uptime, or a bus that cannot
+            // answer. Drawn as `0.00 V, 0%` it would put a flat-pack warning in front of
+            // somebody whose robot has a full one, which is the mistake `robotd`'s own
+            // sentinel exists to avoid.
+            None => Span::raw("batt not read yet").dim(),
+        });
+
+        // Said early, because it qualifies everything after it: these are the numbers from the
+        // last answer, and this is how long ago that answer was.
+        if let Some(age) = self.health_age() {
+            said.push(Span::styled(
+                format!(" · {} s old", age.as_secs()),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+        if let Some(why) = &self.health_lost {
+            said.push(Span::styled(
+                format!(" · health poll: {}", brief(why)),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+
+        // What is wrong, before the temperatures: this is the line that explains a robot
+        // standing still, which is the question somebody is holding when they look here.
+        if !health.healthy {
+            let reason = health.reason.as_deref().unwrap_or("no reason given");
+            said.push(if health.degraded {
+                // A fact about the board rather than about the release — see
+                // `HealthResult::degraded`. Yellow, not red: nothing is broken, the robot
+                // simply cannot move, and no update is going to change that.
+                Span::styled(
+                    format!(" · degraded: {reason}"),
+                    Style::new().fg(Color::Yellow),
+                )
+            } else {
+                Span::styled(
+                    format!(" · unhealthy: {reason}"),
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            });
+        }
+
+        // Frozen orientation does not make `robotd` unhealthy and cannot be seen anywhere else
+        // on this screen: the board keeps answering, so the bus reports no error and `ready`
+        // stays true, while the gravity vector in the header holds a plausible attitude for as
+        // long as it takes somebody to notice it has not moved.
+        if let Some(imu) = &health.imu
+            && imu.frozen()
+        {
+            said.push(Span::styled(
+                format!(
+                    " · orientation frozen — {} stale reads",
+                    imu.consecutive_stale_blocks
+                ),
+                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Bus trouble under a running loop only. The startup case — nothing answered on the bus
+        // at all — is already the degraded reason above, and saying it twice on one row costs
+        // the temperatures for no information.
+        if health.bus.consecutive_errors > 0 {
+            said.push(Span::styled(
+                format!(
+                    " · bus {} read failures running",
+                    health.bus.consecutive_errors
+                ),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
+
+        // Uncoloured, deliberately: nothing in this workspace defines a servo temperature that
+        // is too high, and a threshold invented here would be one `robotctl health` does not
+        // agree with. The number and the joint are what somebody acts on.
+        let mut trimmings: Vec<Span<'static>> = Vec::new();
+        if let Some(m) = &health.motors {
+            trimmings.push(Span::raw(format!(
+                " · motors {:.0} °C max ({})",
+                m.max_c, m.hottest
+            )));
+        }
+        // Beside the servos rather than merged with them: a robot that has been walking has hot
+        // motors, a board in an enclosure with a blocked vent has a hot SoC, and the two are
+        // fixed differently — which is the reason `HealthResult` carries them separately.
+        if let Some(cpu) = health.cpu_temp_c {
+            trimmings.push(Span::raw(format!(" · cpu {cpu:.0} °C")));
+        }
+
+        // The label is nine columns, like `limits`, `head` and `odom` above it.
+        let mut row = vec![Span::raw(" power   ")];
+        let mut used = 9;
+        for span in said {
+            used += span.content.chars().count();
+            row.push(span);
+        }
+        // Whole ones only, and stopping at the first that does not fit rather than skipping it:
+        // a row that dropped the motors and kept the cooler CPU beside them would read as a
+        // robot with no servo temperatures at all.
+        for span in trimmings {
+            let len = span.content.chars().count();
+            if used + len > usize::from(width) {
+                break;
+            }
+            used += len;
+            row.push(span);
+        }
+        Line::from(row)
+    }
+
+    /// How stale the health answer is, when it is stale enough to be worth saying.
+    ///
+    /// `robotd` closing the socket is reported by the poller itself. This catches the other
+    /// shape: a daemon that accepts, answers, and then goes quiet — where the charge would
+    /// otherwise sit on screen looking current for as long as the session lasts.
+    fn health_age(&self) -> Option<Duration> {
+        let age = self.health_at?.elapsed();
+        (age > HEALTH_STALE).then_some(age)
     }
 
     /// Measured against commanded, per joint, with the difference as a bar.
@@ -2407,6 +2729,15 @@ fn joint_rows(state: &proto::RobotState) -> usize {
 /// another crate. Anything unrecognised is passed through verbatim: a `robotd` newer than this
 /// `robotctl` may have limits this build has never heard of, and printing the raw name is
 /// strictly better than hiding it.
+/// The first line of a reason, for somewhere that has one line to put it.
+///
+/// A connect failure is a paragraph — the `systemctl status` hint below it is the useful half,
+/// and `robotctl health` trims the same way for the same reason. Dropped into a `Line` whole, the
+/// rest of it draws as control characters across a row that is on screen at all times.
+fn brief(reason: &str) -> &str {
+    reason.lines().next().unwrap_or("unavailable")
+}
+
 fn explain_limit(limit: &str) -> String {
     match limit {
         "deadman" => "deadman — no intent arrived recently, velocity zeroed".to_owned(),
@@ -2857,6 +3188,48 @@ mod tests {
         assert_eq!(view.angle(None).content, "-");
     }
 
+    /// Render one frame with a health answer absorbed as well as a state.
+    fn draw_with_health(
+        width: u16,
+        height: u16,
+        state: &proto::RobotState,
+        health: proto::HealthResult,
+    ) -> String {
+        let mut view = View::new(20, None);
+        assert!(view.absorb(Update::State(Box::new(state.clone()))).is_ok());
+        assert!(view.absorb(Update::Health(Box::new(health))).is_ok());
+        render_to(&mut view, width, height)
+    }
+
+    /// A healthy robot with everything measured: a two-thirds pack, warm servos, a warm board.
+    fn a_health() -> proto::HealthResult {
+        proto::HealthResult {
+            healthy: true,
+            battery: Some(proto::Battery {
+                volts: 7.66,
+                percent: 66.0,
+            }),
+            motors: Some(proto::MotorThermal {
+                hottest: "left_knee".to_owned(),
+                max_c: 41.0,
+                mean_c: 35.0,
+            }),
+            cpu_temp_c: Some(52.0),
+            control_loop: Some(proto::LoopHealth {
+                target_hz: 50.0,
+                achieved_hz: Some(50.0),
+                ticks: 10_000,
+                missed: 0,
+                last_tick_age_ms: 4,
+            }),
+            imu: Some(proto::ImuHealth {
+                ready: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     /// Render one frame and return it as text.
     fn draw(width: u16, height: u16, state: &proto::RobotState, scroll: usize) -> String {
         let mut view = View::new(20, None);
@@ -2884,6 +3257,206 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The pack's charge is on the frame, in volts *and* as a fraction — the mapping between
+    /// them lives in `duck-control` and travels on the answer precisely so that two screens
+    /// cannot disagree about the same battery.
+    #[test]
+    fn the_frame_shows_what_the_pack_has_left() {
+        let screen = draw_with_health(110, 32, &a_state(), a_health());
+
+        assert!(screen.contains("power"), "the row is labelled:\n{screen}");
+        assert!(screen.contains("7.66 V"), "{screen}");
+        assert!(screen.contains("66%"), "{screen}");
+        // And the two temperatures, which fail differently and are fixed differently.
+        assert!(screen.contains("41 °C max (left_knee)"), "{screen}");
+        assert!(screen.contains("cpu 52 °C"), "{screen}");
+    }
+
+    /// An unread battery says so. Rendered as `0.00 V, 0%` it would put a flat-pack warning in
+    /// front of somebody whose robot has a full one — for the first second of every uptime, and
+    /// forever on a board whose bus cannot answer.
+    #[test]
+    fn an_unmeasured_battery_is_not_an_empty_one() {
+        let health = proto::HealthResult {
+            battery: None,
+            ..a_health()
+        };
+        let screen = draw_with_health(110, 32, &a_state(), health);
+
+        assert!(screen.contains("batt not read yet"), "{screen}");
+        assert!(!screen.contains("0.00 V"), "{screen}");
+        assert!(!screen.contains(" 0%"), "{screen}");
+    }
+
+    /// Nothing has answered yet, versus something answered and stopped: told apart, because one
+    /// of them resolves on its own and the other does not.
+    #[test]
+    fn a_missing_health_answer_says_which_kind_of_missing_it_is() {
+        let mut view = View::new(20, None);
+        assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
+        let waiting = render_to(&mut view, 110, 32);
+        assert!(
+            waiting.contains("asking robotd for the battery"),
+            "{waiting}"
+        );
+
+        assert!(
+            view.absorb(Update::HealthLost(
+                "robotd closed the connection".to_owned()
+            ))
+            .is_ok()
+        );
+        let lost = render_to(&mut view, 110, 32);
+        assert!(lost.contains("no health from robotd"), "{lost}");
+        assert!(lost.contains("closed the connection"), "{lost}");
+    }
+
+    /// A reading that arrived and then stopped being refreshed says how old it is. A frozen
+    /// number with nothing saying it is frozen is the one failure mode a live view must not
+    /// have, and a charge somebody is planning around is the worst place to have it.
+    #[test]
+    fn a_health_answer_that_stopped_arriving_says_how_old_it_is() {
+        let mut view = View::new(20, None);
+        assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
+        assert!(view.absorb(Update::Health(Box::new(a_health()))).is_ok());
+        assert!(
+            !render_to(&mut view, 110, 32).contains("s old"),
+            "a fresh answer is not aged"
+        );
+
+        view.health_at = Some(Instant::now() - Duration::from_secs(30));
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("30 s old"), "{screen}");
+        // The reading itself is kept: it was true when it arrived, and its age is now on screen.
+        assert!(screen.contains("7.66 V"), "{screen}");
+    }
+
+    /// Servo power off is the case this row earns its place in. The loop never completes a tick,
+    /// so no state ever arrives and the joints, the IMU and the trace have nothing to draw —
+    /// while `robot.health` answers, and its answer is the only thing that says why.
+    #[test]
+    fn a_board_with_no_robot_on_the_bus_says_so_with_no_state_at_all() {
+        let mut view = View::new(20, None);
+        let health = proto::HealthResult {
+            healthy: false,
+            degraded: true,
+            reason: Some(
+                "no robot on the motor bus after 3 attempts; is servo power on and the bus wired?"
+                    .to_owned(),
+            ),
+            battery: None,
+            motors: None,
+            cpu_temp_c: Some(48.0),
+            bus: proto::BusHealth {
+                consecutive_errors: 0,
+                startup_failures: 3,
+            },
+            ..Default::default()
+        };
+        assert!(view.absorb(Update::Health(Box::new(health))).is_ok());
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(screen.contains("waiting for robot.state"), "{screen}");
+        assert!(screen.contains("degraded"), "{screen}");
+        assert!(screen.contains("is servo power on"), "{screen}");
+    }
+
+    /// A frozen IMU is invisible everywhere else: the board keeps answering, so the bus reports
+    /// no error, `ready` stays true, and the gravity vector in the header holds a plausible
+    /// attitude for as long as it takes somebody to notice it has stopped moving.
+    #[test]
+    fn frozen_orientation_is_called_out_on_an_otherwise_healthy_robot() {
+        let health = proto::HealthResult {
+            imu: Some(proto::ImuHealth {
+                ready: true,
+                stale_blocks: 400,
+                consecutive_stale_blocks: proto::ImuHealth::FROZEN_RUN,
+            }),
+            ..a_health()
+        };
+        let screen = draw_with_health(120, 32, &a_state(), health);
+        assert!(screen.contains("orientation frozen"), "{screen}");
+
+        // A board that has merely hiccuped is not accused of anything: a warning that fires on
+        // a healthy robot is a warning nobody reads.
+        let hiccuped = proto::HealthResult {
+            imu: Some(proto::ImuHealth {
+                ready: true,
+                stale_blocks: 9,
+                consecutive_stale_blocks: 1,
+            }),
+            ..a_health()
+        };
+        let screen = draw_with_health(120, 32, &a_state(), hiccuped);
+        assert!(!screen.contains("frozen"), "{screen}");
+    }
+
+    /// What a row too narrow for everything gives up. The charge and the verdict are said
+    /// whatever the width — the alternative is an alarm nobody knows fired — and it is the
+    /// temperatures that go, all of them, rather than the row keeping the cooler of the two.
+    #[test]
+    fn a_narrow_row_keeps_the_charge_and_the_verdict_and_drops_the_trimmings() {
+        let health = proto::HealthResult {
+            healthy: false,
+            reason: Some("control loop at 41.2 Hz, below the 45.0 Hz floor".to_owned()),
+            ..a_health()
+        };
+        let mut view = View::new(20, None);
+        assert!(view.absorb(Update::State(Box::new(a_state()))).is_ok());
+        assert!(
+            view.absorb(Update::Health(Box::new(health.clone())))
+                .is_ok()
+        );
+
+        let text = |width: u16| -> String {
+            view.power(width)
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+
+        let narrow = text(60);
+        assert!(narrow.contains("7.66 V"), "{narrow}");
+        assert!(narrow.contains("below the 45.0 Hz floor"), "{narrow}");
+        assert!(!narrow.contains("cpu"), "{narrow}");
+        assert!(!narrow.contains("motors"), "{narrow}");
+
+        // Not a rule against temperatures: given the room, they are there.
+        let wide = text(140);
+        assert!(wide.contains("motors 41 °C"), "{wide}");
+        assert!(wide.contains("cpu 52 °C"), "{wide}");
+    }
+
+    /// The answer is matched by its id, so a reply to something else on the connection cannot be
+    /// mistaken for it — and a refusal is a sentence rather than a poll that waits forever.
+    #[test]
+    fn a_health_answer_is_told_apart_from_everything_else_on_the_socket() {
+        let answer = serde_json::to_string(&proto::Response::ok(
+            Some(proto::Id::Number(HEALTH_ID)),
+            &a_health(),
+        ))
+        .unwrap();
+        assert!(matches!(decode_health(&answer), Some(Ok(_))));
+
+        let someone_else = serde_json::to_string(&proto::Response::ok(
+            Some(proto::Id::Number(SUBSCRIBE_ID)),
+            &a_health(),
+        ))
+        .unwrap();
+        assert!(decode_health(&someone_else).is_none());
+
+        let refused = serde_json::to_string(&proto::Response::err(
+            Some(proto::Id::Number(HEALTH_ID)),
+            proto::Error::new(proto::code::METHOD_NOT_FOUND, "no such method".to_owned()),
+        ))
+        .unwrap();
+        assert!(matches!(decode_health(&refused), Some(Err(_))));
+
+        let state = serde_json::to_string(&proto::Request::notify_state(&a_state())).unwrap();
+        assert!(decode_health(&state).is_none());
     }
 
     /// The end of the stream becomes the command's exit code, not a blank screen.
