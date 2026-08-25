@@ -82,6 +82,25 @@ use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
 
+/// Where the signalling server listens, and what the video is.
+///
+/// One value rather than six positional arguments. `start` had reached eight of them, and two of
+/// those are a `width` and a `height` of the same type: a call site that swapped them would compile
+/// and produce a portrait stream. Named fields make that unrepresentable, and a seventh setting
+/// stops changing the signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settings {
+    /// Where the signalling server binds. All interfaces on the robot — `remote-webrtc.md` §3.
+    pub host: String,
+    /// The signalling server's port, which is *not* the console's: [`crate::web`] owns that one.
+    pub port: u32,
+    /// Starting video bitrate, bits per second. Congestion control moves it from here.
+    pub bitrate: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
 /// Where the video comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -147,13 +166,19 @@ pub struct Channel {
 /// stops the session, which is what a shutdown should do.
 pub fn start(
     source: Source,
-    host: &str,
-    port: u32,
-    bitrate: u32,
-    width: u32,
-    height: u32,
-    fps: u32,
+    producer: &crate::producer::Producer,
+    settings: &Settings,
 ) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
+    let &Settings {
+        port,
+        bitrate,
+        width,
+        height,
+        fps,
+        ..
+    } = settings;
+    let host = settings.host.as_str();
+
     // `GST_DEBUG` has to be in the environment before `init`, which is when GStreamer parses it.
     set_gstreamer_log_threshold();
 
@@ -252,6 +277,16 @@ pub fn start(
     sink.set_property("run-signalling-server", true);
     sink.set_property("signalling-server-host", host);
     sink.set_property("signalling-server-port", port);
+
+    // Who this robot is, handed to every peer in the signalling server's `list` answer — so a
+    // client knows which robot it found before it negotiates anything. [`crate::producer`] is what
+    // goes in it and why. A structure name is required and is not what a peer reads; `meta` is
+    // webrtcsink's own word for the property.
+    let mut meta = gst::Structure::builder("meta");
+    for (field, value) in producer.fields() {
+        meta = meta.field(field, value);
+    }
+    sink.set_property("meta", meta.build());
 
     // Offer H.264 and nothing else. Left alone `webrtcsink` proposes everything it can encode:
     // `mppvp8enc`, `mpph265enc` and `mpph264enc` on the VPU, but `vp9enc` and `av1enc` in

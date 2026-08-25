@@ -10,11 +10,13 @@
 //! testable without a WebRTC peer and would serve a WebSocket surface (§11) unchanged.
 //!
 //! - [`web`] — the console page, served by the daemon it drives. `webrtc-console.md` §1.
+//! - [`producer`] — who this robot says it is, before a peer negotiates anything. §5.
 //!
 //! [`pipeline`] is the rest, and the only part that is not portable: `webrtcsink` with the
 //! signalling server in this process, `mpph264enc` in front of it, and a `control` datachannel per
 //! peer wired to [`session::run`].
 
+pub mod producer;
 pub mod route;
 pub mod session;
 pub mod upstream;
