@@ -120,6 +120,18 @@ for a machine with no browser or for a script; `--port` for a robot started with
 Nothing to install and nothing to serve — `mediad` embeds the page, so a robot running that daemon
 is a robot with a console.
 
+What is on it: the camera with the link's bitrate, frame rate, loss and round trip beside it; two
+pads and the keys `W`/`A`/`S`/`D` and `Q`/`E` to drive, at a gamepad's 0.3 m/s and 1.5 rad/s; a drag
+on the picture to look at a point; enable, init, relax, stop and shutdown; the skills and the voice
+bank as menus; and the state stream at 2 Hz beside `robot.health`, which is where a hot servo, a flat
+pack or a loop running slow gets named.
+
+`stop` zeroes the intents the page is sending. **It is not an emergency stop** — nothing in this
+system cuts servo power from a browser — and the button is a plain one for that reason.
+
+The raw JSON box, the log, and the two calls a WebRTC peer is refused are in the drawer at the
+bottom. They prove the route table is being consulted rather than drive the robot.
+
 Two ports are involved and only this one is typed: the page reaches the signalling server on 8443
 itself, using the host it was served from. If the page loads and then says its signalling port did
 not answer, the robot is up and something between you and 8443 is not — a firewall, most often.
