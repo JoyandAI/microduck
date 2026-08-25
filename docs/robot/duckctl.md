@@ -64,6 +64,23 @@ network; a line with no address at all means a release from before robots broadc
 The SSID is not in the listing — it does not fit in an advertisement. `duckctl wifi status` has
 it, along with the signal and both addresses.
 
+For the address on its own:
+
+```bash
+ssh radxa@$(duckctl ip)
+```
+
+`ip` prints the address and nothing else, so it substitutes. It reads the advertisement, so it
+connects to nothing, needs no PIN, and takes about a second — and the answer is not stale: `btd`
+re-reads the address every five seconds and re-advertises when it moves.
+
+A robot bonded to this machine often stops advertising the service to it, and then `ip` connects and
+asks `net.status` instead. That is slower and needs the PIN, and it always answers. `--verbose` says
+which of the two happened.
+
+A robot with no network address is told what to do about it rather than reported as empty, because
+the fix is over the radio and has to be — `net.connect` is refused over WebRTC by design.
+
 A robot that has never been renamed calls itself `duck-` plus four characters derived from its
 serial, so `duck-c51b`. Either half of a robot reported under two names at once — macOS shows
 `radxa-zero3 [duck-c51b]` — works as `--name`.
@@ -87,6 +104,41 @@ itself and use the new name:
 ```bash
 robotctl system set-name ducky
 ```
+
+## The console
+
+The robot serves a page that streams its camera and drives it:
+
+```bash
+duckctl open
+```
+
+Finds the robot, then opens `http://<address>:8080/` in a browser. `--print` gives the URL instead,
+for a machine with no browser or for a script; `--port` for a robot started with a non-default
+`mediad --web-port`.
+
+Nothing to install and nothing to serve — `mediad` embeds the page, so a robot running that daemon
+is a robot with a console.
+
+What is on it: the camera with the link's bitrate, frame rate, loss and round trip beside it; two
+pads and the keys `W`/`A`/`S`/`D` and `Q`/`E` to drive, at a gamepad's 0.3 m/s and 1.5 rad/s; a drag
+on the picture to look at a point; enable, init, relax, stop and shutdown; the skills and the voice
+bank as menus; and the state stream at 2 Hz beside `robot.health`, which is where a hot servo, a flat
+pack or a loop running slow gets named.
+
+`stop` zeroes the intents the page is sending. **It is not an emergency stop** — nothing in this
+system cuts servo power from a browser — and the button is a plain one for that reason.
+
+The raw JSON box, the log, and the two calls a WebRTC peer is refused are in the drawer at the
+bottom. They prove the route table is being consulted rather than drive the robot.
+
+Two ports are involved and only this one is typed: the page reaches the signalling server on 8443
+itself, using the host it was served from. If the page loads and then says its signalling port did
+not answer, the robot is up and something between you and 8443 is not — a firewall, most often.
+
+The camera and the drive controls are on WebRTC and nothing else, so a robot with no network address
+has no console. Join it to one over the radio first — `duckctl wifi connect` below needs no network
+of its own.
 
 ## Always the same robot
 

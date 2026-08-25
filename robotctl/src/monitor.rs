@@ -2059,8 +2059,9 @@ impl View {
     /// --json` carries the same numbers for anything that wants to read them.
     fn camera_caption() -> Vec<Span<'static>> {
         let Some(camera) = duck_ipc_proto::read_camera_stats() else {
-            // Silent rather than "camera unknown": `mediad` is disabled on most robots, and a
-            // caption implying a fault on every one of them is worse than no caption.
+            // Silent rather than "camera unknown": a board with no camera runs no `mediad`, and a
+            // caption implying a fault on every one of them is worse than no caption. Whether the
+            // daemon is running belongs to `robotctl health`, which says so in words.
             return vec![];
         };
 

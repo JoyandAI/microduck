@@ -342,8 +342,8 @@ cp "$BIN"/robotd staged/
 cp "$BIN"/configd staged/
 cp "$BIN"/btd staged/
 cp "$BIN"/padd staged/
-# The WebRTC gateway. Staged so a board *can* run it; its unit ships with no [Install], so
-# nothing starts it until someone does — see mediad/systemd/mediad.service for why.
+# The WebRTC gateway. Its unit ships with an `[Install]` section, so postinstall enables and starts
+# it and `on_apply` restarts it, exactly as for every other daemon here.
 cp "$BIN"/mediad staged/
 # The voice generator (postinstall renders the per-robot bank with it) and the
 # mic classifier pair — pet-detect for live listening, pet-features for training.
@@ -371,6 +371,7 @@ cargo run -p xtask -- package \
     --include "updater/systemd/sysusers.d/robot.conf=systemd/sysusers.d/robot.conf" \
     --include "robotd/systemd/robotd.service=systemd/robotd.service" \
     --include "hooks/postinstall=hooks/postinstall" \
+    --include "scripts/setup-gstreamer.sh=scripts/setup-gstreamer.sh" \
     --include "scripts/robot-rescue=scripts/robot-rescue" \
     --include "scripts/robot-boot-check=scripts/robot-boot-check" \
     --include "updater/systemd/robot-boot-check.service=systemd/robot-boot-check.service" \
@@ -498,10 +499,6 @@ echo "    current -> $want"
 # no socket at all, so for that one it is the only answer available.
 deadline=$(($(date +%s) + 30))
 stale=""
-# Daemons that are legitimately still on the old release. Reported separately from `stale` because
-# they are not a fault, and separately from silence because the closing line must not then claim
-# that everything is running this build.
-deferred=""
 for svc in robotd configd padd updaterd btd mediad; do
     while :; do
         if [ ! -f "/run/${svc}/identity.json" ]; then
@@ -511,8 +508,8 @@ for svc in robotd configd padd updaterd btd mediad; do
         else
             state="stale"
         fi
-        # Only the two deferred ones are worth waiting for; the rest restarted before the reply, so
-        # a mismatch there is already a fault rather than a race.
+        # Only `updaterd` and `btd` are worth waiting for — they restart five seconds after the
+        # reply. The rest restarted before it, so a mismatch there is a fault rather than a race.
         case "$state:$svc" in
             ok:*) break ;;
             stale:updaterd|stale:btd|silent:updaterd|silent:btd)
@@ -527,27 +524,15 @@ for svc in robotd configd padd updaterd btd mediad; do
         ok) echo "    [ok] $svc" ;;
         silent)
             # Not treated as a failure: systemd removes the runtime directory when a unit stops, so
-            # this is also what a deliberately disabled `padd` looks like — and what `mediad` looks
-            # like on every board, since it ships with no `[Install]` section and is started by
-            # hand until it has proven itself over a few boots.
+            # this is what a deliberately disabled `padd` looks like, and what `mediad` looks like on
+            # a board with no camera. The GStreamer stack is not a cause any more — the preinstall
+            # hook this push just ran installs it — so a silent `mediad` here is worth
+            # `journalctl -u mediad -b` rather than a command to type.
             echo "    [--] $svc published nothing — stopped, or a build too old to say"
             ;;
         stale)
-            # `mediad` is the one daemon nothing restarts for us: it has no `[Install]` section and
-            # `updaterd` does not manage it, so after a push it goes on running the release it was
-            # started with. That is the design working, not a fix that did not take — so it is
-            # reported with what to do about it rather than failed.
-            case "$svc" in
-                mediad)
-                    echo "    [--] $svc is still on the previous release; nothing restarts it"
-                    echo "         sudo systemctl restart mediad"
-                    deferred="${deferred} ${svc}"
-                    ;;
-                *)
-                    echo "    [FAIL] $svc is not running $want"
-                    stale="${stale} ${svc}"
-                    ;;
-            esac
+            echo "    [FAIL] $svc is not running $want"
+            stale="${stale} ${svc}"
             ;;
     esac
 done
@@ -565,22 +550,10 @@ done
 # Answerable, not healthy. A bench board with no servo power reports degraded and that is a fact
 # about the bench, not about this build — the health gate draws the same distinction.
 robotctl health >/dev/null 2>&1 || echo "    [--] robotctl health did not answer cleanly; worth a look"
-
-# 3 rather than 0, so the closing line does not claim every daemon is running this build directly
-# under a line saying one of them is not. Which one is already named above, so the code is all the
-# caller needs.
-[ -z "$deferred" ] || exit 3
 REMOTE
 then
     echo "==> every daemon on $BOARD is running $VERSION"
 else
-    status=$?
-    if [ "$status" = 3 ]; then
-        # Deliberately not "every daemon": one is still on the old release, named above, and this
-        # line used to contradict it.
-        echo "==> $BOARD is running $VERSION, apart from the daemon marked [--] above"
-    else
-        echo "==> the release is live but not everything is running it" >&2
-        exit 1
-    fi
+    echo "==> the release is live but not everything is running it" >&2
+    exit 1
 fi

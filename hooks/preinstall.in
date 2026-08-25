@@ -13,7 +13,18 @@
 # and `control loop has not completed a cycle yet` as the only explanation.
 #
 # The environment is cleared by the updater apart from PATH and the hook context, so there is
-# no token here. That is fine: ONNX Runtime comes from microsoft/onnxruntime, which is public.
+# no token here. That is fine, and it is why both things this hook fetches are public:
+# ONNX Runtime from microsoft/onnxruntime, and the GStreamer plugins from
+# pollen-robotics/microduck-gst-plugins.
+#
+# Two dependencies, and they fail the update differently on purpose:
+#
+#   ONNX Runtime is fatal. A release that cannot load a policy is a robot that cannot stand,
+#   and aborting here leaves the old release live with no rollback and no boot-counter churn.
+#
+#   The GStreamer stack is not. A board with no camera stack loses `mediad` — video and the
+#   WebRTC console — and still walks, still pairs, still updates. Refusing the update over it
+#   would mean a board that cannot be fixed by the mechanism that fixes boards.
 set -eu
 
 ONNX_FLOOR="@ONNX_FLOOR@"
@@ -111,21 +122,55 @@ install_onnx() {
     fi
 }
 
+# The GStreamer stack `mediad` needs, by running the release's own copy of the script that
+# installs it.
+#
+# **The script, not a copy of what it does.** It owns the pinned plugins version, the Debian
+# package list, the Rockchip MPP and RGA debs, the udev rule for `/dev/mpp_service`, and the
+# encoder report — six things that would otherwise exist twice and drift, which is the class of
+# bug this repo keeps writing down. It is idempotent by design: a provisioned board pays a stamp
+# file comparison and two `dpkg -s` calls, and a board that has never had the stack gets it here.
+#
+# This is what the split between provisioning and updating is for. `provision.sh` installs the
+# stack on a new board; every board provisioned before that existed, and every board whose
+# plugins are older than the version this release was built against, is fixed by an ordinary
+# update instead of by somebody remembering a command.
+#
+# Never fatal, for the reason in the header. Its report goes to the update log either way, which
+# is where "this board cannot encode H.264 in hardware" belongs.
+install_gstreamer() {
+    script=scripts/setup-gstreamer.sh
+    if [ ! -f "$script" ]; then
+        say "no ${script} in this release; skipping the camera stack"
+        return 0
+    fi
+
+    say "checking the GStreamer stack"
+    if sh "$script"; then
+        say "GStreamer stack ready"
+    else
+        say "the GStreamer stack did not finish installing — this release will run without a
+  camera or a WebRTC console, and everything else is unaffected. To retry by hand:
+    sudo /usr/local/sbin/robot-setup-gstreamer"
+    fi
+}
+
 have="$(installed_onnx)"
 
 if at_least "$have" "$ONNX_FLOOR"; then
     say "ONNX Runtime ${have} satisfies >= ${ONNX_FLOOR}"
-    exit 0
+else
+    say "ONNX Runtime ${have:-absent} is below ${ONNX_FLOOR}, which this release requires"
+    install_onnx
+
+    # Verified rather than assumed: an install that reported success but left the symlink wrong
+    # would otherwise be discovered by robotd's control thread panicking, which is the failure
+    # mode this hook was written to remove.
+    have="$(installed_onnx)"
+    at_least "$have" "$ONNX_FLOOR" \
+        || die "installed ONNX Runtime ${have:-none}, still below ${ONNX_FLOOR}"
+
+    say "ONNX Runtime now ${have}"
 fi
 
-say "ONNX Runtime ${have:-absent} is below ${ONNX_FLOOR}, which this release requires"
-install_onnx
-
-# Verified rather than assumed: an install that reported success but left the symlink wrong
-# would otherwise be discovered by robotd's control thread panicking, which is the failure
-# mode this hook was written to remove.
-have="$(installed_onnx)"
-at_least "$have" "$ONNX_FLOOR" \
-    || die "installed ONNX Runtime ${have:-none}, still below ${ONNX_FLOOR}"
-
-say "ONNX Runtime now ${have}"
+install_gstreamer

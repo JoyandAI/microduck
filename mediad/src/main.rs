@@ -36,6 +36,15 @@ struct Args {
     #[arg(long, default_value_t = 8443)]
     port: u32,
 
+    /// Where the console is served. `http://<robot>:8080/`, and nothing else to run.
+    ///
+    /// **Two ports, and only this one is ever typed.** `webrtcsink` owns the listener on `--port`
+    /// and takes only a host and a port about it, so the page cannot be a route on it — see
+    /// `webrtc-console.md` §1.3, which also says where this ends up: one port, our own signalling
+    /// server, and a certificate, on the day a microphone or a browser gamepad is wanted.
+    #[arg(long, default_value_t = 8080)]
+    web_port: u16,
+
     /// Target video bitrate, bits per second.
     ///
     /// Explicit rather than the encoder's "auto calculate": `rc-mode` is already constant-bitrate,
@@ -101,6 +110,38 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(async move {
+        // The console, before the pipeline: it is the page that says a robot's pipeline would not
+        // start, so it should be up first — and it needs nothing from GStreamer.
+        //
+        // **A page that cannot be served does not cost the video.** A refused bind is almost always
+        // a port already in use, which `Restart=always` cannot fix by trying again; a robot that
+        // streams and answers control calls with no console is much better than one that does
+        // neither. So this is logged at error and the daemon carries on.
+        let page = mediad::web::page(args.port);
+        let (web_host, web_port) = (args.host.clone(), args.web_port);
+        tokio::spawn(async move {
+            if let Err(e) = mediad::web::serve(&web_host, web_port, page).await {
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    "the console is not being served; video and control are unaffected"
+                );
+            }
+        });
+
+        // Before the pipeline, because `webrtcsink`'s `meta` is set as the element is built and a
+        // producer that registered without a name would keep it until this daemon restarts. Costs a
+        // unix-socket round trip on a boot where `configd` may not be up yet, which is why it is
+        // bounded and why a failure is a warning rather than an exit.
+        let producer =
+            mediad::producer::Producer::learn(Default::default(), duck_ipc_proto::build_info!())
+                .await;
+        tracing::info!(
+            name = producer.name.as_deref().unwrap_or("unknown"),
+            release = %producer.release,
+            api_version = producer.api_version,
+            "producing as"
+        );
+
         let source = if args.camera {
             mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
                 device: args.camera_device.clone(),
@@ -115,24 +156,26 @@ fn main() -> ExitCode {
         // `get_frame` surface in `architecture.md` §5.3 are what it is for — but the branch runs
         // from the start rather than being added later, because a tee inserted into a live
         // pipeline is a different and much harder problem than a tee that was always there.
-        let (_pipeline, mut channels, _frames) = match mediad::pipeline::start(
-            source,
-            &args.host,
-            args.port,
-            args.bitrate,
-            args.width,
-            args.height,
-            args.fps,
-        ) {
-            Ok(started) => started,
-            Err(e) => {
-                // The message names which step failed and what usually causes it — a missing
-                // plugin, a missing library, or a device node nobody can open. Those look
-                // identical from a log line that only says "failed".
-                tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
-                return ExitCode::FAILURE;
-            }
+        let settings = mediad::pipeline::Settings {
+            host: args.host.clone(),
+            port: args.port,
+            bitrate: args.bitrate,
+            width: args.width,
+            height: args.height,
+            fps: args.fps,
         };
+
+        let (_pipeline, mut channels, _frames) =
+            match mediad::pipeline::start(source, &producer, &settings) {
+                Ok(started) => started,
+                Err(e) => {
+                    // The message names which step failed and what usually causes it — a missing
+                    // plugin, a missing library, or a device node nobody can open. Those look
+                    // identical from a log line that only says "failed".
+                    tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
+                    return ExitCode::FAILURE;
+                }
+            };
 
         // One session per peer, each with its own connections to the services it talks to. Per
         // peer rather than shared, so one peer's minutes-long update cannot silence another's

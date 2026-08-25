@@ -130,6 +130,20 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// and this is the second one — the daemon runs the IK and answers with the joints it chose.
 pub const API_VERSION: u32 = 12;
 
+/// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
+///
+/// **Here rather than in `updater`, because it is a contract with every client.** The phase
+/// notification for a hook arrives *before* the hook runs, so a client watching an apply sees
+/// nothing at all while the hook works — and that hook installs what a release needs and the board
+/// may not have: ONNX Runtime, and around 100 MB of apt for `mediad`'s GStreamer stack on a board
+/// that has never had it. A client whose idle budget is shorter than this reports a working update
+/// as a robot that stopped answering, which is exactly what `duckctl` did the first time this
+/// ceiling moved.
+///
+/// `updaterd` enforces it and every client sizes its own budget above it. Both read this constant,
+/// so the two cannot disagree.
+pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
+
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
 /// Where each service listens by default.
