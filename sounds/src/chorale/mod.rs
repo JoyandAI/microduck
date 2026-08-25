@@ -482,6 +482,19 @@ impl Score {
             .expect("the embedded default score must parse")
     }
 
+    /// TEST ONLY — an arrangement of Andrew Prahlow's Outer Wilds theme, for bench and living
+    /// room. **Remove before anything ships**: unlike [`Score::wistful`] and
+    /// [`Score::duck_strut`], which are original precisely because everything this idiom
+    /// evokes is in copyright, this one *is* the copyrighted piece. It exists to exercise the
+    /// piece registry with music people recognise; it must not ride a release.
+    pub fn outer_wilds() -> Self {
+        let mut score = midi::parse(include_bytes!("../../scores/outer_wilds.mid"))
+            .expect("the embedded MIDI score must parse")
+            .score;
+        score.name = "outer-wilds".to_owned();
+        score
+    }
+
     /// The other piece: an upbeat one, through the MIDI front end.
     ///
     /// `scores/duck_strut.mid` is the source of truth and is deliberately a *MIDI file in the

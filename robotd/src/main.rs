@@ -1240,9 +1240,15 @@ async fn control_loop<T: RobotIo>(
     let mut chorale = (params.chorale.accept && params.audio.enabled)
         .then(|| {
             let personality = voice.as_mut().and_then(|v| v.personality())?;
+            // `DUCK_CHORALE_PIECE=<id>` pins the conductor's pick — a bench lever for testing
+            // one piece, read once like everything else about this process's configuration.
+            let forced_piece = std::env::var("DUCK_CHORALE_PIECE")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok());
             Some(chorale::Chorale::new(
                 personality.pitch_center_hz,
                 personality.seed,
+                forced_piece,
             ))
         })
         .flatten();

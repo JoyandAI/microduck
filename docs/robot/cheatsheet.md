@@ -262,6 +262,11 @@ listening for other ducks — Ctrl-C to stop
   tenor    bar   12  beat  45.2  3 voices
 ```
 
+The conductor picks the piece per performance. `DUCK_CHORALE_PIECE=<id>` on `robotd`
+(`sudo systemctl edit robotd`, add `Environment=DUCK_CHORALE_PIECE=2` under `[Service]`,
+restart) pins the pick on the duck that ends up conducting — a bench lever for testing one
+song. Ids: 1 wistful, 2 duck-strut, 3 outer-wilds (test asset, not for release).
+
 To hear the arrangement without any ducks, one machine can render the whole ensemble:
 
 ```
