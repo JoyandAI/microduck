@@ -88,6 +88,25 @@ itself and use the new name:
 robotctl system set-name ducky
 ```
 
+## The console
+
+The robot serves a page that streams its camera and drives it:
+
+```
+http://192.168.1.42:8080/
+```
+
+The address is the one `duckctl scan` printed. Nothing to install and nothing to serve — `mediad`
+embeds the page, so a robot running that daemon is a robot with a console.
+
+Two ports are involved and only this one is typed: the page reaches the signalling server on 8443
+itself, using the host it was served from. If the page loads and then says its signalling port did
+not answer, the robot is up and something between you and 8443 is not — a firewall, most often.
+
+The camera and the drive controls are on WebRTC and nothing else, so a robot with no network address
+has no console. Join it to one over the radio first — `duckctl wifi connect` below needs no network
+of its own.
+
 ## Always the same robot
 
 Put the name in the environment instead of on every command line:

@@ -36,6 +36,15 @@ struct Args {
     #[arg(long, default_value_t = 8443)]
     port: u32,
 
+    /// Where the console is served. `http://<robot>:8080/`, and nothing else to run.
+    ///
+    /// **Two ports, and only this one is ever typed.** `webrtcsink` owns the listener on `--port`
+    /// and takes only a host and a port about it, so the page cannot be a route on it — see
+    /// `webrtc-console.md` §1.3, which also says where this ends up: one port, our own signalling
+    /// server, and a certificate, on the day a microphone or a browser gamepad is wanted.
+    #[arg(long, default_value_t = 8080)]
+    web_port: u16,
+
     /// Target video bitrate, bits per second.
     ///
     /// Explicit rather than the encoder's "auto calculate": `rc-mode` is already constant-bitrate,
@@ -101,6 +110,24 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(async move {
+        // The console, before the pipeline: it is the page that says a robot's pipeline would not
+        // start, so it should be up first — and it needs nothing from GStreamer.
+        //
+        // **A page that cannot be served does not cost the video.** A refused bind is almost always
+        // a port already in use, which `Restart=always` cannot fix by trying again; a robot that
+        // streams and answers control calls with no console is much better than one that does
+        // neither. So this is logged at error and the daemon carries on.
+        let page = mediad::web::page(args.port);
+        let (web_host, web_port) = (args.host.clone(), args.web_port);
+        tokio::spawn(async move {
+            if let Err(e) = mediad::web::serve(&web_host, web_port, page).await {
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    "the console is not being served; video and control are unaffected"
+                );
+            }
+        });
+
         let source = if args.camera {
             mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
                 device: args.camera_device.clone(),

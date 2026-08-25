@@ -2375,6 +2375,7 @@ name = "mediad"
 version = "0.9.1"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "duck-ipc-proto",
  "glib",

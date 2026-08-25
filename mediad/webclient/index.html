@@ -1,20 +1,20 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>mediad test client</title>
+<title>duck console</title>
 <!--
-  A test client for mediad. One file, no build step, no dependencies: serve it and point it at a
-  robot.
+  The robot's console. One file, no build step, no dependencies — mediad embeds this page and
+  serves it, so reaching it is an address and not a command:
 
-      cd mediad/webclient && python3 -m http.server 8080     # then http://localhost:8080/
+      http://<robot>:8080/          — or `duckctl open`, which finds the robot for you
 
-  **Serve it; do not open it from disk.** A file:// page has an opaque origin, and Chrome's
-  Private Network Access blocks requests from one to a private address like 192.168.x — which is
-  every robot. It fails as a websocket error with nothing useful in it. Firefox is more forgiving,
-  but serving costs one command and works everywhere.
+  **The robot serves it, and that is what makes the signalling target derivable.** The page was
+  served by the robot it is about to talk to, so the host is `location.hostname` and the port is
+  filled in by mediad as it serves (see SERVED_PORT below). Nothing is typed, and nothing here
+  holds a second copy of the port.
 
   It speaks gst-plugins-rs's signalling protocol directly rather than using its gstwebrtc-api
-  JS library, for one reason: a test client that needs npm is a test client nobody runs. The
-  protocol is small and the exact shapes are below, read off net/webrtc/protocol at 0.15.3.
+  JS library, for one reason: a client that needs npm is a client nobody runs. The protocol is
+  small and the exact shapes are below, read off net/webrtc/protocol at 0.15.3.
 
   What it exercises, which is everything mediad does today:
 
@@ -22,8 +22,14 @@
     * the video track, hardware-encoded H.264         (constrained-baseline, so a browser takes it)
     * the `control` datachannel, and the JSON-RPC on it, including a refusal   (§5)
 
-  Serve it over http, never https: ws:// from an https page is mixed content and blocked outright,
-  and a robot on a LAN has no certificate to offer wss.
+  Served over http, never https: ws:// from an https page is mixed content and blocked outright,
+  and a robot on a LAN has no certificate to offer wss. docs/design/webrtc-console.md §1.3 says
+  what that costs — a microphone, and on some browsers a gamepad — and when it changes.
+
+  Opening this file from a checkout still works for development: with no port substituted it
+  falls back to 8443, and the host comes from wherever it is served. A file:// page cannot reach
+  a robot at all — Chrome's Private Network Access blocks requests from an opaque origin to a
+  private address — so serve it, or let the robot serve it.
 -->
 <style>
   :root { color-scheme: light dark; }
@@ -46,11 +52,11 @@
 </style>
 
 <header>
-  <h1>mediad test client</h1>
-  <input id="url" type="text" value="ws://radxa-zero3.local:8443" spellcheck="false">
+  <h1>duck console</h1>
   <button id="connect">connect</button>
   <span id="state" class="pill">idle</span>
   <span id="dcstate" class="pill dim">no control channel</span>
+  <span id="signalling" class="pill dim"></span>
 </header>
 
 <section>
@@ -94,6 +100,19 @@ function log(cls, ...parts) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// **The signalling target, derived rather than typed.**
+//
+// mediad replaces the token below with its own `--port` as it serves this page (`web.rs`), so the
+// port is in one place and `--port` is safe to move. NaN means nobody substituted it — this page
+// was opened from a checkout rather than served by a robot — and then webrtcsink's own default is
+// the right guess. That same fact is what makes the two failures distinguishable below: a page the
+// robot served reaching no signalling port is a firewall between two ports on one robot, and a page
+// opened by hand reaching nothing is a wrong host.
+const SERVED_PORT = Number("{{SIGNALLING_PORT}}");
+const SERVED_BY_ROBOT = Number.isFinite(SERVED_PORT);
+const SIGNALLING_PORT = SERVED_BY_ROBOT ? SERVED_PORT : 8443;
+const SIGNALLING_URL = `ws://${location.hostname || "localhost"}:${SIGNALLING_PORT}`;
+
 let ws = null, pc = null, sessionId = null, control = null;
 
 function setState(text, cls = "pill") { $("state").textContent = text; $("state").className = cls + " pill"; }
@@ -104,13 +123,24 @@ function send(msg) {
   ws.send(JSON.stringify(msg));
 }
 
+$("signalling").textContent = SIGNALLING_URL;
+
 $("connect").onclick = () => {
   if (ws) { ws.close(); return; }
-  ws = new WebSocket($("url").value);
+  ws = new WebSocket(SIGNALLING_URL);
   setState("connecting…");
 
   ws.onopen = () => { setState("signalling"); $("connect").textContent = "disconnect"; };
-  ws.onerror = () => log("bad", "!! websocket error — wrong host, or mediad is not running");
+  // The one failure two ports can produce, named in words rather than as `websocket error`. If this
+  // page arrived from the robot, the robot is up and reachable and one of its two ports is not —
+  // which is a firewall between them far more often than it is mediad, since mediad serves both.
+  ws.onerror = () => log("bad", SERVED_BY_ROBOT
+    ? `!! this page came from this robot, but its signalling port (${SIGNALLING_PORT}) did not `
+      + `answer. mediad serves both ports, so it is running — check for a firewall between you `
+      + `and ${SIGNALLING_PORT}, and \`journalctl -u mediad -b\` for a pipeline that stopped.`
+    : `!! no answer from ${SIGNALLING_URL} — wrong host, or mediad is not running. This page was `
+      + `opened from a file rather than served by a robot; \`duckctl open\` serves it from the `
+      + `robot instead.`);
   ws.onclose = () => {
     setState("closed", "bad"); setDc("no control channel");
     $("connect").textContent = "connect";
