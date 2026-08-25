@@ -54,6 +54,16 @@ const SETTLE: Duration = Duration::from_millis(1500);
 /// duck joining knows what to load.
 const PIECE_WISTFUL: u8 = 1;
 
+/// How often an *idle* beacon changes, so that it is noticed at all.
+///
+/// A payload that never changes is an advertisement that is never re-registered, and on this
+/// stack a duck is reported to a scanner mainly when it turns up at a new address — which,
+/// with BLE privacy on, happens on the radio's schedule and not on ours. Two willing ducks in
+/// a room took tens of seconds to find each other. So the idle beacon carries a slow counter
+/// purely to make itself change; slow, because each change costs an advertisement
+/// re-registration and a fresh random address.
+const IDLE_HEARTBEAT: Duration = Duration::from_millis(1500);
+
 /// Another duck, as last heard.
 #[derive(Debug, Clone)]
 struct Peer {
@@ -79,9 +89,18 @@ enum State {
     /// Singing to somebody else's beat.
     Following {
         follower: Follower,
-        /// The conductor, so a second conductor appearing does not pull this duck off its beat.
-        /// Empty until the first singing beacon names one.
-        conductor: String,
+        /// Which duck is conducting, by its **beacon id** — never by its radio address.
+        ///
+        /// This was the address, and it is the bug that made a chorale never synchronise —
+        /// twice, because the first fix was committed with a message describing it and a patch
+        /// that had silently not applied. These robots advertise with BLE privacy on, so the
+        /// address is a resolvable random one that rotates every few seconds: a follower that
+        /// adopted the conductor at one address rejected every beat after the rotation, the
+        /// phase lock starved on its single observation, and the duck never sang. The beacon
+        /// carries `(register, id)` precisely so identity never comes from the radio layer.
+        ///
+        /// `None` until the first singing beacon names one.
+        conductor: Option<u8>,
         roster: Vec<(u8, u8)>,
         /// The counter last taken, so a repeated beacon is not counted as another beat.
         last_beat: Option<u8>,
@@ -208,14 +227,16 @@ impl Chorale {
             last_beat,
         } = &mut self.state
         {
-            // The beacon carries no address, so the first singing beacon adopts its sender as *the*
-            // conductor. After that another duck's beacon cannot pull this one off its beat — which
-            // matters when two pieces briefly overlap in one room.
-            if conductor.is_empty() && heard.beacon.singing() {
-                *conductor = heard.from.clone();
-                tracing::warn!(conductor = %heard.from, "chorale: following");
+            // The first singing beacon names the conductor; after that another duck's beacon
+            // cannot pull this one off its beat — which matters when two pieces briefly
+            // overlap in one room. By beacon id, never by `heard.from`: the radio address
+            // rotates under BLE privacy, and keying on it is how a follower ends up rejecting
+            // every beat its conductor sends after the first few seconds.
+            if conductor.is_none() && heard.beacon.singing() {
+                *conductor = Some(heard.beacon.id);
+                tracing::warn!(conductor = heard.beacon.id, "chorale: following");
             }
-            if *conductor != heard.from {
+            if *conductor != Some(heard.beacon.id) || !heard.beacon.singing() {
                 return;
             }
             roster.clone_from(&heard.beacon.roster);
@@ -227,6 +248,12 @@ impl Chorale {
                 follower.observe(heard.beacon.beat, arrival);
             }
         }
+    }
+
+    /// A slowly-turning byte, so an idle beacon changes and is therefore noticed. See
+    /// [`IDLE_HEARTBEAT`].
+    fn heartbeat(&self, now: Instant) -> u8 {
+        (self.seconds(now) / IDLE_HEARTBEAT.as_secs_f64()) as u64 as u8
     }
 
     /// Seconds since this module's epoch — the clock `sounds::chorale::beat` speaks in.
@@ -264,7 +291,7 @@ impl Chorale {
                     );
                     self.state = State::Following {
                         follower: Follower::new(self.score.bpm),
-                        conductor: String::new(),
+                        conductor: None,
                         roster: peer.beacon.roster.clone(),
                         last_beat: None,
                     };
@@ -288,7 +315,7 @@ impl Chorale {
                     };
                     return self.tick(now);
                 }
-                let idle = self.beacon(proto::ChoraleBeacon::IDLE, 0, Vec::new());
+                let idle = self.beacon(proto::ChoraleBeacon::IDLE, self.heartbeat(now), Vec::new());
                 let advertise = self.publish(Some(idle), true);
                 Tick {
                     advertise,
@@ -359,7 +386,7 @@ impl Chorale {
         let position = follower.position_beats(seconds);
         // A follower advertises an idle beacon: it is willing and findable, but it is not the one
         // holding the beat, and two beacons carrying a piece would be two conductors.
-        let idle = self.beacon(proto::ChoraleBeacon::IDLE, 0, Vec::new());
+        let idle = self.beacon(proto::ChoraleBeacon::IDLE, self.heartbeat(now), Vec::new());
         let advertise = self.publish(Some(idle), true);
         Tick {
             advertise,
@@ -527,6 +554,74 @@ mod tests {
                 .is_none_or(|b| !b.singing()),
             "the higher id must not also conduct: {tick:?}"
         );
+    }
+
+    /// THE regression test for this feature's worst bug, present twice: the conductor's radio
+    /// address rotates every few seconds (BLE privacy, and re-registering an advertisement
+    /// rotates it too), so a follower keyed on the address adopted the conductor once and then
+    /// rejected every beat it ever sent again — one observation, no lock, no singing, while the
+    /// conductor happily counted two voices. Identity must come from the beacon.
+    #[test]
+    fn the_conductor_is_followed_across_its_rotating_addresses() {
+        let mut c = chorale();
+        let now = Instant::now();
+        c.set_active(true, now);
+        let mine = (c.register, c.id);
+        let roster = vec![(120u8, 9u8), mine];
+
+        // Six beats, each from a brand-new address, one per second — exactly what the radio
+        // does — with the loop ticking in between, as it does on the robot. The beat counter
+        // is what says the beacons are the same conductor; the addresses say otherwise.
+        let mut tick = c.tick(now);
+        for beat in 0..6u8 {
+            let at = now + Duration::from_secs(u64::from(beat));
+            let heard = proto::ChoraleHeard {
+                beacon: proto::ChoraleBeacon {
+                    piece: PIECE_WISTFUL,
+                    beat,
+                    register: 120,
+                    id: 9,
+                    roster: roster.clone(),
+                },
+                from: format!("{beat:02X}:AA:BB:CC:DD:EE"),
+                age_us: 2_000,
+            };
+            c.heard(&heard, at);
+            tick = c.tick(at);
+        }
+        let _ = tick;
+        let tick = c.tick(now + Duration::from_secs(6));
+        let (part, position) = tick.singing.expect("locked and seated, so singing");
+        // Register bytes decode near 234 Hz (this duck, 65) and 347 Hz (the conductor, 120):
+        // this duck is the low voice, so it takes the bass under the conductor's soprano.
+        assert_eq!(part, Part::Bass);
+        assert!(position > 0.0, "{position}");
+        assert_eq!(tick.voices, 2, "{tick:?}");
+    }
+
+    /// An idle beacon must change on its own, or nothing re-registers the advertisement and a
+    /// waiting duck is only noticed when the radio happens to rotate its address — tens of
+    /// seconds, measured. The heartbeat is that change.
+    #[test]
+    fn an_idle_beacon_has_a_heartbeat() {
+        let mut c = chorale();
+        let now = Instant::now();
+        c.set_active(true, now);
+        let first = c
+            .tick(now)
+            .advertise
+            .and_then(|a| a.beacon)
+            .expect("an idle beacon goes out");
+        // Within one heartbeat: no change, nothing re-sent.
+        assert_eq!(c.tick(now + Duration::from_millis(300)).advertise, None);
+        // Past it: the beacon differs, so btd re-registers and the duck is re-noticed.
+        let later = c
+            .tick(now + IDLE_HEARTBEAT + Duration::from_millis(100))
+            .advertise
+            .and_then(|a| a.beacon)
+            .expect("the heartbeat re-advertises");
+        assert_ne!(first, later);
+        assert!(!later.singing(), "still idle, only different");
     }
 
     /// A duck hearing a piece already under way joins it rather than starting a second one — which
