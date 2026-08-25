@@ -64,6 +64,23 @@ network; a line with no address at all means a release from before robots broadc
 The SSID is not in the listing — it does not fit in an advertisement. `duckctl wifi status` has
 it, along with the signal and both addresses.
 
+For the address on its own:
+
+```bash
+ssh radxa@$(duckctl ip)
+```
+
+`ip` prints the address and nothing else, so it substitutes. It reads the advertisement, so it
+connects to nothing, needs no PIN, and takes about a second — and the answer is not stale: `btd`
+re-reads the address every five seconds and re-advertises when it moves.
+
+A robot bonded to this machine often stops advertising the service to it, and then `ip` connects and
+asks `net.status` instead. That is slower and needs the PIN, and it always answers. `--verbose` says
+which of the two happened.
+
+A robot with no network address is told what to do about it rather than reported as empty, because
+the fix is over the radio and has to be — `net.connect` is refused over WebRTC by design.
+
 A robot that has never been renamed calls itself `duck-` plus four characters derived from its
 serial, so `duck-c51b`. Either half of a robot reported under two names at once — macOS shows
 `radxa-zero3 [duck-c51b]` — works as `--name`.
@@ -92,12 +109,16 @@ robotctl system set-name ducky
 
 The robot serves a page that streams its camera and drives it:
 
-```
-http://192.168.1.42:8080/
+```bash
+duckctl open
 ```
 
-The address is the one `duckctl scan` printed. Nothing to install and nothing to serve — `mediad`
-embeds the page, so a robot running that daemon is a robot with a console.
+Finds the robot, then opens `http://<address>:8080/` in a browser. `--print` gives the URL instead,
+for a machine with no browser or for a script; `--port` for a robot started with a non-default
+`mediad --web-port`.
+
+Nothing to install and nothing to serve — `mediad` embeds the page, so a robot running that daemon
+is a robot with a console.
 
 Two ports are involved and only this one is typed: the page reaches the signalling server on 8443
 itself, using the host it was served from. If the page loads and then says its signalling port did

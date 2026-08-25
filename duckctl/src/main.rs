@@ -401,6 +401,60 @@ fn choose<T>(found: Vec<(T, String)>, target: &Target) -> Result<(T, String), St
     })
 }
 
+/// Deliver a resolved address the way the command asked for it.
+///
+/// **`ip` prints the address and nothing else**, because the tool's split is diagnostics on stderr
+/// and data on stdout: `ssh radxa@$(duckctl ip)` only works if that is the whole of what stdout
+/// carries. Every note this command emits goes to stderr for the same reason.
+fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Command::Ip => {
+            println!("{address}");
+            Ok(())
+        }
+        Command::Open { print, port } => {
+            let url = console_url(address, *port);
+            if *print {
+                println!("{url}");
+                return Ok(());
+            }
+            eprintln!("opening {url}");
+            webbrowser::open(&url).map_err(|e| {
+                format!(
+                    "could not open a browser: {e}\nThe robot is at {url} — `duckctl open --print` \
+                     gives the URL without launching anything."
+                )
+                .into()
+            })
+        }
+        // `run` only calls this for the two above; every other command's answer is its JSON.
+        _ => Err("this command does not resolve an address".into()),
+    }
+}
+
+/// Where the console is, given where the robot is.
+///
+/// Plain `http`, because a robot on a LAN has no certificate to offer and `ws://` from an `https`
+/// page is blocked outright as mixed content. `webrtc-console.md` §1.3 says what that costs — a
+/// microphone, and on some browsers a gamepad, both being secure-context APIs — and when it changes.
+fn console_url(address: &str, port: u16) -> String {
+    format!("http://{address}:{port}/")
+}
+
+/// What to say when the robot is right there and has no address.
+///
+/// Two ways to arrive here and they are the same situation: an advertisement that carried `0.0.0.0`,
+/// and a `net.status` with no `ip4`. The fix is over the radio in both cases, and it has to be —
+/// `net.connect` is refused over WebRTC by design, because a robot that has never seen a network
+/// cannot be configured over that network.
+fn no_address(name: &str) -> String {
+    format!(
+        "{name} is in range and has no network address. Join it to a network over the same radio, \
+         which needs no network of its own:\n  duckctl --name '{name}' wifi connect <ssid> --psk \
+         <passphrase>\nThen `duckctl ip` again. `duckctl wifi status` says what the wifi is doing."
+    )
+}
+
 /// Has discovery found what it came for, or should it keep listening until the deadline?
 ///
 /// **Without a name, the first candidate wins**, and stopping there is the point: a bonded robot may
@@ -677,8 +731,8 @@ async fn step<T>(
     version,
     about = "Talk to a robot over BLE — the phone app's stand-in",
     long_about = "Finds a robot advertising the duck GATT service and speaks the same JSON-RPC \
-                  lines every other transport uses. This is a development tool: it is an example \
-                  rather than a binary, so it never ships to a robot."
+                  lines every other transport uses. This is a development tool, and nothing on a \
+                  robot depends on it, so it never ships to one."
 )]
 struct Cli {
     /// Connect to this robot by advertised name. Without it, `DUCK_ROBOT`; without that, the first
@@ -723,6 +777,30 @@ struct Cli {
 enum Command {
     /// List robots in range with the address each one broadcast, and stop.
     Scan,
+    /// The robot's IPv4 address on stdout, and nothing else.
+    ///
+    /// `ssh radxa@$(duckctl ip)`. Read from the advertisement `btd` already broadcasts, so no
+    /// connection is made, no bond is needed and no PIN can be wrong — and it costs about a second
+    /// rather than the tens `wifi status` does. A robot that is bonded to this machine and has
+    /// stopped advertising the service to it is asked over BLE instead, which is slower and always
+    /// answers.
+    Ip,
+    /// Open the robot's console in a browser.
+    ///
+    /// The page `mediad` serves: the camera, and the controls a WebRTC peer is allowed to drive.
+    /// Finds the robot the way `ip` above does.
+    Open {
+        /// Print the URL instead of opening it — for a machine with no browser, or a script.
+        #[arg(long)]
+        print: bool,
+        /// The console's port, for a robot started with a non-default `--web-port`.
+        //
+        // The same default as `mediad --web-port`, and the reason this command exists rather than a
+        // documented `open "http://$(duckctl ip):8080"`: the port belongs in one place that nobody
+        // has to read.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+    },
     /// Version handshake plus update status.
     Status,
     /// What the robot is running: the API version, the release, and the revision it was built from.
@@ -884,6 +962,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // what makes it the safe command to reach for when a robot cannot be reached, and it is also why
     // it can only report what an advertisement carries.
     let list_only = matches!(cli.command, Command::Scan);
+    // `ip` and `open` want one field out of an advertisement, so they read it the way `scan` does —
+    // and unlike `scan` they connect after all when no advertisement carried one. Cheap read first,
+    // call second: without the fallback these two commands would fail on exactly the laptops that
+    // use them most, because a robot bonded to this Mac often stops advertising the service to it.
+    let resolving = matches!(cli.command, Command::Ip | Command::Open { .. });
 
     let manager = Manager::new().await?;
     let adapter = manager
@@ -917,6 +1000,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the latter broke as soon as the Mac bonded with the robot. The authoritative test is whether
     // it serves our characteristic, which is only knowable after connecting.
     let mut advertised: Vec<(Peripheral, String)> = Vec::new();
+    // What each robot said about its address, beside the name it said it under — the two fields
+    // `choose` needs, so `ip` inherits the collision rule every other command follows rather than
+    // picking whichever robot the radio reported first.
+    let mut addresses: Vec<(Address, String)> = Vec::new();
     let mut named: Vec<(Peripheral, String)> = Vec::new();
     let mut connected: Vec<(Peripheral, String)> = Vec::new();
     // Everything the Mac reported, kept only so a failure can say what was in range. `configd`
@@ -927,6 +1014,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         advertised.clear();
+        addresses.clear();
         named.clear();
         connected.clear();
         // Cleared with the tiers, and rebuilt from the same sweep: `peripherals()` reports
@@ -944,13 +1032,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| properties.address.to_string());
 
             let duck = properties.services.contains(&SERVICE_UUID);
+            let address = Address::read(&properties, duck);
+            if duck {
+                addresses.push((address, name.clone()));
+            }
             seen.push(Seen {
                 peripheral: peripheral.clone(),
                 identity: identity(&peripheral, properties.address),
                 local_name: properties.local_name.clone(),
                 services: properties.services.len(),
                 duck,
-                address: Address::read(&properties, duck),
+                address,
             });
 
             if list_only {
@@ -993,6 +1085,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("{}", listing(&seen, cli.verbose, &target).await);
         return Ok(());
+    }
+
+    // The advertisement, before anything connects. An address here costs no bond, no PIN and about a
+    // second — and it is not stale: `btd` re-reads `net.status` every five seconds and re-advertises
+    // when the answer moves, so this is that call with a five-second lag, well inside the window in
+    // which a new lease has already broken ssh.
+    if resolving {
+        match choose(std::mem::take(&mut addresses), &target) {
+            Ok((Address::At(address), _)) => return deliver(&cli.command, &address.to_string()),
+            // The robot broadcast `0.0.0.0`, which is a robot with no network rather than a robot
+            // that did not say. Asking `net.status` over a connection would return the same nothing
+            // more slowly, so this answers now.
+            Ok((Address::Unassigned, name)) => return Err(no_address(&name).into()),
+            // A release from before `btd` advertised an address. The fallback answers anyway;
+            // updating makes it fast.
+            Ok((Address::Unsaid, name)) => eprintln!(
+                "{name} advertises no address — a release from before robots broadcast one. Asking \
+                 it over Bluetooth instead, which takes longer; `duckctl update apply` makes this \
+                 fast."
+            ),
+            // Nothing advertised the service, or nothing answering to the name did. Both are the
+            // fallback's case, and the tiers below have their own answer for each: this is the
+            // bonded-Mac situation the fallback exists for, and its failure message is better than
+            // anything that could be said here.
+            Err(_) => {
+                if cli.verbose {
+                    eprintln!(
+                        "no advertisement carried an address; connecting to ask net.status instead"
+                    );
+                }
+            }
+        }
     }
 
     let mut found = advertised;
@@ -1180,6 +1304,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("· {}", serde_json::to_string(&value)?);
                 }
                 continue;
+            }
+
+            // `ip` and `open` asked `net.status` for one field, so the reply is not the answer:
+            // stdout carries an address or a URL, or nothing at all. Before the JSON is printed,
+            // because printing it would be the bug — `$(duckctl ip)` would carry the whole object.
+            if resolving {
+                let _ = peripheral.disconnect().await;
+                if let Some(error) = value.get("error") {
+                    return Err(format!(
+                        "the robot answered and refused net.status: {error}\nA wrong PIN is the \
+                         usual cause — `robotctl system pin` on the robot says what it is."
+                    )
+                    .into());
+                }
+                return match value["result"]["ip4"].as_str().filter(|ip| !ip.is_empty()) {
+                    Some(address) => deliver(&cli.command, address),
+                    None => Err(no_address(&name).into()),
+                };
             }
 
             println!("{}", serde_json::to_string_pretty(&value)?);
@@ -1405,6 +1547,10 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // request: there is no method to send, and connecting is the thing it exists not to do.
         Command::Scan => unreachable!("scan returns before anything connects"),
         Command::Status => ("update.status", serde_json::json!({}), REPLY_TIMEOUT),
+        // The fallback, reached only when no advertisement carried an address. `net.status` is what
+        // the advertisement is made of — `btd` re-reads it every five seconds — so this asks the
+        // same question over a connection that costs a bond and a PIN.
+        Command::Ip | Command::Open { .. } => ("net.status", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Version => (
             "hello",
             serde_json::json!({ "api_version": duck_ipc_proto::API_VERSION }),
@@ -1943,6 +2089,72 @@ mod tests {
     }
 
     /// The whole point of the change: a listing says where to reach the robot, with no connection.
+    /// The one thing `open` adds over `ip`, and the reason it is a command rather than a documented
+    /// `open "http://$(duckctl ip):8080"`: the port has one home.
+    #[test]
+    fn the_console_url_is_the_address_and_the_port() {
+        assert_eq!(
+            console_url("192.168.1.42", 8080),
+            "http://192.168.1.42:8080/"
+        );
+        assert_eq!(
+            console_url("192.168.1.42", 9000),
+            "http://192.168.1.42:9000/"
+        );
+    }
+
+    /// `ip` picks a robot the same way every other command does. Two robots on one bench, one of
+    /// them named — the address that comes back has to be that robot's, not whichever advertisement
+    /// arrived first.
+    #[test]
+    fn an_advertised_address_is_chosen_by_name() {
+        let found = vec![
+            (
+                Address::At("192.168.1.7".parse().unwrap()),
+                "duck-aaaa".to_owned(),
+            ),
+            (
+                Address::At("192.168.1.42".parse().unwrap()),
+                "duck-c51b".to_owned(),
+            ),
+        ];
+        let (address, name) = choose(found, &asked_for("duck-c51b")).expect("one robot answers");
+        assert_eq!(name, "duck-c51b");
+        assert_eq!(address, Address::At("192.168.1.42".parse().unwrap()));
+    }
+
+    /// A robot that broadcast `0.0.0.0` is a robot with no network, and the fix is over the radio —
+    /// so the message names the command that does it rather than the field that was empty.
+    #[test]
+    fn a_robot_with_no_network_is_told_how_to_get_one() {
+        let message = no_address("duck-c51b");
+        assert!(message.contains("duck-c51b"));
+        assert!(message.contains("wifi connect"));
+    }
+
+    /// `--print` and `--port` are the two things `open` takes, and neither is positional.
+    #[test]
+    fn open_takes_a_port_and_can_print_instead() {
+        let cli = Cli::try_parse_from(["duckctl", "open", "--print", "--port", "9000"])
+            .expect("open --print --port parses");
+        assert!(matches!(
+            cli.command,
+            Command::Open {
+                print: true,
+                port: 9000
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["duckctl", "open"]).expect("open parses on its own");
+        assert!(matches!(
+            cli.command,
+            Command::Open {
+                print: false,
+                port: 8080
+            }
+        ));
+    }
+
     #[test]
     fn a_robot_broadcasts_where_it_is() {
         let (properties, duck) = advertised(

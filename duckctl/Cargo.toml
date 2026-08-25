@@ -39,6 +39,11 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 btleplug = "0.11"
 clap = { workspace = true, features = ["derive"] }
 futures = "0.3"
+# `open` launches a browser, and which command does that is per-platform: `open` on macOS,
+# `xdg-open` or one of five fallbacks on Linux, `cmd /c start` on Windows. A crate rather than a
+# match on `target_os`, for the same reason `btleplug` is one — this tool runs on whatever the
+# developer sits at, and the interesting part of `open` is finding the robot, not spawning a process.
+webbrowser = "1.2.4"
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
