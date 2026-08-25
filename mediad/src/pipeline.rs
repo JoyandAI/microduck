@@ -542,74 +542,79 @@ const CAPTURE_BUFFERS: u32 = 4;
 
 /// Get `v4l2src` off two capture buffers, which costs a third of the frames.
 ///
-/// **Two things are needed and neither works alone**, which is what made this take three
-/// attempts. `gst_v4l2_object_decide_allocation` has two branches:
+/// `gst_v4l2_object_decide_allocation` computes the pool depth three different ways, and only one
+/// of them is enough:
 ///
 /// ```text
 /// can_share_own_pool = (has_video_meta || !obj->need_video_meta);
 /// ...
-/// if (pushing_from_our_pool)
-///     own_min = min + obj->min_buffers + 2;      // honours the query's `min`
-/// else
-///     own_min = MAX (obj->min_buffers + 1, GST_V4L2_MIN_BUFFERS (obj));   // ignores it
+/// if (pushing_from_our_pool) {
+///     own_min = min + obj->min_buffers + 2;
+///     if (!update) own_min += 2;              /* `update` == the query carried a pool */
+/// } else {
+///     own_min = MAX (obj->min_buffers + 1, GST_V4L2_MIN_BUFFERS (obj));
+/// }
 /// ```
 ///
-/// rkisp offers a two-plane, non-contiguous `NM12` alongside single-plane `NV12` — both map to
-/// GStreamer's `NV12`, and `v4l2src` picks `NM12`. Only a `GstVideoMeta` can describe that, so
-/// `need_video_meta` is true, and with nothing downstream advertising the meta
-/// `can_share_own_pool` is false. That takes the **else** branch, where the query's `min` is
-/// discarded and the driver's own `min_buffers` is used — and rkisp does not implement
-/// `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, so that is **0**. `MAX(0 + 1, 2)` is 2, which the pool
-/// reports as "increasing minimum buffers to 2", and the debug log then shows it cycling `ix=0`,
-/// `ix=1` forever.
+/// rkisp implements neither `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` (so `obj->min_buffers` is 0) nor a
+/// contiguous `NV12` — it offers the two-plane `NM12`, which `v4l2src` prefers and which only a
+/// `GstVideoMeta` can describe. Measured on the board, 300 frames of 720p:
 ///
-/// So: the meta unlocks the branch that reads `min`, and the pool is what puts a useful `min`
-/// there. Asking for one without the other changes nothing measurable — verified both ways.
+/// | chain | `own_min` | fps |
+/// |---|---|---|
+/// | `UYVY ! queue ! fakesink` | `0 + 0 + 2 + 2` | 29.3 |
+/// | `UYVY ! videoconvert ! fakesink` | `0 + 0 + 2` | 19.7 |
+/// | `UYVY ! mpph264enc` | `0 + 0 + 2` | 19.7 |
+/// | `NV12 ! fakesink` | else branch, `MAX(1, 2)` | 19.7 |
 ///
-/// The cost of `update = TRUE` (which a pool in the query sets) is that copy-at-threshold is
-/// switched off. That mechanism exists to stop a shallow pool starving, and at six buffers
-/// (`4 + 0 + 2`) there is nothing for it to rescue.
+/// Three is the cliff, so two costs a third of every second. Two things are therefore needed:
+///
+/// 1. **The meta**, or `can_share_own_pool` is false and the else branch ignores everything the
+///    query says. That also means a copy of every frame into a generic pool.
+/// 2. **A first pool whose `min` is not zero**, because any downstream element that proposes a
+///    pool sets `update` and forfeits the `+ 2`. `GstVideoEncoder::propose_allocation` proposes
+///    exactly that — a pool with `min = 0` — so `mpph264enc` downstream is enough to do it.
+///
+/// **And (2) has to happen after downstream answers.** `propose_allocation` implementations
+/// overwrite pool 0 rather than appending, so a `min` written on the way out is replaced by the
+/// encoder's zero on the way back. A pad probe fires in both directions, so this rewrites pool 0
+/// every time it sees the query and the last word is ours. That is the bug that made three
+/// earlier versions of this function look like they were being ignored.
 fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     let pad = src
         .static_pad("src")
         .context("v4l2src has no src pad, which cannot happen")?;
 
-    // Logged once, at INFO, because three versions of this probe changed nothing measurable and
-    // "the probe never fired" and "GStreamer ignored what it added" want completely different
-    // fixes. Whichever it is, the next run says so instead of being inferred from a frame rate.
-    let reported = std::sync::atomic::AtomicBool::new(false);
-
-    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, move |_, info| {
+    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
         if let Some(gst::PadProbeData::Query(query)) = info.data.as_mut()
             && let gst::QueryViewMut::Allocation(allocation) = query.view_mut()
         {
-            let pools_before = allocation.allocation_pools().len();
-            let had_meta = allocation
+            if allocation
                 .find_allocation_meta::<gst_video::VideoMeta>()
-                .is_some();
-
-            if !had_meta {
+                .is_none()
+            {
                 allocation.add_allocation_meta::<gst_video::VideoMeta>(None);
             }
-            // Size 0 because `decide_allocation` overwrites it with the driver's own frame size
-            // for every io-mode we can end up in; max 0 means unlimited.
-            if pools_before == 0 {
-                allocation.add_allocation_pool(
+
+            match allocation.allocation_pools().next() {
+                // Size 0 is fine: `decide_allocation` overwrites it with the driver's own frame
+                // size in every io-mode this can reach. Max 0 means unlimited.
+                None => allocation.add_allocation_pool(
                     None::<&gst::BufferPool>,
                     0,
                     CAPTURE_BUFFERS,
                     0,
-                );
-            }
-
-            if !reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::info!(
-                    pools_before,
-                    had_meta,
-                    pools_after = allocation.allocation_pools().len(),
-                    asked_for = CAPTURE_BUFFERS,
-                    "allocation query seen; capture buffers requested"
-                );
+                ),
+                Some((pool, size, min, max)) if min < CAPTURE_BUFFERS => {
+                    allocation.set_nth_allocation_pool(
+                        0,
+                        pool.as_ref(),
+                        size,
+                        CAPTURE_BUFFERS,
+                        max,
+                    );
+                }
+                Some(_) => {}
             }
         }
         gst::PadProbeReturn::Ok
