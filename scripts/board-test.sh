@@ -757,7 +757,7 @@ ln -sfn releases/under-test /opt/robot/daemon/current
 # board keep a stale on_apply list for months — so this takes the branch a re-install takes,
 # and substitutes the repository the way the fetch path would.
 mkdir -p /etc/robot
-sed "s|\"ORG/duck-daemon\"|\"pollen-robotics/microduck_daemon\"|" \
+sed "s|\"ORG/duck-daemon\"|\"pollen-robotics/microduck\"|" \
     /bin/deploy/updater.toml > /etc/robot/updater.toml
 cp /bin/deploy/robotd.toml /etc/robot/robotd.toml
 
