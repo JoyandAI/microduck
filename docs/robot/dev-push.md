@@ -49,8 +49,8 @@ export DUCK_ROBOT=duck-c51b
 scripts/dev-push.sh
 ```
 
-The name is the one `duck-btctl scan` lists and `robotctl system set-name` sets — the same
-`DUCK_ROBOT` that tool reads ([`duck-btctl.md`](duck-btctl.md)). Its address is
+The name is the one `duckctl scan` lists and `robotctl system set-name` sets — the same
+`DUCK_ROBOT` that tool reads ([`duckctl.md`](duckctl.md)). Its address is
 asked for over Bluetooth — the robot's own `net.status` answers with it — and then cached, so only
 a push that cannot reach the cached address goes back to the radio. That is what makes a new DHCP
 lease, a reflash or a different network cost nothing to follow.
@@ -272,7 +272,7 @@ grep -c 'DEV BOARD' /var/lib/robot/provision.log
 the name path to resolve an address.
 
 ```bash
-duck-btctl scan
+duckctl scan
 ```
 
 Nothing listed is a robot that is off, out of range, or already connected to a phone. Give the
@@ -286,7 +286,7 @@ scripts/dev-push.sh radxa@192.168.1.42
 there is nothing to ssh to. Join one over the same radio:
 
 ```bash
-duck-btctl --name duck-c51b wifi connect <ssid> --psk <passphrase>
+duckctl --name duck-c51b wifi connect <ssid> --psk <passphrase>
 ```
 
 **`still <address>, which ssh could not reach`** — the address never moved, so whatever ssh is
@@ -328,7 +328,7 @@ This should not have been necessary, so it is worth reading the journal for why 
 |---|---|
 | `DUCK_ROBOT` | The robot, by name. Its address is found over Bluetooth and cached. |
 | `DUCK_BOARD_USER` | The ssh user on the board, for the name path. Default `radxa`. |
-| `DUCK_PIN` | The robot's pairing PIN, if it is not the factory `000000`. Read by `duck-btctl`. |
+| `DUCK_PIN` | The robot's pairing PIN, if it is not the factory `000000`. Read by `duckctl`. |
 | `DUCK_BOARD_CACHE` | Where resolved addresses are cached. Default `~/.cache/duck/boards`. |
 | `DUCK_BOARD` | The board, by address, instead of an argument. `radxa@192.168.1.42`. |
 | `DUCK_DEV_SECRET_KEY` | The dev signing key. Default `~/.duck-keys/team.dev.key`. |
