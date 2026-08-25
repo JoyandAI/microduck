@@ -73,7 +73,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -580,23 +580,20 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
 /// be discovered from the topology rather than named. Doing it here rather than in the unit means
 /// a `--camera`-less run needs no camera at all.
 fn pin_sensor_mode(fps: u32) -> Result<()> {
-    let (media, entity) = find_sensor().context(
-        "no imx219 entity on any /dev/media*. The camera overlay is enabled by \
-         setup-board.sh's configure_camera and needs a reboot; without it there are no \
-         /dev/video* nodes at all",
-    )?;
+    let (media, entity) = find_sensor()?;
 
     let format = format!("\"{entity}\":0[fmt:SRGGB10_1X10/1920x1080]");
-    let status = std::process::Command::new("media-ctl")
+    let output = std::process::Command::new("media-ctl")
         .args(["-d", &media, "--set-v4l2", &format])
-        .status()
+        .output()
         .context("could not run media-ctl; it comes from v4l-utils")?;
 
-    if !status.success() {
+    if !output.status.success() {
         // Not fatal: capture still works, just slower. Said loudly because a third of the frames
         // going missing looks like a network problem from the far end.
         tracing::warn!(
             %media, %entity,
+            why = %String::from_utf8_lossy(&output.stderr).trim(),
             "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
              mode, which caps it at 21 fps"
         );
@@ -610,21 +607,38 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
 ///
 /// Matched on a substring rather than a fixed name: the entity is `m00_b_imx219 2-0010`, which
 /// embeds the I2C bus and address, and those move with the overlay.
-fn find_sensor() -> Option<(String, String)> {
+///
+/// **Every way this fails says which one it was.** An earlier version returned `Option` and
+/// reported "no imx219 entity" for all of them, which sent the first real run chasing the
+/// overlay when the actual cause was `media-ctl` being denied `/dev/media0`. The three cases want
+/// three different fixes and look identical from the outside.
+fn find_sensor() -> Result<(String, String)> {
+    let mut nodes = 0;
+    let mut failures = Vec::new();
+
     for index in 0..8 {
         let media = format!("/dev/media{index}");
         if !std::path::Path::new(&media).exists() {
             continue;
         }
-        let Ok(output) = std::process::Command::new("media-ctl")
+        nodes += 1;
+
+        let output = match std::process::Command::new("media-ctl")
             .args(["-d", &media, "-p"])
             .output()
-        else {
-            continue;
+        {
+            Ok(output) => output,
+            Err(err) => {
+                failures.push(format!("{media}: cannot run media-ctl ({err})"));
+                continue;
+            }
         };
         if !output.status.success() {
+            let why = String::from_utf8_lossy(&output.stderr);
+            failures.push(format!("{media}: {}", why.trim()));
             continue;
         }
+
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             // "- entity 76: m00_b_imx219 2-0010 (1 pad, 1 link, 0 routes)"
             let line = line.trim_start();
@@ -636,11 +650,32 @@ fn find_sensor() -> Option<(String, String)> {
             };
             let name = rest.split(" (").next().unwrap_or(rest).trim();
             if !name.is_empty() {
-                return Some((media, name.to_string()));
+                return Ok((media, name.to_string()));
             }
         }
     }
-    None
+
+    if nodes == 0 {
+        bail!(
+            "no /dev/media* at all, so no camera is attached as far as the kernel is concerned.\n  \
+             The overlay is enabled by setup-board.sh's configure_camera and needs a reboot; \
+             Armbian ships it unprefixed while the board sets overlay_prefix=rk3568, so a boot \
+             with no camera and no complaint is the expected shape of that bug."
+        );
+    }
+    if !failures.is_empty() {
+        bail!(
+            "found {nodes} media device(s) and could not read the topology of any:\n  {}\n  \
+             /dev/media* is root:video, so this is what running outside the `video` group looks \
+             like. The unit grants it with SupplementaryGroups=, which `sudo -u` does not apply — \
+             use `systemctl` or `systemd-run -p SupplementaryGroups=video`.",
+            failures.join("\n  ")
+        );
+    }
+    bail!(
+        "read {nodes} media device(s) and none has an imx219 entity. The overlay loaded something, \
+         so DUCK_CAMERA_OVERLAY may name the wrong module for this camera."
+    )
 }
 
 /// Configure each encoder `webrtcsink` builds, before it runs.
