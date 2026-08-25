@@ -1,6 +1,6 @@
 # The WebRTC client: from a test page to the robot's console
 
-Status: proposal · Date: 2026-08-25 · Owner: pierre
+Status: landed · Date: 2026-08-25 · Owner: pierre
 
 `mediad/webclient/index.html` proved the transport. This is what turns it into something a person
 uses: served by the robot rather than by `python3`, found through the address `btd` already
@@ -10,10 +10,13 @@ Companion to [`remote-webrtc.md`](remote-webrtc.md), which owns the transport �
 the session model, authorisation, and what a peer may call. Where the two touch, that page is the
 owner and this one points at it.
 
-**Nothing here is built.** The approach, written down before the first line, so the decisions are
-arguable rather than implied by a diff.
+**All four changes are in.** This page was written before the first line of them, so the decisions
+are arguable rather than implied by a diff; it is kept because the alternatives are the part worth
+being able to re-read. Where the code and this page could drift, the code is the answer:
+`mediad/src/web.rs` serves the page, `mediad/src/producer.rs` fills in `meta`, `duckctl`'s `ip` and
+`open` find the robot, and `mediad/webclient/index.html` is the console. §7 says what is left.
 
-## 0. What is wrong with it today
+## 0. What was wrong with it
 
 Not much, for what it was for. It answered "does a browser get video and a datachannel", and the
 answer was yes. Six things are wrong with it as *a client*:
@@ -31,6 +34,8 @@ Every one of those is a step between a person and a working robot, and none of t
 WebRTC.
 
 ## 1. `mediad` serves the page
+
+**Landed** — `mediad/src/web.rs`, `--web-port`, default 8080.
 
 An HTTP listener in `mediad`, one route, returning the page. `http://<robot>:8080/` and there is
 nothing else to run.
@@ -111,6 +116,8 @@ our own signalling server when audio or a browser gamepad is wanted, TLS on the 
 Worth writing down now rather than discovering it while wiring a microphone.
 
 ## 2. Finding the robot: two commands, and one of them is already hand-rolled
+
+**Landed** — `duckctl ip` and `duckctl open`, advertisement first and `net.status` behind it.
 
 `btd` files the robot's IPv4 in its advertisement under company id `0xFFFF`, and `duckctl`
 already parses it — `Address::At`, `Unassigned`, `Unsaid`, three answers rather than two, and
@@ -270,6 +277,8 @@ exactly as before.
 
 ## 4. The page becomes a console
 
+**Landed** — `mediad/webclient/index.html`, still one file and still no build step.
+
 The permitted subset is large and almost none of it is reachable from the page. Reorganised
 around what a person came to do:
 
@@ -302,6 +311,8 @@ believe and expensive to be wrong about.
 
 ## 5. The robot names itself before the session starts
 
+**Landed** — `mediad/src/producer.rs`.
+
 `webrtcsink` takes a `meta` structure and the signalling server hands it to every peer in `list`
 — the page already logs it and it is empty. Fill it from `configd`: name, serial, release,
 `API_VERSION`.
@@ -321,19 +332,23 @@ nothing reads it yet.
 Named so the shape is visible, not proposed here. It is a second transport and the first one
 should be good.
 
-## 7. Order
+## 7. Order, and what is left
 
-Four changes, each of which stands alone and lands separately:
+Four changes, each of which stood alone and landed separately, in this order:
 
-1. **Serve the page, with the signalling URL filled in as it is served.** Deletes the python
-   instruction and the warning block. Small, and everything else is nicer on top of it.
+1. **Serve the page, with the signalling URL filled in as it is served.** Deleted the python
+   instruction and the warning block. Small, and everything else was nicer on top of it. The API
+   version is substituted the same way, for §4's banner — a literal in the page would be a second
+   copy of `API_VERSION`, wrong on the day it is bumped and wrong in the direction that reports
+   agreement.
 2. **Producer `meta`.** Smaller still, and independent.
-3. **`duckctl` gains `ip` and `open`.** Client-side only, touches no daemon. The rename it needed
-   first (§3) is done. `ip` before `open`, since `ip` stands on its own for ssh and `open` is a
-   port number on top of it.
-4. **The console.** The large one, done last, on a page that is already reachable.
+3. **`duckctl` gains `ip` and `open`.** Client-side only, touched no daemon.
+4. **The console.** The large one, done last, on a page that was already reachable.
 
-Then, separately, `dev-push.sh` switching to `duckctl ip` (§2.4).
+**Not done, and deliberately separate:** `dev-push.sh`'s `resolve_board` still hand-rolls this with
+`duckctl wifi status` and six lines of embedded Python (§2.4). It becomes `duckctl ip`, which deletes
+the Python and the wrong-PIN branch — separate because it touches the push path, and because it
+should land after `ip` has been used by hand a few times.
 
 ## 8. Not doing
 
@@ -342,6 +357,6 @@ Then, separately, `dev-push.sh` switching to `duckctl ip` (§2.4).
   flags — one flag, not a mechanism.
 - **A JS framework, a bundler, or `gstwebrtc-api`.** The page speaks the protocol by hand because
   a client that needs npm is a client nobody runs. Still true at four times the size.
-- **Serving over TLS in this change.** §1.3 says when, and why it is not now.
+- **Serving over TLS.** §1.3 says when, and why it was not now.
 - **Teaching the advertisement a port.** Four bytes of IPv4 is what it carries; a robot on a
   non-default `--web-port` is a `--port` on `duckctl open`, not a wire-format change.
