@@ -53,6 +53,10 @@ pub struct AudioParams {
     /// Where the per-robot voice bank lives. The release's postinstall renders it there
     /// (`sounds ensure-bank`), seeded from the SoC serial.
     pub bank: PathBuf,
+    /// Quack once as the control loop comes up. On by default because on a headless board
+    /// it is the audible "robotd is running"; off for anyone who restarts the daemon all
+    /// day and would rather it did so quietly.
+    pub greet: bool,
     /// Listen for petting on the onboard mic. Absent resolves per mode, as the prototype's
     /// launcher does: on for walking, off for the roller (its launch line dropped
     /// `--pet-detect`).
@@ -71,6 +75,7 @@ impl Default for AudioParams {
             enabled: true,
             device: "plughw:aic3104".to_owned(),
             bank: PathBuf::from("/var/lib/robot/sounds"),
+            greet: true,
             pet_detect: None,
             pet_model: None,
             pet_enter_threshold: 0.95,
