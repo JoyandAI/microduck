@@ -2440,7 +2440,7 @@ fn deviation_bar(error: Option<f64>) -> Line<'static> {
 }
 
 /// Is stdout a terminal? Decides which of the two renderings runs.
-fn stdout_is_a_terminal() -> bool {
+pub(crate) fn stdout_is_a_terminal() -> bool {
     // SAFETY: `isatty` only inspects a file descriptor; it touches no memory of ours.
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
 }
