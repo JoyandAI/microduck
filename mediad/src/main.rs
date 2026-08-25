@@ -44,9 +44,23 @@ struct Args {
     #[arg(long, default_value_t = 2_000_000)]
     bitrate: u32,
 
-    /// Stream the head camera instead of a test pattern. Not implemented yet.
+    /// Stream the head camera instead of a test pattern.
     #[arg(long)]
     camera: bool,
+
+    /// Which capture node. rkisp exposes several; `video0` is the main path.
+    #[arg(long, default_value = "/dev/video0")]
+    camera_device: String,
+
+    /// Sensor exposure in lines (~19 µs each) and analogue gain, where 256 is 1x.
+    ///
+    /// There is no 3A daemon on this platform, so nothing converges these. The defaults are the
+    /// prototype's, and with the boot values the picture is black rather than merely dark.
+    #[arg(long, default_value_t = 600)]
+    exposure: u32,
+
+    #[arg(long, default_value_t = 1024)]
+    analogue_gain: u32,
 
     /// Frame size and rate, pinned rather than negotiated.
     ///
@@ -88,7 +102,11 @@ fn main() -> ExitCode {
 
     runtime.block_on(async move {
         let source = if args.camera {
-            mediad::pipeline::Source::Camera
+            mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
+                device: args.camera_device.clone(),
+                exposure: args.exposure,
+                analogue_gain: args.analogue_gain,
+            })
         } else {
             mediad::pipeline::Source::Test
         };

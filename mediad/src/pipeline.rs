@@ -81,17 +81,26 @@ use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
 
 /// Where the video comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// A test pattern. Works with no camera attached, which is what makes a session testable
     /// before the capture path exists.
     Test,
     /// The head camera, through the rkisp capture path.
-    ///
-    /// Not implemented yet, and deliberately an error rather than a silent fallback to `Test`: a
-    /// robot streaming a test pattern when someone asked for its camera is worse than one that
-    /// says it cannot.
-    Camera,
+    Camera(Camera),
+}
+
+/// The head camera, and the two things it will not work without.
+///
+/// **There is no 3A daemon on this platform.** Nothing converges exposure or gain, so a capture
+/// with the driver's boot defaults comes out black — this is not tuning, it is the difference
+/// between a picture and no picture. Values are in the sensor's own units: exposure in lines
+/// (~19 µs each) and analogue gain where 256 is 1x, up to 2816 for 11x.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Camera {
+    pub device: String,
+    pub exposure: u32,
+    pub analogue_gain: u32,
 }
 
 /// One raw frame off the tee, as the last one seen.
@@ -157,17 +166,16 @@ pub fn start(
 
     let pipeline = gst::Pipeline::new();
 
-    let src = match source {
-        Source::Test => make("videotestsrc")?,
-        Source::Camera => {
-            return Err(anyhow!(
-                "the camera source is not implemented yet — see docs/project/media-bringup.md \
-                 for the capture path, which cannot simply be v4l2src on this driver"
-            ));
+    let src = match &source {
+        Source::Test => {
+            let src = make("videotestsrc")?;
+            // `is-live` so the pipeline behaves like a camera does rather than racing ahead of
+            // the clock. A camera is live by construction and needs no such property.
+            src.set_property("is-live", true);
+            src
         }
+        Source::Camera(camera) => camera_source(camera, fps)?,
     };
-    // `is-live` so the pipeline behaves like a camera does rather than racing ahead of the clock.
-    src.set_property("is-live", true);
 
     // Pinned rather than negotiated, because both branches of the tee depend on the answer. NV12
     // is what the rkisp capture path emits and what `mpph264enc` takes, so this costs no
@@ -472,6 +480,167 @@ fn make(name: &str) -> Result<gst::Element> {
     gst::ElementFactory::make(name)
         .build()
         .map_err(|_| anyhow!("no {name} element; a GStreamer package is missing"))
+}
+
+/// How many capture buffers to ask the driver for.
+///
+/// **Three is the cliff, and it is a cliff rather than a slope.** Measured on an RK3566 against
+/// rkisp's main path, 1280x720 NV12, 300 frames:
+///
+/// | buffers | 2 | 3 | 4 | 6 |
+/// |---|---|---|---|---|
+/// | seconds for 300 frames | 15.2 | 10.3 | 10.3 | 10.3 |
+///
+/// So two buffers is 19.7 fps from a 30 fps sensor and three is 29.2. `v4l2src` asks for the
+/// driver's minimum, which is two — nothing about `io-mode` changes it, and there is no property
+/// for it. Four rather than three so a late requeue has somewhere to go.
+const CAPTURE_BUFFERS: u32 = 4;
+
+/// The head camera as a `v4l2src`, with the two adjustments this driver needs.
+///
+/// `v4l2src` rather than a hand-written V4L2 loop, and that is a reversal worth recording: the
+/// case for our own capture was that the driver drops every third frame and that raw bytes
+/// through `fdsrc` need `rawvideoparse blocksize=…`, which is silently wrong the moment stride
+/// padding appears. Both belong to the *subprocess* shape rather than to `v4l2src` — the frame
+/// loss is a buffer count (see [`CAPTURE_BUFFERS`]), and `v4l2src` attaches a `GstVideoMeta`
+/// carrying the driver's real strides, so nothing downstream has to assume a layout.
+fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
+    pin_sensor_mode(fps)?;
+
+    // Exposure and gain go through `extra-controls` rather than a `v4l2-ctl` call, so they are
+    // applied by whoever opens the device — including after a re-open we did not initiate.
+    let controls = gst::Structure::builder("c")
+        .field("exposure", camera.exposure as i32)
+        .field("analogue_gain", camera.analogue_gain as i32)
+        .build();
+
+    let src = gst::ElementFactory::make("v4l2src")
+        .property("device", &camera.device)
+        .property("extra-controls", &controls)
+        .build()
+        .map_err(|_| {
+            anyhow!(
+                "no v4l2src element; it comes from gstreamer1.0-plugins-good, which \
+                 setup-gstreamer.sh installs"
+            )
+        })?;
+
+    raise_capture_buffers(&src)?;
+
+    tracing::info!(
+        device = %camera.device,
+        exposure = camera.exposure,
+        analogue_gain = camera.analogue_gain,
+        buffers = CAPTURE_BUFFERS,
+        "head camera"
+    );
+    Ok(src)
+}
+
+/// Ask the driver for [`CAPTURE_BUFFERS`] buffers instead of its minimum of two.
+///
+/// There is no property for this, so it goes through the one channel that decides it:
+/// `gst_v4l2_object_decide_allocation` reads `min` out of the first pool in the ALLOCATION query,
+/// and falls back to the driver minimum when the query carries none. `basesrc` builds that query,
+/// sends it downstream, and then reads it back — **keeping the same query object even when the
+/// peer query fails** — so a pool added on the way out is still there when the decision is made.
+///
+/// If this ever stops working the symptom is 20 fps from a 30 fps sensor and nothing else, which
+/// is why the frame rate is checked at startup rather than trusted.
+fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
+    let pad = src
+        .static_pad("src")
+        .context("v4l2src has no src pad, which cannot happen")?;
+
+    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
+        if let Some(gst::PadProbeData::Query(query)) = info.data.as_mut()
+            && let gst::QueryViewMut::Allocation(allocation) = query.view_mut()
+        {
+            allocation.add_allocation_pool(
+                None::<&gst::BufferPool>,
+                0,
+                CAPTURE_BUFFERS,
+                0,
+            );
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .context("could not add the allocation probe to v4l2src")?;
+    Ok(())
+}
+
+/// Switch the IMX219 out of its boot mode, which caps capture at 21 fps.
+///
+/// The sensor boots in 3280x2464 and the rkisp scaler will happily give us 1280x720 from it — at
+/// the full-res frame rate. 1920x1080 is the mode that runs at 30, and the ISP scales down from
+/// there, so nothing else in the pipeline changes with it.
+///
+/// This shells out to `media-ctl` once at startup, because the switch is a subdev ioctl on an
+/// entity whose name embeds its I2C bus and address (`m00_b_imx219 2-0010`) and therefore has to
+/// be discovered from the topology rather than named. Doing it here rather than in the unit means
+/// a `--camera`-less run needs no camera at all.
+fn pin_sensor_mode(fps: u32) -> Result<()> {
+    let (media, entity) = find_sensor().context(
+        "no imx219 entity on any /dev/media*. The camera overlay is enabled by \
+         setup-board.sh's configure_camera and needs a reboot; without it there are no \
+         /dev/video* nodes at all",
+    )?;
+
+    let format = format!("\"{entity}\":0[fmt:SRGGB10_1X10/1920x1080]");
+    let status = std::process::Command::new("media-ctl")
+        .args(["-d", &media, "--set-v4l2", &format])
+        .status()
+        .context("could not run media-ctl; it comes from v4l-utils")?;
+
+    if !status.success() {
+        // Not fatal: capture still works, just slower. Said loudly because a third of the frames
+        // going missing looks like a network problem from the far end.
+        tracing::warn!(
+            %media, %entity,
+            "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
+             mode, which caps it at 21 fps"
+        );
+    } else {
+        tracing::info!(%media, %entity, target_fps = fps, "sensor mode 1920x1080");
+    }
+    Ok(())
+}
+
+/// The media device and entity name of the IMX219, from the topology.
+///
+/// Matched on a substring rather than a fixed name: the entity is `m00_b_imx219 2-0010`, which
+/// embeds the I2C bus and address, and those move with the overlay.
+fn find_sensor() -> Option<(String, String)> {
+    for index in 0..8 {
+        let media = format!("/dev/media{index}");
+        if !std::path::Path::new(&media).exists() {
+            continue;
+        }
+        let Ok(output) = std::process::Command::new("media-ctl")
+            .args(["-d", &media, "-p"])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            // "- entity 76: m00_b_imx219 2-0010 (1 pad, 1 link, 0 routes)"
+            let line = line.trim_start();
+            if !line.starts_with("- entity") || !line.contains("imx219") {
+                continue;
+            }
+            let Some((_, rest)) = line.split_once(": ") else {
+                continue;
+            };
+            let name = rest.split(" (").next().unwrap_or(rest).trim();
+            if !name.is_empty() {
+                return Some((media, name.to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// Configure each encoder `webrtcsink` builds, before it runs.
