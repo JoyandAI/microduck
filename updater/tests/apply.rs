@@ -875,10 +875,18 @@ async fn a_revert_whose_restart_fails_is_still_a_revert() {
                 "the release must be reported as reverted, because it was"
             );
             // Why the update failed comes first — that is what someone is looking for — and the
-            // daemon that did not come back is a second thing to act on rather than a correction.
+            // unit that did not come back is a second thing to act on rather than a correction.
             assert!(reason.contains("not healthy"), "{reason}");
-            assert!(reason.contains("did not restart"), "{reason}");
-            assert!(reason.contains("is down"), "{reason}");
+            assert!(reason.contains("the release was reverted"), "{reason}");
+
+            // The claim it must not make. Every daemon runs `Restart=always`, so a refused restart
+            // is not an outage — asserting one put "something on this robot is down" under a
+            // `robot healthy` line on a bench board.
+            assert!(
+                !reason.contains("is down"),
+                "an outage this never checked for: {reason}"
+            );
+            assert!(reason.contains("robotctl health"), "{reason}");
         }
         other => panic!("expected RolledBack, got {other:?}"),
     }

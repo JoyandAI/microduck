@@ -58,7 +58,10 @@ jobs:
       # a C library, unconditional on Linux with no feature to disable it. The runner image
       # does not ship the headers, so without this `cargo clippy --workspace` fails to build
       # before it checks anything.
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
+      # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
+      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
@@ -69,7 +72,7 @@ jobs:
       # would catch a typo in one until someone tried to provision a board. shellcheck is on the
       # runner already.
       #
-      # `ci-release-notes.sh` is here despite running only in CI, unlike `ci-cross-deps.sh`: it runs
+      # `ci-release-notes.sh` is here despite running only in CI: it runs
       # *during a release*, which is the worst moment to find a typo in a shell script.
       #
       # `migrate-network.sh` was missing from this list while being the riskiest of them —
@@ -94,7 +97,7 @@ jobs:
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.
@@ -159,14 +162,40 @@ jobs:
       #   - "latest" would let the glibc floor move under us between runs. The floor is
       #     the whole point of building with zig (see .cargo/config.toml), so the
       #     toolchain that sets it must be a fixed input.
-      # libudev for the *target* architecture, so gilrs can be cross-compiled. zig supplies
-      # the compiler but not the target's C libraries, and libudev-sys resolves those
-      # through pkg-config — hence multiarch plus the cross hints on the build step.
+
+      # GStreamer and libudev for the *target*, unpacked from the robot's own Debian packages.
       #
-      # This is the price of keeping gilrs, and it is worth naming: the same expense returns
-      # for the next C dependency that has to reach the board.
-      - name: Cross-compilation C dependencies
-        run: ./scripts/ci-cross-deps.sh
+      # This replaced Ubuntu multiarch from ports.ubuntu.com, which served libudev alone and could
+      # not serve GStreamer honestly: it would give Ubuntu's while the robot runs Debian trixie's.
+      # One sysroot covers both, because PKG_CONFIG_LIBDIR *replaces* pkg-config's search path
+      # rather than adding to it — so a sysroot carrying only GStreamer would break `padd`, inside
+      # libudev-sys, nowhere near anything about media.
+      #
+      # Cached on the script, because the package list lives in it: edit the list and the cache
+      # misses, which is exactly when it should.
+      - name: Cache the aarch64 sysroot
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/duck-sysroot
+          key: duck-sysroot-${{ hashFiles('scripts/cross-sysroot.sh') }}
+
+      - name: Target GStreamer and libudev, as a sysroot
+        run: |
+          set -eu
+          export DUCK_SYSROOT="$HOME/.cache/duck-sysroot"
+          sh scripts/cross-sysroot.sh | tee /tmp/sysroot.log
+
+          # Expanded in this shell before being written, because GITHUB_ENV does no shell
+          # expansion: the script emits RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-L ...", and writing
+          # that verbatim would put the literal braces into RUSTFLAGS. Evaluating first also picks
+          # up the workflow-level `-D warnings` rather than dropping it.
+          eval "$(grep '^export' /tmp/sysroot.log)"
+          {
+            echo "PKG_CONFIG_SYSROOT_DIR=$PKG_CONFIG_SYSROOT_DIR"
+            echo "PKG_CONFIG_LIBDIR=$PKG_CONFIG_LIBDIR"
+            echo "PKG_CONFIG_ALLOW_CROSS=$PKG_CONFIG_ALLOW_CROSS"
+            echo "RUSTFLAGS=$RUSTFLAGS"
+          } >> "$GITHUB_ENV"
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -202,7 +231,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       # Same reason as the check job: the workspace does not build without it.
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
+      # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
+      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 
       # `xtask` is excluded because it is build tooling that never ships. It is exercised
       # by CI actually packaging a release — the `check` job runs `xtask package` — not by

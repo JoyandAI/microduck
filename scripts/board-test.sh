@@ -136,8 +136,19 @@ fi
 
 # Level 1: this artifact is unpacked once and thrown away. The shipping default of 19 is
 # single-threaded and would cost more than every check below put together.
+# The workspace's own version, read from the table that owns it rather than from the first
+# `version =` line in the file. `grep -m1 '^version'` used to do this and worked only because
+# nothing above `[workspace.package]` happened to have that key — until
+# `[workspace.metadata.gst-plugins]` did, and this became
+# `invalid value 'v1' for '--version'` several minutes into a CI run.
+workspace_version="$(sed -n \
+    '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p;}' \
+    Cargo.toml | head -1)"
+[ -n "$workspace_version" ] \
+    || { echo "error: no version under [workspace.package] in Cargo.toml" >&2; exit 1; }
+
 cargo run -q -p xtask -- package \
-    --version "$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" \
+    --version "$workspace_version" \
     --bin-dir "$INSTALL_STAGED" \
     --out "$INSTALL_DIST" \
     --zstd-level 1 \
@@ -746,7 +757,7 @@ ln -sfn releases/under-test /opt/robot/daemon/current
 # board keep a stale on_apply list for months — so this takes the branch a re-install takes,
 # and substitutes the repository the way the fetch path would.
 mkdir -p /etc/robot
-sed "s|\"ORG/duck-daemon\"|\"pollen-robotics/microduck_daemon\"|" \
+sed "s|\"ORG/duck-daemon\"|\"pollen-robotics/microduck\"|" \
     /bin/deploy/updater.toml > /etc/robot/updater.toml
 cp /bin/deploy/robotd.toml /etc/robot/robotd.toml
 

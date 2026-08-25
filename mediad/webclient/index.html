@@ -1,0 +1,238 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>mediad test client</title>
+<!--
+  A test client for mediad. One file, no build step, no dependencies: serve it and point it at a
+  robot.
+
+      cd mediad/webclient && python3 -m http.server 8080     # then http://localhost:8080/
+
+  **Serve it; do not open it from disk.** A file:// page has an opaque origin, and Chrome's
+  Private Network Access blocks requests from one to a private address like 192.168.x — which is
+  every robot. It fails as a websocket error with nothing useful in it. Firefox is more forgiving,
+  but serving costs one command and works everywhere.
+
+  It speaks gst-plugins-rs's signalling protocol directly rather than using its gstwebrtc-api
+  JS library, for one reason: a test client that needs npm is a test client nobody runs. The
+  protocol is small and the exact shapes are below, read off net/webrtc/protocol at 0.15.3.
+
+  What it exercises, which is everything mediad does today:
+
+    * the signalling server mediad runs in-process    (§3 of docs/design/remote-webrtc.md)
+    * the video track, hardware-encoded H.264         (constrained-baseline, so a browser takes it)
+    * the `control` datachannel, and the JSON-RPC on it, including a refusal   (§5)
+
+  Serve it over http, never https: ws:// from an https page is mixed content and blocked outright,
+  and a robot on a LAN has no certificate to offer wss.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 1rem;
+         display: grid; gap: 1rem; grid-template-columns: minmax(320px, 1fr) minmax(320px, 1fr); }
+  header { grid-column: 1 / -1; display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 1rem; margin: 0 1rem 0 0; font-weight: 600; }
+  input, button, select, textarea { font: inherit; padding: .3rem .5rem; }
+  input[type=text] { min-width: 18rem; }
+  video { width: 100%; background: #111; aspect-ratio: 16/9; border-radius: 4px; }
+  pre { margin: 0; padding: .5rem; background: color-mix(in srgb, currentColor 8%, transparent);
+        border-radius: 4px; height: 22rem; overflow: auto; white-space: pre-wrap;
+        font: 12px/1.45 ui-monospace, monospace; }
+  .row { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; margin-bottom: .5rem; }
+  .pill { padding: .1rem .5rem; border-radius: 99px; font-size: 12px;
+          background: color-mix(in srgb, currentColor 12%, transparent); }
+  .in  { color: #2a7; } .out { color: #59f; } .bad { color: #e55; } .dim { opacity: .6; }
+  section > h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em;
+                 opacity: .6; margin: 0 0 .4rem; }
+</style>
+
+<header>
+  <h1>mediad test client</h1>
+  <input id="url" type="text" value="ws://radxa-zero3.local:8443" spellcheck="false">
+  <button id="connect">connect</button>
+  <span id="state" class="pill">idle</span>
+  <span id="dcstate" class="pill dim">no control channel</span>
+</header>
+
+<section>
+  <h2>video</h2>
+  <video id="video" autoplay muted playsinline></video>
+  <h2 style="margin-top:1rem">control · JSON-RPC over the datachannel</h2>
+  <div class="row">
+    <button data-call='{"jsonrpc":"2.0","id":1,"method":"robot.health"}'>robot.health</button>
+    <button data-call='{"jsonrpc":"2.0","id":2,"method":"system.info"}'>system.info</button>
+    <button data-call='{"jsonrpc":"2.0","id":3,"method":"update.status"}'>update.status</button>
+    <button data-call='{"jsonrpc":"2.0","id":4,"method":"hello","params":{"apiVersion":10}}'>hello</button>
+  </div>
+  <div class="row">
+    <!-- Permitted over BLE and refused here, because reconfiguring wifi would take this session
+         with it. The interesting button: it proves the route table is being consulted. -->
+    <button data-call='{"jsonrpc":"2.0","id":5,"method":"net.connect","params":{"ssid":"x","psk":"y"}}'>net.connect <span class="dim">(should refuse)</span></button>
+    <button data-call='{"jsonrpc":"2.0","id":6,"method":"system.pairingPin"}'>system.pairingPin <span class="dim">(should refuse)</span></button>
+  </div>
+  <div class="row">
+    <input id="custom" type="text" spellcheck="false"
+           value='{"jsonrpc":"2.0","id":9,"method":"robot.subscribe","params":{"hz":2}}'>
+    <button id="send">send</button>
+  </div>
+</section>
+
+<section>
+  <h2>log</h2>
+  <pre id="log"></pre>
+</section>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+
+function log(cls, ...parts) {
+  const line = document.createElement("div");
+  line.className = cls;
+  line.textContent = parts.join(" ");
+  logEl.append(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let ws = null, pc = null, sessionId = null, control = null;
+
+function setState(text, cls = "pill") { $("state").textContent = text; $("state").className = cls + " pill"; }
+function setDc(text, cls = "dim") { $("dcstate").textContent = text; $("dcstate").className = cls + " pill"; }
+
+function send(msg) {
+  log("out", "→", JSON.stringify(msg));
+  ws.send(JSON.stringify(msg));
+}
+
+$("connect").onclick = () => {
+  if (ws) { ws.close(); return; }
+  ws = new WebSocket($("url").value);
+  setState("connecting…");
+
+  ws.onopen = () => { setState("signalling"); $("connect").textContent = "disconnect"; };
+  ws.onerror = () => log("bad", "!! websocket error — wrong host, or mediad is not running");
+  ws.onclose = () => {
+    setState("closed", "bad"); setDc("no control channel");
+    $("connect").textContent = "connect";
+    ws = null; sessionId = null; control = null;
+    if (pc) { pc.close(); pc = null; }
+  };
+
+  ws.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+    // Skip the noisy ones so the log stays readable.
+    if (msg.type !== "peerStatusChanged") log("in", "←", event.data.slice(0, 400));
+
+    switch (msg.type) {
+      case "welcome":
+        // The server assigns us an id, then we ask who is producing. `list` takes no fields.
+        send({ type: "list" });
+        break;
+
+      case "list": {
+        const producer = msg.producers && msg.producers[0];
+        if (!producer) {
+          log("bad", "!! no producers. mediad registers as one when its pipeline reaches PLAYING —",
+                     "check its journal for a pipeline that would not start.");
+          setState("no producer", "bad");
+          return;
+        }
+        log("dim", "producer:", producer.id, JSON.stringify(producer.meta || {}));
+        // No `offer`, so the producer offers and we answer. That is the direction webrtcsink
+        // wants: it knows what it is sending.
+        send({ type: "startSession", peerId: producer.id });
+        break;
+      }
+
+      case "sessionStarted":
+        sessionId = msg.sessionId;
+        setState("negotiating");
+        newPeerConnection();
+        break;
+
+      // `peer` carries either an sdp or an ice, flattened alongside sessionId — the shapes are
+      // `{type:"peer", sessionId, sdp:{type:"offer"|"answer", sdp}}` and
+      // `{type:"peer", sessionId, ice:{candidate, sdpMLineIndex}}`. Getting these wrong is the
+      // one mistake that produces silence rather than an error, so they are read off
+      // net/webrtc/protocol rather than guessed.
+      case "peer":
+        if (msg.sdp) {
+          await pc.setRemoteDescription(msg.sdp);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          send({ type: "peer", sessionId, sdp: { type: "answer", sdp: answer.sdp } });
+        } else if (msg.ice) {
+          await pc.addIceCandidate({
+            candidate: msg.ice.candidate,
+            sdpMLineIndex: msg.ice.sdpMLineIndex,
+          });
+        }
+        break;
+
+      case "endSession":
+        log("dim", "session ended by the robot");
+        if (pc) { pc.close(); pc = null; }
+        setState("signalling"); setDc("no control channel");
+        break;
+
+      case "error":
+        log("bad", "!! server error:", msg.details);
+        break;
+    }
+  };
+};
+
+function newPeerConnection() {
+  // No ICE servers: this is a LAN client talking to a robot on the same network, which is the
+  // case §3 exists for. Reaching a robot elsewhere goes through the bridge (§7) and would need
+  // STUN, which is that design's problem rather than this page's.
+  pc = new RTCPeerConnection();
+
+  pc.ontrack = (event) => {
+    log("dim", "track:", event.track.kind);
+    $("video").srcObject = event.streams[0];
+  };
+
+  pc.onicecandidate = (event) => {
+    if (!event.candidate) return;
+    send({
+      type: "peer",
+      sessionId,
+      ice: {
+        candidate: event.candidate.candidate,
+        sdpMLineIndex: event.candidate.sdpMLineIndex,
+      },
+    });
+  };
+
+  pc.onconnectionstatechange = () => {
+    setState(pc.connectionState, pc.connectionState === "failed" ? "bad" : "pill");
+  };
+
+  // **The robot creates the datachannel, so we receive it.** mediad calls
+  // `create-data-channel` on each consumer's webrtcbin rather than waiting for the peer, so a
+  // client that opens nothing still gets a control surface — and a client that opens its own
+  // would get a second, unrouted channel.
+  pc.ondatachannel = (event) => {
+    control = event.channel;
+    log("dim", "datachannel:", control.label);
+    control.onopen = () => setDc("control open", "in");
+    control.onclose = () => setDc("control closed", "bad");
+    control.onmessage = (e) => log("in", "control ←", e.data);
+  };
+}
+
+function sendControl(text) {
+  if (!control || control.readyState !== "open") {
+    log("bad", "!! no control channel yet");
+    return;
+  }
+  log("out", "control →", text);
+  control.send(text);
+}
+
+for (const button of document.querySelectorAll("button[data-call]")) {
+  button.onclick = () => sendControl(button.dataset.call);
+}
+$("send").onclick = () => sendControl($("custom").value);
+</script>

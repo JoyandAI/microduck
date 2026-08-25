@@ -9,7 +9,7 @@ Read-only commands need no privilege. Anything that **changes** the robot needs 
 
 Branch builds, release candidates and the restart traps after an update are in
 [`cheatsheet-dev.md`](cheatsheet-dev.md) — they need a dev board. The same robot over Bluetooth from
-a laptop, with no network and no ssh, is [`duck-btctl.md`](duck-btctl.md).
+a laptop, with no network and no ssh, is [`duckctl.md`](duckctl.md).
 
 ## On the robot — `robotctl`
 
@@ -46,7 +46,22 @@ Also on the frame: every joint measured against what it was commanded, the IMU's
 and the fall verdict drawn from it, and the achieved loop rate as a trace so a stutter that has
 already recovered is still visible. Projected gravity is the only IMU quantity on this stream —
 upright is about `[0, 0, -1]`, and it is what `fallen` is decided from. The stale-read counters and
-the rest of the sensing live in `robotctl health`.
+the ratios they mean anything against live in `robotctl health`.
+
+The last row of the header is the robot's condition rather than its behaviour: the pack's charge in
+volts and as a fraction, the hottest servo and the board's own temperature. It comes from
+`robot.health`, polled every two seconds, because none of it is on the state stream — and it is
+where anything wrong gets named, whether that is `unhealthy: control loop at 43.9 Hz`, `degraded:
+no robot on the motor bus after 3 attempts` or `orientation frozen — 25 stale reads`. That last one
+is on this row and nowhere else on the frame: a board that has stopped fusing keeps answering the
+bus, so nothing errors and the gravity vector above holds a plausible attitude indefinitely.
+
+0% is `BATTERY_EMPTY_V`, which is where `robotd` sits the robot down and cuts power, so the figure
+is a countdown rather than a gauge — yellow at 30%, red at 15%. A reading that has not been taken
+says `batt not read yet` instead of `0.00 V`, which is what the first second of an uptime and a bus
+that cannot answer both look like. The row is drawn even when there is no state at all, and that is
+the case it matters most in: a board whose servo power is off never completes a control tick, so
+nothing arrives on the stream and the reason is only on the health answer.
 
 The bottom border names the policy that is loaded — the `.onnx` files, and whether a standing
 network is configured at all — because `walk` is a mode two releases with different gaits both
@@ -64,6 +79,36 @@ behave, and those numbers stay radians whatever the screen is set to. The joint 
 ```
 robotctl monitor --json --hz 50 > run.jsonl
 ```
+
+### Configuring `robotd`
+
+```
+sudo robotctl configure
+```
+
+An interactive editor over `/etc/robot/robotd.toml`: every key the daemon knows, the feature
+switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
+shutdown…), current value against default, one line of doc. SPACE toggles, ENTER types a
+value, `u` reverts a key to its default. Values in yellow (marked `•`) are the keys where
+this robot diverges from the defaults; everything else is the built-in default, and `unset`
+optionals show what they resolve to `(auto)`.
+
+Three properties worth trusting:
+
+- **It cannot disagree with the daemon.** The schema, the defaults and the validation come
+  from the same crate `robotd` parses the file with, and the key list is pinned complete by a
+  test — a new `[section]` in the daemon shows up here or the build fails.
+- **It cannot eat your file.** Comments, ordering and keys from other releases survive
+  untouched; only the keys you change are written. Reverting a key removes it (and the
+  comment attached to it) rather than pinning the default, so the file stays a list of
+  *decisions*, not a copy of the defaults.
+- **It cannot write a file robotd refuses to start on.** Every save is validated through the
+  daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
+
+`robotd` reads the file once at startup, so saving offers a restart. `sudo`, because the file
+is root-owned — without it the editor opens read-only and says so on the first write.
+`--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
+reference for *why* each knob exists; this is for flipping them.
 
 ### Power to the joints (`robotd`)
 
@@ -208,10 +253,19 @@ robotctl quack
 The loudest way to tell ducks apart: every robot's voice bank is generated from its SoC
 serial (`sounds ensure-bank`, run by every release install), so the robot that answers — in
 a voice that is only its own — is the one you're SSH'd into. A robot with no voice — audio
-off, or no bank — says so instead of printing 🦆, so silence always means the wrong duck. The robot also greets when
-`robotd` comes up, pecks goodbye before powering off, and coos when the mic hears its head
-being scratched (walk mode; the classifier ships in the release). Audio hardware bring-up —
-codec driver, overlays, mixer — is `setup-board.sh`'s audio section, once per board.
+off, or no bank — says so instead of printing 🦆, so silence always means the wrong duck.
+The robot also greets when `robotd` comes up, pecks goodbye before powering off, and coos
+when the mic hears its head being scratched (walk mode; the classifier ships in the
+release). The startup greet has its own switch, for anyone restarting the daemon all day:
+
+```
+sudo robotctl configure
+```
+
+Set `audio.greet = false` and take the restart it offers on save. That silences the one
+quack and leaves the triggers and the mic alone, which `audio.enabled = false` does not.
+Audio hardware bring-up — codec driver, overlays, mixer — is `setup-board.sh`'s audio
+section, once per board.
 
 To audition a voice or regenerate the bank by hand, the release carries the generator:
 

@@ -1,32 +1,37 @@
-# `duck-btctl` — every command
+# `duckctl` — every command
 
-Talk to a robot over Bluetooth LE from a laptop, with no network and no ssh. It is the phone app's
-stand-in, and the way to reach a robot that has never seen a wifi network.
+Talk to a robot from a laptop, with no network and no ssh. It is the phone app's stand-in, and the
+way to reach a robot that has never seen a wifi network.
 
-An *example* rather than a binary, so it is never on a robot. `robotctl` is the tool that ships,
-and [`cheatsheet.md`](cheatsheet.md) has its commands — most of which have a `duck-btctl`
-equivalent below.
+Bluetooth LE is how it gets there today, and the name deliberately does not say so: `mediad` gives
+a robot a second transport that reaches a different set of methods, so the tool is named for what
+it talks to rather than for the radio it currently uses. It was `duck-btctl` while BLE was the only
+answer.
+
+**Never on a robot.** Nothing in a release depends on it — `robotctl` is the tool that ships, and
+[`cheatsheet.md`](cheatsheet.md) has its commands, most of which have a `duckctl` equivalent
+below.
 
 ## Getting it
 
 Run it from a clone of this repo:
 
 ```bash
-cargo run -q -p btd --example duck-btctl -- --name <robot-name> info
+cargo run -q -p duckctl -- --name <robot-name> info
 ```
 
 Or install it once, at the cost of a snapshot that no longer follows the branch:
 
 ```bash
-cargo install --path btd --example duck-btctl
+cargo install --path duckctl
 ```
 
 ```bash
-duck-btctl --name <robot-name> info
+duckctl --name <robot-name> info
 ```
 
 Every command below is written in the installed form. Prefix it with
-`cargo run -q -p btd --example duck-btctl --` to run it from the clone instead.
+`cargo run -q -p duckctl --` to run it from the clone instead.
 
 This tool used to install itself as `btctl`. If `which btctl` still finds one, it is a build from
 whenever you installed it and it will never change again:
@@ -38,7 +43,7 @@ cargo uninstall btd --bin btctl
 ## Finding a robot
 
 ```bash
-duck-btctl scan
+duckctl scan
 ```
 
 ```
@@ -54,9 +59,9 @@ that list, and it is worth reading when the robot you want is not in the first o
 Each robot broadcasts its IPv4 address, so this is also where the address to ssh to comes from. No
 connection is made and no PIN is needed. `no address` on the line means the robot is not on a
 network; a line with no address at all means a release from before robots broadcast one, and
-`duck-btctl wifi status` still reports it.
+`duckctl wifi status` still reports it.
 
-The SSID is not in the listing — it does not fit in an advertisement. `duck-btctl wifi status` has
+The SSID is not in the listing — it does not fit in an advertisement. `duckctl wifi status` has
 it, along with the signal and both addresses.
 
 A robot that has never been renamed calls itself `duck-` plus four characters derived from its
@@ -94,7 +99,7 @@ export DUCK_ROBOT=duck-c51b
 Put that line in `~/.zshrc` to keep it. Every command below then works without `--name`:
 
 ```bash
-duck-btctl info
+duckctl info
 ```
 
 `DUCK_PIN` does the same for `--pin`, which a robot with a PIN of its own needs on every command:
@@ -106,14 +111,14 @@ export DUCK_PIN=418299
 For one command against a different robot, `--name` still wins:
 
 ```bash
-duck-btctl --name duck-ffff info
+duckctl --name duck-ffff info
 ```
 
 To ignore the default for one command — a bench with somebody else's robot on it — set it to
 nothing:
 
 ```bash
-DUCK_ROBOT= duck-btctl scan
+DUCK_ROBOT= duckctl scan
 ```
 
 `scan` marks the robot `DUCK_ROBOT` names and lists it first, and every command that goes looking
@@ -122,13 +127,13 @@ for it says so before it starts scanning.
 ## Identity
 
 ```bash
-duck-btctl --name <robot-name> info
+duckctl --name <robot-name> info
 ```
 
 Name, serial and uptime.
 
 ```bash
-duck-btctl --name <robot-name> name <new-name>
+duckctl --name <robot-name> name <new-name>
 ```
 
 Up to 24 characters. It takes effect within a few seconds and needs no restart, but the Mac keeps
@@ -139,44 +144,44 @@ A rename does not follow `DUCK_ROBOT`. The tool says so afterwards; the variable
 by hand, or every later command looks for a name that no longer answers.
 
 ```bash
-duck-btctl --name <robot-name> reboot
+duckctl --name <robot-name> reboot
 ```
 
 ## Wifi
 
 ```bash
-duck-btctl --name <robot-name> wifi status
+duckctl --name <robot-name> wifi status
 ```
 
 SSID, signal and addresses.
 
 ```bash
-duck-btctl --name <robot-name> wifi scan
+duckctl --name <robot-name> wifi scan
 ```
 
 Takes a few seconds — the robot sweeps the radio rather than returning the previous scan.
 
 ```bash
-duck-btctl --name <robot-name> wifi connect <ssid> --psk <passphrase>
+duckctl --name <robot-name> wifi connect <ssid> --psk <passphrase>
 ```
 
 Omit `--psk` for an open network. Joining disconnects the robot from the network it is on, so an ssh
 session over wifi drops; that is the command working. It can take up to 45 seconds to answer.
 
 ```bash
-duck-btctl --name <robot-name> wifi forget <ssid>
+duckctl --name <robot-name> wifi forget <ssid>
 ```
 
 ## Is it alright
 
 ```bash
-duck-btctl --name <robot-name> health
+duckctl --name <robot-name> health
 ```
 
 Whether the control loop is healthy.
 
 ```bash
-duck-btctl --name <robot-name> status
+duckctl --name <robot-name> status
 ```
 
 The version handshake and the update status.
@@ -184,7 +189,7 @@ The version handshake and the update status.
 ## Which release is it running
 
 ```bash
-duck-btctl --name <robot-name> version
+duckctl --name <robot-name> version
 ```
 
 The API version, the release, and the git revision it was built from. A `revision` of `null` means
@@ -196,25 +201,25 @@ Same words as `robotctl update`, so a command learned on the robot works here. E
 takes `--component <name>` and defaults to `daemon`, which is the only component a robot has today.
 
 ```bash
-duck-btctl --name <robot-name> update check
+duckctl --name <robot-name> update check
 ```
 
 ```bash
-duck-btctl --name <robot-name> update status
+duckctl --name <robot-name> update status
 ```
 
 ```bash
-duck-btctl --name <robot-name> update versions
+duckctl --name <robot-name> update versions
 ```
 
 ```bash
-duck-btctl --name <robot-name> update log --limit 20
+duckctl --name <robot-name> update log --limit 20
 ```
 
 Installing takes minutes and prints progress lines as it goes:
 
 ```bash
-duck-btctl --name <robot-name> update apply
+duckctl --name <robot-name> update apply
 ```
 
 ```
@@ -230,7 +235,7 @@ duck-btctl --name <robot-name> update apply
   "to": "0.6.0"
 }
 note: the robot restarts its daemons now, and `btd` about five seconds after this reply — so this
-connection drops. That is the update working. Reconnect and run `duck-btctl update status`:
+connection drops. That is the update working. Reconnect and run `duckctl update status`:
 `last_attempt` carries the outcome of what just ran.
 ```
 
@@ -240,15 +245,15 @@ The connection dropping after an apply is the update working, not a failure. Rec
 A branch build, an exact version, or the staging candidate:
 
 ```bash
-duck-btctl --name <robot-name> update apply --ref my-branch
+duckctl --name <robot-name> update apply --ref my-branch
 ```
 
 ```bash
-duck-btctl --name <robot-name> update apply --version 0.5.1
+duckctl --name <robot-name> update apply --version 0.5.1
 ```
 
 ```bash
-duck-btctl --name <robot-name> update apply --staging
+duckctl --name <robot-name> update apply --staging
 ```
 
 `--dry-run` verifies everything and stops before the swap. `--ref` and `--version` are alternatives;
@@ -257,11 +262,11 @@ asking for both is refused.
 Going back — the previous release, or one named from `update versions`:
 
 ```bash
-duck-btctl --name <robot-name> update rollback
+duckctl --name <robot-name> update rollback
 ```
 
 ```bash
-duck-btctl --name <robot-name> update select 0.5.1
+duckctl --name <robot-name> update select 0.5.1
 ```
 
 Both are gated like an apply, so one that does not come up is reverted. Neither discards anything.
@@ -269,7 +274,7 @@ Both are gated like an apply, so one that does not come up is reverted. Neither 
 Progress for an update somebody else started, or one triggered by the robot itself:
 
 ```bash
-duck-btctl --name <robot-name> update watch
+duckctl --name <robot-name> update watch
 ```
 
 It prints where the update in flight has got to and then everything that follows. It never receives
@@ -278,11 +283,11 @@ a reply, so it ends with Ctrl-C.
 ## Anything else — `call`
 
 ```bash
-duck-btctl --name <robot-name> call <method> '<json-params>'
+duckctl --name <robot-name> call <method> '<json-params>'
 ```
 
 Params default to `{}`. These are reachable over Bluetooth but have no wrapper of their own, and are
-written without the `duck-btctl --name <robot-name>` in front of them:
+written without the `duckctl --name <robot-name>` in front of them:
 
 | | |
 |---|---|
@@ -308,7 +313,7 @@ minutes with nothing arriving at all — which is why they are the way to run an
 ## What it prints
 
 Replies go to stdout as pretty JSON, and everything else — progress, diagnosis, what the radio
-saw — to stderr. So `duck-btctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
+saw — to stderr. So `duckctl ... info > reply.json` keeps the two apart, and a JSON-RPC error
 from the robot still exits non-zero. Progress lines start with `·` and are one line each, so
 `update apply > outcome.json` leaves them on screen and keeps the outcome in the file.
 
@@ -316,9 +321,10 @@ One command is one connection: it finds the robot, pairs if it has to, proves th
 disconnects.
 
 Every command gives up after a period of silence rather than after a fixed total, so a slow update
-is never cut off and a robot that stops answering is reported in seconds. An update in flight
-survives that: the robot pulls, so it carries on with nobody watching, and `update status` afterwards
-says how it went.
+is never cut off and a robot that stops answering is reported in seconds. A link that *drops* is
+reported at once rather than waited out, and after an apply it says so: the restart is what took the
+connection down. An update in flight survives either: the robot pulls, so it carries on with nobody
+watching, and `update status` afterwards says how it went.
 
 ## What is refused
 
@@ -336,7 +342,7 @@ Those commands are `robotctl` on the robot.
 ## When it cannot find the robot
 
 ```bash
-duck-btctl --verbose scan
+duckctl --verbose scan
 ```
 
 An empty list — not one pair of earbuds — points at the Mac rather than the robot: Bluetooth off,

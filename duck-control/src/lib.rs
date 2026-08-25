@@ -4,8 +4,8 @@
 //! owns all of that. The boundary is enforced by the compiler rather than by discipline,
 //! which is what stops process concerns leaking into the code that drives motors.
 //!
-//! Slice 1 (`docs/design/robotd-design.md` §4) is the model, the bus, and the [`io::RobotIo`]
-//! seam. Observations, the policy runner and the safety layer arrive with slice 2.
+//! The control path it holds — model, bus, [`io::RobotIo`], observations, policy, safety — is
+//! designed in `docs/design/robotd-design.md` §2.
 
 pub mod bus;
 pub mod fall;

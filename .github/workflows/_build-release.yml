@@ -62,8 +62,38 @@ jobs:
       #   - "latest" would let the glibc floor move under us between runs. The floor is
       #     the whole point of building with zig (see .cargo/config.toml), so the
       #     toolchain that sets it must be a fixed input.
-      - name: Cross-compilation C dependencies
-        run: ./scripts/ci-cross-deps.sh
+      # GStreamer and libudev for the *target*, unpacked from the robot's own Debian packages.
+      #
+      # This replaced Ubuntu multiarch from ports.ubuntu.com, which served libudev alone and could
+      # not serve GStreamer honestly: it would give Ubuntu's while the robot runs Debian trixie's.
+      # One sysroot covers both, because PKG_CONFIG_LIBDIR *replaces* pkg-config's search path
+      # rather than adding to it — so a sysroot carrying only GStreamer would break `padd`, inside
+      # libudev-sys, nowhere near anything about media.
+      #
+      # Cached on the script, because the package list lives in it: edit the list and the cache
+      # misses, which is exactly when it should.
+      - name: Cache the aarch64 sysroot
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/duck-sysroot
+          key: duck-sysroot-${{ hashFiles('scripts/cross-sysroot.sh') }}
+
+      - name: Target GStreamer and libudev, as a sysroot
+        run: |
+          set -eu
+          export DUCK_SYSROOT="$HOME/.cache/duck-sysroot"
+          sh scripts/cross-sysroot.sh | tee /tmp/sysroot.log
+
+          # Expanded in this shell before being written, because GITHUB_ENV does no shell
+          # expansion: the script emits RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-L ...", and writing
+          # that verbatim would put the literal braces into RUSTFLAGS.
+          eval "$(grep '^export' /tmp/sysroot.log)"
+          {
+            echo "PKG_CONFIG_SYSROOT_DIR=$PKG_CONFIG_SYSROOT_DIR"
+            echo "PKG_CONFIG_LIBDIR=$PKG_CONFIG_LIBDIR"
+            echo "PKG_CONFIG_ALLOW_CROSS=$PKG_CONFIG_ALLOW_CROSS"
+            echo "RUSTFLAGS=$RUSTFLAGS"
+          } >> "$GITHUB_ENV"
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -90,10 +120,6 @@ jobs:
       - name: Build for the board
         env:
           DUCK_REVISION: ${{ github.sha }}
-          # libudev-sys (via gilrs, via padd) resolves the target's C library through
-          # pkg-config, which refuses to answer for another architecture unless told to.
-          PKG_CONFIG_ALLOW_CROSS: "1"
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
         run: |
           export DUCK_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           cargo board --bins
@@ -116,6 +142,9 @@ jobs:
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
           cp target/aarch64-unknown-linux-gnu/release/padd staged/
+          # mediad is the WebRTC gateway. Shipped so a board *can* run it; its unit has no
+          # [Install], so nothing starts it until someone does. See mediad/systemd/mediad.service.
+          cp target/aarch64-unknown-linux-gnu/release/mediad staged/
           # The voice generator (postinstall renders the per-robot bank with it) and the
           # mic classifier pair — pet-detect for live listening, pet-features for training.
           cp target/aarch64-unknown-linux-gnu/release/sounds staged/
@@ -145,6 +174,8 @@ jobs:
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "padd/systemd/padd.service=systemd/padd.service" \
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+            --include "mediad/systemd/mediad.service=systemd/mediad.service" \
+            --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
             --include "tof/systemd/tofd.service=systemd/tofd.service" \
             --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \

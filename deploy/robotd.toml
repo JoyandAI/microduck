@@ -2,7 +2,7 @@
 #
 # Installed to /etc/robot/robotd.toml. Read once at startup, not watched: changing
 # anything here needs `systemctl restart robotd`. Live reload is deferred
-# (docs/design/robotd-design.md §7.2).
+# (docs/design/robotd-design.md §4.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
 # per-robot configuration rather than a shipped default, so it must survive an update
@@ -260,6 +260,11 @@ mode = "walk"
 
 # Where the voice bank lives.
 # bank = "/var/lib/robot/sounds"
+
+# Quack once as the control loop comes up — on a headless board that greet is the audible
+# "robotd is running". Turn it off (and keep the triggers, and the mic) if you restart the
+# daemon often enough to be tired of it.
+# greet = true
 
 # Listen for petting on the onboard mic and coo about it. Unset resolves per mode, as the
 # prototype's launcher did: on for walking, off for the roller. The model ships in the

@@ -299,7 +299,7 @@ pass "current went back to 1.3.0"
 
 # The revert happened *and* one unit did not come back with it. Two facts, reported as two — this was
 # a single `rollback failed after a failed update`, which asserted the one thing that was false (the
-# robot had not been put back) and buried the one thing that was true (a daemon is down).
+# robot had not been put back) and buried the one thing that was true (a unit refused to restart).
 #
 # `hooks/postinstall` overwrote 1.3.0's good unit file with 1.4.0's broken one and by design does not
 # put it back, so the revert's own restart of a unit with that name inherits the same failure. The
@@ -307,11 +307,20 @@ pass "current went back to 1.3.0"
 # it. What changed is that this no longer reads as the recovery having failed.
 grep -q "rollback failed" "$WORK/ghost.log" \
     && { sed 's/^/    /' "$WORK/ghost.log"; fail "a revert that happened is still reported as a failed rollback"; }
-grep -q "did not restart" "$WORK/ghost.log" \
-    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the outcome does not name the unit that did not come back"; }
+grep -q "the release was reverted" "$WORK/ghost.log" \
+    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the outcome does not report the revert"; }
+grep -q "restarting needs-a-user failed" "$WORK/ghost.log" \
+    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the outcome does not name the unit that would not come back"; }
+
+# And the claim it must NOT make. Every daemon here runs `Restart=always`, so a unit refusing a
+# restart on command is routinely back seconds later; a board on the bench printed "so something on
+# this robot is down" directly under its own `robot healthy` line. The outcome now reports the
+# refusal and names the command that answers what it cannot.
 grep -q "is down" "$WORK/ghost.log" \
-    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the outcome does not say something is down"; }
-pass "reported as reverted and as having left something down, not as a failed rollback"
+    && { sed 's/^/    /' "$WORK/ghost.log"; fail "the outcome still asserts an outage it did not observe"; }
+grep -q "robotctl health" "$WORK/ghost.log" \
+    || { sed 's/^/    /' "$WORK/ghost.log"; fail "the outcome does not say how to find out whether it came back"; }
+pass "reported as reverted, naming the unit, without claiming an outage it never checked for"
 
 # The rest of the robot is still up, which is what keeps this a gap rather than an outage.
 in_container "systemctl is-active --quiet fake-robotd" \

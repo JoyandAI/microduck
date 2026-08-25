@@ -919,8 +919,8 @@ impl Server {
 ///
 /// So the pair of versions goes to the journal, where it turns a later shape error from a puzzle into
 /// a diagnosis, and `HelloResult::api_version` hands the client the same fact so it can say so
-/// itself. `duck-btctl` reached this conclusion from the far end of the link first — see
-/// `btd/examples/duck-btctl.rs`.
+/// itself. `duckctl` reached this conclusion from the far end of the link first — see
+/// `duckctl/src/main.rs`.
 fn note_version_skew(client: u32) {
     tracing::warn!(
         client,
