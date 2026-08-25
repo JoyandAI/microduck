@@ -262,10 +262,13 @@ listening for other ducks — Ctrl-C to stop
   tenor    bar   12  beat  45.2  3 voices
 ```
 
-The conductor picks the piece per performance. `DUCK_CHORALE_PIECE=<id>` on `robotd`
-(`sudo systemctl edit robotd`, add `Environment=DUCK_CHORALE_PIECE=2` under `[Service]`,
-restart) pins the pick on the duck that ends up conducting — a bench lever for testing one
-song. Ids: 1 wistful, 2 duck-strut, 3 outer-wilds (test asset, not for release).
+The conductor picks the piece per performance, and a performance *ends* — after the last
+note everyone goes back to listening, re-settles, and sings something else after a breath.
+`robotctl chorale --piece 2` pins what this robot picks **if it conducts** (a follower sings
+what the beacon names, so set it on every duck to guarantee the song); unknown ids are
+refused with the robot's catalogue. Ids: 1 wistful, 2 duck-strut, 3 outer-wilds (test asset,
+not for release). `DUCK_CHORALE_PIECE=<id>` in `robotd`'s environment is the standing
+fallback — note it must be on **robotd**, not on the `robotctl` command line.
 
 To hear the arrangement without any ducks, one machine can render the whole ensemble:
 
