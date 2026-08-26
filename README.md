@@ -38,7 +38,7 @@ recipe, and the export to ONNX that this repo loads.
 <table>
 <tr>
 <td width="50%">
-  <video src="https://github.com/user-attachments/assets/06c14246-85bf-4aa2-b663-a4e77a98fbff" controls width="100%"></video>
+  <video src="https://github.com/user-attachments/assets/1323be2e-969d-492b-be10-023b23f2a2c2" controls width="100%"></video>
 </td>
 <td width="50%">
   <video src="https://github.com/user-attachments/assets/abfbf250-1b1c-42cb-8430-00267e2b148a" controls width="100%"></video>
@@ -51,10 +51,10 @@ recipe, and the export to ONNX that this repo loads.
 </tr>
 <tr>
 <td width="50%">
-  <video src="https://github.com/user-attachments/assets/6546f911-3d16-4335-b360-aa84732d70a6" controls width="100%"></video>
+  <video src="https://github.com/user-attachments/assets/abbfdc75-6e00-436c-979e-91eed53e120f" controls width="100%"></video>
 </td>
 <td width="50%">
-  <video src="https://github.com/user-attachments/assets/849af629-b9ac-4ae1-a503-bf41fdba839b" controls width="100%"></video>
+  <video src="https://github.com/user-attachments/assets/7ce4bf4c-3088-4688-89fd-b6e51d751c91" controls width="100%"></video>
 </td>
 </tr>
 <tr>
