@@ -354,7 +354,7 @@ bad time" than a clock.
 /etc/robot/trusted_keys/release-*.pub   trust anchor
 /opt/robot/daemon/releases/<version>/   the release tree
 /opt/robot/daemon/current -> releases/<version>
-/etc/systemd/system/{updaterd,robotd}.service   copied out of the release
+/etc/systemd/system/*.service           every unit the release ships, copied out of it
 /usr/lib/sysusers.d/robot.conf          creates the `robot` group
 /var/lib/robot/updater/                 lock, update log, boot counter
 /usr/local/bin/robotctl -> current/bin/robotctl

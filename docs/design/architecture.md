@@ -15,26 +15,26 @@ rewritten). v1 targets a **single, well-specified hardware configuration**.
 
 ## The shape of it
 
-Five daemons on one board, talking over unix sockets. One of them drives the robot; the
-other four exist so that the first one can be broken without the board becoming
-unreachable.
+Seven daemons on one board, talking over unix sockets. One of them drives the robot; three
+of the others exist so that the first one can be broken without the board becoming unreachable,
+and the rest are transports and sensors that own nothing.
 
 ```text
-   gamepad          phone             you, on a laptop          a GitHub release
-      │ BLE/USB        │ BLE                │ ssh                       │ https
-      ▼                ▼                    ▼                           │
-  ┌────────┐      ┌────────┐          ┌──────────┐                      │
-  │  padd  │      │  btd   │          │ robotctl │                      │
-  └───┬────┘      └───┬────┘          └────┬─────┘                      │
-      │               │  a subset of the same API                       │
-      │  robot.*      │  robot.health · update.* · net.* · pad.* · system.*
-      ▼               ▼                    ▼                            │
-  ┌──────────────────────────────────────────────────────────────────┐  │
-  │   one unix socket per service · JSON-RPC 2.0, one object a line  │  │
-  └────┬──────────────────────┬─────────────────────────┬────────────┘  │
-       ▼                      ▼                         ▼               │
-  ┌───────────┐        ┌─────────────┐           ┌─────────────┐        │
-  │  robotd   │        │  configd    │           │  updaterd   │◄───────┘
+   gamepad          phone          you, on a laptop     a peer, anywhere    a GitHub release
+      │ BLE/USB        │ BLE             │ ssh                 │ WebRTC              │ https
+      ▼                ▼                 ▼                     ▼                     │
+  ┌────────┐      ┌────────┐       ┌──────────┐          ┌──────────┐                │
+  │  padd  │      │  btd   │       │ robotctl │          │  mediad  │                │
+  └───┬────┘      └───┬────┘       └────┬─────┘          └────┬─────┘                │
+      │               │  a subset of the same API             │                      │
+      │  robot.*      │  robot.health · update.* · net.* · pad.* · system.*           │
+      ▼               ▼                 ▼                     ▼                      │
+  ┌──────────────────────────────────────────────────────────────────┐               │
+  │   one unix socket per service · JSON-RPC 2.0, one object a line  │               │
+  └────┬──────────────────────┬─────────────────────────┬────────────┘               │
+       ▼                      ▼                         ▼                            │
+  ┌───────────┐        ┌─────────────┐           ┌─────────────┐                     │
+  │  robotd   │        │  configd    │           │  updaterd   │◄────────────────────┘
   │ robot.*   │        │ net.* pad.* │           │ update.*    │
   │ 50 Hz     │        │ system.*    │           │ verify      │
   │ loop      │        │ wifi, name, │           │ swap        │
@@ -45,8 +45,9 @@ unreachable.
   15 servos + IMU      BlueZ · NetworkManager           ▼
   on one UART                                    /opt/robot/daemon/current
 
-  ┌ not built ────────────────────────────────────────────────────────┐
-  │  mediad — camera, mic, perception, WebRTC, and the remote gateway │
+  ┌ publishes, answers nothing ───────────────────────────────────────┐
+  │  tofd — the head's 8×8 depth matrix, on /run/tofd/tof.sock.       │
+  │         mediad and robotd read it; it reads no one.               │
   └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -56,15 +57,19 @@ fast", "look there", "stand up" — and the safety layer inside `robotd` decides
 actually executable. Nothing else in the system can command a motor
 ([`robotd-design.md`](robotd-design.md)).
 
-**The other three survive a dead `robotd`.** `configd`, `updaterd` and `btd` have no systemd
+**Three of them survive a dead `robotd`.** `configd`, `updaterd` and `btd` have no systemd
 dependency on it, no ML runtime, and no media stack, because they are the recovery path: a
 robot whose control loop will not start is exactly the robot someone needs to reconfigure,
 update, or roll back. That is also why config lives in `configd` and not in `robotd` (§1.1).
+`mediad` and `padd` do depend on it, and are allowed to: a robot with no camera and no gamepad
+is still a robot you can update.
 
-**`btd` and `padd` own nothing.** They are transports. `btd` forwards a subset of the API
-from BLE to whichever socket answers it; `padd` reads a gamepad and sends the same intents an
-app would. Both are replaceable without touching robot behaviour, and both are exercised
-daily, so the API an app will use cannot quietly rot.
+**`btd`, `padd` and `mediad` own nothing of the robot.** They are transports. `btd` forwards a
+subset of the API from BLE to whichever socket answers it; `padd` reads a gamepad and sends the
+same intents an app would; `mediad` carries the same calls over a WebRTC data channel and owns only
+the pipeline. All three are replaceable without touching robot behaviour, and all three are
+exercised daily, so the API an app will use cannot quietly rot. `tofd` is the odd one out: it owns
+one sensor, publishes frames, and reads nothing (§1).
 
 **Releases are swapped, not patched.** A build lands as a whole directory under
 `/opt/robot/daemon/releases/<version>/`; `updaterd` verifies its signature, moves the
@@ -77,9 +82,11 @@ counter ([`updater-design.md`](updater-design.md)).
 | `robotd` | motor control, sensing, policies, safety, `robot.health` | `/run/robotd.sock` | the Dynamixel bus |
 | `configd` | wifi, robot identity and name, pairing PIN, gamepad bonding, reboot | `/run/configd.sock` | BlueZ and NetworkManager over D-Bus |
 | `updaterd` | releases: verify, install, swap, health-gate, roll back | `/run/updaterd.sock` | GitHub releases, `systemctl`, `robotd` |
-| `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | all three sockets |
+| `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | `robotd`, `configd`, `updaterd` — not `padd` or `tofd`, whose streams a radio this narrow cannot carry |
 | `padd` | nothing — gamepad transport; serves a raw input tap | `/run/padd/pad.sock` (`pad.input` only) | `/run/robotd.sock` |
-| `robotctl` | nothing — the CLI, and the tool that must work on a broken robot | — | all four sockets |
+| `mediad` | the camera and audio pipeline; nothing of the robot — WebRTC transport and the remote front door (§5.2) | TCP: the console on `:8080`, signalling on `:8443` — no unix socket of its own | `robotd`, `configd`, `updaterd` |
+| `tofd` | the head's ToF sensor: an 8×8 depth matrix it publishes and nobody else reads | `/run/tofd/tof.sock` (`tof.stream`) | the HAT's I²C bus |
+| `robotctl` | nothing — the CLI, and the tool that must work on a broken robot | — | every socket above |
 
 Where the state lives, and what survives an update:
 

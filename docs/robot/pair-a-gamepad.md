@@ -270,5 +270,6 @@ axis and button mappings, whatever else matches.
 
 ---
 
-Driving — the controls, the speed limits, and running `padd` from a laptop over a forwarded socket —
-is in the [README](../../README.md#drive-it).
+Driving — the controls and the speed limits — is in the
+[cheat sheet](cheatsheet.md#gamepad-configd); running `padd` from a laptop over a forwarded socket
+is in the [dev cheat sheet](cheatsheet-dev.md#from-a-laptop--drive-with-a-pad-in-your-hands).
