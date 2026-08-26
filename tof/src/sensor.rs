@@ -18,14 +18,21 @@
 //! quietly share and corrupt the first one's state. [`Sensor::open`] refuses
 //! instead.
 
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(target_os = "linux")]
+use anyhow::{Context, anyhow};
+use anyhow::{Result, bail};
 
-use crate::{COLS, Frame, ROWS, ZONES};
+use crate::Frame;
+#[cfg(target_os = "linux")]
+use crate::{COLS, ROWS, ZONES};
 
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     /// Generation-agnostic: `vendor/probe.c`, no driver involved.
     fn tof_probe_id(
@@ -55,6 +62,7 @@ unsafe extern "C" {
 }
 
 /// Held for the life of the process by the one [`Sensor`] that exists.
+#[cfg(target_os = "linux")]
 static TAKEN: AtomicBool = AtomicBool::new(false);
 
 /// Which sensor answered the ID probe.
@@ -72,6 +80,9 @@ pub enum Generation {
 }
 
 impl Generation {
+    // Both this and `driver` below are only ever reached from an open sensor, and
+    // no sensor opens without the driver — see the off-board `Sensor` at the end.
+    #[cfg(target_os = "linux")]
     fn from_ids(device_id: u8, revision_id: u8) -> Self {
         match revision_id {
             0x0C => Self::L8cx,
@@ -92,6 +103,7 @@ impl Generation {
     }
 
     /// The shim this generation drives through. `None` for one neither ULD knows.
+    #[cfg(target_os = "linux")]
     fn driver(&self) -> Option<Driver> {
         match self {
             Self::L8cx => Some(Driver::L8),
@@ -102,12 +114,14 @@ impl Generation {
 }
 
 /// Which set of `extern "C"` functions to call. One variant per vendored ULD.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Driver {
     L5,
     L8,
 }
 
+#[cfg(target_os = "linux")]
 impl Driver {
     // Each of these is the same call into a different generation's shim. Wrapped
     // one per operation rather than as a table of function pointers because the
@@ -198,12 +212,14 @@ impl Driver {
 }
 
 /// An open, initialised sensor, ranging or not.
+#[cfg(target_os = "linux")]
 pub struct Sensor {
     generation: Generation,
     driver: Driver,
     ranging: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl Sensor {
     /// Probe what is on the bus, then open it with the matching driver.
     ///
@@ -310,6 +326,7 @@ impl Sensor {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Sensor {
     fn drop(&mut self) {
         if self.ranging {
@@ -322,7 +339,49 @@ impl Drop for Sensor {
     }
 }
 
-#[cfg(test)]
+/// The same type on a platform with no i2c-dev, so the daemon still builds there.
+///
+/// `vendor/platform.c` reaches the bus through Linux's `I2C_RDWR` ioctl, so
+/// `build.rs` compiles no driver anywhere else and there is nothing for `open` to
+/// open. This is not a fake sensor and must never become one — `tofd --fake`
+/// already exists for a laptop, and it says what it is in its name. This exists so
+/// that `cargo test --workspace` works off a board.
+///
+/// Uninhabited on purpose: `open` is the only constructor and it always fails, so
+/// the compiler discharges every other method instead of leaving a body that could
+/// one day return an invented frame.
+#[cfg(not(target_os = "linux"))]
+pub struct Sensor(std::convert::Infallible);
+
+#[cfg(not(target_os = "linux"))]
+impl Sensor {
+    pub fn open(bus: &Path, _address: u8) -> Result<Self> {
+        bail!(
+            "no i2c-dev on this platform, so {} cannot be opened — off a board, run `tofd --fake`",
+            bus.display()
+        )
+    }
+
+    pub fn generation(&self) -> Generation {
+        match self.0 {}
+    }
+
+    pub fn start(&mut self, _hz: u8) -> Result<()> {
+        match self.0 {}
+    }
+
+    pub fn data_ready(&self) -> Result<bool> {
+        match self.0 {}
+    }
+
+    pub fn read_frame(&mut self) -> Result<Frame> {
+        match self.0 {}
+    }
+}
+
+// Both tests reach the driver — one the generation-to-shim mapping, the other the
+// single-instance claim — so neither has anything to say where no driver is built.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

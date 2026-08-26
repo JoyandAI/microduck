@@ -29,18 +29,24 @@ use duck_ipc_proto as proto;
 pub const PADD: &str = "padd.service";
 
 /// Every unit a daemon release manages, in the order a reader wants them: the update engine, then
-/// the robot, then the three that depend on both.
+/// the robot, then the ones that depend on both.
 ///
 /// Hardcoded rather than discovered, and that is a real limitation worth naming: a unit added to a
 /// release and not to this list is invisible here. The alternative — asking systemd for everything
 /// and filtering — reports units this project does not own, which is worse for a status line.
-/// `scripts/install.sh` enables exactly these.
-pub const MANAGED: [&str; 5] = [
+/// `scripts/install.sh` knows exactly these.
+///
+/// It has already cost once: `mediad` and `tofd` shipped units two releases before they were named
+/// here, so the block a person reads after an update — the one that exists to say which daemon is
+/// still on the old release — could not report either of them at all.
+pub const MANAGED: [&str; 7] = [
     "updaterd.service",
     "robotd.service",
     "configd.service",
     "btd.service",
     "padd.service",
+    "mediad.service",
+    "tofd.service",
 ];
 
 /// What systemd says about one unit. The narrow question, kept for `pad.status`.

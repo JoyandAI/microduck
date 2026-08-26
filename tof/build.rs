@@ -18,6 +18,13 @@
 //! Warnings are not errors here: `vl53l?cx_api.c` is upstream code we do not
 //! edit, and a new compiler finding something in it must not be able to stop a
 //! robot release from building.
+//!
+//! **Linux only, and quietly so.** `vendor/platform.c` reaches the bus through
+//! `linux/i2c.h`'s `I2C_RDWR` ioctl, which exists on no other platform — so on a
+//! developer's Mac there is nothing here to compile and `sensor.rs` gates the
+//! calls that would need it. Skipping rather than failing is what lets
+//! `cargo test --workspace` run off a board at all; `tofd --fake` is how this
+//! daemon is run there anyway.
 
 struct Generation {
     /// Directory under `vendor/`, and the name of the static library.
@@ -52,6 +59,14 @@ const HOOKS: [&str; 6] = [
 ];
 
 fn main() {
+    // The target, not the host: a build script is compiled for the machine it runs
+    // on, so `cfg!(target_os)` here would answer for the laptop and cross-compiling
+    // to the board would build nothing.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        println!("cargo::rerun-if-changed=build.rs");
+        return;
+    }
+
     let vendor = std::path::Path::new("vendor");
 
     for generation in &GENERATIONS {
