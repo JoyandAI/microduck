@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "btd"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "bluer",
  "clap",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "configd"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "async-trait",
  "clap",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "duck-control"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "duck-ipc-proto",
  "libloading 0.8.9",
@@ -1052,7 +1052,7 @@ dependencies = [
 
 [[package]]
 name = "duck-ipc-proto"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "semver",
  "serde",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "duckctl"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "btd",
  "btleplug",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "kinematics"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "roxmltree",
  "serde",
@@ -2383,7 +2383,7 @@ dependencies = [
 
 [[package]]
 name = "mediad"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2708,7 +2708,7 @@ dependencies = [
 
 [[package]]
 name = "odometry"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "duck-ipc-proto",
  "kinematics",
@@ -2772,7 +2772,7 @@ checksum = "06503bb33f294c5f1ba484011e053bfa6ae227074bdb841e9863492dc5960d4b"
 
 [[package]]
 name = "padd"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -2877,7 +2877,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pet-detect"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "robotctl"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3294,7 +3294,7 @@ dependencies = [
 
 [[package]]
 name = "robotd"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "arc-swap",
  "clap",
@@ -3325,7 +3325,7 @@ dependencies = [
 
 [[package]]
 name = "robotd-params"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "duck-ipc-proto",
  "kinematics",
@@ -3813,7 +3813,7 @@ dependencies = [
 
 [[package]]
 name = "sounds"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -3996,7 +3996,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "clap",
  "minisign",
@@ -4105,7 +4105,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tof"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "cc",
@@ -4457,7 +4457,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -5056,7 +5056,7 @@ checksum = "636f85e5ca6488e96401b61eb7de54f4e44755c988af0f52cf90230c312a1a89"
 
 [[package]]
 name = "xtask"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "clap",
  "minisign",
