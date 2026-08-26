@@ -83,14 +83,14 @@ deliberately:
         │ on_apply: systemctl restart robotd              │
         └─────────────────────────────────────────────────┘
 
-   ┌ not built ─────────────────────────────────┐
+   ┌ the two transports ────────────────────────┐
    │  mediad — WebRTC + JSON-RPC relay          │  phone, browser and LLM
    │  btd    — BLE, a subset of the same API    │  clients arrive through here
    └────────────────────────────────────────────┘
 ```
 
 Every one of those speaks the same two vocabularies — intents in, state out — so `mediad`
-will **relay** frames rather than translate them (§3.1, §3.2). `updaterd` only ever asks
+**relays** frames rather than translating them (§3.1, §3.2). `updaterd` only ever asks
 questions: nothing in the update path can command a motor.
 
 ### 1.3 The crate boundary
@@ -101,10 +101,21 @@ duck-control/    robot model · bus · IMU · RobotIo · obs · policy · safety
                  everything between reading the bus and writing it
                  no tokio, no sockets, no systemd
 robotd/          the process: socket, JSON-RPC, systemd, health reporting
+robotd-params/   the startup parameters: schema, defaults, validation (§4.2)
+kinematics/      the MJCF model, forward kinematics, head and hand chains
+odometry/        where the robot is, from foot contacts and the IMU
+sounds/          the voice: synthesis, per-robot personality, the chorale's score
+pet-detect/      the camera-side detector robotd polls, off the loop
 robotctl/        CLI
 padd/            gamepad → intents
 updater/         engine + updaterd
 ```
+
+Everything below `robotd/` in that list is a **library it drives**, not a service: no tokio
+runtime of its own, no socket, nothing systemd starts. They are separate crates for the same
+reason `duck-control` is — the compiler is what keeps daemon concerns out of them, and
+`kinematics` in particular has two consumers (`odometry` and `robotd`'s head FK) that would
+otherwise each grow a copy of the model.
 
 `duck-control` holds everything between reading the bus and writing it; `robotd` is the
 process around it. The compiler enforces that boundary, which is what stops daemon concerns
@@ -772,6 +783,50 @@ all it has. Pairing a pad therefore belongs to `configd` (`architecture.md` §1)
 a device needs root and BlueZ, and a `padd` holding either would no longer be exercising the API
 the app will use.
 
+### 4.4 Odometry, on the sample the loop already took
+
+`odometry::Odometry::alpha()` is stepped once per tick from the joint positions and the IMU
+quaternion the loop has just read, and its estimate goes out on the state stream as
+`odom: { position, yaw }`. `robotctl monitor` draws it as a path map under the 3D view.
+
+**Contact-based**, ported from the prototype runtime: one sole corner is the ground anchor, the
+trunk's world pose follows from it by forward kinematics through the `kinematics` crate's model,
+and the anchor moves when another corner drops below it — so a step never makes the estimate jump.
+Heading is the IMU's integrated yaw, so the world frame is wherever the robot was looking at boot.
+There is no magnetometer and nothing corrects drift; this is relative motion, and every consumer
+has to treat it that way.
+
+It costs the loop two chain evaluations per tick and no extra bus traffic, which is why it runs at
+the loop's own rate rather than the prototype's separate 100 Hz. That cost is the reason the
+"no odometry" decision in §7 was reversed rather than re-argued: the objection was never the
+arithmetic, it was that nothing read the answer.
+
+### 4.5 What else the loop drives, and why none of it has a design page
+
+`robotd` grew four subsystems after slice 2 that are not control and not safety. They share a
+shape: each hangs off the tick, none may block it, and none can reach the bus except through the
+intents the loop already arbitrates.
+
+| in the process | what it is | where the reasoning lives |
+|---|---|---|
+| `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
+| `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
+| `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
+| `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
+
+Plus `soc.rs`, which reads the board's own thermal zones out of `sysfs` — not behind `RobotIo`,
+because it has to keep answering when the motor bus does not.
+
+**None of them has a design page, and that is the rule working rather than a gap.** A service earns
+one when a second reader would otherwise have to derive its contract from the code
+(`../README.md`). These have exactly one implementation and one consumer each, and their decisions
+are local enough to live in the module header next to what they constrain. What they need instead
+is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin].
+
+[the voice]: ../robot/cheatsheet.md#the-voice
+[the chorale]: ../robot/cheatsheet.md#the-duck-chorale
+[the theremin]: ../robot/cheatsheet.md#play-the-duck-the-tof-theremin
+
 ## 5. Why it exists, and where it came from
 
 ### 5.1 The goal, which is not "a good `robotd`"
@@ -867,7 +922,7 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 | adopt current pose on start | an update must not move a standing robot |
 | bring-up as a state machine, not a flag | `set_torque` is a transaction per joint |
 | the fall verdict reports, it does not gate | what to do about a fall is a control decision (§2.4) |
-| no odometry | nothing reads it; one 50 Hz rate instead of 50/100 |
+| ~~no odometry~~ — reversed | `monitor`'s path map reads it, and it is one `kinematics` pass on a sample the loop already took (§4.4) |
 | the priority chain keeps the runtime's shape | the skills were tuned against its quirks |
 | gamepad as its own crate | keeps `gilrs` out of the recovery CLI |
 | sim after slice 2 | hardware is the validation path; `FakeIo` covers laptop development |
@@ -876,7 +931,10 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 
 MuJoCo backend and the `RemoteIo` protocol · the skill abstraction · policy bundle manifests and
 `model_api` gating · `look`/`pose`/`do` intents · gaze IK · live params reload and the config store ·
-odometry · thermal limits · rate limits · per-device IMU calibration.
+thermal limits · rate limits · per-device IMU calibration.
+
+**Odometry has left this list.** It was deferred because nothing read it; `robotctl monitor`'s
+path map now does. §4.4.
 
 ## 9. Open
 

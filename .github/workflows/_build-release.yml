@@ -142,8 +142,10 @@ jobs:
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
           cp target/aarch64-unknown-linux-gnu/release/padd staged/
-          # mediad is the WebRTC gateway. Shipped so a board *can* run it; its unit has no
-          # [Install], so nothing starts it until someone does. See mediad/systemd/mediad.service.
+          # mediad is the WebRTC gateway. Its unit carries an [Install] section, so postinstall
+          # enables it and an update restarts it like any other daemon
+          # (docs/design/restart-order.md §1). It was once shipped inert, and this comment
+          # said so for two releases after that stopped being true.
           cp target/aarch64-unknown-linux-gnu/release/mediad staged/
           # The voice generator (postinstall renders the per-robot bank with it) and the
           # mic classifier pair — pet-detect for live listening, pet-features for training.

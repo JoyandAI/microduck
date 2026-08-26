@@ -68,9 +68,28 @@ network is configured at all — because `walk` is a mode two releases with diff
 report. A robot with no policy says so, and one whose policy would not load says that instead,
 which the stream's `held` cannot distinguish.
 
+Down the right-hand side, **the robot drawn as it is standing** — the same visual model the
+policies were trained against, posed by the measured joint angles and tilted by the IMU's gravity
+vector. A leg folded the wrong way, a head pitched into the floor and a duck lying on its side are
+all just numbers in the joints table; every one of them is obvious here. It is on by default and
+appears whenever the terminal is wide enough (about 110 columns — the tables come first, and the
+robot takes what is spare). **`d`** turns it off; **`[`** and **`]`**, or `←`/`→`, orbit it.
+
+Whenever the ToF is delivering frames, what it sees is drawn into the same scene — yellow for a
+hit, green for floor — depth-tested against the robot's own body, so a point behind the beak is
+hidden by it. That is what makes "is it seeing my hand, or is it seeing itself" answerable. It
+needs no key: the points appear when frames arrive and go when they stop.
+
+Under it, when the column is tall enough, **a map of where the robot has been**: odometry's track
+from the foot contacts and the IMU, in braille. The panel never grows — the world zooms out as the
+track does, so the whole path stays in frame. `+` is where it started, `●` is the robot with a
+short ray for its heading, screen-up is the heading it booted with. There is no magnetometer, so
+this is relative motion and it drifts; it answers "did it walk in a circle" and not "where is it".
+
 `q` quits; `↑`/`↓` scroll the joint list on a window too short for all of it; `u` switches the
-angles between degrees and radians; `p` opens the pad's raw input stream — every evdev report from
-the gamepad, with the gaps between them, which is the only place a stalled radio is visible
+angles between degrees and radians; `t` opens the [ToF matrix](#the-tof-sensor-tofd); `d` toggles
+the robot view and `[` / `]` orbit it; `p` opens the pad's raw input stream — every evdev report
+from the gamepad, with the gaps between them, which is the only place a stalled radio is visible
 ([pair a gamepad](pair-a-gamepad.md#when-it-drops-while-you-are-driving)). Angles are degrees on screen — joints, head and the yaw rate.
 Redirected or piped it prints one line per tick instead, so `> run.log` and `| grep FALLEN`
 behave, and those numbers stay radians whatever the screen is set to. The joint vectors are in

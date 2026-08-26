@@ -862,7 +862,7 @@ components. Adapting to a new robot = new config + new signing key + (maybe) a
 new health probe.
 
 The authoritative, parse-tested example is
-[`updater/updater.example.toml`](../updater/updater.example.toml) — a unit test
+[`updater/updater.example.toml`](../../updater/updater.example.toml) — a unit test
 parses it, so it cannot drift from the code. Abridged here:
 
 ```toml

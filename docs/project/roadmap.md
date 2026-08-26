@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: draft · Date: 2026-08-05 · Owner: pierre
+Status: draft · Date: 2026-08-05, revised 2026-08-26 · Owner: pierre
 
 Companion to [`architecture.md`](../design/architecture.md) (what we're building) and
 [`updater-design.md`](../design/updater-design.md) (how it ships). This is *order and sequencing*
@@ -13,9 +13,9 @@ Companion to [`architecture.md`](../design/architecture.md) (what we're building
 | `updater/` | engine, verification, store, journal, hooks, preflight, GitHub/HF/local sources, IPC server, systemd unit — **done** |
 | `duck-control/` | robot model · bus · IMU · `RobotIo` · observations · ONNX policy · safety — **slices 1–2 done, and run on a robot**. A library: no tokio, no sockets, no systemd |
 | `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
-| `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done, and it walks on a board**; no kinematics |
+| `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done, and it walks on a board**. Since then: kinematics, contact odometry, the voice, the ToF theremin and the chorale, all hung off the same tick ([`robotd-design.md`](../design/robotd-design.md) §4.4–4.5) |
 | `padd/` | gamepad → intents, as an ordinary socket client — **done**, ships in the release and runs as its own unit from boot, so pairing a pad is the only step; needs libudev, installed by CI and the board cross-build |
-| `robotctl/` | the operator CLI — `update`, `health`, `version`, `monitor`, `net`, `system`, `pad`, `completions`; depends on `duck-ipc-proto`, not `updater`, so it stays on the recovery path |
+| `robotctl/` | the operator CLI — `update`, `health`, `version`, `monitor`, `net`, `system`, `robot`, `pad`, `configure`, `quack`, `chorale`, `theremin`, `completions`; depends on `duck-ipc-proto`, not `updater`, so it stays on the recovery path |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
 | `.github/` | ci · release · promote — **all three run for real**: `0.2.0` was tagged to staging, verified through the engine, installed on a board and promoted to stable on 2026-08-05, byte-identical (§16.3) |
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
@@ -24,8 +24,10 @@ Companion to [`architecture.md`](../design/architecture.md) (what we're building
 | `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](../design/app-path-design.md) §5.5 |
 | `duckctl/` | The robot from a laptop. BLE today; named for the robot rather than the radio, because `mediad` is a second transport |
 | `configd/` | wifi over NetworkManager, robot name and the identity it derives from the SoC serial, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
-| tests | **458 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
-| missing | `mediad`, app, SDK |
+| `mediad/` | camera, mic, encode and the WebRTC gateway, plus the console it serves. **Streaming to a browser on the LAN from a Radxa Zero 3W**, hardware H.264 through `mpph264enc`, with a `control` datachannel alongside — [`remote-webrtc.md`](../design/remote-webrtc.md) §0. Ships in the release and runs as its own unit |
+| `tof/` | `tofd`: the head's 8×8 ToF matrix, published on its own socket at 15 Hz. Read by `robotd`'s theremin and drawn by `robotctl monitor`; a board with no sensor fitted runs it anyway and says so |
+| tests | **936 passing** on a Mac (`--exclude tof`), a few more on Linux — including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
+| missing | the app, the SDK, and reaching a robot from outside the LAN |
 | on hardware | walking through the intent API, the update path (install · health gate · commit · auto-rollback), a signed release installed from the stable channel, BLE provisioning of wifi. The loop held 50.0 Hz with `missed=3` in 15022 ticks before inference |
 | not on hardware | the numbers M4 exists for: thermals, eMMC write timing, battery under load, and whether logs survive a power cut. The 30s health-gate timeout is still a guess |
 
@@ -195,12 +197,27 @@ off-board (`deploy/README.md`):
 cleanly with the gate passing, and `journalctl -u robotd -b -1` returns the previous boot's
 logs after a power cut.
 
-### M5 — `mediad`, WebRTC, SDK
+### M5 — `mediad`, WebRTC, SDK  ·  in progress
 
 Camera/mic, encode, perception, the remote gateway. Privacy lands here and not later:
 per-session consent and a visible streaming indicator are cheap now and expensive to
 bolt on. The SDK's WebSocket + snapshot path (§5.3) is what makes "an LLM drives the
 robot" easy.
+
+**Landed, on hardware.** `mediad` ships in the release and runs as its own unit. The camera
+reaches a browser on the LAN through the VPU — `mpph264enc` → `webrtcsink`, constrained baseline —
+with a `control` datachannel carrying the same JSON-RPC every other transport speaks, and the
+console is served by the robot itself so there is a URL and nothing to install
+([`remote-webrtc.md`](../design/remote-webrtc.md) §0, [`webrtc-console.md`](../design/webrtc-console.md)).
+Two GStreamer plugins had to be built from source to get there, which is its own record
+([`media-bringup.md`](media-bringup.md)), and the camera has since got 3A through `rkaiq`.
+
+**Still open, and they are what keeps this milestone from closing:** reaching a robot from outside
+the LAN — the design is the same one with a proxy in front (§7), deliberately built second — the
+SDK, and the privacy pair. Consent and the streaming indicator are *not* done, and this is the
+milestone that was supposed to stop them being bolted on, and the reason given for deferring them
+is a hardware one — an LED under software control, which does not yet exist
+([`remote-webrtc.md`](../design/remote-webrtc.md) §11).
 
 **Done when:** telepresence works from outside the LAN, and a server-side script can
 fetch a frame and send an intent in a few dozen lines.
@@ -230,22 +247,31 @@ bricked release recovers without a laptop.
 
 ## Organisation
 
-**One repo, one workspace.** `robotd`, `btd`, `configd` and `padd` have joined as siblings;
-`mediad` is the one still outstanding. They co-version because they all ship in the same
+**One repo, one workspace.** `robotd`, `btd`, `configd`, `padd`, `mediad` and `tofd` are all
+siblings now — nothing is outstanding. They co-version because they all ship in the same
 `daemon` artifact — one version line is correct, and models version separately already.
 
 **Crate layout as it should end up:**
 
+It ended up wider than this section first drew it — the libraries `robotd` drives are their own
+crates now, for the reason `duck-control` was: the compiler is what keeps daemon concerns out of
+them. The list lives in [CONTRIBUTING.md](../../CONTRIBUTING.md#the-layout) rather than here,
+because it is reference and this page is a record. The shape:
+
 ```
 duck-ipc-proto/ wire types — serde/serde_json/semver only; btd/robotd/robotctl depend
                 on this, never on updater
-configd/        wifi (NetworkManager), robot name, pairing PIN, reboot, gamepad pairing (BlueZ)
 updater/        engine + updaterd
-robotctl/       CLI
-robotd/         control, gait, safety — no kinematics yet
+robotd/         control, gait, safety, the voice, the theremin, the chorale
+duck-control/   the control core, extracted from the prototype runtime
+kinematics/  odometry/  sounds/  pet-detect/  robotd-params/
+                libraries robotd drives — no sockets, nothing systemd starts
+configd/        wifi (NetworkManager), robot name, pairing PIN, reboot, gamepad pairing (BlueZ)
 padd/           gamepad → intents; a client, with no privilege the app will not have
-mediad/         camera, encode, perception, WebRTC gateway  (not built yet)
+mediad/         camera, encode, WebRTC gateway, and the console it serves
+tof/            tofd — the head's depth sensor, published on its own socket
 btd/            BLE transport adapter
+robotctl/       CLI
 duckctl/        the client, from a laptop (dev tool, never shipped)
 xtask/          build/publish tooling — never ships
 ```

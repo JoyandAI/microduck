@@ -87,7 +87,7 @@ install what that branch last built.
 cannot bond a gamepad at all. See [`pair-a-gamepad.md`](pair-a-gamepad.md).
 
 `DUCK_NO_START=1` installs the release, the units, the users and the groups and enables **nothing**
-— not even for the next boot. It also stops and disables any of the five a previous install left
+— not even for the next boot. It also stops and disables any daemon a previous install left
 running, so the state is the same whether the card is fresh or not. For separating a board-level
 fault from the daemons: reboot into a board with nothing of ours running, test, then bring them up
 one at a time.
