@@ -2,16 +2,16 @@
   <img src="docs/images/hero.svg" alt="microduck" width="820">
 </p>
 
-<h1 align="center">microduck</h1>
+<h1 align="center">Microduck</h1>
 
 <p align="center">
-  <em>A duck-sized biped that walks, puts on wheels when it feels like it,<br>
-  plays a theremin with your hand, and sings four-part harmony with its friends.</em>
+  <em>A tiny biped robot that moves using reinforcement learning policies.</em>
 </p>
 
 <p align="center">
-  <a href="https://pollen-robotics.com/microduck"><b>pollen-robotics.com/microduck</b></a> ·
+  <a href="https://pollen-robotics.com/microduck"><b>Get yours here</b></a> ·
   <a href="docs/robot/cheatsheet.md">Cheat sheet</a> ·
+  <a href="https://github.com/pollen-robotics/microduck_rl">Training the policies</a> ·
   <a href="docs/design/architecture.md">How it works</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -23,11 +23,16 @@
 
 ---
 
-**This repo is the duck's brain.** A handful of daemons on a Radxa Zero 3W: a 50 Hz control loop
-driving fifteen servos from a neural policy, the radios and the camera, and the update machinery
-that gets new software onto a robot without bricking it. If you have a microduck, everything you need to run
-it is here. If you want one, the [website](https://pollen-robotics.com/microduck) is the place to
-start.
+**This repo is the duck's brain.** About 25 cm and 800 g of robot, run by a handful of daemons on a
+Rockchip RK3566: a 50 Hz control loop driving fifteen servos from a neural policy, the radios and
+the camera, and the update machinery that gets new software onto a robot without bricking it.
+
+Everything you need to run a Microduck is here. **If you want one,
+[get yours here](https://pollen-robotics.com/microduck).**
+
+The policies it runs are trained next door, in
+**[microduck_rl](https://github.com/pollen-robotics/microduck_rl)** — MuJoCo and PPO, the sim2real
+recipe, and the export to ONNX that this repo loads. Brains grown there, driven here.
 
 ## It does things
 
@@ -37,33 +42,21 @@ start.
 <td width="50%"><img src="docs/images/roller.svg" alt="Roller mode" width="100%"></td>
 </tr>
 <tr>
-<td><b>It walks.</b> A policy trained in simulation, running on the board — no tether, no laptop in
-the loop. Pick up the gamepad and drive.</td>
-<td><b>It rolls.</b> Put wheels on it, hold D-pad up for three seconds, and it loads a different
-brain: one quack for legs, two for wheels.</td>
+<td><b>It walks.</b> Pick up a gamepad and drive.</td>
+<td><b>It rolls.</b> Put wheels on, hold D-pad up, and it loads the other brain.</td>
 </tr>
 <tr>
-<td><img src="docs/images/chorale.svg" alt="The chorale" width="100%"></td>
-<td><img src="docs/images/theremin.svg" alt="The theremin" width="100%"></td>
+<td><img src="docs/images/ground-pick.svg" alt="Ground pick" width="100%"></td>
+<td><img src="docs/images/standup.svg" alt="Standing back up" width="100%"></td>
 </tr>
 <tr>
-<td><b>It sings.</b> Ducks in the same room find each other over Bluetooth, work out who takes
-which part, and sing in four voices — mouths on the beat, no shared clock, no wires.</td>
-<td><b>It plays.</b> The time-of-flight sensor in its head turns your hand's distance into a pitch,
-in the duck's own voice, with its beak opening as the note climbs.</td>
+<td><b>It picks things up.</b> Beak to the floor, one button.</td>
+<td><b>It gets back up.</b> Knock it over and it stands itself up.</td>
 </tr>
 </table>
 
-It also sits, stands, kicks a ball, rolls forward on command, coos when you scratch its head if
-you turn that on, and goes limp before it hits the floor — so a fall costs it some dignity rather
-than a gearbox.
-
-<p align="center">
-  <img src="docs/images/console.svg" alt="The WebRTC console" width="820">
-</p>
-
-<p align="center"><em>…and it serves its own console: open a browser, see what the duck sees, drive
-it from the page.</em></p>
+It also sits, kicks a ball, rolls forward, quacks in a voice that is its own, plays a theremin with
+your hand, and sings four-part harmony with other ducks in the room.
 
 ## Say hello
 
@@ -72,11 +65,12 @@ On the robot, over ssh:
 ```bash
 robotctl health      # is it alive, and what is wrong if not
 robotctl monitor     # the control loop, live: asked vs applied, joints, battery, temps
-robotctl quack        # it answers in a voice that is only its own
+robotctl quack       # it answers in a voice that is only its own
 ```
 
 Switch a paired gamepad on and drive — `padd` runs from boot and waits for one. **Start** enables
-the policy; the first press moves the robot to its home pose, so hold it or stand it up.
+the policy; the first press moves the robot to its home pose, so hold it or stand it up. The
+[full button mapping](docs/robot/cheatsheet.md#gamepad-configd) is in the cheat sheet.
 
 Every command explains itself, so exploring beats reading:
 
@@ -99,7 +93,8 @@ robotctl --help
 
 | | |
 |---|---|
-| [How it works](docs/design/architecture.md) | The whole system on one page — five daemons, one bus, how an update reaches a robot — then a page per part. |
+| [microduck_rl](https://github.com/pollen-robotics/microduck_rl) | Where the policies come from: MuJoCo, PPO, domain randomisation, and the ONNX export this repo loads. |
+| [How it works](docs/design/architecture.md) | The whole system on one page — the daemons, the bus, how an update reaches a robot — then a page per part. |
 | [Set up a dev board](docs/robot/install-dev.md) | From a blank board to a robot that takes branch builds. |
 | [Dev cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, driving from a laptop, and the restart traps after an update. |
 | [Push your branch](docs/robot/dev-push.md) | Build on your machine, install over ssh, about a minute. |
@@ -115,9 +110,8 @@ the camera over WebRTC; `tofd` serves the depth sensor. They talk over one JSON-
 Unix sockets, and every client — the app, the console, the gamepad, your script — sends exactly the
 same calls.
 
-The interesting decisions are written down rather than folklore:
-[`docs/design/`](docs/design/) is why things are the way they are, and
-[`docs/project/`](docs/project/) is what has gone wrong and what would close it.
+The interesting decisions are written down: [`docs/design/`](docs/design/) is why things are the
+way they are, and [`docs/project/`](docs/project/) is what has gone wrong and what would close it.
 
 ## A note on ducks
 

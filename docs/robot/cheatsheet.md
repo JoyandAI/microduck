@@ -191,6 +191,8 @@ mapping is the prototype's, so muscle memory carries over:
 
 | control | does |
 | --- | --- |
+| left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
+| right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
 | **Start** | toggle the policy — nothing moves until it is on |
 | **Y** / triangle | head mode: sticks pose the head (body holds still) |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |

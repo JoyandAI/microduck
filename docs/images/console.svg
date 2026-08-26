@@ -1,5 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-label="the console — placeholder">
-  <rect x="1" y="1" width="1198" height="418" rx="10" fill="#8b8b8b22" stroke="#8b8b8b" stroke-width="2" stroke-dasharray="9 7"/>
-  <text x="50%" y="202.0" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="26" font-weight="600" fill="#8b8b8b">the console</text>
-  <text x="50%" y="230.0" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" fill="#8b8b8b">screenshot: browser console, video + telemetry — 1200x420</text>
-</svg>

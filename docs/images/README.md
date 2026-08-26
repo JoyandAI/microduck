@@ -8,12 +8,11 @@ file, and delete the placeholder. Keep the sizes — the layout is built around 
 
 | placeholder | what goes there | size |
 |---|---|---|
-| `hero.svg` | The duck, three-quarter view, in room light. The one image somebody sees first. | 1200×500 |
+| `hero.svg` | The robot, three-quarter view, in room light. The one image somebody sees first. | 1200×500 |
 | `walk.svg` | A lap of the desk, side on. Short loop, no audio. | 560×340 |
 | `roller.svg` | Wheels on, rolling past the camera. | 560×340 |
-| `chorale.svg` | Four ducks in a row, beaks open, mid-chord. | 560×340 |
-| `theremin.svg` | A hand rising in front of the beak, mouth opening with the pitch. | 560×340 |
-| `console.svg` | The browser console: video on the left, telemetry on the right. | 1200×420 |
+| `ground-pick.svg` | Beak to the floor, picking something up. | 560×340 |
+| `standup.svg` | Face-down to standing, in one take. | 560×340 |
 
 Two things to keep in mind. GitHub serves these through its own proxy, so a `.gif` over a couple of
 megabytes is slow on the landing page — keep loops short and the palette small. And a video file
