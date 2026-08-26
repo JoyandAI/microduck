@@ -336,7 +336,8 @@ is two lines standing between a working pipeline and four different confusing fa
 
 **The bitrate came out ~50× under target.** 15,553 bytes for 3.3 s of capture against
 `bps=2000000` is about 37 kbps. Either the scene was static enough for CBR to collapse — plausible,
-the ISP was on raw defaults and the image is green and noisy until `setup_rkaiq.sh` runs — or
+the ISP was on raw defaults and the image is green and noisy until `scripts/setup-rkaiq.sh` runs
+(ported from the prototype; provisioning and the pre-install hook both run it now) — or
 capture is delivering well below 30 fps. The frame count has not been measured. If it is the
 latter, the sensor mode is the suspect: the IMX219 boots in 3280x2464 and the prototype pins the
 mode with `media-ctl` before every capture (`camera.rs:277`).

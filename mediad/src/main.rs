@@ -63,8 +63,10 @@ struct Args {
 
     /// Sensor exposure in lines (~19 µs each) and analogue gain, where 256 is 1x.
     ///
-    /// There is no 3A daemon on this platform, so nothing converges these. The defaults are the
-    /// prototype's, and with the boot values the picture is black rather than merely dark.
+    /// The starting values only: with the driver's boot values the picture is black rather than
+    /// merely dark, so something must write the sensor before the first frame. On a board where
+    /// `scripts/setup-rkaiq.sh` installed the 3A engine, it converges exposure from here; on one
+    /// where it did not, these are what the camera keeps. The defaults are the prototype's.
     #[arg(long, default_value_t = 600)]
     exposure: u32,
 
@@ -84,6 +86,17 @@ struct Args {
 
     #[arg(long, default_value_t = 30)]
     fps: u32,
+
+    /// Turn the picture this many degrees clockwise: 0, 90, 180 or 270.
+    ///
+    /// **90 because the head camera is mounted a quarter turn off**, so a straight capture is
+    /// sideways. This is the one place that fact is written down; see `pipeline::Rotation` for why
+    /// it is turned on the robot rather than in the console.
+    ///
+    /// A quarter turn swaps the frame's width and height, and it costs a CPU pass — `--rotate 0`
+    /// is the way to take that pass out if the control loop starts missing ticks while streaming.
+    #[arg(long, default_value_t = 90)]
+    rotate: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -105,6 +118,16 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(e) => {
             tracing::error!(error = %e, "no tokio runtime");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Refused before anything starts: a bad angle is a typo on a command line, and the daemon
+    // should say so rather than opening a camera first.
+    let rotation = match mediad::pipeline::Rotation::from_degrees(args.rotate) {
+        Ok(rotation) => rotation,
+        Err(e) => {
+            tracing::error!(error = %e, "mediad cannot start");
             return ExitCode::FAILURE;
         }
     };
@@ -152,10 +175,6 @@ fn main() -> ExitCode {
             mediad::pipeline::Source::Test
         };
 
-        // `_frames` is the raw NV12 tap off the tee. Nothing reads it yet — perception and the
-        // `get_frame` surface in `architecture.md` §5.3 are what it is for — but the branch runs
-        // from the start rather than being added later, because a tee inserted into a live
-        // pipeline is a different and much harder problem than a tee that was always there.
         let settings = mediad::pipeline::Settings {
             host: args.host.clone(),
             port: args.port,
@@ -163,8 +182,13 @@ fn main() -> ExitCode {
             width: args.width,
             height: args.height,
             fps: args.fps,
+            rotation,
         };
 
+        // `_frames` is the raw NV12 tap off the tee. Nothing reads it yet — perception and the
+        // `get_frame` surface in `architecture.md` §5.3 are what it is for — but the branch runs
+        // from the start rather than being added later, because a tee inserted into a live
+        // pipeline is a different and much harder problem than a tee that was always there.
         let (_pipeline, mut channels, _frames) =
             match mediad::pipeline::start(source, &producer, &settings) {
                 Ok(started) => started,
