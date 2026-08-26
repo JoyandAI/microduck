@@ -7,9 +7,9 @@
 //! ## Shape
 //!
 //! ```text
-//!                                    ┌─ queue ─ webrtcsink ── encoder-setup → mpph264enc
-//! videotestsrc | camera ─ NV12 ─ tee ┤              │
-//!                                    └─ queue ─     │  run-signalling-server=true
+//!                                                ┌─ queue ─ webrtcsink ─ setup → mpph264enc
+//! videotestsrc | camera ─ NV12 ─ videoflip ─ tee ┤          │
+//!                                                └─ queue ─ │  run-signalling-server=true
 //!                                       (leaky)     │
 //!                                          │        └─ consumer-added → "control" channel
 //!                                      appsink
@@ -23,7 +23,14 @@
 //! need pixels, and taking them off the encoded branch would mean decoding what we just encoded.
 //!
 //! NV12 because that is what the rkisp capture path emits and what `mpph264enc` takes, so nothing
-//! converts anywhere: no `videoconvert`, and no RGA pass, between capture and either consumer.
+//! *converts* anywhere: no `videoconvert`, and no RGA pass, between capture and either consumer.
+//!
+//! **`videoflip` is the one pass, and it is a rotation rather than a conversion.** The head camera
+//! is mounted a quarter turn off, so a straight capture is sideways; turning it before the tee is
+//! what lets both consumers — and the console's drag-to-look, which maps a gaze off the same
+//! geometry — agree about which way is up. It costs CPU on the SoC that runs `robotd`'s control
+//! loop, which is why it is one element and one flag ([`Rotation`], `--rotate 0`) rather than a
+//! property of the pipeline nobody can take out.
 //!
 //! **Each branch has its own `queue`, and the raw one is leaky.** A `tee` without queues runs its
 //! branches on one thread, so a slow consumer stalls the others — here that would mean a
@@ -82,6 +89,67 @@ use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
 
+/// How far the picture is turned before anything downstream sees it.
+///
+/// **The head camera is mounted a quarter turn off**, so the sensor's rows run down the world
+/// rather than across it and a straight capture comes out sideways. That is a fact about the
+/// robot, not a preference, which is why the default is a quarter turn rather than none.
+///
+/// Turned here rather than in the console, and the console is the reason: it maps a drag on the
+/// picture to a gaze (`aim` in `webclient/index.html`), so a page that rotated the video in CSS
+/// would send the robot looking 90° away from where the operator pointed. Rotating before the tee
+/// also means the raw branch — the one a perception consumer reads — sees the same picture the
+/// stream does, rather than each consumer having to know about the mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rotation {
+    /// Leave the frame as the sensor delivered it.
+    None,
+    /// A quarter turn clockwise: what this robot's mount needs.
+    Cw90,
+    Cw180,
+    /// A quarter turn anticlockwise, for a head assembled the other way round.
+    Cw270,
+}
+
+impl Rotation {
+    /// From degrees clockwise, which is how the flag is written.
+    pub fn from_degrees(degrees: u32) -> Result<Self> {
+        match degrees {
+            0 => Ok(Self::None),
+            90 => Ok(Self::Cw90),
+            180 => Ok(Self::Cw180),
+            270 => Ok(Self::Cw270),
+            other => Err(anyhow!(
+                "rotation must be 0, 90, 180 or 270 degrees clockwise, not {other}"
+            )),
+        }
+    }
+
+    /// `videoflip`'s `video-direction`, or `None` where there is nothing to do.
+    ///
+    /// `90r` is clockwise and `90l` anticlockwise, which is GStreamer's naming and not ours.
+    fn video_direction(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Cw90 => Some("90r"),
+            Self::Cw180 => Some("180"),
+            Self::Cw270 => Some("90l"),
+        }
+    }
+
+    /// The frame size after the turn. A quarter turn swaps the axes; a half turn does not.
+    ///
+    /// Everything that reads a raw frame depends on this being right: [`Frame`] carries the
+    /// dimensions the buffer is in, and a consumer handed 1280x720 for a 720x1280 buffer reads
+    /// the picture diagonally rather than failing.
+    fn output(self, width: u32, height: u32) -> (u32, u32) {
+        match self {
+            Self::Cw90 | Self::Cw270 => (height, width),
+            Self::None | Self::Cw180 => (width, height),
+        }
+    }
+}
+
 /// Where the signalling server listens, and what the video is.
 ///
 /// One value rather than six positional arguments. `start` had reached eight of them, and two of
@@ -99,6 +167,9 @@ pub struct Settings {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// How far to turn the picture; see [`Rotation`]. The capture geometry above is the sensor's,
+    /// *before* this is applied.
+    pub rotation: Rotation,
 }
 
 /// Where the video comes from.
@@ -178,8 +249,13 @@ pub fn start(
         width,
         height,
         fps,
+        rotation,
         ..
     } = settings;
+
+    // What leaves the pipeline, which is what every consumer downstream of the tee sees. Only the
+    // capture side uses `width`/`height` from here on.
+    let (out_width, out_height) = rotation.output(width, height);
     let host = settings.host.as_str();
 
     // `GST_DEBUG` has to be in the environment before `init`, which is when GStreamer parses it.
@@ -244,6 +320,36 @@ pub fn start(
         .property("caps", &caps)
         .build()
         .map_err(|_| anyhow!("no capsfilter element; gstreamer core is incomplete"))?;
+
+    // ── the turn ────────────────────────────────────────────────────────────
+    //
+    // `videoflip` from `gstreamer1.0-plugins-good`, which the board already has — see the package
+    // list in `scripts/setup-gstreamer.sh`. It is a CPU pass, and this pipeline was built to have
+    // none: "no `videoconvert`, and no RGA pass, between capture and either consumer". A quarter
+    // turn of 4:2:2 720p is real work (a scattered write per pixel, so the copy is cache-hostile
+    // rather than merely large), and it lands on the SoC that also runs `robotd`'s control loop.
+    //
+    // It buys a picture that is the right way up for every consumer at once, which is worth a
+    // pass — but if the loop starts missing ticks when the camera streams, this is the first
+    // thing to suspect and `--rotate 0` is how to confirm it in one restart. The cheaper fix, if
+    // it comes to that, is the SoC's 2D engine: the RGA is already doing one operation per frame
+    // inside `mpph264enc`, and a rotation is the same class of operation — it needs an RGA element
+    // in the plugin set, which this one does not have.
+    let flip = match rotation.video_direction() {
+        Some(direction) => Some(
+            gst::ElementFactory::make("videoflip")
+                .property_from_str("video-direction", direction)
+                .build()
+                .map_err(|_| {
+                    anyhow!(
+                        "no videoflip element, so the picture cannot be turned the right way up. \
+                         It comes from gstreamer1.0-plugins-good: \
+                         sudo /usr/local/sbin/robot-setup-gstreamer"
+                    )
+                })?,
+        ),
+        None => None,
+    };
 
     let tee = make("tee")?;
 
@@ -351,9 +457,20 @@ pub fn start(
         .build()
         .map_err(|_| anyhow!("no queue element; gstreamer core is incomplete"))?;
 
+    // The turn happens before the tee, so this branch carries the rotated geometry. Built from
+    // `out_width`/`out_height` rather than reusing `caps`: handing the appsink the capture caps
+    // would fail negotiation on a quarter turn, and silently describe the wrong shape on a half
+    // one.
+    let out_caps = gst::Caps::builder("video/x-raw")
+        .field("format", CAPTURE_FORMAT)
+        .field("width", out_width as i32)
+        .field("height", out_height as i32)
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+
     let frames = Frames::default();
     let appsink = gst_app::AppSink::builder()
-        .caps(&caps)
+        .caps(&out_caps)
         // `sync=false` so this branch never waits on the clock: a snapshot wants the newest frame
         // as soon as it exists, and pacing it would only add latency to a consumer that is not
         // rendering anything.
@@ -361,7 +478,13 @@ pub fn start(
         .max_buffers(1)
         .drop(true)
         .build();
-    wire_frames(&appsink, frames.clone(), width, height);
+    wire_frames(&appsink, frames.clone(), out_width, out_height);
+
+    if let Some(flip) = flip.as_ref() {
+        pipeline
+            .add(flip)
+            .context("could not add videoflip to the pipeline")?;
+    }
 
     pipeline
         .add_many([
@@ -387,7 +510,11 @@ pub fn start(
         consumers.clone(),
     )?;
 
-    gst::Element::link_many([&src, &capsfilter, &tee]).context(
+    match flip.as_ref() {
+        Some(flip) => gst::Element::link_many([&src, &capsfilter, flip, &tee]),
+        None => gst::Element::link_many([&src, &capsfilter, &tee]),
+    }
+    .context(
         "could not link the source to the tee. A caps failure here means the source cannot \
          produce NV12 at the requested size and rate.",
     )?;
@@ -421,6 +548,9 @@ pub fn start(
         ?source,
         width,
         height,
+        out_width,
+        out_height,
+        ?rotation,
         fps,
         "signalling server listening"
     );
@@ -1194,4 +1324,54 @@ fn open_control_channel(
 
     tracing::info!(peer, "control channel open");
     Ok(Channel { inbound, outbound })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A quarter turn swaps the frame's axes; a half turn does not.
+    ///
+    /// [`Frame`] carries the dimensions its buffer is in, and the raw branch is handed these
+    /// rather than reading them back off the caps. Get this wrong and a consumer reads a 720x1280
+    /// picture as 1280x720 — which is not a failure, it is a diagonal smear, and the kind of thing
+    /// that gets blamed on the camera.
+    #[test]
+    fn a_quarter_turn_swaps_the_frame_size() {
+        assert_eq!(Rotation::None.output(1280, 720), (1280, 720));
+        assert_eq!(Rotation::Cw90.output(1280, 720), (720, 1280));
+        assert_eq!(Rotation::Cw180.output(1280, 720), (1280, 720));
+        assert_eq!(Rotation::Cw270.output(1280, 720), (720, 1280));
+    }
+
+    /// The mount is a quarter turn clockwise, and `90r` is GStreamer's name for that.
+    ///
+    /// Named the wrong way round, the picture is upside down twice over: the console's drag-to-look
+    /// maps a gaze off the same geometry, so a 180° error there sends the robot looking away from
+    /// where the operator pointed rather than merely showing a sideways picture.
+    #[test]
+    fn clockwise_is_90r_and_identity_is_nothing_at_all() {
+        assert_eq!(Rotation::Cw90.video_direction(), Some("90r"));
+        assert_eq!(Rotation::Cw270.video_direction(), Some("90l"));
+        assert_eq!(Rotation::Cw180.video_direction(), Some("180"));
+        // Not `Some("identity")`: no element is built at all, so the pass costs nothing.
+        assert_eq!(Rotation::None.video_direction(), None);
+    }
+
+    /// Only the four right angles, and a wrong one is refused rather than rounded.
+    #[test]
+    fn only_right_angles_are_accepted() {
+        for (degrees, expected) in [
+            (0, Rotation::None),
+            (90, Rotation::Cw90),
+            (180, Rotation::Cw180),
+            (270, Rotation::Cw270),
+        ] {
+            assert_eq!(Rotation::from_degrees(degrees).unwrap(), expected);
+        }
+        for bad in [45, 89, 91, 360, 1] {
+            let error = Rotation::from_degrees(bad).unwrap_err().to_string();
+            assert!(error.contains("0, 90, 180 or 270"), "{error}");
+        }
+    }
 }

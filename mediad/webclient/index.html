@@ -67,8 +67,12 @@
   .row { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
   .hint { margin: .5rem 0 0; font-size: 12px; opacity: .6; }
 
+  /* 16/9 is the placeholder, held only until a frame arrives: the robot's camera is mounted a
+     quarter turn off and `mediad --rotate` turns it, so the picture is portrait. `fitVideoBox`
+     then gives the box the stream's own shape — a box pinned to 16/9 would letterbox a portrait
+     picture into a sliver, and it is the surface the operator drags on to aim. */
   video { width: 100%; background: #111; aspect-ratio: 16/9; border-radius: 4px; display: block;
-          touch-action: none; cursor: crosshair; }
+          touch-action: none; cursor: crosshair; margin: 0 auto; }
   .stats { margin-top: .5rem; font: 12px/1.4 ui-monospace, monospace; gap: .75rem; }
   .stats b { font-weight: 600; opacity: .55; font-size: 11px; text-transform: uppercase; }
 
@@ -388,6 +392,24 @@ function newPeerConnection() {
     log("dim", "track:", event.track.kind);
     $("video").srcObject = event.streams[0];
   };
+
+  // Take the box's shape from the stream rather than assuming landscape. `loadedmetadata` is the
+  // first point the dimensions are known, and `resize` covers a stream that changes shape while
+  // playing — which a `--rotate` change on the robot does, without the page reloading.
+  const fitVideoBox = () => {
+    const element = $("video");
+    const { videoWidth: w, videoHeight: h } = element;
+    if (!w || !h) return;
+    element.style.aspectRatio = `${w} / ${h}`;
+    // Landscape fills the column; portrait is capped by height instead, or `width: 100%` on a
+    // 9:16 stream makes a box nearly twice the column's width tall and pushes everything else
+    // off the screen.
+    const portrait = h > w;
+    element.style.width = portrait ? "auto" : "100%";
+    element.style.height = portrait ? "min(70vh, 80vw)" : "auto";
+  };
+  $("video").addEventListener("loadedmetadata", fitVideoBox);
+  $("video").addEventListener("resize", fitVideoBox);
 
   pc.onicecandidate = (event) => {
     if (!event.candidate) return;
