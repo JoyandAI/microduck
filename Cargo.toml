@@ -4,7 +4,7 @@
 # docs/design/architecture.md §1. `robotd`, `btd` and `mediad` are all siblings now.
 [workspace]
 resolver = "3"
-members = ["btd", "configd", "duck-control", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
+members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
 
 # Everything except `duckctl`, and that exception is the whole reason this key exists.
 #
@@ -18,7 +18,7 @@ members = ["btd", "configd", "duck-control", "duck-ipc-proto", "duckctl", "kinem
 # writing down. One list here, and a new daemon is picked up by both without anybody remembering.
 #
 # `--workspace` is unaffected, so CI still lints and tests `duckctl` exactly as before.
-default-members = ["btd", "configd", "duck-control", "duck-ipc-proto", "kinematics", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
+default-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
 
 # ONNX Runtime, which robotd dlopens to run a policy. One source of truth: `xtask package`
 # bakes these into the release's preinstall hook, and a test asserts scripts/setup-board.sh
@@ -30,6 +30,16 @@ default-members = ["btd", "configd", "duck-control", "duck-ipc-proto", "kinemati
 [workspace.metadata.onnxruntime]
 floor  = "1.23"
 target = "1.28.0"
+
+# Rockchip's NPU runtime, which `duck-detect` dlopens to run the duck detector. Same shape as the
+# ONNX Runtime pin above and for the same reason — `scripts/setup-npu.sh` is fetched standalone with
+# curl and cannot read this file, so it carries a literal and a test asserts the two agree.
+#
+# The version is a tag in Rockchip's `rknn-toolkit2` repository, which is where the .so lives; it has
+# to be at least as new as the model the converter produces, because a runtime older than its model
+# fails at `rknn_init` with a number.
+[workspace.metadata.rknpu]
+runtime = "v2.3.2"
 
 # The prebuilt GStreamer plugins `mediad` needs, built in CI from pinned upstream sources at
 # https://github.com/pollen-robotics/microduck-gst-plugins — `mpph264enc` (hardware H.264 through

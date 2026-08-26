@@ -1303,6 +1303,29 @@ mod tests {
         }
     }
 
+    /// `setup-npu.sh` pins the NPU runtime, and Cargo.toml pins it too.
+    ///
+    /// Third instance of the same trap — after ONNX Runtime and the GStreamer plugins — and the
+    /// same fix: the script is fetched standalone with `curl` and cannot read Cargo.toml, so it
+    /// carries a literal and this asserts the two agree. A runtime older than the model it is asked
+    /// to load fails at `rknn_init` with a number, which is not a diagnosis.
+    #[test]
+    fn setup_npu_pins_the_same_runtime() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let pinned = manifest["workspace"]["metadata"]["rknpu"]["runtime"]
+            .as_str()
+            .unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-npu.sh")).unwrap();
+        let expected = format!("RUNTIME=\"{pinned}\"");
+        assert!(
+            script.contains(&expected),
+            "setup-npu.sh must carry the line {expected:?}"
+        );
+    }
+
     /// Same trap, same shape: `scripts/setup-gstreamer.sh` is fetched standalone with `curl`, so
     /// it carries a literal plugin version and cannot read Cargo.toml. A drift here is a board
     /// running plugins nobody can name — which is exactly what building them ourselves, from
