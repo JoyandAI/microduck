@@ -252,8 +252,9 @@ sudo systemctl daemon-reload
 sudo systemctl restart updaterd
 ```
 
-A token on a *developer's* board is fine. A token on a customer robot is not, and is why
-artifact hosting is still an open question — see `docs/design/updater-design.md` §6.1.
+A token on a *developer's* board is fine. A token on a customer robot is not, which is why the
+repository is going public rather than shipping one — see `docs/design/updater-design.md` §6.1.
+Until it does, a board with no token can still install from a local directory or a dev push.
 
 ## Installing without a network
 

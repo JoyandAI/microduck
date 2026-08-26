@@ -74,10 +74,11 @@ there, and a trusted key only counts as a dev key if its filename ends `.dev.pub
 **Done:** verified against the real repository — `dev.yml` published, `--ref main` installed
 over the network, and a customer-robot config refused the same build.
 
-**One thing it left open, and it is now an M6 item rather than a footnote:** a private repo's
-release assets are reachable with a token and a customer robot has none, so as things stand
-**robots in the field cannot download anything**. [`updater-design.md`](../design/updater-design.md)
-§6.1 lays out the four options and picks none.
+**One thing it left open, now decided:** a private repo's release assets are reachable with a
+token and a customer robot has none, so until this week robots in the field could not download
+anything. **The repository goes public**, which resolves it and changes no code — the API path
+the engine uses works for public repos too
+([`updater-design.md`](../design/updater-design.md) §6.1).
 
 ### M3 — `robotd` for real · **done**, in two slices
 
@@ -166,10 +167,6 @@ What a stranger needs. Preorders are open and shipping is a few months out, so t
 by **lead time** rather than by difficulty — the items with the least code have the longest
 lead.
 
-- **Where a customer robot downloads from.** M2's open question, above: a private repo cannot
-  serve the fleet, and this changes where `release.yml` publishes and what `updater.toml` on
-  every robot points at. Longest lead of anything here, because a robot shipped pointing at the
-  wrong place is a robot that cannot be updated.
 - **The pairing PIN.** BLE pairing security rests on a per-robot PIN; the factory default is
   `000000` and public in this repository, so out of the box pairing proves physical presence and
   nothing more. Something has to generate one, print it, and record what was printed — a factory
@@ -188,6 +185,12 @@ lead.
 - **The app.** #107 designs it and builds nothing. The blocker is a phone spike — scan, connect,
   `hello`, authenticate, `system.info` with `--require-pairing` on, on a real iPhone and a real
   Android — because §5.5 is currently a fact about CoreBluetooth on a laptop.
+
+One item left M6 by being decided: where a customer robot downloads from. The repository goes
+public, so a shipped robot reaches its releases with no token and no second host. The follow-up
+it leaves is a budget rather than a blocker — anonymous GitHub API requests are capped at 60 an
+hour per IP, which one duck is nowhere near and a room of twenty on one wifi is not
+(§6.1).
 
 **Done when:** a non-developer updates the robot from the phone, and a deliberately bricked
 release recovers without a laptop.
@@ -263,6 +266,28 @@ tried and rolled back on its own version line.
   to a board without a daemon release. The model equivalent of `dev-push.sh` is what makes
   "train it and try it" a minute rather than a CI run.
 
+**Looking at what other people have made** is the other half of the ask, and it lands on the
+trust model rather than on the plumbing. Our own policies are basic and we sign them; a
+stranger's is signed by nobody this robot trusts, and every artifact the engine installs is
+verified against a trusted key. Three things to settle with the milestone rather than after it:
+
+- **Curated or open.** A model published into an org we sign for keeps every guarantee the
+  component system already gives — rollback, pin, known-bad, the health gate — and costs
+  nothing new. An open set needs an explicitly unverified install path: off by default, never
+  auto-applied, and refused on a customer robot the way `allow_dev_keys` already refuses dev
+  builds.
+- **The shape gate stops being a nicety.** `obs[1,61] → actions[1,14]` has to be checked before
+  a model goes live whoever signed it, because an arbitrary policy drives fifteen servos.
+- **What makes it survivable is already built.** The safety layer holds the only write handle to
+  the bus — joint clamps, fall → limp, an intent deadman — so a bad policy is bounded rather
+  than dangerous. That is the argument for allowing a stranger's model at all.
+
+**Slots stay fixed, sources do not.** `walk`, `stand`, `kick_left` and the rest are components
+with their own version lines; "look for others" is a query over the Hub for models tagged for
+this robot, plus repointing one slot's source at another repo. Letting arbitrary components
+appear at runtime would mean the config is no longer the authority on what a robot may run,
+which is the property the whole component design rests on.
+
 **One decision comes before all of it.** If policies move to the Hub, a freshly flashed board
 with no network has no gait. Keeping the release's copies as the floor and letting a model
 component override them is the obvious shape, but it means two sources for one file and a rule
@@ -273,7 +298,8 @@ does.
 
 **Done when:** a policy trained in `microduck_rl` is published to the Hub, installed on a duck
 with `robotctl update apply model-walk`, and rolled back with `robotctl update select` — with
-the control loop never dropping a tick through either.
+the control loop never dropping a tick through either — and someone who did not train it can
+find it from the robot and try it.
 
 ### M9 — The autonomous brain
 
@@ -323,9 +349,12 @@ The numbers above are identifiers. This is the order.
    process rather than code (M6).
 4. **Privacy** — consent is M5 and unblocked; the indicator is a hardware question and should be
    asked as one.
-5. **Where a customer robot downloads from** — open, and the longest-lead decision in M6.
-   [`updater-design.md`](../design/updater-design.md) §6.1 has the options.
+5. ~~**Where a customer robot downloads from**~~ — **decided 2026-08-26:** the repository goes
+   public. §6.1 keeps the options and the reasoning, because they are the fallback if the source
+   ever has to close again.
 6. **Whether policies leave the daemon artifact** — open, and M8 cannot start without it.
+7. **Curated models or an open set** — open, and it is a trust decision rather than a plumbing
+   one (M8).
 
 ## Not doing, on purpose
 
