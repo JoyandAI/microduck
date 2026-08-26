@@ -355,6 +355,37 @@ puts the old behaviour back for a consumer that cannot rotate for itself and can
 
 The proper fix, if an upright stream is ever genuinely needed, is an RGA element in the plugin set:
 the 2D engine rotates for nothing, which is why the encoder can afford to use it.
+### The 3A engine has to be waiting before the stream starts
+
+`rkaiq_3A_server` attaches to the ISP and then waits for a **stream start** event — and it misses one
+that already happened. Restart it while `mediad` is streaming and it sits on
+
+```
+DBG: /dev/media0: wait stream start event...
+```
+
+for ever: no stats loop, so no auto exposure and no white balance, and a green picture. A reboot
+"fixes" it only because a reboot happens to order the two correctly.
+
+Which made it a regression with no obvious cause, because **every `robotctl update apply` restarted
+the engine underneath a running stream**: the pre-install hook runs `setup-rkaiq.sh`, and that script
+restarts `rkaiq_3A`. It even printed "restart the camera stream for it to take effect" — advice
+nobody follows and nothing enforced.
+
+So the drop-in that script installs carries the invariant now:
+
+```ini
+ExecStartPost=-/bin/systemctl --no-block try-restart mediad.service
+```
+
+Whenever the engine starts, the stream is bounced behind it, so the event it waits for is one that
+has not happened yet. `try-restart` leaves a board with no `mediad` alone, and `--no-block` is what
+keeps a unit waiting on another unit's job from deadlocking systemd. To rescue a board by hand, the
+order is the whole trick:
+
+```bash
+sudo systemctl stop mediad && sudo systemctl restart rkaiq_3A && sleep 2 && sudo systemctl start mediad
+```
 
 ### Two things known to be unfinished
 

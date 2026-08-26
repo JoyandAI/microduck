@@ -253,12 +253,24 @@ chmod 755 "$PIN"
 say "wiring the shim and the pin into rkaiq_3A.service"
 mkdir -p "$DROP_IN_DIR"
 cat > "${DROP_IN_DIR}/robot.conf" <<DROPIN
-# Installed by scripts/setup-rkaiq.sh. Both lines are load-bearing: LD_PRELOAD is what keeps
-# the engine from segfaulting on this kernel, and the pin is what keeps it from programming the
-# ISP with the sensor's boot resolution.
+# Installed by scripts/setup-rkaiq.sh. All three lines are load-bearing.
+#
+# LD_PRELOAD is what keeps the engine from segfaulting on this kernel, and the pin is what keeps it
+# from programming the ISP with the sensor's boot resolution.
+#
+# **The third is an ordering invariant, and it was learned the hard way.** The engine attaches to the
+# ISP and then waits for a *stream start* event — and it misses one that already happened. Restart it
+# while \`mediad\` is streaming (which every \`robotctl update apply\` did, because the pre-install hook
+# runs this script) and it sits on "wait stream start event..." for ever: no stats loop, no auto
+# exposure, no white balance, and a green picture that a reboot fixes only because the reboot happens
+# to order the two correctly. So whenever the engine starts, the camera stream is bounced behind it.
+#
+# \`try-restart\`, so a board with no \`mediad\` running is left alone, and \`--no-block\`, because a unit
+# waiting on another unit's job inside its own start transaction is how you deadlock systemd.
 [Service]
 Environment=LD_PRELOAD=${SHIM_SO}
 ExecStartPre=${PIN}
+ExecStartPost=-/bin/systemctl --no-block try-restart mediad.service
 DROPIN
 
 systemctl daemon-reload
@@ -280,8 +292,9 @@ if [ -e /dev/video8 ] && [ -e /dev/video9 ]; then
     # single fact worth reporting. A second is enough for the latter.
     sleep 1
     if pgrep rkaiq_3A_server >/dev/null 2>&1; then
-        say "rkaiq_3A_server is running — restart the camera stream for it to take effect:
-    sudo systemctl restart mediad"
+        say "rkaiq_3A_server is running, and the camera stream has been bounced behind it so the
+  engine sees it start — that is the ExecStartPost in the drop-in above, not something to do by
+  hand. \`journalctl -fu rkaiq_3A\` should say 'wait stream start event success'."
     else
         warn "rkaiq_3A_server is not running. The camera still works, with no 3A:
     journalctl -t rkaiq -b --no-pager | tail -40
