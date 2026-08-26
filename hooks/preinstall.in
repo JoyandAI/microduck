@@ -155,6 +155,27 @@ install_gstreamer() {
     fi
 }
 
+# The camera's 3A engine, for the same reason and on the same terms as the GStreamer stack
+# above: it is what gives the camera auto exposure and white balance, a board provisioned
+# before it existed should get it from an ordinary update, and a board that cannot install it
+# still has a robot — with a green, fixed-exposure camera.
+install_rkaiq() {
+    script=scripts/setup-rkaiq.sh
+    if [ ! -f "$script" ]; then
+        say "no ${script} in this release; skipping the camera 3A engine"
+        return 0
+    fi
+
+    say "checking the camera 3A engine"
+    if sh "$script"; then
+        say "camera 3A engine ready"
+    else
+        say "the camera 3A engine did not finish installing — the camera will run on raw ISP
+  defaults, which is green, noisy and fixed-exposure. Everything else is unaffected. To retry:
+    sudo /usr/local/sbin/robot-setup-rkaiq"
+    fi
+}
+
 have="$(installed_onnx)"
 
 if at_least "$have" "$ONNX_FLOOR"; then
@@ -174,3 +195,4 @@ else
 fi
 
 install_gstreamer
+install_rkaiq

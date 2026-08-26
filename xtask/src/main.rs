@@ -1270,6 +1270,39 @@ mod tests {
         );
     }
 
+    /// `setup-rkaiq.sh` builds an LD_PRELOAD shim from a C file beside it, so the C file has to
+    /// be packaged too.
+    ///
+    /// Not covered by `every_script_the_hooks_run_is_packaged`, which watches `script=scripts/…`
+    /// assignments in the hooks: the shim is not a script anything runs, it is a source file the
+    /// script compiles. Packaged without it, the engine is installed and then segfaults on this
+    /// kernel — which looks like a broken camera rather than a missing file, and the script says
+    /// so and stops rather than guessing.
+    #[test]
+    fn the_rkaiq_shim_travels_with_its_script() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+
+        const SHIM: &str = "scripts/rkaiq-modinfo-shim.c";
+        assert!(root.join(SHIM).exists(), "{SHIM} is missing");
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-rkaiq.sh")).unwrap();
+        assert!(
+            script.contains("rkaiq-modinfo-shim.c"),
+            "setup-rkaiq.sh must name the shim source it builds"
+        );
+
+        for workflow in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(workflow))
+                .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+            assert!(
+                text.contains(&format!("={SHIM}")),
+                "{workflow} packages setup-rkaiq.sh but not {SHIM}, which it cannot run without"
+            );
+        }
+    }
+
     /// Same trap, same shape: `scripts/setup-gstreamer.sh` is fetched standalone with `curl`, so
     /// it carries a literal plugin version and cannot read Cargo.toml. A drift here is a board
     /// running plugins nobody can name — which is exactly what building them ourselves, from
@@ -1378,6 +1411,7 @@ mod tests {
             "setup-board.sh",
             "migrate-network.sh",
             "setup-gstreamer.sh",
+            "setup-rkaiq.sh",
             "install.sh",
             "provision.sh",
             "provision-board.sh",

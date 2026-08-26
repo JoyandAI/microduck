@@ -113,10 +113,13 @@ pub enum Source {
 
 /// The head camera, and the two things it will not work without.
 ///
-/// **There is no 3A daemon on this platform.** Nothing converges exposure or gain, so a capture
-/// with the driver's boot defaults comes out black — this is not tuning, it is the difference
-/// between a picture and no picture. Values are in the sensor's own units: exposure in lines
-/// (~19 µs each) and analogue gain where 256 is 1x, up to 2816 for 11x.
+/// **These are a starting exposure, not a policy.** A capture with the driver's boot defaults
+/// comes out black, so something has to write the sensor before the first frame — that is what
+/// these are for, and they are the difference between a picture and no picture on a board with
+/// no 3A. Where `scripts/setup-rkaiq.sh` has run, Rockchip's engine owns exposure from its first
+/// statistics onward and these hold for the few frames before that; where it has not, they are
+/// all there is and the picture stays at one exposure. Values are in the sensor's own units:
+/// exposure in lines (~19 µs each) and analogue gain where 256 is 1x, up to 2816 for 11x.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Camera {
     pub device: String,

@@ -63,8 +63,10 @@ struct Args {
 
     /// Sensor exposure in lines (~19 µs each) and analogue gain, where 256 is 1x.
     ///
-    /// There is no 3A daemon on this platform, so nothing converges these. The defaults are the
-    /// prototype's, and with the boot values the picture is black rather than merely dark.
+    /// The starting values only: with the driver's boot values the picture is black rather than
+    /// merely dark, so something must write the sensor before the first frame. On a board where
+    /// `scripts/setup-rkaiq.sh` installed the 3A engine, it converges exposure from here; on one
+    /// where it did not, these are what the camera keeps. The defaults are the prototype's.
     #[arg(long, default_value_t = 600)]
     exposure: u32,
 

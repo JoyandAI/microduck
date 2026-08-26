@@ -68,6 +68,7 @@ ENV_DEV_KEY="${DUCK_DEV_KEY:-}"
 ENV_FORCE="${DUCK_FORCE_REINSTALL:-}"
 ENV_WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
 ENV_GSTREAMER="${DUCK_GSTREAMER:-}"
+ENV_RKAIQ="${DUCK_RKAIQ:-}"
 
 REPO="${ENV_REPO:-pollen-robotics/microduck}"
 REF="${ENV_REF:-main}"
@@ -128,6 +129,17 @@ WEIRD_BLE="$ENV_WEIRD_BLE"
 # default rather than a flag anybody has to know about.
 GSTREAMER="${ENV_GSTREAMER:-1}"
 
+# Install the camera's 3A engine? Passed to `setup-rkaiq.sh`.
+#
+# **On** by default, and paired with the GStreamer stack above: that one makes the board able to
+# encode a picture, this one makes the picture worth encoding. Without it the ISP has no tuning
+# and no 3A loop — green, noisy, and stuck at whatever exposure `mediad` pinned — so a board
+# with the stack and not the engine has a camera nobody wants to look at.
+#
+# `DUCK_RKAIQ=0` turns it off — `--no-rkaiq` on `provision-board.sh`. Empty is *not* off, for
+# the reason spelled out above.
+RKAIQ="${ENV_RKAIQ:-1}"
+
 # The branch the operator asked for, or empty. Kept apart from `REF` because they answer different
 # questions: `REF` is always set — it defaults to `main` — and says where the *scripts* come from,
 # while this says whether a *branch build of the daemon* was asked for. Provisioning plainly with no
@@ -166,6 +178,7 @@ DEV_KEY_KEPT="${STATE_DIR}/team.dev.pub"
 SETUP_SELF=/usr/local/sbin/robot-setup-board
 MIGRATE_SELF=/usr/local/sbin/robot-migrate-network
 GST_SELF=/usr/local/sbin/robot-setup-gstreamer
+RKAIQ_SELF=/usr/local/sbin/robot-setup-rkaiq
 
 say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
@@ -537,6 +550,23 @@ phase_two() {
         else
             tmp=/tmp/setup-gstreamer.sh
             fetch setup-gstreamer.sh "$tmp"
+            sh "$tmp"
+        fi
+    fi
+
+    # The camera's 3A engine, on the same terms — see `RKAIQ` above. After GStreamer because it
+    # ends by restarting the camera stream, and there is no stream to restart until `mediad` has
+    # a stack to run on.
+    #
+    # Two files, not one: the script builds an LD_PRELOAD shim from the C source beside it, and
+    # fetching the script alone would leave it with nothing to compile.
+    if [ -n "$RKAIQ" ] && [ "$RKAIQ" != 0 ]; then
+        if [ -x "$RKAIQ_SELF" ]; then
+            "$RKAIQ_SELF"
+        else
+            tmp=/tmp/setup-rkaiq.sh
+            fetch setup-rkaiq.sh "$tmp"
+            fetch rkaiq-modinfo-shim.c /tmp/rkaiq-modinfo-shim.c
             sh "$tmp"
         fi
     fi
