@@ -38,16 +38,40 @@ recipe, and the export to ONNX that this repo loads. Brains grown there, driven 
 
 <table>
 <tr>
-<td width="50%"><img src="docs/images/walk.svg" alt="Walking" width="100%"></td>
-<td width="50%"><img src="docs/images/roller.svg" alt="Roller mode" width="100%"></td>
+<td width="50%">
+  <!-- To use a video here, replace this <img> with the <video> line — a bare attachment URL does
+       not become a player inside a table. See docs/images/README.md.
+  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted loop width="100%"></video>
+  -->
+  <img src="docs/images/walk.svg" alt="Walking" width="100%">
+</td>
+<td width="50%">
+  <!-- To use a video here, replace this <img> with the <video> line — a bare attachment URL does
+       not become a player inside a table. See docs/images/README.md.
+  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted loop width="100%"></video>
+  -->
+  <img src="docs/images/roller.svg" alt="Roller mode" width="100%">
+</td>
 </tr>
 <tr>
 <td><b>It walks.</b> Pick up a gamepad and drive.</td>
 <td><b>It rolls.</b> Put wheels on, hold D-pad up, and it loads the other brain.</td>
 </tr>
 <tr>
-<td><img src="docs/images/ground-pick.svg" alt="Ground pick" width="100%"></td>
-<td><img src="docs/images/standup.svg" alt="Standing back up" width="100%"></td>
+<td width="50%">
+  <!-- To use a video here, replace this <img> with the <video> line — a bare attachment URL does
+       not become a player inside a table. See docs/images/README.md.
+  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted loop width="100%"></video>
+  -->
+  <img src="docs/images/ground-pick.svg" alt="Ground pick" width="100%">
+</td>
+<td width="50%">
+  <!-- To use a video here, replace this <img> with the <video> line — a bare attachment URL does
+       not become a player inside a table. See docs/images/README.md.
+  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted loop width="100%"></video>
+  -->
+  <img src="docs/images/standup.svg" alt="Standing back up" width="100%">
+</td>
 </tr>
 <tr>
 <td><b>It picks things up.</b> Beak to the floor, one button.</td>
