@@ -32,17 +32,58 @@ use crate::upstream::Pool;
 /// `inbound` carries one JSON-RPC object per item, as the peer sent it. `outbound` is where replies
 /// and notifications go, merged from every service — the peer sorts them out by `id`, which is its
 /// business rather than ours.
+/// What the video is: the frame the encoder sends, and how far the camera is mounted from upright.
+///
+/// Held by the session because a peer has to be able to *ask*. Pushing it when the channel appears
+/// races the browser: `mediad` writes the line the moment `webrtcsink` hands over the channel, and
+/// if the peer's datachannel is not open yet the line is dropped — which is exactly what happened,
+/// and the console showed a sideways picture with nothing in the log to say why. The push is kept
+/// as a courtesy for a client that only listens; `media.video` as a *call* is what the console uses,
+/// because a question it asks when it is ready cannot arrive too early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Video {
+    pub width: u32,
+    pub height: u32,
+    /// Degrees clockwise the camera is mounted from upright.
+    pub rotate: u32,
+}
+
+/// The method a peer asks with. Answered here rather than routed: no service owns it.
+const VIDEO_METHOD: &str = "media.video";
+
+/// What the video is, told to a peer once when its channel opens.
+///
+/// **The rotation is the whole point.** Nothing on the robot rotates pixels any more — a `videoflip`
+/// in the pipeline cost the encoder its zero-copy path and the board 22 fps — so the stream a
+/// browser receives is the picture the camera took, sideways on a robot whose camera is mounted a
+/// quarter turn off. The page cannot work out by how much: a 180° mount is indistinguishable from an
+/// upright one, and even a quarter turn is only a guess from the aspect ratio. So it is told.
+///
+/// A notification, with no id, because the page already treats an id-less line as something that
+/// streams (`robot.state` is the other one) — no new mechanism at either end.
+pub fn video_notification(video: Video) -> String {
+    let Video {
+        width,
+        height,
+        rotate,
+    } = video;
+    format!(
+        r#"{{"jsonrpc":"2.0","method":"{VIDEO_METHOD}","params":{{"width":{width},"height":{height},"rotate":{rotate}}}}}"#
+    )
+}
+
 pub async fn run(
     mut inbound: mpsc::Receiver<String>,
     outbound: mpsc::Sender<String>,
     mut pool: Pool,
+    video: Video,
 ) {
     while let Some(line) = inbound.recv().await {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
-        if let Some(reply) = handle(&line, &mut pool).await {
+        if let Some(reply) = handle(&line, &mut pool, video).await {
             // A closed outbound means the peer is gone; there is nothing left to do for it.
             if outbound.send(reply).await.is_err() {
                 break;
@@ -54,7 +95,7 @@ pub async fn run(
 
 /// Route one line. Returns a reply to send back only when this transport answers it itself —
 /// which is to say, only when it refuses.
-async fn handle(line: &str, pool: &mut Pool) -> Option<String> {
+async fn handle(line: &str, pool: &mut Pool, video: Video) -> Option<String> {
     let request: proto::Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -72,6 +113,22 @@ async fn handle(line: &str, pool: &mut Pool) -> Option<String> {
     // serialises that as `null` — which is right: a refusal to a notification is still worth
     // sending, because silence would look like acceptance.
     let id = request.id.clone();
+
+    // Answered here, before anything tries to make a `Call` of it: this is `mediad`'s own question
+    // about `mediad`'s own pipeline, and there is no service to route it to.
+    if request.method == VIDEO_METHOD {
+        return Some(
+            serde_json::to_string(&proto::Response::ok(
+                id,
+                &serde_json::json!({
+                    "width": video.width,
+                    "height": video.height,
+                    "rotate": video.rotate,
+                }),
+            ))
+            .expect("Response serialises"),
+        );
+    }
 
     let call = match request.as_call() {
         Ok(call) => call,
@@ -177,7 +234,16 @@ mod tests {
                 }
             }
         });
-        tokio::spawn(run(inbound, outbound, pool));
+        tokio::spawn(run(
+            inbound,
+            outbound,
+            pool,
+            Video {
+                width: 1280,
+                height: 720,
+                rotate: 90,
+            },
+        ));
         Harness {
             to_peer,
             from_peer,
@@ -338,6 +404,50 @@ mod tests {
 
         let reply = h.to_peer.recv().await.unwrap();
         assert!(reply.contains("robot.teleport"), "{reply}");
+    }
+
+    /// The line that tells a page how the camera is mounted.
+    ///
+    /// Hand-built JSON, so this is the only thing between a console that rotates the picture and one
+    /// that shows it sideways and says nothing.
+    #[test]
+    fn the_video_notification_carries_the_mount_rotation() {
+        let line = video_notification(Video {
+            width: 1280,
+            height: 720,
+            rotate: 90,
+        });
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(parsed["method"], "media.video");
+        assert!(parsed.get("id").is_none(), "a notification carries no id");
+        assert_eq!(parsed["params"]["width"], 1280);
+        assert_eq!(parsed["params"]["height"], 720);
+        assert_eq!(parsed["params"]["rotate"], 90);
+    }
+
+    /// `media.video` is answered by the session, not routed to a service.
+    ///
+    /// This is the path the console uses, and it exists because pushing the same information when
+    /// the channel appears races the browser's datachannel and loses — a sideways picture with
+    /// nothing in the log. A question the page asks when it is ready cannot arrive too early.
+    #[tokio::test]
+    async fn the_page_can_ask_what_the_video_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = harness(sockets_in(dir.path()), dir);
+
+        h.from_peer
+            .send(r#"{"jsonrpc":"2.0","id":7,"method":"media.video","params":{}}"#.into())
+            .await
+            .unwrap();
+
+        let reply = h.to_peer.recv().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&reply).expect("valid json");
+        assert_eq!(parsed["id"], 7, "{reply}");
+        assert_eq!(parsed["result"]["width"], 1280);
+        assert_eq!(parsed["result"]["height"], 720);
+        assert_eq!(parsed["result"]["rotate"], 90);
+        // No service was involved: it is answered here, and nothing was forwarded.
+        assert!(parsed.get("error").is_none(), "{reply}");
     }
 
     /// Garbage is answered rather than dropped, with a null id because there is none to echo.

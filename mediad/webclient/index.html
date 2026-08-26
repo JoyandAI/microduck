@@ -67,12 +67,20 @@
   .row { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
   .hint { margin: .5rem 0 0; font-size: 12px; opacity: .6; }
 
-  /* 16/9 is the placeholder, held only until a frame arrives: the robot's camera is mounted a
-     quarter turn off and `mediad --rotate` turns it, so the picture is portrait. `fitVideoBox`
-     then gives the box the stream's own shape — a box pinned to 16/9 would letterbox a portrait
-     picture into a sliver, and it is the surface the operator drags on to aim. */
-  video { width: 100%; background: #111; aspect-ratio: 16/9; border-radius: 4px; display: block;
-          touch-action: none; cursor: crosshair; margin: 0 auto; }
+  /* 16/9 is the placeholder, held until the robot says what the video is. The camera is mounted a
+     quarter turn off and nothing on the robot rotates the picture — so this does, on the GPU. */
+  #videobox { display: grid; justify-content: center; line-height: 0; container-type: size;
+              aspect-ratio: 16/9; width: 100%; }
+  #videobox > video { grid-area: 1 / 1; width: 100%; height: 100%; background: #111;
+                      border-radius: 4px; display: block; touch-action: none; cursor: crosshair; }
+  /* A rotated element still occupies its pre-transform box, so a quarter turn needs the video sized
+     to the *swapped* axes. `100cqh`/`100cqw` are the wrapper's own height and width — exactly that
+     swap, done by the browser, and it survives a resize with no JavaScript. */
+  #videobox > video.turn90, #videobox > video.turn270 { width: 100cqh; height: 100cqw;
+                                                        place-self: center; }
+  #videobox > video.turn90  { transform: rotate(90deg); }
+  #videobox > video.turn270 { transform: rotate(-90deg); }
+  #videobox > video.turn180 { transform: rotate(180deg); }
   .stats { margin-top: .5rem; font: 12px/1.4 ui-monospace, monospace; gap: .75rem; }
   .stats b { font-weight: 600; opacity: .55; font-size: 11px; text-transform: uppercase; }
 
@@ -117,7 +125,13 @@
 <main>
   <section>
     <h2>video</h2>
-    <video id="video" autoplay muted playsinline></video>
+    <!-- The wrapper is the *upright* picture and the video is turned inside it, because the robot
+         no longer rotates pixels: doing that in the pipeline cost the encoder its zero-copy path to
+         the 2D engine, and the board 22 fps. Everything that reads coordinates off this — the
+         drag-to-look below — keeps working, because the wrapper is the space it always was. -->
+    <div id="videobox">
+      <video id="video" autoplay muted playsinline></video>
+    </div>
     <div class="row stats">
       <span><b>bitrate</b> <span id="bitrate">–</span></span>
       <span><b>fps</b> <span id="fps">–</span></span>
@@ -397,6 +411,8 @@ function newPeerConnection() {
   // first point the dimensions are known, and `resize` covers a stream that changes shape while
   // playing — which a `--rotate` change on the robot does, without the page reloading.
   const fitVideoBox = () => {
+    // `onVideoInfo` owns the sizing when the camera is mounted off upright.
+    if (mountRotation) return;
     const element = $("video");
     const { videoWidth: w, videoHeight: h } = element;
     if (!w || !h) return;
@@ -492,6 +508,8 @@ function onControl(data) {
   // arriving this way is worth seeing in full rather than summarised.
   if (msg.id === undefined || msg.id === null) {
     if (msg.method === "robot.state") { onState(msg.params); return; }
+    // How far the camera is mounted from upright. Sent once when the channel opens.
+    if (msg.method === "media.video") { onVideoInfo(msg.params); return; }
     log("in", "control ←", data.slice(0, 400));
     return;
   }
@@ -559,6 +577,10 @@ let healthTimer = null, statsTimer = null;
 
 function startTelemetry() {
   identify();
+  // **Asked, not waited for.** The robot also pushes this when the channel appears, which races
+  // this page's datachannel and loses — the picture then stays sideways with nothing in the log to
+  // say why. Asking once the channel is open cannot arrive too early.
+  call("media.video", {}, true).then(onVideoInfo).catch(() => {});
   // 2 Hz: enough to watch a robot, and decimation is server-side and per-subscriber, so this costs
   // the robot a twenty-fifth of what a digital twin at 50 Hz would.
   call("robot.subscribe", { hz: 2 }, true).catch(() => {});
@@ -779,6 +801,33 @@ video.addEventListener("pointermove", (event) => { if (looking) aim(event); });
 const stopLooking = () => { looking = false; lookAt = null; $("gaze").hidden = true; };
 video.addEventListener("pointerup", stopLooking);
 video.addEventListener("pointercancel", stopLooking);
+
+// ── the camera is mounted sideways, and the robot does not rotate the pixels ───────────────────
+//
+// Rotating in the pipeline cost 145% of a core: `videoflip`'s buffers are ones the SoC's 2D engine
+// refuses, so the encoder converted every frame in software — 97 °C, the CPU throttled to 408 MHz,
+// 8 fps out of a 30 fps camera. Here the turn is a GPU transform and costs nothing.
+//
+// **The wrapper stays upright.** It is the space `aim` maps a drag from, and the space anything drawn
+// over the video would be in; only the <video> inside it turns. So nothing else on this page has to
+// know about the mount.
+let mountRotation = 0;
+
+function onVideoInfo({ width, height, rotate }) {
+  mountRotation = ((rotate % 360) + 360) % 360;
+  log("dim", `video ${width}x${height}, camera mounted ${mountRotation}° off upright`);
+
+  const quarter = mountRotation === 90 || mountRotation === 270;
+  const [uw, uh] = quarter ? [height, width] : [width, height];
+  const box = $("videobox");
+
+  // Portrait is capped by height so a tall picture cannot push the rest of the page off screen;
+  // landscape fills the column as it always did.
+  box.style.aspectRatio = `${uw} / ${uh}`;
+  box.style.width = uh > uw ? "auto" : "100%";
+  box.style.height = uh > uw ? "min(70vh, 80vw)" : "auto";
+  $("video").className = mountRotation ? `turn${mountRotation}` : "";
+}
 
 function aim(event) {
   const box = video.getBoundingClientRect();

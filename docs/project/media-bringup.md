@@ -332,6 +332,30 @@ This cost three separate debugging rounds, each with a failure that named someth
 **`mediad.service` needs `SupplementaryGroups=video`** — with `Environment=GST_PLUGIN_PATH`, that
 is two lines standing between a working pipeline and four different confusing failures.
 
+### The rotation that cost 22 fps
+
+The camera is mounted a quarter turn off, and the obvious fix — `videoflip` before the tee, so every
+consumer gets an upright picture — is the wrong one, measured on a robot:
+
+| | RGA failures | frames lost by `v4l2src` | fps | SoC |
+|---|---|---|---|---|
+| without the flip | 0 | 0 | ~30 | fine |
+| with the flip | 5522 in one session | 1565 | 7–8 | 97 °C, CPU at 408 MHz |
+
+`mpph264enc` hands the UYVY→NV12 conversion to the SoC's 2D engine and pays nothing for it.
+`videoflip`'s output is a buffer the RGA refuses — `10000 is unsupport format`, then `RGA_BLIT fail:
+Bad address` on a `rect[0, 0, 720, 1280]` — so MPP falls back to converting **every frame in
+software**. That saturates the CPU, the SoC hits its thermal limit, everything throttles to 408 MHz,
+and the camera drops frames it cannot deliver. The rotation itself is the smaller half of the bill.
+
+So nothing in the pipeline rotates. The mount is *reported* (`media.video`, once per control
+channel) and whoever displays the picture turns it: the console does it with a CSS transform, which
+is free, and a perception consumer folds it into the resampling it already does. `--flip-in-pipeline`
+puts the old behaviour back for a consumer that cannot rotate for itself and can afford this.
+
+The proper fix, if an upright stream is ever genuinely needed, is an RGA element in the plugin set:
+the 2D engine rotates for nothing, which is why the encoder can afford to use it.
+
 ### Two things known to be unfinished
 
 **The bitrate came out ~50× under target.** 15,553 bytes for 3.3 s of capture against

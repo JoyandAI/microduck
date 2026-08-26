@@ -25,12 +25,12 @@
 //! NV12 because that is what the rkisp capture path emits and what `mpph264enc` takes, so nothing
 //! *converts* anywhere: no `videoconvert`, and no RGA pass, between capture and either consumer.
 //!
-//! **`videoflip` is the one pass, and it is a rotation rather than a conversion.** The head camera
-//! is mounted a quarter turn off, so a straight capture is sideways; turning it before the tee is
-//! what lets both consumers — and the console's drag-to-look, which maps a gaze off the same
-//! geometry — agree about which way is up. It costs CPU on the SoC that runs `robotd`'s control
-//! loop, which is why it is one element and one flag ([`Rotation`], `--rotate 0`) rather than a
-//! property of the pipeline nobody can take out.
+//! **Nothing converts and nothing rotates.** The head camera is mounted a quarter turn off, and for
+//! one afternoon this pipeline fixed that with a `videoflip` before the tee — which broke
+//! `mpph264enc`'s zero-copy path to the 2D engine and had MPP converting every frame in software:
+//! 97 °C, the CPU throttled to 408 MHz, 8 fps out of a 30 fps camera. Rotation is now the
+//! consumer's business, because for both consumers it is free — a CSS transform in the browser, and
+//! a resample the detector was doing anyway. [`Rotation`] has the numbers.
 //!
 //! **Each branch has its own `queue`, and the raw one is leaky.** A `tee` without queues runs its
 //! branches on one thread, so a slow consumer stalls the others — here that would mean a
@@ -89,17 +89,22 @@ use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
 
-/// How far the picture is turned before anything downstream sees it.
+/// How far the picture is turned *in the pipeline* — which, by default, is not at all.
 ///
-/// **The head camera is mounted a quarter turn off**, so the sensor's rows run down the world
-/// rather than across it and a straight capture comes out sideways. That is a fact about the
-/// robot, not a preference, which is why the default is a quarter turn rather than none.
+/// **This defaulted to a quarter turn for one afternoon and cost 145% of a core.** `mpph264enc`
+/// hands the UYVY→NV12 conversion to the SoC's 2D engine and pays nothing for it; `videoflip`'s
+/// output is a buffer the RGA refuses — `10000 is unsupport format`, then `RGA_BLIT fail: Bad
+/// address` on a `rect[0, 0, 720, 1280]` — so MPP fell back to converting **every frame in
+/// software**. Measured on the robot: 97 °C, the CPU throttled from 1.8 GHz to 408 MHz, 1565 frames
+/// lost by `v4l2src` in one session, and 8 fps out of a 30 fps camera. The boot before that change
+/// had zero RGA failures and zero lost frames.
 ///
-/// Turned here rather than in the console, and the console is the reason: it maps a drag on the
-/// picture to a gaze (`aim` in `webclient/index.html`), so a page that rotated the video in CSS
-/// would send the robot looking 90° away from where the operator pointed. Rotating before the tee
-/// also means the raw branch — the one a perception consumer reads — sees the same picture the
-/// stream does, rather than each consumer having to know about the mount.
+/// So the pipeline no longer rotates pixels. The camera is still mounted a quarter turn off, and the
+/// consumer that has to care rotates for itself, for free: the console does it with a CSS transform
+/// on the GPU, and a perception consumer folds the turn into the resampling it already does.
+/// [`Settings::rotation`] stays for a consumer that genuinely needs an upright *encoded* stream —
+/// `--flip-in-pipeline` — and now that its cost is written down, that is a choice rather than a
+/// default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
     /// Leave the frame as the sensor delivered it.
@@ -167,8 +172,8 @@ pub struct Settings {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    /// How far to turn the picture; see [`Rotation`]. The capture geometry above is the sensor's,
-    /// *before* this is applied.
+    /// How far the *pipeline* turns the picture; see [`Rotation`]. Almost always `None` — the
+    /// capture geometry above is then also what leaves the tee.
     pub rotation: Rotation,
 }
 
@@ -321,20 +326,16 @@ pub fn start(
         .build()
         .map_err(|_| anyhow!("no capsfilter element; gstreamer core is incomplete"))?;
 
-    // ── the turn ────────────────────────────────────────────────────────────
+    // ── the turn, when somebody asks for it ─────────────────────────────────
     //
-    // `videoflip` from `gstreamer1.0-plugins-good`, which the board already has — see the package
-    // list in `scripts/setup-gstreamer.sh`. It is a CPU pass, and this pipeline was built to have
-    // none: "no `videoconvert`, and no RGA pass, between capture and either consumer". A quarter
-    // turn of 4:2:2 720p is real work (a scattered write per pixel, so the copy is cache-hostile
-    // rather than merely large), and it lands on the SoC that also runs `robotd`'s control loop.
+    // `videoflip` from `gstreamer1.0-plugins-good`, and **off unless asked**: see [`Rotation`] for
+    // the measurement. It does not merely cost a CPU pass of its own — it takes the encoder's
+    // zero-copy path down with it, because the RGA will not touch what it produces, so the true
+    // price is a software colour conversion of every frame as well.
     //
-    // It buys a picture that is the right way up for every consumer at once, which is worth a
-    // pass — but if the loop starts missing ticks when the camera streams, this is the first
-    // thing to suspect and `--rotate 0` is how to confirm it in one restart. The cheaper fix, if
-    // it comes to that, is the SoC's 2D engine: the RGA is already doing one operation per frame
-    // inside `mpph264enc`, and a rotation is the same class of operation — it needs an RGA element
-    // in the plugin set, which this one does not have.
+    // Left in for the consumer that cannot rotate for itself and can afford this. If that ever
+    // becomes the common case, the fix is an RGA element in the plugin set (the 2D engine can
+    // rotate for nothing), not this.
     let flip = match rotation.video_direction() {
         Some(direction) => Some(
             gst::ElementFactory::make("videoflip")
