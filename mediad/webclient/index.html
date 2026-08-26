@@ -577,6 +577,10 @@ let healthTimer = null, statsTimer = null;
 
 function startTelemetry() {
   identify();
+  // **Asked, not waited for.** The robot also pushes this when the channel appears, which races
+  // this page's datachannel and loses — the picture then stays sideways with nothing in the log to
+  // say why. Asking once the channel is open cannot arrive too early.
+  call("media.video", {}, true).then(onVideoInfo).catch(() => {});
   // 2 Hz: enough to watch a robot, and decimation is server-side and per-subscriber, so this costs
   // the robot a twenty-fifth of what a digital twin at 50 Hz would.
   call("robot.subscribe", { hz: 2 }, true).catch(() => {});

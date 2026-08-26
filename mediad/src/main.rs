@@ -219,6 +219,14 @@ fn main() -> ExitCode {
                 }
             };
 
+        // What every peer is told about the picture. The geometry is the *encoded* frame — the
+        // pipeline does not rotate, so it is the capture geometry — and the rotation is the mount.
+        let video = mediad::session::Video {
+            width: args.width,
+            height: args.height,
+            rotate: args.rotate,
+        };
+
         // One session per peer, each with its own connections to the services it talks to. Per
         // peer rather than shared, so one peer's minutes-long update cannot silence another's
         // telemetry — which is the same reason a session keeps one connection per lane.
@@ -234,12 +242,12 @@ fn main() -> ExitCode {
                     }
                 }
             });
-            // Before anything else on this channel: the page cannot rotate the picture for
-            // display until it knows how far the camera is mounted from upright.
+            // Pushed as a courtesy for a client that only listens — and it may well arrive before
+            // the peer's datachannel is open, in which case it is dropped. The console *asks*
+            // (`media.video`), which is why that path exists and this one is best-effort.
             {
                 let to_peer = channel.outbound.clone();
-                let line =
-                    mediad::session::video_notification(args.width, args.height, args.rotate);
+                let line = mediad::session::video_notification(video);
                 tokio::spawn(async move {
                     let _ = to_peer.send(line).await;
                 });
@@ -249,6 +257,7 @@ fn main() -> ExitCode {
                 channel.inbound,
                 channel.outbound,
                 pool,
+                video,
             ));
         }
 
