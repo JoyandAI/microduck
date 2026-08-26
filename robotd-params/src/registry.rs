@@ -112,7 +112,8 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "policy.mode",
         Kind::Choice(&["walk", "roller"]),
-        "Legs or the roller: picks policies and per-mode tuning defaults",
+        "Legs or the roller: picks policies and tuning. Held DPad-Up switches it live; this is \
+         the mode a reboot comes back in",
     ),
     entry(
         "policy.walk",

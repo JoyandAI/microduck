@@ -96,6 +96,12 @@ fn permits(call: &proto::Call) -> bool {
         // which is the condition BLE could not meet.
         RobotShutdown => true,
 
+        // Not this one, even though the peer can watch. A mode switch says "this duck now has
+        // wheels on it", which is a claim about hardware only somebody in the room can make —
+        // and getting it wrong drives the robot with the wrong policy. The pad in that room is
+        // where it belongs.
+        RobotSetMode(_) => false,
+
         // ── the streams BLE pointed here ────────────────────────────────────
         //
         // `pad.input` exists to measure the cadence of its own delivery, and `btd` refuses it
