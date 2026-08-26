@@ -38,8 +38,32 @@ afternoon:
   <video src="https://github.com/user-attachments/assets/8d7a530b-…" controls muted loop width="100%"></video>
   ```
 
-  `controls`, `muted` and `loop` are the attributes worth relying on; treat `autoplay` as something
-  that may not survive GitHub's sanitiser, so assume a viewer presses play.
+  **`src`, `controls`, `muted` and `width` are the only attributes that survive.** Tested against
+  GitHub's own renderer (`POST https://api.github.com/markdown`, which runs the same sanitiser):
+  `autoplay`, `loop`, `playsinline`, `preload` and `poster` are all stripped from the element.
+
+### So a video cannot autoplay, and cannot loop
+
+Not with `<video>`, and not with the player a bare URL produces either — both wait for a click.
+**The only media that plays by itself in a README is an animated image**, which the browser
+animates without asking: a GIF, or an animated WebP at a fraction of the size.
+
+That is the route for the four tiles in "It does things", where the whole point is that they move
+while somebody reads. Keep the clip to two or three seconds and treat it as a moving thumbnail:
+
+```bash
+# animated WebP — much smaller than a GIF at the same quality, and GitHub serves it fine
+ffmpeg -i clip.mp4 -vf "fps=15,scale=560:-1:flags=lanczos" -loop 0 -q:v 55 walk.webp
+
+# GIF, when you want the safest thing that exists
+ffmpeg -i clip.mp4 -vf "fps=12,scale=560:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse" walk.gif
+```
+
+Then reference it as an ordinary image — `<img src="docs/images/walk.webp" width="100%">` — and it
+plays, silently, forever, in a table cell.
+
+Use `<video controls muted>` for the things a thumbnail cannot carry: a longer clip, or one with
+sound. It is a click, and that is the trade.
 
 Each cell in the README's table carries that line commented out beside its placeholder, so filling
 one in is: upload, paste the id, delete the `<img>`.

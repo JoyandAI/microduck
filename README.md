@@ -39,16 +39,16 @@ recipe, and the export to ONNX that this repo loads. Brains grown there, driven 
 <table>
 <tr>
 <td width="50%">
-  <!-- To use a video here, replace this <img> with the <video> line — a bare attachment URL does
-       not become a player inside a table. See docs/images/README.md.
-  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted loop width="100%"></video>
+  <!-- A GIF or animated WebP here plays by itself; a video needs a click, because GitHub strips
+       `autoplay` and `loop`. Recipes and the trade-off: docs/images/README.md.
+  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted width="100%"></video>
   -->
   <video src="https://github.com/user-attachments/assets/06c14246-85bf-4aa2-b663-a4e77a98fbff" alt="Walking" width="100%">
 </td>
 <td width="50%">
-  <!-- To use a video here, replace this <img> with the <video> line — a bare attachment URL does
-       not become a player inside a table. See docs/images/README.md.
-  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted loop width="100%"></video>
+  <!-- A GIF or animated WebP here plays by itself; a video needs a click, because GitHub strips
+       `autoplay` and `loop`. Recipes and the trade-off: docs/images/README.md.
+  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted width="100%"></video>
   -->
   <video src="https://github.com/user-attachments/assets/abfbf250-1b1c-42cb-8430-00267e2b148a" alt="Roller mode" width="100%">
 
@@ -60,16 +60,16 @@ recipe, and the export to ONNX that this repo loads. Brains grown there, driven 
 </tr>
 <tr>
 <td width="50%">
-  <!-- To use a video here, replace this <img> with the <video> line — a bare attachment URL does
-       not become a player inside a table. See docs/images/README.md.
-  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted loop width="100%"></video>
+  <!-- A GIF or animated WebP here plays by itself; a video needs a click, because GitHub strips
+       `autoplay` and `loop`. Recipes and the trade-off: docs/images/README.md.
+  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted width="100%"></video>
   -->
   <video src="https://github.com/user-attachments/assets/6546f911-3d16-4335-b360-aa84732d70a6" alt="Ground pick" width="100%">
 </td>
 <td width="50%">
-  <!-- To use a video here, replace this <img> with the <video> line — a bare attachment URL does
-       not become a player inside a table. See docs/images/README.md.
-  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted loop width="100%"></video>
+  <!-- A GIF or animated WebP here plays by itself; a video needs a click, because GitHub strips
+       `autoplay` and `loop`. Recipes and the trade-off: docs/images/README.md.
+  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted width="100%"></video>
   -->
   <video src="https://github.com/user-attachments/assets/849af629-b9ac-4ae1-a503-bf41fdba839b" alt="Standing back up" width="100%">
 </td>
