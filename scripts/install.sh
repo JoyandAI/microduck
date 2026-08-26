@@ -723,6 +723,7 @@ install_units() {
 
     install_completions
     install_login_banner
+    install_name_prompt
 
     systemctl daemon-reload
     enable_unit updaterd.service
@@ -862,6 +863,60 @@ exit 0
 BANNER
     chmod 755 /etc/update-motd.d/40-robot
     say "wrote /etc/update-motd.d/40-robot, so a login says what is running"
+}
+
+# The robot's name beside the hostname in the prompt: `microduck@radxa-zero3 (coincoin):~$`.
+#
+# Every board flashed from one image says `microduck@radxa-zero3`, so three ssh windows to
+# three ducks are three identical prompts — and a command typed into the wrong one is exactly
+# the failure the per-board *name* exists to prevent (configd/src/identity.rs). The prompt is
+# where an operator looks before typing; put the name there.
+#
+# A profile.d snippet rather than editing anyone's .bashrc: it needs no per-user provisioning
+# and an update replaces it cleanly. The wrinkle is ordering — ~/.bashrc sets PS1 *after*
+# /etc/profile.d runs, so the snippet cannot edit PS1 directly; it hooks PROMPT_COMMAND and
+# injects the name at the first prompt instead, when PS1 has settled.
+install_name_prompt() {
+    if [ ! -d /etc/profile.d ]; then
+        # Not the image we know. A prompt nicety is not worth creating login machinery for.
+        return 0
+    fi
+
+    cat > /etc/profile.d/robot-name-prompt.sh <<'PROMPT'
+# The robot's name beside the hostname in the prompt. Installed by scripts/install.sh.
+#
+# Prompt surgery below is bash syntax, and /etc/profile.d is also read by plain sh.
+[ -n "$BASH_VERSION" ] || return 0
+
+# The same name the robot advertises over BLE: configd's store where someone has renamed it,
+# else `duck-xxxx` derived exactly as configd derives it — the first four hex characters of
+# the SoC serial's SHA-256 (configd/src/identity.rs says why it is not the Bluetooth address).
+# Read from the file rather than asked of configd, so the prompt works while daemons are down
+# — which is much of what anyone is ssh'd in to deal with.
+_robot_name="$(sed -n 's/.*"name": *"\(.*\)".*/\1/p' /var/lib/robot/config/config.json 2>/dev/null)"
+if [ -z "$_robot_name" ] && [ -r /proc/device-tree/serial-number ]; then
+    _robot_serial="$(tr '\0' '\n' < /proc/device-tree/serial-number 2>/dev/null | head -n 1)"
+    [ -n "$_robot_serial" ] && _robot_name="duck-$(printf '%s' "$_robot_serial" | sha256sum | cut -c1-4)"
+fi
+unset _robot_serial
+
+# A name reaches prompt expansion, where $(...) and backticks *execute*. configd only strips
+# control characters, so strip the rest here.
+_robot_name="$(printf '%s' "$_robot_name" | tr -d '\\$`')"
+
+if [ -n "$_robot_name" ]; then
+    # Global substitution, not first-match: the xterm-title prefix Debian's .bashrc builds
+    # contains its own \h before the visible one, and naming the window too is a feature —
+    # it is the other place an operator tells sessions apart.
+    _robot_name_inject() {
+        case "$PS1" in *"($_robot_name)"*) return ;; esac
+        PS1="${PS1//\\h/\\h ($_robot_name)}"
+    }
+    PROMPT_COMMAND="_robot_name_inject${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+fi
+PROMPT
+    chmod 644 /etc/profile.d/robot-name-prompt.sh
+    say "wrote /etc/profile.d/robot-name-prompt.sh, so the prompt names the duck"
 }
 
 install_completions() {
