@@ -18,13 +18,12 @@
 
 <p align="center">
   <a href="https://github.com/pollen-robotics/microduck/actions/workflows/ci.yml"><img src="https://github.com/pollen-robotics/microduck/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/pollen-robotics/microduck/releases"><img src="https://img.shields.io/github/v/release/pollen-robotics/microduck?label=release" alt="Release"></a>
 </p>
 
 ---
 
 **This repo is the duck's brain.** About 25 cm and 800 g of robot, run by a handful of daemons on a
-Rockchip RK3566: a 50 Hz control loop driving fifteen servos from a neural policy, the radios and
+Rockchip RK3566: a 50 Hz control loop driving fifteen servos from neural policies, the radios and
 the camera, and the update machinery that gets new software onto a robot without bricking it.
 
 Everything you need to run a Microduck is here. **If you want one,
@@ -32,25 +31,17 @@ Everything you need to run a Microduck is here. **If you want one,
 
 The policies it runs are trained next door, in
 **[microduck_rl](https://github.com/pollen-robotics/microduck_rl)** — MuJoCo and PPO, the sim2real
-recipe, and the export to ONNX that this repo loads. Brains grown there, driven here.
+recipe, and the export to ONNX that this repo loads.
 
 ## It does things
 
 <table>
 <tr>
 <td width="50%">
-  <!-- A GIF or animated WebP here plays by itself; a video needs a click, because GitHub strips
-       `autoplay` and `loop`. Recipes and the trade-off: docs/images/README.md.
-  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted width="100%"></video>
-  -->
-  <video src="https://github.com/user-attachments/assets/06c14246-85bf-4aa2-b663-a4e77a98fbff" alt="Walking" width="100%">
+  <video src="https://github.com/user-attachments/assets/06c14246-85bf-4aa2-b663-a4e77a98fbff" controls width="100%"></video>
 </td>
 <td width="50%">
-  <!-- A GIF or animated WebP here plays by itself; a video needs a click, because GitHub strips
-       `autoplay` and `loop`. Recipes and the trade-off: docs/images/README.md.
-  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted width="100%"></video>
-  -->
-  <video src="https://github.com/user-attachments/assets/abfbf250-1b1c-42cb-8430-00267e2b148a" alt="Roller mode" width="100%">
+  <video src="https://github.com/user-attachments/assets/abfbf250-1b1c-42cb-8430-00267e2b148a" controls width="100%"></video>
 
 </td>
 </tr>
@@ -60,18 +51,10 @@ recipe, and the export to ONNX that this repo loads. Brains grown there, driven 
 </tr>
 <tr>
 <td width="50%">
-  <!-- A GIF or animated WebP here plays by itself; a video needs a click, because GitHub strips
-       `autoplay` and `loop`. Recipes and the trade-off: docs/images/README.md.
-  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted width="100%"></video>
-  -->
-  <video src="https://github.com/user-attachments/assets/6546f911-3d16-4335-b360-aa84732d70a6" alt="Ground pick" width="100%">
+  <video src="https://github.com/user-attachments/assets/6546f911-3d16-4335-b360-aa84732d70a6" controls width="100%"></video>
 </td>
 <td width="50%">
-  <!-- A GIF or animated WebP here plays by itself; a video needs a click, because GitHub strips
-       `autoplay` and `loop`. Recipes and the trade-off: docs/images/README.md.
-  <video src="https://github.com/user-attachments/assets/PASTE-ID" controls muted width="100%"></video>
-  -->
-  <video src="https://github.com/user-attachments/assets/849af629-b9ac-4ae1-a503-bf41fdba839b" alt="Standing back up" width="100%">
+  <video src="https://github.com/user-attachments/assets/849af629-b9ac-4ae1-a503-bf41fdba839b" controls width="100%"></video>
 </td>
 </tr>
 <tr>
@@ -80,28 +63,7 @@ recipe, and the export to ONNX that this repo loads. Brains grown there, driven 
 </tr>
 </table>
 
-It also sits, kicks a ball, rolls forward, quacks in a voice that is its own, plays a theremin with
-your hand, and sings four-part harmony with other ducks in the room.
-
-## Say hello
-
-On the robot, over ssh:
-
-```bash
-robotctl health      # is it alive, and what is wrong if not
-robotctl monitor     # the control loop, live: asked vs applied, joints, battery, temps
-robotctl quack       # it answers in a voice that is only its own
-```
-
-Switch a paired gamepad on and drive — `padd` runs from boot and waits for one. **Start** enables
-the policy; the first press moves the robot to its home pose, so hold it or stand it up. The
-[full button mapping](docs/robot/cheatsheet.md#gamepad-configd) is in the cheat sheet.
-
-Every command explains itself, so exploring beats reading:
-
-```bash
-robotctl --help
-```
+It also sits, kicks a ball, rolls forward on command, and quacks in a voice that is its own.
 
 ## Where to find things
 
@@ -110,7 +72,7 @@ robotctl --help
 | | |
 |---|---|
 | [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: drive, configure, voice, chorale, theremin, wifi, updates, logs. Start here. |
-| [Pair a gamepad](docs/robot/pair-a-gamepad.md) | Once per pad — and what to do when it will not bond. |
+| [Gamepad](docs/robot/cheatsheet.md#gamepad-configd) | The full button mapping, and pairing a pad — [once per pad](docs/robot/pair-a-gamepad.md), plus what to do when it will not bond. |
 | [`duckctl`](docs/robot/duckctl.md) | The robot from a laptop over Bluetooth, with no network and no ssh. |
 | [Updates](docs/robot/cheatsheet.md#updates-updaterd) | Install, roll back, pin. Every update is verified, health-gated and reversible. |
 

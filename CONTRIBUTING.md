@@ -86,6 +86,32 @@ process. [`docs/project/roadmap.md`](docs/project/roadmap.md) has what actually 
   being optimised; maintenance is.
 - Commit trailers use `Assisted-by:`, not `Co-Authored-By:`, for AI assistance.
 
+## Media in the README
+
+The videos and the hero image are **GitHub attachments, not files in this repo**: drop a clip into
+the comment box of any issue or pull request and GitHub hands back a
+`https://github.com/user-attachments/assets/<id>` URL. Nothing to commit, nothing to keep in sync —
+and nothing in a clone either, so those tiles are blank without a network.
+
+Inside the README's `<table>` the URL has to go in an element, because markdown is not parsed in
+block HTML and a bare URL there stays text:
+
+```html
+<video src="https://github.com/user-attachments/assets/<id>" controls width="100%"></video>
+```
+
+**A video cannot autoplay or loop.** Verified against the renderer itself
+(`POST https://api.github.com/markdown`): of `src autoplay muted loop controls playsinline preload
+poster width`, only `src`, `muted`, `controls` and `width` survive the sanitiser. So a video waits
+for a click, and the only media that moves on its own is an animated image — a GIF, or an animated
+WebP at a fraction of the size:
+
+```bash
+ffmpeg -i clip.mp4 -vf "fps=15,scale=560:-1:flags=lanczos" -loop 0 -q:v 55 walk.webp
+```
+
+Two or three seconds, treated as a moving thumbnail. Use a video where sound or length matters.
+
 ## Releasing
 
 Releases are signed **in CI**, never locally. The entry point is the GitHub releases page, and the
