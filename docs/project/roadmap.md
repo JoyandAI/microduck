@@ -288,13 +288,33 @@ this robot, plus repointing one slot's source at another repo. Letting arbitrary
 appear at runtime would mean the config is no longer the authority on what a robot may run,
 which is the property the whole component design rests on.
 
-**One decision comes before all of it.** If policies move to the Hub, a freshly flashed board
-with no network has no gait. Keeping the release's copies as the floor and letting a model
-component override them is the obvious shape, but it means two sources for one file and a rule
-about which wins; the alternative — models only from the Hub — makes the network a hard
-dependency for a robot that walks. Note that this milestone does *not* inherit M6's
-download problem: the Hub is public, and a model repo can be public whatever the source repo
-does.
+**One decision comes before all of it, and the lean is that policies leave the artifact.** Two
+things follow, and neither is a reason to reverse it:
+
+- A freshly flashed board with no network has no gait.
+- The sharper one: `robotd` reports **unhealthy** when a policy it wanted could not be loaded
+  (`deploy/robotd.toml`, `[policy] enabled`), so on a board with no models installed every
+  subsequent daemon update would fail its health gate and roll back — an update loop caused by
+  a missing file the update could not have supplied.
+
+Both have answers that already exist:
+
+- **A missing model is `degraded`, not unhealthy.** `HealthResult::degraded` was built for
+  exactly this shape — a condition that is a property of the *board* rather than of the release
+  being gated, where reverting the daemon cannot fix it and only churns the boot counter. Which
+  model components are installed is precisely that, so the gate commits and `robotctl health`
+  says which policy is missing.
+- **Provisioning installs the bootstrap set**, the way `setup-board.sh` already installs the
+  ONNX runtime and `setup-gstreamer.sh` the plugins. The network dependency lands where one
+  already exists, and at runtime there is exactly one source for a policy — the component's
+  install dir — with no precedence rule between a release copy and a Hub copy.
+
+The alternative — the release keeps its copies as a floor a Hub component overrides — buys a
+duck that walks with no network at all, at the cost of two sources for one file and a rule about
+which wins. It stays on the table if bootstrapping at provisioning turns out to be fragile.
+
+This milestone does *not* inherit M6's download problem: the Hub is public, whatever the source
+repo does.
 
 **Done when:** a policy trained in `microduck_rl` is published to the Hub, installed on a duck
 with `robotctl update apply model-walk`, and rolled back with `robotctl update select` — with
@@ -352,7 +372,9 @@ The numbers above are identifiers. This is the order.
 5. ~~**Where a customer robot downloads from**~~ — **decided 2026-08-26:** the repository goes
    public. §6.1 keeps the options and the reasoning, because they are the fallback if the source
    ever has to close again.
-6. **Whether policies leave the daemon artifact** — open, and M8 cannot start without it.
+6. **Whether policies leave the daemon artifact** — **leaning yes**, not settled. They leave, a
+   missing model reports `degraded` rather than unhealthy so the gate commits, and provisioning
+   installs the bootstrap set. M8 says what the alternative buys if this turns out fragile.
 7. **Curated models or an open set** — open, and it is a trust decision rather than a plumbing
    one (M8).
 
