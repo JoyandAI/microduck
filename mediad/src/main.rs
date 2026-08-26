@@ -87,16 +87,23 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     fps: u32,
 
-    /// Turn the picture this many degrees clockwise: 0, 90, 180 or 270.
+    /// How far the camera is mounted from upright, clockwise: 0, 90, 180 or 270.
     ///
-    /// **90 because the head camera is mounted a quarter turn off**, so a straight capture is
-    /// sideways. This is the one place that fact is written down; see `pipeline::Rotation` for why
-    /// it is turned on the robot rather than in the console.
-    ///
-    /// A quarter turn swaps the frame's width and height, and it costs a CPU pass — `--rotate 0`
-    /// is the way to take that pass out if the control loop starts missing ticks while streaming.
+    /// **90, because the head camera is mounted a quarter turn off**, and this is the one place that
+    /// fact is written down. It no longer means "rotate the pixels": it is told to whoever displays
+    /// the video, and they rotate for free — the console with a CSS transform on the GPU. Rotating
+    /// here cost 145% of a core and 22 fps; `pipeline::Rotation` has the numbers.
     #[arg(long, default_value_t = 90)]
     rotate: u32,
+
+    /// Rotate in the pipeline as well, so the *encoded stream* comes out upright.
+    ///
+    /// **Off by default because it is expensive in a way that does not look like rotation.** It
+    /// breaks `mpph264enc`'s zero-copy path to the SoC's 2D engine, so MPP converts every frame in
+    /// software: measured at 97 °C, the CPU throttled to 408 MHz and 8 fps out of a 30 fps camera.
+    /// Worth it only for a consumer that cannot rotate for itself.
+    #[arg(long)]
+    flip_in_pipeline: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -124,12 +131,23 @@ fn main() -> ExitCode {
 
     // Refused before anything starts: a bad angle is a typo on a command line, and the daemon
     // should say so rather than opening a camera first.
-    let rotation = match mediad::pipeline::Rotation::from_degrees(args.rotate) {
+    // Validated even when the pipeline will not use it, because it is still what every consumer is
+    // told about the mount — a typo should not reach the console as a rotation nobody can apply.
+    let mount = match mediad::pipeline::Rotation::from_degrees(args.rotate) {
         Ok(rotation) => rotation,
         Err(e) => {
             tracing::error!(error = %e, "mediad cannot start");
             return ExitCode::FAILURE;
         }
+    };
+    let rotation = if args.flip_in_pipeline {
+        tracing::warn!(
+            degrees = args.rotate,
+            "--flip-in-pipeline: rotating in the pipeline costs the encoder its zero-copy path"
+        );
+        mount
+    } else {
+        mediad::pipeline::Rotation::None
     };
 
     runtime.block_on(async move {
@@ -216,6 +234,17 @@ fn main() -> ExitCode {
                     }
                 }
             });
+            // Before anything else on this channel: the page cannot rotate the picture for
+            // display until it knows how far the camera is mounted from upright.
+            {
+                let to_peer = channel.outbound.clone();
+                let line =
+                    mediad::session::video_notification(args.width, args.height, args.rotate);
+                tokio::spawn(async move {
+                    let _ = to_peer.send(line).await;
+                });
+            }
+
             tokio::spawn(mediad::session::run(
                 channel.inbound,
                 channel.outbound,
