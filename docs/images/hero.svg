@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="500" viewBox="0 0 1200 500" role="img" aria-label="photo goes here — placeholder">
+  <rect x="1" y="1" width="1198" height="498" rx="10" fill="#8b8b8b22" stroke="#8b8b8b" stroke-width="2" stroke-dasharray="9 7"/>
+  <text x="50%" y="242.0" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="26" font-weight="600" fill="#8b8b8b">photo goes here</text>
+  <text x="50%" y="270.0" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" fill="#8b8b8b">the duck, three-quarter view, room light — 1200x500</text>
+</svg>

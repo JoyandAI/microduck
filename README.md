@@ -1,354 +1,124 @@
-# microduck daemon
+<p align="center">
+  <img src="docs/images/hero.svg" alt="microduck" width="820">
+</p>
 
-The software that runs on the robot, and the machinery that ships it there.
+<h1 align="center">microduck</h1>
 
-`robotctl` is how you talk to a robot. It runs on the robot itself.
+<p align="center">
+  <em>A duck-sized biped that walks, puts on wheels when it feels like it,<br>
+  plays a theremin with your hand, and sings four-part harmony with its friends.</em>
+</p>
 
-Every command describes itself, so you can explore rather than read:
+<p align="center">
+  <a href="https://pollen-robotics.com/microduck"><b>pollen-robotics.com/microduck</b></a> ·
+  <a href="docs/robot/cheatsheet.md">Cheat sheet</a> ·
+  <a href="docs/design/architecture.md">How it works</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/pollen-robotics/microduck/actions/workflows/ci.yml"><img src="https://github.com/pollen-robotics/microduck/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/pollen-robotics/microduck/releases"><img src="https://img.shields.io/github/v/release/pollen-robotics/microduck?label=release" alt="Release"></a>
+</p>
+
+---
+
+**This repo is the duck's brain.** A handful of daemons on a Radxa Zero 3W: a 50 Hz control loop
+driving fifteen servos from a neural policy, the radios and the camera, and the update machinery
+that gets new software onto a robot without bricking it. If you have a microduck, everything you need to run
+it is here. If you want one, the [website](https://pollen-robotics.com/microduck) is the place to
+start.
+
+## It does things
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/walk.svg" alt="Walking" width="100%"></td>
+<td width="50%"><img src="docs/images/roller.svg" alt="Roller mode" width="100%"></td>
+</tr>
+<tr>
+<td><b>It walks.</b> A policy trained in simulation, running on the board — no tether, no laptop in
+the loop. Pick up the gamepad and drive.</td>
+<td><b>It rolls.</b> Put wheels on it, hold D-pad up for three seconds, and it loads a different
+brain: one quack for legs, two for wheels.</td>
+</tr>
+<tr>
+<td><img src="docs/images/chorale.svg" alt="The chorale" width="100%"></td>
+<td><img src="docs/images/theremin.svg" alt="The theremin" width="100%"></td>
+</tr>
+<tr>
+<td><b>It sings.</b> Ducks in the same room find each other over Bluetooth, work out who takes
+which part, and sing in four voices — mouths on the beat, no shared clock, no wires.</td>
+<td><b>It plays.</b> The time-of-flight sensor in its head turns your hand's distance into a pitch,
+in the duck's own voice, with its beak opening as the note climbs.</td>
+</tr>
+</table>
+
+It also sits, stands, kicks a ball, rolls forward on command, coos when you scratch its head if
+you turn that on, and goes limp before it hits the floor — so a fall costs it some dignity rather
+than a gearbox.
+
+<p align="center">
+  <img src="docs/images/console.svg" alt="The WebRTC console" width="820">
+</p>
+
+<p align="center"><em>…and it serves its own console: open a browser, see what the duck sees, drive
+it from the page.</em></p>
+
+## Say hello
+
+On the robot, over ssh:
+
+```bash
+robotctl health      # is it alive, and what is wrong if not
+robotctl monitor     # the control loop, live: asked vs applied, joints, battery, temps
+robotctl quack        # it answers in a voice that is only its own
+```
+
+Switch a paired gamepad on and drive — `padd` runs from boot and waits for one. **Start** enables
+the policy; the first press moves the robot to its home pose, so hold it or stand it up.
+
+Every command explains itself, so exploring beats reading:
 
 ```bash
 robotctl --help
 ```
 
-```bash
-robotctl update --help
-```
+## Where to find things
 
-Tab completion comes with the install — press Tab for the commands a release actually has. For a
-shell it did not set up:
-
-```bash
-eval "$(robotctl completions zsh)"
-```
-
-## Is it alive
-
-```bash
-robotctl health
-```
-
-```
-robot     healthy
-  loop      50.1 of 50.0 Hz · 2834 ticks · 0 missed · last 13 ms ago
-  bus       ok
-  imu       ready
-  battery   7.62 V (64%)
-  motors    41 °C max (left_knee) · 36 °C mean
-  cpu       52 °C
-
-software
-  updaterd  0.5.0 (rev abc1234)
-  robotd    0.5.0 (rev abc1234)
-  configd   0.5.0 (rev abc1234)
-  daemon    0.5.0 installed
-            last update 0.4.1 → 0.5.0: applied
-
-units
-  updaterd  active · 0.5.0 (rev abc1234)
-  robotd    active · 0.5.0 (rev abc1234)
-  configd   active · 0.5.0 (rev abc1234)
-  btd       active · 0.5.0 (rev abc1234)
-  padd      active · 0.5.0 (rev abc1234)
-```
-
-The two software blocks answer different questions. `software` is what each daemon that serves a
-socket says about itself, and what is installed on the board; `units` is what systemd says about
-every unit a release manages — including `btd` and `padd`, which answer no version query and can
-only be reported from outside — with the release each process was actually launched from. That second one
-is the question after an update: a daemon still running the old binary shows a release older than
-the installed one, and the report names the restart that fixes it.
-
-## Drive it
-
-Switch the pad on and drive — `padd` runs from boot, waits for a pad and drives whatever connects.
-
-Pairing is once per pad and lives in
-[`docs/robot/pair-a-gamepad.md`](docs/robot/pair-a-gamepad.md): `sudo robotctl pad pair` with the pad
-in pairing mode, plus what to do when it will not bond.
-
-```bash
-robotctl pad status
-```
-
-```
-pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
-padd    active — driving whatever pad connects
-```
-
-`padd` reads the pad and sends intents over the socket. It has no privileged access — it is an
-ordinary client, sending exactly what the app and the SDK will send, which is why pairing is
-`configd`'s job rather than its own.
-
-Driving from **your laptop** works too, with the socket forwarded — pad in your hands, robot on
-the bench, nothing installed. Stop the one on the robot first, or two processes fight over the
-sticks:
-
-```bash
-sudo systemctl stop padd
-```
-
-```bash
-ssh -L /tmp/robotd.sock:/run/robotd.sock radxa@192.168.1.42
-```
-
-Leave that open, and in another terminal from this clone:
-
-```bash
-cargo run -p padd -- --socket /tmp/robotd.sock
-```
-
-The controls:
+### You have a duck
 
 | | |
 |---|---|
-| **Start** | enable / disable the policy — nothing moves until this is on. On a limp robot this is also what powers the joints: torque on, two seconds to the home pose, then it drives |
-| **Y** / triangle | switch between driving the **body** and posing the **head** |
-| **B** / circle | stop |
-| left stick | body: forward/back and strafe · head: neck pitch and roll |
-| right stick | body: turn · head: head pitch and yaw |
-
-Two things worth knowing before the robot surprises you. Sticks drive the body or the head,
-never both, so switching to head mode zeroes the body velocity rather than leaving it walking.
-And if the pad disconnects, `padd` sends nothing at all — `robotd`'s deadman stops the robot on
-its own, which is the wanted behaviour and the reason `padd` does not invent a zero command.
-
-The first Start after power-on **moves the robot**: the joints go from wherever they are resting to
-the home pose over two seconds. Hold it, or have it on its stand.
-
-The same two steps by hand, for when there is no pad in the room:
-
-```bash
-sudo robotctl robot init
-```
-
-```bash
-sudo robotctl robot relax --yes
-```
-
-`init` powers the joints and ramps to the home pose; `relax` cuts power, and **the robot collapses**
-if nothing is holding it. That is the only way back to limp short of pulling the plug — pressing Start
-again stops the policy but keeps the robot standing.
-
-A robot the IMU already considers fallen refuses both Start and `robot init`: the fall gate holds a
-fallen robot limp on purpose. Stand it up by hand first.
-
-Speeds are conservative by default. `--max-linear` (m/s), `--max-angular` (rad/s) and
-`--max-head` (radians) raise them; `--deadzone` is there because analogue sticks rarely rest at
-exactly zero and the robot creeps without it. The unit runs with the defaults, so to use those
-flags on the robot, stop it and run the binary yourself:
-
-```bash
-sudo systemctl stop padd
-```
-
-```bash
-sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
-```
-
-`systemctl start padd` puts the default back.
-
-## Watch what it is doing
-
-```bash
-robotctl monitor
-```
-
-The one window into the control loop. It shows what a client asked for beside what was actually
-applied, and names the reason when they differ — safety clamps things constantly, and "the stick
-is forward and the robot is still" is unreadable without that. A limit is spelled out rather than
-named: `deadman — no intent arrived recently, velocity zeroed`.
-
-Also on the frame: every joint measured against what it was commanded, the IMU's projected
-gravity and the fall verdict drawn from it, and the achieved loop rate as a trace so a stutter
-that has already recovered is still visible. The last row of the header is the robot's condition —
-the pack's charge, the hottest servo, the board temperature, and whatever `robot.health` says is
-wrong. 0% is where `robotd` sits down and cuts power, so the charge is a countdown; the row is
-there even when no state is arriving at all, which is what a board with its servo power off looks
-like. The bottom border names the policy that is loaded, because `walk` is a mode two releases
-with different gaits both report — and "which network is this?" is the first question when
-comparing them.
-
-`p` opens the gamepad's raw input: every evdev report from the pad `padd` is driving from, the
-sticks and buttons as the kernel delivered them, and the gaps between reports as a trace. That last
-part is the reason it exists — `padd` resends the last stick value at 50 Hz, so a radio that has
-stopped delivering still looks like a live driver in the `asked` column above it, and the robot walks
-on a command nobody is giving. Reading it is in
-[pair a gamepad](docs/robot/pair-a-gamepad.md#when-it-drops-while-you-are-driving).
-
-`q` quits, `↑`/`↓` scroll the joint list, `u` switches the angles between degrees and radians.
-Angles are degrees on screen — joints, head and the yaw rate. Redirected or piped it prints one
-line per tick instead, so `> run.log` and `| grep FALLEN` behave, and those numbers stay radians
-whatever the screen is set to. The joint vectors are in `--json`:
-
-```bash
-robotctl monitor --json --hz 50 > run.jsonl
-```
-
-## Run your own policy
-
-You do not need to cut a release to try a network. Point `robotd` at your own `.onnx` on the
-board, in `/etc/robot/robotd.toml`:
-
-```toml
-[policy]
-walk = "/home/radxa/my_walking.onnx"
-stand = "/home/radxa/my_stand.onnx"
-```
-
-```bash
-sudo systemctl restart robotd
-```
-
-Your paths survive updates. Delete the lines to go back to the policy the release ships.
-
-A policy that could not be loaded reports **unhealthy** — `robotctl health` and the bottom of
-`monitor` both name the reason. The shape a policy has to have, and what else is checked at
-load, are in [`docs/design/robotd-design.md`](docs/design/robotd-design.md) §2.3.
-
-## Keep it up to date
-
-What each daemon is running, and what is installed:
-
-```bash
-robotctl version
-```
-
-Install the latest release:
-
-```bash
-sudo robotctl update apply daemon
-```
-
-Go back if it misbehaves:
-
-```bash
-sudo robotctl update rollback daemon
-```
-
-`daemon` covers every binary. On a dev board this installs the latest *stable* release, which is
-usually a downgrade — use `--ref` below instead.
-
-A release candidate — published, not yet promoted — is flagged as a prerelease, and a plain `apply`
-skips those so no robot drifts onto a build nobody has validated. Ask for one by name:
-
-```bash
-sudo robotctl update apply --staging daemon
-```
-
-To pick a candidate rather than the newest one:
-
-```bash
-sudo robotctl update apply --staging --version 0.5.1 daemon
-```
-
-The flag applies to that one command and leaves nothing switched on, so the next `apply` is back
-on stable. This is what a canary robot runs before a promotion.
-
-## Put your branch on the robot
-
-Make sure the board has been through the [dev install](docs/robot/install-dev.md) first — a board that
-has not will refuse branch builds.
-
-Push your branch, then wait for CI to build it:
-
-```bash
-gh run list --branch my-branch
-```
-
-Once it is green, on the robot:
-
-```bash
-sudo robotctl update apply --ref my-branch daemon
-```
-
-```bash
-robotctl version
-```
-
-Go back:
-
-```bash
-sudo robotctl update rollback daemon
-```
-
-Every push needs the apply again.
-
-### Or skip CI entirely
-
-From a clone of this repo, with the board reachable over ssh:
-
-```bash
-scripts/dev-push.sh radxa@<board>
-```
-
-It builds here, signs with the dev key, copies the release to the board and applies it — same
-verification, same health gate, same auto-rollback, about a minute instead of a push and a CI run.
-Setup and the one-time first push are in [`dev-push.md`](docs/robot/dev-push.md).
-
-## Cut a release
-
-Releases are built and signed in CI, never on a laptop. Two tags: the pre-release goes to a canary
-robot, and the release promotes exactly those bytes.
-
-Bump `version` under `[workspace.package]` in `Cargo.toml` first — 0.5.0 to 0.5.1 here. `xtask
-package` refuses a tag that disagrees with it, which is what stops a robot reporting a version it
-is not running. Then refresh the lockfile:
-
-```bash
-cargo update --workspace
-```
-
-Merge that, then from `main`:
-
-```bash
-git tag daemon-staging-v0.5.1 && git push --tags
-```
-
-CI builds it, signs it, verifies it through the real update engine and publishes it as a
-prerelease. Watch it:
-
-```bash
-gh run list --workflow release
-```
-
-Once it is green, on the canary robot:
-
-```bash
-sudo robotctl update apply --staging daemon
-```
-
-Drive it. When it holds up, from `main` again:
-
-```bash
-git tag daemon-v0.5.1 && git push --tags
-```
-
-That promotes the staging build rather than rebuilding it — the same bytes, re-signed with the key
-customer robots trust. Creating the release in the GitHub UI instead of pushing the tag does the
-same thing.
-
-A `daemon-v` tag with no staging build behind it is allowed and builds directly. Both are signed
-the same way, so the difference is validation rather than authenticity, and the release notes say
-which one happened. Key custody and the `promote` workflow — including `min_supported`, for forcing
-robots off a bad release — are in [CONTRIBUTING.md](CONTRIBUTING.md#releasing) and
-[`docs/project/ci-setup.md`](docs/project/ci-setup.md).
-
-## Where next
-
-### Going further with a robot
+| [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: drive, configure, voice, chorale, theremin, wifi, updates, logs. Start here. |
+| [Pair a gamepad](docs/robot/pair-a-gamepad.md) | Once per pad — and what to do when it will not bond. |
+| [`duckctl`](docs/robot/duckctl.md) | The robot from a laptop over Bluetooth, with no network and no ssh. |
+| [Updates](docs/robot/cheatsheet.md#updates-updaterd) | Install, roll back, pin. Every update is verified, health-gated and reversible. |
+
+### You are building on it
 
 | | |
 |---|---|
-| [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: wifi, updates, rollback, pinning, logs. |
-| [Dev board cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, and the restart traps after an update. |
-| [`duckctl` cheat sheet](docs/robot/duckctl.md) | Every `duckctl` command: the robot over Bluetooth, from a laptop, with no network. |
-| [Setting up a dev board](docs/robot/install-dev.md) | From nothing, and the fix when `--ref` is refused. |
-| [How it works](docs/design/architecture.md) | The whole system on one page — five daemons, one bus, how an update reaches the robot — then a page per part. |
+| [How it works](docs/design/architecture.md) | The whole system on one page — five daemons, one bus, how an update reaches a robot — then a page per part. |
+| [Set up a dev board](docs/robot/install-dev.md) | From a blank board to a robot that takes branch builds. |
+| [Dev cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, driving from a laptop, and the restart traps after an update. |
+| [Push your branch](docs/robot/dev-push.md) | Build on your machine, install over ssh, about a minute. |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, layout, conventions, releasing. |
+| [Docs index](docs/README.md) | Everything, including the design pages and the open problems. |
 
-### Contributing
+## Under the hood
 
-| | |
-|---|---|
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, repo layout, conventions, releasing. |
-| [Roadmap](docs/project/roadmap.md) | What works today, what is next, and what we are deliberately not doing. |
-| [Open problems](docs/project/) | Records of what has gone wrong and what would close it. |
+Rust, no framework, one workspace. `robotd` owns the control loop and the motor bus; `updaterd`
+installs signed releases and rolls them back when a robot comes up unhealthy; `configd` owns wifi
+and identity; `btd` is the Bluetooth path a phone uses; `padd` reads the gamepad; `mediad` streams
+the camera over WebRTC; `tofd` serves the depth sensor. They talk over one JSON-RPC contract on
+Unix sockets, and every client — the app, the console, the gamepad, your script — sends exactly the
+same calls.
+
+The interesting decisions are written down rather than folklore:
+[`docs/design/`](docs/design/) is why things are the way they are, and
+[`docs/project/`](docs/project/) is what has gone wrong and what would close it.
+
+## A note on ducks
+
+No duck was harmed in the making of this robot. Several were consulted.

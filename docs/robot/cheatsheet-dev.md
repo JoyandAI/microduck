@@ -111,6 +111,39 @@ The result is an ordinary gated update, so the restart traps above still apply.
 [`dev-push.md`](dev-push.md) has the setup, the container build, `--dry-run`, the first push to a
 board below 0.5.0, and what to do when it fails.
 
+## From a laptop — drive with a pad in your hands
+
+The pad in your hands, the robot on the bench, and nothing installed on either: `padd` is an
+ordinary client, so it can run from a clone against a forwarded socket.
+
+Stop the one on the robot first, or two processes fight over the sticks:
+
+```bash
+sudo systemctl stop padd
+```
+
+Forward the socket and leave it open:
+
+```bash
+ssh -L /tmp/robotd.sock:/run/robotd.sock radxa@192.168.1.42
+```
+
+Then from this clone, in another terminal:
+
+```bash
+cargo run -p padd -- --socket /tmp/robotd.sock
+```
+
+`systemctl start padd` puts the robot's own back. This is also where `padd`'s flags are worth
+having — `--max-linear` (m/s), `--max-angular` (rad/s), `--max-head` (radians) and `--deadzone`,
+which exists because analogue sticks rarely rest at exactly zero and the robot creeps without it.
+The unit runs with the defaults, so trying other values means running the binary yourself, here or
+on the board:
+
+```bash
+sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
+```
+
 ## From a laptop — `duckctl`
 
 Reaching the robot over Bluetooth LE, with no network and no ssh:

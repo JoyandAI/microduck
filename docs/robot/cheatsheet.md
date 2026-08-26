@@ -110,6 +110,28 @@ is root-owned — without it the editor opens read-only and says so on the first
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
 
+#### Your own policy
+
+You do not need to cut a release to try a network. Point `robotd` at your own `.onnx` on the
+board, in `/etc/robot/robotd.toml`:
+
+```toml
+[policy]
+walk = "/home/radxa/my_walking.onnx"
+stand = "/home/radxa/my_stand.onnx"
+```
+
+```
+sudo systemctl restart robotd
+```
+
+Your paths survive updates — a release replaces the binaries and the policies it ships, not the
+file that points elsewhere. Delete the lines to go back to the ones the release carries.
+
+A policy that could not be loaded reports **unhealthy**, and `robotctl health` and the bottom
+border of `monitor` both name the reason. The shape a policy has to have, and what else is
+checked at load, are in [`../design/robotd-design.md`](../design/robotd-design.md) §2.3.
+
 ### Power to the joints (`robotd`)
 
 ```
@@ -262,9 +284,10 @@ The loudest way to tell ducks apart: every robot's voice bank is generated from 
 serial (`sounds ensure-bank`, run by every release install), so the robot that answers — in
 a voice that is only its own — is the one you're SSH'd into. A robot with no voice — audio
 off, or no bank — says so instead of printing 🦆, so silence always means the wrong duck.
-The robot also greets when `robotd` comes up, pecks goodbye before powering off, and coos
-when the mic hears its head being scratched (walk mode; the classifier ships in the
-release). The startup greet has its own switch, for anyone restarting the daemon all day:
+The robot also greets when `robotd` comes up, pecks goodbye before powering off, and — if you
+ask it to — coos when the mic hears its head being scratched. That one is off by default in
+both modes (`audio.pet_detect = true` turns it on; the classifier ships in the release): the
+always-on version cooed at every incidental brush and wore thin. The startup greet has its own switch, for anyone restarting the daemon all day:
 
 ```
 sudo robotctl configure
