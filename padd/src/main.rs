@@ -156,6 +156,13 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 /// Select held this long sits the robot down and powers it off.
 const SHUTDOWN_HOLD: Duration = Duration::from_secs(2);
 
+/// D-pad up held this long switches drive mode, walk ⇄ roller.
+///
+/// Three seconds, longer than the shutdown hold, and the prototype's number. D-pad up is a
+/// direction anybody might lean on for a moment while driving; the mode switch takes the robot
+/// home and reloads its policies, so it has to be a hold nobody performs by accident.
+const MODE_HOLD: Duration = Duration::from_secs(3);
+
 /// Body-pose stick ranges, from the training env via the prototype: z is asymmetric
 /// (little headroom up at the standing height, more crouch down), angles capped at ~15°.
 const BODY_MAX_Z_UP: f64 = 0.010;
@@ -225,10 +232,10 @@ fn main() -> std::process::ExitCode {
 
     let mut next_id = 1u64;
 
-    // Which robot is this? A roller duck wants the roller stick shaping. Asked once —
-    // the answer cannot change while robotd lives, and neither process outlives a restart
-    // of the other in practice (systemd restarts both on update).
-    let roller = match request(&mut stream, &mut next_id, &proto::Call::RobotMode) {
+    // Which robot is this? A roller duck wants the roller stick shaping. Asked once at startup,
+    // then kept in step by the D-pad-up switch below — which is this process asking for the
+    // change, so it knows the answer without asking again.
+    let mut roller = match request(&mut stream, &mut next_id, &proto::Call::RobotMode) {
         Ok(Some(answer)) => match answer.result_as::<proto::ModeResult>() {
             Ok(mode) => mode.mode == "roller",
             Err(_) => false,
@@ -240,7 +247,8 @@ fn main() -> std::process::ExitCode {
         hz = args.hz,
         roller,
         "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
-         LB/RB kicks, DPad-Down sit, triggers mouth, Select (2s) shutdown"
+         LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
+         Select (2s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -248,6 +256,8 @@ fn main() -> std::process::ExitCode {
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
     let mut select_held_since: Option<Instant> = None;
+    let mut dpad_up_held_since: Option<Instant> = None;
+    let mut mode_switch_sent = false;
     let mut shutdown_sent = false;
     // Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
     // starts the wheee ride. The prototype's threshold.
@@ -423,6 +433,49 @@ fn main() -> std::process::ExitCode {
         } else {
             select_held_since = None;
             shutdown_sent = false;
+        }
+
+        // D-pad up held three seconds: switch drive mode, which is what somebody who has just
+        // put wheels on the duck (or taken them off) wants. Sent once per hold, and the target is
+        // named rather than toggled — so a request that crosses a switch from somewhere else asks
+        // for a mode rather than for "the other one", which could be either by the time it lands.
+        if pad.is_pressed(Button::DPadUp) {
+            let held = dpad_up_held_since.get_or_insert(tick);
+            if tick.duration_since(*held) >= MODE_HOLD && !mode_switch_sent {
+                mode_switch_sent = true;
+                let target = if roller { "walk" } else { "roller" };
+                tracing::warn!(
+                    target,
+                    "DPad-Up held — asking the robot to switch drive mode"
+                );
+                let call = proto::Call::RobotSetMode(proto::SetModeParams {
+                    mode: target.to_owned(),
+                });
+                match request(&mut stream, &mut next_id, &call) {
+                    Ok(Some(answer)) => match answer.result_as::<proto::IntentResult>() {
+                        // The stick shaping follows the robot, and only when it agreed: a refused
+                        // switch that changed the mapping here would leave the pad driving a
+                        // walking duck with roller curves.
+                        Ok(result) if result.accepted => {
+                            roller = target == "roller";
+                            tracing::warn!(roller, "drive mode switched");
+                        }
+                        Ok(result) => tracing::warn!(
+                            reason = result.reason.as_deref().unwrap_or("no reason given"),
+                            "the robot refused the mode switch"
+                        ),
+                        Err(e) => tracing::error!(error = %e, "unreadable answer to the switch"),
+                    },
+                    Ok(None) => tracing::warn!("no answer to the mode switch"),
+                    Err(e) => {
+                        tracing::error!(error = %e, "mode switch request failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+            }
+        } else {
+            dpad_up_held_since = None;
+            mode_switch_sent = false;
         }
 
         let deadzone = |v: f32| {

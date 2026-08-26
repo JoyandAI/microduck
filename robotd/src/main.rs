@@ -29,10 +29,10 @@ mod theremin;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::{Parser, Subcommand};
 use duck_control::fall::{FallPredictor, FallPredictorConfig};
 use duck_control::io::RobotIo;
@@ -277,6 +277,61 @@ fn parse_duration(raw: &str) -> Result<Duration, String> {
 /// control loop. A robot whose loop is wedged still has to be able to say "I am not
 /// healthy" — if answering required the loop's lock, the one situation where `updaterd`
 /// needs an answer is the situation it would hang in.
+/// [`Mode`] as the byte [`RobotState::mode`] holds, and back.
+///
+/// Two tiny functions rather than a numeric cast, so the mapping is written down once: a mode
+/// added later gets a code here and nowhere else, and an unknown byte reads as walking rather
+/// than panicking on the IPC thread.
+fn mode_code(mode: Mode) -> u8 {
+    match mode {
+        Mode::Walk => 0,
+        Mode::Roller => 1,
+    }
+}
+
+fn mode_of(code: u8) -> Mode {
+    match code {
+        1 => Mode::Roller,
+        _ => Mode::Walk,
+    }
+}
+
+/// The policy file names for one mode, as a set.
+///
+/// `None` in a skill slot doubles as "this robot cannot do that", which is what lets `dispatch`
+/// refuse a `robot.do` for a skill this mode has no network for instead of queueing a request the
+/// loop will drop — and roller mode is exactly that case: no standing network, a crouch where the
+/// ground pick was.
+#[derive(Debug, Clone, Default)]
+struct PolicyNames {
+    walk: Option<String>,
+    stand: Option<String>,
+    sitstand: Option<String>,
+    ground_pick: Option<String>,
+    kick_left: Option<String>,
+    kick_right: Option<String>,
+    roulade: Option<String>,
+}
+
+impl PolicyNames {
+    /// The names for `policy`, or all-`None` when no policy is wanted.
+    fn of(policy: &params::ResolvedPolicy) -> Self {
+        if !policy.enabled {
+            return Self::default();
+        }
+        let name = |path: &Option<std::path::PathBuf>| path.as_deref().and_then(file_name);
+        Self {
+            walk: file_name(&policy.walk),
+            stand: name(&policy.stand),
+            sitstand: name(&policy.sitstand),
+            ground_pick: name(&policy.ground_pick),
+            kick_left: name(&policy.kick_left),
+            kick_right: name(&policy.kick_right),
+            roulade: name(&policy.roulade),
+        }
+    }
+}
+
 struct RobotState {
     /// Epoch for every timestamp below. `Instant` so the clock cannot go backwards.
     started: Instant,
@@ -329,24 +384,20 @@ struct RobotState {
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
-    /// Which policy files this process was configured with, as file names. `None` when the
-    /// policy is disabled.
+    /// Which policy files this process is running, as file names. `None` when the policy is
+    /// disabled.
     ///
     /// From the params rather than from the loaded network, and therefore known before the
     /// control thread has finished loading anything — a client that subscribes during startup
     /// gets the answer rather than a race. What *failed* to load is `policy_error`; this is
     /// what was asked for, and the pair is what distinguishes "no policy wanted" from "the
     /// policy this release ships would not load".
-    policy_walk: Option<String>,
-    policy_stand: Option<String>,
-    /// The skill networks, same provenance. `None` doubles as "this robot cannot do that",
-    /// which is what lets `dispatch` refuse a `robot.do` for a skill that was never
-    /// configured instead of queueing a request the loop will drop.
-    policy_sitstand: Option<String>,
-    policy_ground_pick: Option<String>,
-    policy_kick_left: Option<String>,
-    policy_kick_right: Option<String>,
-    policy_roulade: Option<String>,
+    ///
+    /// **One swap for the whole set rather than seven fields**, because a mode switch replaces
+    /// all of them at once: a reader that caught `walk` from roller beside `stand` from walking
+    /// would be told about a robot that does not exist. Swapped by the control loop, which is
+    /// the only thing that loads a policy.
+    policies: ArcSwap<PolicyNames>,
     /// Whether this robot can make a sound at all: audio enabled, and a bank with wavs in
     /// it. Same job as the `policy_*` fields above — false is "this robot cannot do that",
     /// which is what lets `dispatch` refuse a `robot.sound` with a reason instead of
@@ -362,8 +413,12 @@ struct RobotState {
     /// Whether this robot's config allows it to sing with others. Read once at startup, like the
     /// policies: `[chorale] accept`, false by default.
     chorale_accepted: bool,
-    /// `walk` or `roller` — constant for the life of the process; `robot.mode` reports it.
-    mode: &'static str,
+    /// `walk` or `roller`, as `robot.mode` reports it.
+    ///
+    /// Not constant any more: `robot.setMode` switches it while the robot runs, so this is stored
+    /// rather than read from the params it started as. An `AtomicU8` over [`Mode`] because it is
+    /// read on the IPC side and written by the control loop, and there is nothing to allocate.
+    mode: AtomicU8,
     /// Published by the loop so the IPC side can answer without consulting it.
     fallen: AtomicBool,
     /// The policy is driving and has been asked for a non-zero velocity.
@@ -405,20 +460,11 @@ impl RobotState {
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
-            policy_walk: {
-                let policy = params.policy.resolved();
-                policy.enabled.then(|| file_name(&policy.walk)).flatten()
-            },
-            policy_stand: named_policy(params, |p| p.stand.clone()),
-            policy_sitstand: named_policy(params, |p| p.sitstand.clone()),
-            policy_ground_pick: named_policy(params, |p| p.ground_pick.clone()),
-            policy_kick_left: named_policy(params, |p| p.kick_left.clone()),
-            policy_kick_right: named_policy(params, |p| p.kick_right.clone()),
-            policy_roulade: named_policy(params, |p| p.roulade.clone()),
+            policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             theremin_ready: AtomicBool::new(false),
             chorale_accepted: params.chorale.accept,
-            mode: params.policy.mode.as_str(),
+            mode: AtomicU8::new(mode_code(params.policy.mode)),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
@@ -1002,55 +1048,25 @@ async fn adopt_startup_pose<T: RobotIo>(
 /// back. The alternative — refusing to start — becomes a crashloop under
 /// `Restart=always` and reaches the health gate as `Unreachable`, which blames the wrong
 /// thing in the journal.
-async fn control_loop<T: RobotIo>(
-    io: T,
-    state: Arc<RobotState>,
-    intents: Arc<Intents>,
-    params: Params,
-    period: Duration,
-    poweroff: PowerOff,
-) {
-    let policy_cfg = params.policy.resolved();
-    let mut safety = Safety::new(
-        io,
-        SafetyConfig {
-            fall_gravity_z: params.safety.fall_gravity_z,
-            fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
-            deadman: Duration::from_millis(params.safety.deadman_ms),
-            gain_running: policy_cfg.gain,
-            gain_limp: params.safety.gain_limp,
-        },
-    );
-
-    let Some(mut hold) = adopt_startup_pose(&mut safety, &state, period).await else {
-        return;
-    };
-
-    // Was the robot powered on already sitting? A seated duck has hips and knees folded
-    // far from the standing pose. If so, the first bring-up rises via the sitstand network
-    // instead of dragging the legs through the linear ramp — the ramp is for a robot that
-    // is roughly standing.
-    const LEG_JOINTS: [usize; 10] = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14];
-    let leg_deviation = LEG_JOINTS
-        .iter()
-        .map(|&j| (hold[j] - DEFAULT_POSITION[j]).abs())
-        .sum::<f64>()
-        / LEG_JOINTS.len() as f64;
-    let mut seated_boot = leg_deviation > SEATED_BOOT_RAD;
-    if seated_boot {
-        tracing::warn!(
-            deviation = format!("{leg_deviation:.2}"),
-            "seated boot detected — will stand up via the sitstand policy"
-        );
-    }
-
-    // A policy that was *not wanted* is healthy; one that was wanted and could not be
-    // loaded is not. Collapsing those two would either make a bench robot look broken or
-    // let a release with an unusable bundle pass the health gate.
-    let mut controller = if !policy_cfg.enabled {
+/// Load one mode's policy bundle, or `None` when there is nothing to load.
+///
+/// A function rather than a block inline in the loop's preamble, because it runs twice: once at
+/// startup, and again on every `robot.setMode` — which is a mode's whole difference, since the
+/// networks and the tuning are all a mode *is* by the time params are resolved.
+///
+/// A policy that was *not wanted* is healthy; one that was wanted and could not be loaded is not.
+/// Collapsing those two would either make a bench robot look broken or let a release with an
+/// unusable bundle pass the health gate.
+fn build_controller(
+    policy_cfg: &params::ResolvedPolicy,
+    limp_fall: bool,
+    state: &RobotState,
+) -> Option<Controller> {
+    if !policy_cfg.enabled {
         tracing::warn!("policy disabled; holding the startup pose");
-        None
-    } else {
+        return None;
+    }
+    {
         let tuning = Tuning {
             action_scale: policy_cfg.action_scale,
             standing_action_scale: policy_cfg.standing_action_scale,
@@ -1093,7 +1109,7 @@ async fn control_loop<T: RobotIo>(
                     ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
                     kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
                     roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
-                    limp_fall = params.safety.limp_fall,
+                    limp_fall,
                     "policy loaded"
                 );
                 Some(Controller::new(policy, tuning, skills))
@@ -1104,7 +1120,55 @@ async fn control_loop<T: RobotIo>(
                 None
             }
         }
+    }
+}
+
+async fn control_loop<T: RobotIo>(
+    io: T,
+    state: Arc<RobotState>,
+    intents: Arc<Intents>,
+    params: Params,
+    period: Duration,
+    poweroff: PowerOff,
+) {
+    // `mut` because a mode switch replaces it: the resolved policy *is* the mode, once the
+    // per-mode defaults have been applied.
+    let mut policy_cfg = params.policy.resolved();
+    let mut safety = Safety::new(
+        io,
+        SafetyConfig {
+            fall_gravity_z: params.safety.fall_gravity_z,
+            fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
+            deadman: Duration::from_millis(params.safety.deadman_ms),
+            gain_running: policy_cfg.gain,
+            gain_limp: params.safety.gain_limp,
+        },
+    );
+
+    let Some(mut hold) = adopt_startup_pose(&mut safety, &state, period).await else {
+        return;
     };
+
+    // Was the robot powered on already sitting? A seated duck has hips and knees folded
+    // far from the standing pose. If so, the first bring-up rises via the sitstand network
+    // instead of dragging the legs through the linear ramp — the ramp is for a robot that
+    // is roughly standing.
+    const LEG_JOINTS: [usize; 10] = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14];
+    let leg_deviation = LEG_JOINTS
+        .iter()
+        .map(|&j| (hold[j] - DEFAULT_POSITION[j]).abs())
+        .sum::<f64>()
+        / LEG_JOINTS.len() as f64;
+    let mut seated_boot = leg_deviation > SEATED_BOOT_RAD;
+    if seated_boot {
+        tracing::warn!(
+            deviation = format!("{leg_deviation:.2}"),
+            "seated boot detected — will stand up via the sitstand policy"
+        );
+    }
+
+    // Loaded once here and again on a mode switch — see `build_controller`.
+    let mut controller = build_controller(&policy_cfg, params.safety.limp_fall, &state);
 
     tracing::warn!(
         joints = NUM_JOINTS,
@@ -1135,6 +1199,12 @@ async fn control_loop<T: RobotIo>(
     let mut last_summary = Instant::now();
     let mut was_driving = false;
     let mut bringup = Bringup::Limp;
+    // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
+    // the time, which is nearly always.
+    let mut mode_change: Option<Mode> = None;
+    // The policy params this loop is running, which a mode switch replaces. Owned rather than
+    // borrowed from `params` because the mode is no longer what the file said.
+    let mut policy_params = params.policy.clone();
 
     // Command smoothing, per the prototype: `cmd += α × (target − cmd)` at the tick rate.
     // A stick snap becomes a ramp the gait can follow; the state lives here because it is
@@ -1459,6 +1529,47 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
+        // A drive-mode switch: `robot.setMode`, which the pad's held D-pad up sends.
+        //
+        // The robot goes back to its home pose first and the policies load there, for the reason
+        // the prototype relaunched into pose 0: swapping the network under a moving gait means the
+        // next tick is a different policy's idea of what the legs were doing. Torque stays on
+        // throughout — the robot holds itself up across the swap rather than sitting down.
+        if let Some(code) = intents.take_mode_switch() {
+            let target = mode_of(code);
+            if target == policy_params.mode {
+                tracing::info!(
+                    mode = target.as_str(),
+                    "already in that mode; nothing to switch"
+                );
+            } else if mode_change.is_some() {
+                tracing::warn!(mode = target.as_str(), "a mode switch is already in flight");
+            } else {
+                tracing::warn!(
+                    from = policy_params.mode.as_str(),
+                    to = target.as_str(),
+                    "mode switch: going home before loading the other policies"
+                );
+                // The prototype's cue, and worth keeping: one quack for walking, two for roller,
+                // so the robot says which mode it is going to without anybody reading a log.
+                if let Some(voice) = voice.as_mut() {
+                    voice.play("chirp", false);
+                    if target == Mode::Roller {
+                        voice.play("chirp", false);
+                    }
+                }
+                mode_change = Some(target);
+                // Home the robot with the machinery `init` and a fall recovery already use: it
+                // ramps per tick, and `driving` is false until it reaches Ready.
+                if let Some(sensors) = sensors.as_ref() {
+                    bringup = Bringup::Homing {
+                        from: sensors.positions,
+                        since: tick_start,
+                    };
+                }
+            }
+        }
+
         // The sit-then-power-off sequence: `robot.shutdown`, or a genuinely empty pack.
         // The battery reading is a ~10 s EMA refreshed once a second, so a load sag cannot
         // reach the floor — a pack that gets there is spent.
@@ -1721,6 +1832,27 @@ async fn control_loop<T: RobotIo>(
         if let Bringup::Homing { .. } = bringup
             && bringup.homing_target(tick_start).is_none()
         {
+            // Home, and a switch waiting: load the other mode's bundle here, where the robot is
+            // standing still at a known pose with torque on. `Policy::load` validates and warms
+            // up each network, so this blocks the loop for a moment — deliberately, and in the one
+            // place where a stalled command stream costs nothing, because the robot is holding a
+            // pose rather than mid-stride. Missed ticks in that window are expected.
+            if let Some(target) = mode_change.take() {
+                policy_params.mode = target;
+                let cfg = policy_params.resolved();
+                state.policy_error.store(None);
+                controller = build_controller(&cfg, params.safety.limp_fall, &state);
+                // Published together with the mode, and only after the load: a client that reads
+                // `robot.mode` and gets the new one must not then be told the old mode's networks.
+                state.policies.store(Arc::new(PolicyNames::of(&cfg)));
+                state.mode.store(mode_code(target), Ordering::Relaxed);
+                policy_cfg = cfg;
+                tracing::warn!(
+                    mode = target.as_str(),
+                    loaded = controller.is_some(),
+                    "mode switch complete"
+                );
+            }
             tracing::warn!("at the home pose; the policy has the robot");
             bringup = Bringup::Ready;
             hold = DEFAULT_POSITION;
@@ -2145,19 +2277,6 @@ async fn control_loop<T: RobotIo>(
 /// which would read as "no policy".
 fn file_name(path: &std::path::Path) -> Option<String> {
     Some(path.file_name()?.to_string_lossy().into_owned())
-}
-
-/// One resolved optional policy slot as its reportable file name — `None` when the policy
-/// is disabled outright or the slot is not configured in this mode.
-fn named_policy(
-    params: &Params,
-    pick: impl Fn(&params::ResolvedPolicy) -> Option<std::path::PathBuf>,
-) -> Option<String> {
-    let policy = params.policy.resolved();
-    if !policy.enabled {
-        return None;
-    }
-    pick(&policy).as_deref().and_then(file_name)
 }
 
 /// The sample a tick steps from, and how stale it may get.
@@ -2598,12 +2717,15 @@ fn dispatch(
         // down; the loop still arbitrates against whatever move is mid-flight, exactly as
         // the prototype's buttons did.
         proto::Call::RobotDo(p) => {
+            let policies = state.policies.load();
             let configured = match p.skill {
-                proto::Skill::GroundPick => state.policy_ground_pick.is_some(),
-                proto::Skill::KickLeft => state.policy_kick_left.is_some(),
-                proto::Skill::KickRight => state.policy_kick_right.is_some(),
-                proto::Skill::SitToggle => state.policy_sitstand.is_some(),
-                proto::Skill::Roulade => state.policy_roulade.is_some(),
+                // One load for the whole decision: these are the *current* mode's networks, and
+                // reading them field by field could straddle a mode switch.
+                proto::Skill::GroundPick => policies.ground_pick.is_some(),
+                proto::Skill::KickLeft => policies.kick_left.is_some(),
+                proto::Skill::KickRight => policies.kick_right.is_some(),
+                proto::Skill::SitToggle => policies.sitstand.is_some(),
+                proto::Skill::Roulade => policies.roulade.is_some(),
             };
             // Not refused for being down. A skill on a fallen robot is the human's call,
             // and refusing it is how a robot ends up unable to do the thing that would
@@ -2680,10 +2802,37 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // Switch drive mode. Refused here for the two things this side knows: a mode nobody has
+        // heard of, and a robot with no policy to switch between — the loop arbitrates the rest.
+        //
+        // "Already in that mode" is an acceptance rather than a refusal: the caller asked for a
+        // state and that state is what they get, and a pad held a beat too long should not report
+        // an error.
+        proto::Call::RobotSetMode(p) => {
+            let target = match p.mode.as_str() {
+                "walk" => Some(Mode::Walk),
+                "roller" => Some(Mode::Roller),
+                _ => None,
+            };
+            let result = match target {
+                None => proto::IntentResult::refused("mode must be \"walk\" or \"roller\""),
+                Some(_) if state.policies.load().walk.is_none() => proto::IntentResult::refused(
+                    "no policy on this robot, so there is nothing to switch between",
+                ),
+                Some(mode) => {
+                    intents.request_mode_switch(mode_code(mode));
+                    proto::IntentResult::accepted()
+                }
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         proto::Call::RobotMode => proto::Response::ok(
             Some(id),
             &proto::ModeResult {
-                mode: state.mode.to_owned(),
+                mode: mode_of(state.mode.load(Ordering::Relaxed))
+                    .as_str()
+                    .to_owned(),
             },
         ),
 
@@ -2742,28 +2891,30 @@ fn dispatch(
             },
         ),
 
-        proto::Call::RobotSubscribe(_) => proto::Response::ok(
-            Some(id),
-            &proto::SubscribeResult {
-                accepted: true,
-                walk: state.policy_walk.clone(),
-                stand: state.policy_stand.clone(),
-                sitstand: state.policy_sitstand.clone(),
-                ground_pick: state.policy_ground_pick.clone(),
-                kick_left: state.policy_kick_left.clone(),
-                kick_right: state.policy_kick_right.clone(),
-                roulade: state.policy_roulade.clone(),
-                unavailable: state.policy_error.load_full().map_or_else(
-                    || {
-                        state
-                            .policy_walk
-                            .is_none()
-                            .then(|| "no policy configured; holding the startup pose".to_owned())
-                    },
-                    |e| Some(format!("policy would not load: {e}")),
-                ),
-            },
-        ),
+        proto::Call::RobotSubscribe(_) => {
+            let policies = state.policies.load();
+            proto::Response::ok(
+                Some(id),
+                &proto::SubscribeResult {
+                    accepted: true,
+                    walk: policies.walk.clone(),
+                    stand: policies.stand.clone(),
+                    sitstand: policies.sitstand.clone(),
+                    ground_pick: policies.ground_pick.clone(),
+                    kick_left: policies.kick_left.clone(),
+                    kick_right: policies.kick_right.clone(),
+                    roulade: policies.roulade.clone(),
+                    unavailable: state.policy_error.load_full().map_or_else(
+                        || {
+                            policies.walk.is_none().then(|| {
+                                "no policy configured; holding the startup pose".to_owned()
+                            })
+                        },
+                        |e| Some(format!("policy would not load: {e}")),
+                    ),
+                },
+            )
+        }
 
         proto::Call::RobotStop => {
             intents.stop();
@@ -3053,6 +3204,116 @@ mod tests {
     /// **The point of slice 1.** A loop that ticked once and then wedged must report
     /// unhealthy, not stay healthy forever on the strength of that one tick. This is what
     /// the updater's auto-rollback actually gates on.
+    /// `robot.setMode` is accepted, refused or a no-op — and never a parse error.
+    ///
+    /// The refusals are what this test is for. A robot with no policy has nothing to switch
+    /// between, and a mode nobody has heard of must come back naming the two that exist rather
+    /// than as a decode failure the caller cannot act on.
+    #[test]
+    fn setting_the_mode_accepts_refuses_and_says_which() {
+        let params = Params::default();
+        assert_eq!(params.policy.mode, Mode::Walk, "the shipped default");
+        let s = RobotState::new(&params, false, false);
+        let intents = Arc::new(Intents::new());
+        let id = || proto::Id::Number(1);
+        let set = |mode: &str| -> proto::IntentResult {
+            dispatch(
+                &s,
+                &intents,
+                id(),
+                &proto::Call::RobotSetMode(proto::SetModeParams {
+                    mode: mode.to_owned(),
+                }),
+            )
+            .result
+            .expect("a result")
+            .as_object()
+            .map(|o| serde_json::from_value(serde_json::Value::Object(o.clone())).expect("shape"))
+            .expect("an object")
+        };
+
+        // Default params name a walking bundle, so there is something to switch between.
+        assert!(set("roller").accepted, "a real mode is accepted");
+        assert_eq!(
+            intents.take_mode_switch(),
+            Some(mode_code(Mode::Roller)),
+            "the loop is the thing that switches; dispatch only queues it"
+        );
+
+        // The same mode is an acceptance, not a refusal: the caller asked for a state.
+        assert!(set("walk").accepted);
+        assert_eq!(intents.take_mode_switch(), Some(mode_code(Mode::Walk)));
+
+        let refused = set("hovercraft");
+        assert!(!refused.accepted);
+        let reason = refused.reason.unwrap_or_default();
+        assert!(
+            reason.contains("walk") && reason.contains("roller"),
+            "{reason}"
+        );
+        assert_eq!(
+            intents.take_mode_switch(),
+            None,
+            "a refused switch must not reach the loop"
+        );
+
+        // A robot with no policy at all: nothing to switch between, and saying so beats homing
+        // the robot for a swap that would load nothing.
+        let mut bare = Params::default();
+        bare.policy.enabled = false;
+        let s = RobotState::new(&bare, false, false);
+        let response = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotSetMode(proto::SetModeParams {
+                mode: "roller".to_owned(),
+            }),
+        );
+        let result: proto::IntentResult =
+            serde_json::from_value(response.result.expect("a result")).expect("shape");
+        assert!(!result.accepted);
+        assert!(
+            result.reason.unwrap_or_default().contains("no policy"),
+            "the reason must name the cause"
+        );
+    }
+
+    /// Roller mode has no standing network, and the published set must say so.
+    ///
+    /// This is the reason the names are swapped as a set rather than left at what startup
+    /// resolved: `dispatch` refuses a `robot.do` for a skill whose slot is `None`, so a stale set
+    /// would have the robot accepting a kick in a mode with no kick network — or refusing the
+    /// crouch that roller mode does have.
+    #[test]
+    fn the_published_policy_names_are_one_modes_answer() {
+        let walk = PolicyNames::of(&Params::default().policy.resolved());
+        assert!(walk.stand.is_some(), "walking has a standing network");
+
+        let mut rolling = Params::default();
+        rolling.policy.mode = Mode::Roller;
+        let roller = PolicyNames::of(&rolling.policy.resolved());
+        assert!(
+            roller.stand.is_none(),
+            "roller mode loads no standing network"
+        );
+        assert_ne!(
+            walk.walk, roller.walk,
+            "the driving network differs by mode"
+        );
+        assert_ne!(
+            walk.ground_pick, roller.ground_pick,
+            "the ground-pick slot holds the crouch in roller mode"
+        );
+
+        // Disabled means every slot empty, which is what `robot.subscribe` reports as "no policy
+        // configured" rather than as a load failure.
+        let mut off = Params::default();
+        off.policy.enabled = false;
+        let none = PolicyNames::of(&off.policy.resolved());
+        assert!(none.walk.is_none() && none.roulade.is_none());
+    }
+
     #[test]
     fn a_stalled_loop_reports_unhealthy() {
         // A short window so the test does not sleep for the real 500 ms default. Two

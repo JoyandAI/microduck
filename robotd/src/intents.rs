@@ -15,6 +15,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+/// "No mode switch pending" in [`Intents::mode_switch`].
+///
+/// 255 rather than 0, because 0 is a real mode code and a sentinel that collides with a value is
+/// how a "switch to walking" request becomes a no-op.
+pub const MODE_NONE: u8 = u8::MAX;
+
 /// Encodings for [`Intents::power`]. An `AtomicU8` rather than two bools, so "init" and "relax"
 /// cannot both be pending — they are alternatives, and the last one asked for wins.
 const POWER_NONE: u8 = 0;
@@ -150,6 +156,13 @@ pub struct Intents {
     skills: std::sync::atomic::AtomicU32,
     /// A shutdown was requested. A level, not an edge: once asked, the sequence runs.
     shutdown: AtomicBool,
+    /// A drive-mode switch was requested, and which mode to switch to.
+    ///
+    /// An `AtomicU8` holding [`MODE_NONE`] or a mode's code, for the same reason `shutdown` is a
+    /// flag: the IPC thread writes and the control loop takes, with nothing to lock. The last
+    /// request wins — two arriving in the same tick means somebody pressed twice, and the second
+    /// answer is the one they are waiting for.
+    mode_switch: AtomicU8,
     /// Pending one-shot sound tags, a bitmask taken once per tick like the skills.
     sounds: std::sync::atomic::AtomicU32,
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
@@ -213,6 +226,7 @@ impl Intents {
             chorale_heard: std::sync::Mutex::new(Vec::new()),
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
+            mode_switch: AtomicU8::new(MODE_NONE),
             sounds: std::sync::atomic::AtomicU32::new(0),
             wheee: ArcSwap::from_pointee(Stamped {
                 value: false,
@@ -324,6 +338,22 @@ impl Intents {
             WheeeHold::Held
         } else {
             WheeeHold::Decayed
+        }
+    }
+
+    /// Ask for a drive-mode switch, by the code the caller and the loop agree on.
+    ///
+    /// The code rather than [`Mode`] itself, so this module does not have to know what modes
+    /// exist — `main.rs` owns that mapping and the loop reads it back.
+    pub fn request_mode_switch(&self, code: u8) {
+        self.mode_switch.store(code, Ordering::Relaxed);
+    }
+
+    /// Take a pending mode switch. Taken, so the sequence runs once per request.
+    pub fn take_mode_switch(&self) -> Option<u8> {
+        match self.mode_switch.swap(MODE_NONE, Ordering::Relaxed) {
+            MODE_NONE => None,
+            code => Some(code),
         }
     }
 

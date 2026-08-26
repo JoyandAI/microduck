@@ -216,10 +216,15 @@ fn permits(call: &proto::Call) -> bool {
         // robot, and that is `robotctl` or the pad's long-press, deliberately.
         RobotShutdown => false,
 
-        // Constant for the life of the process, and only a stick-mapping hint for local
-        // clients like `padd`. An app gets the same answer through `system.info` territory
-        // when it ever needs one; no reason to open another read to the radio today.
+        // Only a stick-mapping hint for local clients like `padd`. An app gets the same answer
+        // through `system.info` territory when it ever needs one; no reason to open another read
+        // to the radio today.
         RobotMode => false,
+
+        // Switching modes means the robot goes home, loads other policies and drives differently
+        // — and the reason to switch is that somebody just put wheels on it. That is a decision
+        // made in the room, holding the pad, the same place `robot.shutdown` is refused for.
+        RobotSetMode(_) => false,
 
         // Power to the joints. A phone button that drops the robot on the floor is not one to
         // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,

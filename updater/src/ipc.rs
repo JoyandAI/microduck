@@ -626,6 +626,7 @@ impl Server {
             | Call::ChoraleHeard(_)
             | Call::RobotShutdown
             | Call::RobotMode
+            | Call::RobotSetMode(_)
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(

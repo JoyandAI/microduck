@@ -177,12 +177,20 @@ mapping is the prototype's, so muscle memory carries over:
 | **LB / RB** | left / right kick |
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
+| **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
 | **Select**, held 2 s | sit down, then power off |
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
 if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
 shaping automatically — asymmetric push/brake, no strafe — and A triggers the crouch. The
 other skills ride along: sit, kicks and the roulade work on wheels too, as the prototype has it.
+
+**Holding DPad-Up switches between the two**, for when you have just put wheels on the duck or
+taken them off: the robot quacks once for walking or twice for roller, returns to its home pose,
+loads that mode's policies there and drives again — a few seconds, torque on throughout, no
+restart. `robotd.toml` is not touched, so a reboot comes back in the configured mode; make it
+stick with `robotctl configure` (or `[policy] mode`). It is a hold rather than a press because
+D-pad up is easy to lean on while driving.
 
 `pad status` answers two questions separately, because a connected pad and a dead driver look
 identical from the outside:

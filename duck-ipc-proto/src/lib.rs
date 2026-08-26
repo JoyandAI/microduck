@@ -143,7 +143,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// with it. Additive, same rule as every method before it — plus an optional `theremin`
 /// block in `robot.state`, absent while the instrument is down, so a client from v12 sees
 /// exactly the frame it saw before.
-pub const API_VERSION: u32 = 14;
+///
+/// # v15 — `robot.setMode`
+///
+/// Walk and roller stop being a startup constant: the mode can be switched while the robot runs,
+/// which is what the gamepad's held D-pad up does. Additive as a method — but `robot.mode`'s
+/// answer, and the policy names in the `robot.subscribe` acknowledgement, can now *change* during
+/// a session. A client that read either once and cached it forever was already making an
+/// assumption this method breaks; nothing about a frame's shape changes.
+pub const API_VERSION: u32 = 15;
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -378,12 +386,20 @@ pub mod method {
     pub const ROBOT_CHORALE: &str = "robot.chorale";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
-    /// Which drive mode this `robotd` was configured with: `walk` or `roller`.
+    /// Which drive mode this `robotd` is in: `walk` or `roller`.
     ///
-    /// Constant for the life of the process — switching modes is a params edit plus a
-    /// restart. Exists so `padd` can shape its stick mapping to the mode without owning
-    /// config it has no business reading.
+    /// `[policy] mode` is where it starts; [`ROBOT_SET_MODE`] moves it while the robot runs, so
+    /// this is a question with a changing answer rather than a startup constant. Exists so `padd`
+    /// can shape its stick mapping to the mode without owning config it has no business reading.
     pub const ROBOT_MODE: &str = "robot.mode";
+
+    /// Switch drive mode: `walk` or `roller`.
+    ///
+    /// Held on the gamepad's D-pad up, as the prototype held it — putting wheels on a duck is a
+    /// thing you do in the room with it, not from a laptop. The robot returns to its home pose,
+    /// loads the other mode's policies, and drives again; the config is untouched, so a reboot
+    /// comes back in the configured mode.
+    pub const ROBOT_SET_MODE: &str = "robot.setMode";
 
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
@@ -613,6 +629,8 @@ pub enum Call {
     RobotShutdown,
     /// Which drive mode this robotd runs: walk or roller.
     RobotMode,
+    /// Switch drive mode; see [`method::ROBOT_SET_MODE`].
+    RobotSetMode(SetModeParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -737,6 +755,7 @@ impl Call {
             Call::ChoraleHeard(_) => method::CHORALE_HEARD,
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
+            Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -848,6 +867,7 @@ impl Call {
             | Call::RobotSound(_)
             | Call::RobotTheremin(_)
             | Call::RobotChorale(_)
+            | Call::RobotSetMode(_)
             | Call::RobotShutdown => (Robot, Prompt),
             Call::RobotSubscribe(_) => (Robot, Stream),
             // `btd` asking what to put on the air. The answering connection carries the beacon
@@ -931,6 +951,7 @@ impl Call {
             Call::RobotDo(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
+            Call::RobotSetMode(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -1013,6 +1034,7 @@ impl Call {
             method::CHORALE_HEARD => Call::ChoraleHeard(decode(params)?),
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
+            method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1684,6 +1706,16 @@ impl Default for PoseParams {
 pub struct MouthParams {
     /// 0 closed, 1 fully open. Clamped by the robot.
     pub open: f64,
+}
+
+/// Which mode to switch to, for [`Call::RobotSetMode`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetModeParams {
+    /// `"walk"` or `"roller"`. A string for the same reason [`ModeResult`] carries one: a mode
+    /// this build has never heard of should come back as a refusal naming what it does know,
+    /// not as a parse error with no explanation in it.
+    pub mode: String,
 }
 
 /// Answer to [`Call::RobotMode`].
