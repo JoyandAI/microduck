@@ -288,6 +288,27 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
+    // ── [detect] ─────────────────────────────────────────────────────────────
+    feature(
+        "detect.enabled",
+        Kind::Bool,
+        "Look for other ducks in the camera (mediad runs it; needs a restart)",
+    ),
+    entry(
+        "detect.model",
+        Kind::OptionalPath,
+        "Model to run; unset = the release's, .rknn on the NPU before .onnx on the CPU",
+    ),
+    entry(
+        "detect.hz",
+        Kind::Float,
+        "Looks per second. 2 is a thermal limit, not a preference — flat out cooks the board",
+    ),
+    entry(
+        "detect.threshold",
+        Kind::Float,
+        "Confidence a detection needs, on this model's own scale (int8 scores are not 0..1)",
+    ),
     // ── [chorale] ────────────────────────────────────────────────────────────
     feature(
         "chorale.accept",
@@ -552,6 +573,7 @@ mod tests {
                 "policy.voltage_adapt",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
+                "detect.enabled",
                 "chorale.accept",
                 "theremin.enabled",
                 "audio.enabled",

@@ -94,9 +94,20 @@ pub struct Model {
     defaults: toml::Value,
     /// Keyed by `section.key`. Applied to the document only on save.
     pub pending: BTreeMap<&'static str, Edit>,
+    /// What has actually been written, across every save this session.
+    ///
+    /// Kept because `pending` is *cleared* by a save, and what wants restarting is decided after
+    /// the editor has closed — reading `pending` there found nothing every time, so nothing was
+    /// ever restarted and a `[detect]` change looked like a no-op.
+    written: Vec<String>,
 }
 
 impl Model {
+    /// Every key written this session, in the order it was first written.
+    pub fn written(&self) -> &[String] {
+        &self.written
+    }
+
     /// Load the file — or start from an empty document when there is none, which is a real
     /// state: a robot may run entirely on defaults with no file at all.
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -120,6 +131,7 @@ impl Model {
             doc,
             defaults: toml::Value::try_from(Params::default()).expect("Params serializes"),
             pending: BTreeMap::new(),
+            written: Vec::new(),
         })
     }
 
@@ -337,6 +349,12 @@ impl Model {
         std::fs::rename(&staged, &self.path).map_err(|e| writable_hint(&self.path, &e))?;
         // The document on disk is now the rendered one; fold the edits in.
         self.doc = text.parse().expect("just validated");
+        for key in self.pending.keys() {
+            let key = (*key).to_owned();
+            if !self.written.contains(&key) {
+                self.written.push(key);
+            }
+        }
         self.pending.clear();
         Ok(())
     }
@@ -386,27 +404,25 @@ fn writable_hint(path: &Path, e: &std::io::Error) -> String {
 
 /// Which daemon reads a section, and so which unit a change to it needs restarted.
 ///
-/// `robotd` parses this file for itself; `[media]` is `mediad` reading the same file, because a
-/// per-board setting belongs in the per-board config rather than on a unit file the release
-/// installer rewrites. Being wrong here is an edit that appears to do nothing until the next
-/// reboot — which is exactly what the restart offer exists to prevent, so it is derived from the
-/// keys that changed rather than assumed.
+/// `robotd` parses this file for itself; `[media]` and `[detect]` are `mediad` reading the same
+/// file, because a per-board setting belongs in the per-board config rather than on a unit file the
+/// release installer rewrites — and because the camera frames `[detect]` is about are on `mediad`'s
+/// tee. Being wrong here is an edit that appears to do nothing until the next reboot — which is
+/// exactly what the restart offer exists to prevent, so it is derived from the keys that changed
+/// rather than assumed.
 fn unit_for(section: &str) -> &'static str {
     match section {
-        "media" => "mediad",
+        "media" | "detect" => "mediad",
         _ => "robotd",
     }
 }
 
-/// The units the pending edits require restarting, in start order, without duplicates.
-///
-/// Empty is a real answer — no edits, nothing to restart — and the caller must not offer a
-/// restart for it.
-pub fn units_for(model: &Model) -> Vec<&'static str> {
+/// The units a set of `section.key` names requires restarting, in start order, without duplicates.
+fn units_for_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<&'static str> {
     // `robotd` first, because `mediad.service` is `After=robotd.service`: restarting in the
     // other order means mediad reconnects to a robotd that is about to go away.
     let mut units: Vec<&'static str> = Vec::new();
-    for key in model.pending.keys() {
+    for key in keys {
         let (section, _) = key.split_once('.').expect("registry keys are section.key");
         let unit = unit_for(section);
         if !units.contains(&unit) {
@@ -415,6 +431,23 @@ pub fn units_for(model: &Model) -> Vec<&'static str> {
     }
     units.sort_unstable_by_key(|unit| *unit != "robotd");
     units
+}
+
+/// The units the pending edits require restarting, in start order, without duplicates.
+///
+/// Empty is a real answer — no edits, nothing to restart — and the caller must not offer a
+/// restart for it. Read *before* a save, which clears the pending map.
+pub fn units_for(model: &Model) -> Vec<&'static str> {
+    units_for_keys(model.pending.keys().copied())
+}
+
+/// The daemons that read the keys somebody just changed.
+///
+/// The same mapping as [`units_for`], from what a save recorded rather than from what is still
+/// pending — which is what the exit flow has to work from, because the save already cleared the
+/// other one.
+pub fn units_to_restart(edited: &[String]) -> Vec<&'static str> {
+    units_for_keys(edited.iter().map(String::as_str))
 }
 
 /// Restart units, reporting rather than hiding the outcome.
@@ -634,6 +667,9 @@ pub fn run(path: &Path) -> Result<(), String> {
         Focus::Restart { units } => units.clone(),
         _ => Vec::new(),
     };
+    // What was *written*, not what is pending: the save already happened inside the loop above and
+    // cleared the pending map, which is why reading it here restarted nothing at all.
+    let edited = model.written().to_vec();
     ratatui::restore();
 
     let saved = outcome?;
@@ -643,8 +679,9 @@ pub fn run(path: &Path) -> Result<(), String> {
         restart_units(&restart_wanted)?;
         println!("{names} restarted");
     } else if saved {
+        let names = units_to_restart(&edited).join(" and ");
         println!(
-            "written to {} — changes apply on the next `systemctl restart …`",
+            "written to {} — changes apply on the next `systemctl restart {names}`",
             path.display()
         );
     }
@@ -1222,6 +1259,56 @@ mod tests {
         );
     }
 
+    /// A save records what it wrote, because that is what decides the restart.
+    ///
+    /// The bug this pins: `save` clears `pending`, and the restart decision is made after the
+    /// editor closes — so reading `pending` there found an empty map, `units_to_restart` returned
+    /// nothing, and turning the detector off looked like it had no effect at all. Twice, on a
+    /// robot, before anybody suspected the editor rather than the daemon.
+    #[test]
+    fn a_save_remembers_what_it_wrote_so_the_right_daemon_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "").unwrap();
+        let mut m = Model::load(&path).expect("loads");
+
+        assert!(m.written().is_empty(), "nothing written yet");
+        m.edit(entry("detect.enabled"), "true").expect("edits");
+        assert!(!m.pending.is_empty());
+        m.save().expect("saves");
+
+        assert!(m.pending.is_empty(), "a save clears what is pending");
+        assert_eq!(m.written(), ["detect.enabled".to_owned()]);
+        assert_eq!(units_to_restart(m.written()), vec!["mediad"]);
+
+        // A second save adds to the record rather than replacing it: somebody who changes the
+        // detector and then the gait wants both daemons restarted.
+        m.edit(entry("policy.mode"), "roller").expect("edits");
+        m.save().expect("saves");
+        assert_eq!(units_to_restart(m.written()), vec!["robotd", "mediad"]);
+    }
+
+    /// A `[detect]` change restarts `mediad`, not `robotd`.
+    ///
+    /// `robotd` owned every key in this file for long enough that the restart was hardcoded, and
+    /// `[detect]` is read by `mediad` because the camera frames are on its tee. Restarting the
+    /// wrong daemon is how somebody edits a value three times and swears it does nothing.
+    #[test]
+    fn the_section_decides_which_daemon_restarts() {
+        let detect = vec!["detect.enabled".to_owned()];
+        assert_eq!(units_to_restart(&detect), vec!["mediad"]);
+
+        let policy = vec!["policy.mode".to_owned()];
+        assert_eq!(units_to_restart(&policy), vec!["robotd"]);
+
+        // Both, in the order they are least disruptive to restart: the control loop first, then the
+        // camera — a robot that is standing up should not be waiting on a WebRTC teardown.
+        let both = vec!["detect.hz".to_owned(), "audio.enabled".to_owned()];
+        assert_eq!(units_to_restart(&both), vec!["robotd", "mediad"]);
+
+        assert!(units_to_restart(&[]).is_empty());
+    }
+
     /// Sections come out in registry order, once each — the editor's headers.
     #[test]
     fn sections_are_ordered_and_unique() {
@@ -1234,6 +1321,7 @@ mod tests {
                 "update_gate",
                 "policy",
                 "safety",
+                "detect",
                 "chorale",
                 "theremin",
                 "audio",

@@ -137,13 +137,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // What the stream is, from `[media]` — see `--config` and `mediad::config`.
+    // What the stream is and what it looks for, from `[media]` and `[detect]` — see
+    // `--config` and `mediad::config`. One file, one read: `[detect]` is `mediad`'s section
+    // too, and a second config file for the second daemon that wants one is how a fleet ends
+    // up with settings nobody can find.
     let explicit = args.config.is_some();
     let config = args
         .config
         .clone()
         .unwrap_or_else(mediad::config::default_path);
-    let media = mediad::config::load(&config, explicit);
+    let params = mediad::config::load(&config, explicit);
+    let (media, detect) = (params.media, params.detect);
     tracing::info!(
         camera = media.camera,
         quality = media.quality.label(),
@@ -154,6 +158,15 @@ fn main() -> ExitCode {
         congestion_control = media.congestion_control.nick(),
         "streaming"
     );
+    // The same angle the detector needs, in its own vocabulary: it folds the turn into the
+    // resampling it already does, which is why nothing in the pipeline has to.
+    let turn = match duck_detect::Turn::from_degrees(args.rotate) {
+        Some(turn) => turn,
+        None => {
+            tracing::error!(degrees = args.rotate, "mediad cannot start");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let rotation = if args.flip_in_pipeline {
         tracing::warn!(
@@ -264,6 +277,44 @@ fn main() -> ExitCode {
             (mediad::pipeline::Source::Test, _) => None,
         };
 
+        // **The duck detector, from the same config file as everything else.** `[detect]` lives in
+        // robotd.toml because that is the file `robotctl configure` edits and a robot has one place
+        // for its switches — even though it is this daemon that reads that section.
+        //
+        // A detector that was asked for and cannot start is a warning, not a failure: the camera,
+        // the console and the control channel are all still worth having, and "mediad refused to
+        // boot because a model file moved" is a bad trade.
+        let models = detect.models();
+        let detector = if models.is_empty() {
+            tracing::info!("duck detector off ([detect] enabled = false, or no model)");
+            None
+        } else {
+            // The frames on the tee are as the camera took them — unless the pipeline was asked
+            // to flip, in which case they are upright already and the sampler must not turn them
+            // again.
+            let sampler_turn = if args.flip_in_pipeline {
+                duck_detect::Turn::None
+            } else {
+                turn
+            };
+            match mediad::detect::spawn_first(
+                &models,
+                frames.clone(),
+                detect.hz,
+                detect.threshold,
+                sampler_turn,
+            ) {
+                Ok(detector) => Some(detector),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "the duck detector will not start; carrying on without it"
+                    );
+                    None
+                }
+            }
+        };
+
         // What every peer is told about the picture. The geometry is the *encoded* frame — the
         // pipeline does not rotate, so it is the capture geometry — and the rotation is the mount.
         let video = mediad::session::Video {
@@ -295,6 +346,33 @@ fn main() -> ExitCode {
                 let line = mediad::session::video_notification(video);
                 tokio::spawn(async move {
                     let _ = to_peer.send(line).await;
+                });
+            }
+
+            // Detections go to the peer as notifications, on the same channel the console already
+            // reads `robot.state` from — no polling, and one subscription per peer so a slow
+            // consumer cannot hold up the detector.
+            if let Some(detector) = detector.as_ref() {
+                let mut sightings = detector.sightings.subscribe();
+                let to_peer = channel.outbound.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match sightings.recv().await {
+                            Ok(sighting) => {
+                                if to_peer
+                                    .send(mediad::detect::notification(&sighting))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            // Lagged: the peer is slower than the detector, and only the newest
+                            // sighting is worth having. Skipping is what the bounded channel is for.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
                 });
             }
 

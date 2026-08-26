@@ -1,7 +1,8 @@
-//! What this daemon streams, out of the config file `robotd` already reads.
+//! What this daemon streams and what it looks for, out of the config file `robotd` already reads.
 //!
-//! `[media]` in `/etc/robot/robotd.toml` — camera or test pattern, frame size, rate, bitrate. The
-//! schema, the defaults and the validation are `robotd_params`'s, which is the point: the crate
+//! `[media]` in `/etc/robot/robotd.toml` — camera or test pattern, frame size, rate, bitrate — and
+//! `[detect]` beside it, which is this daemon's too because the frames are on this daemon's tee.
+//! The schema, the defaults and the validation are `robotd_params`'s, which is the point: the crate
 //! read here is the one `robotctl configure` writes through, so the editor cannot offer a value
 //! this daemon would not understand.
 //!
@@ -10,14 +11,14 @@
 
 use std::path::{Path, PathBuf};
 
-use robotd_params::{MediaParams, Params};
+use robotd_params::Params;
 
 /// The file, when `--config` said nothing.
 pub fn default_path() -> PathBuf {
     PathBuf::from(robotd_params::DEFAULT_PATH)
 }
 
-/// Read `[media]`, or fall back to the built-in defaults.
+/// Read the file, or fall back to the built-in defaults.
 ///
 /// **A file this daemon cannot read is not a reason to have no video.** `robotd` refuses to start
 /// on a broken params file — that is the loud signal, and it is the daemon whose control loop the
@@ -27,16 +28,16 @@ pub fn default_path() -> PathBuf {
 /// A *missing* file is not even a warning at the default path: an unprovisioned board has none and
 /// streams its camera at 720p30 like every other. A path named on the command line must exist,
 /// which is `Params::load`'s own rule and the reason `explicit` is passed through.
-pub fn load(path: &Path, explicit: bool) -> MediaParams {
+pub fn load(path: &Path, explicit: bool) -> Params {
     match Params::load(path, explicit) {
-        Ok(params) => params.media,
+        Ok(params) => params,
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
                 "unusable params file; streaming the built-in defaults"
             );
-            MediaParams::default()
+            Params::default()
         }
     }
 }
@@ -44,6 +45,7 @@ pub fn load(path: &Path, explicit: bool) -> MediaParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use robotd_params::MediaParams;
 
     fn write(dir: &Path, text: &str) -> PathBuf {
         let path = dir.join("robotd.toml");
@@ -56,7 +58,7 @@ mod tests {
     fn a_quality_in_the_file_is_what_gets_streamed() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "[media]\nquality = \"360p30\"\n");
-        let media = load(&path, true);
+        let media = load(&path, true).media;
         assert_eq!(media.quality.size(), (640, 360));
         assert_eq!(media.quality.fps(), 30);
         assert_eq!(media.bitrate_resolved(), media.quality.default_bitrate());
@@ -67,7 +69,7 @@ mod tests {
     #[test]
     fn a_missing_file_streams_the_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let media = load(&dir.path().join("absent.toml"), false);
+        let media = load(&dir.path().join("absent.toml"), false).media;
         assert_eq!(media.quality, MediaParams::default().quality);
         assert!(media.camera);
     }
@@ -78,7 +80,7 @@ mod tests {
     fn a_broken_file_still_streams() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "[media\nquality = ");
-        let media = load(&path, true);
+        let media = load(&path, true).media;
         assert_eq!(media.quality, MediaParams::default().quality);
         assert!(media.camera);
     }
@@ -93,7 +95,7 @@ mod tests {
             dir.path(),
             "[media]\nquality = \"720p15\"\nchroma_subsampling = \"4:4:4\"\n",
         );
-        let media = load(&path, true);
+        let media = load(&path, true).media;
         assert_eq!(media.quality.fps(), 15);
     }
 }
