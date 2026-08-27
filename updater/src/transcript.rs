@@ -193,6 +193,9 @@ impl Transcript {
                 return Err(Error::NoSuchRun {
                     run: Some(id),
                     available: Self::ids(state_dir),
+                    // Only the "most recent" case needs this; a named run that is missing is
+                    // already answered by the range of the ones that are not.
+                    earlier: 0,
                 });
             }
             Err(source) => return Err(Error::Io { path, source }),
@@ -223,10 +226,21 @@ impl Transcript {
 ///
 /// The runs kept are a contiguous window — ids only count up, and only the oldest are pruned — so
 /// a range says everything a list would and stays one line at any retention.
-pub fn no_such_run(run: Option<u64>, available: &[u64]) -> String {
+pub fn no_such_run(run: Option<u64>, available: &[u64], earlier: usize) -> String {
     let Some(run) = run else {
         // Asked for the most recent and there is none. Not an error about a number they typed.
-        return "no update has recorded a transcript on this board yet".to_owned();
+        return match earlier {
+            0 => "no update has recorded a transcript on this board yet".to_owned(),
+            // The once-per-board case. `update log` is full of updates and this says none
+            // happened, so it has to say which of those two things it means.
+            n => format!(
+                "no transcripts on this board yet. The {n} attempt{} in `robotctl update log` \
+                 ran under an updaterd that did not record them — a release cannot transcribe \
+                 its own installation, because the one before it performs that. The next update \
+                 will have one.",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
     };
     match (available.first(), available.last()) {
         (Some(first), Some(last)) if first == last => {
@@ -347,6 +361,25 @@ mod tests {
         Transcript::begin(dir.path(), 10).unwrap().record(note("x"));
         let message = Transcript::read(dir.path(), 99).unwrap_err().to_string();
         assert!(message.contains("1 to 2"), "{message}");
+    }
+
+    /// The state every board passes through once: a log full of updates, and no transcripts,
+    /// because the release that added them was installed by the release before it.
+    #[test]
+    fn no_transcripts_but_a_log_full_of_updates_says_which_it_means() {
+        let fresh = no_such_run(None, &[], 0);
+        assert_eq!(
+            fresh,
+            "no update has recorded a transcript on this board yet"
+        );
+
+        let upgraded = no_such_run(None, &[], 3);
+        assert!(upgraded.contains("The 3 attempts"), "{upgraded}");
+        assert!(upgraded.contains("next update will have one"), "{upgraded}");
+        // Not "no update has happened", which is what the board is looking at a list of.
+        assert!(!upgraded.contains("no update has"), "{upgraded}");
+
+        assert!(no_such_run(None, &[], 1).contains("The 1 attempt in"));
     }
 
     /// The oldest runs are pruned, and the newest are the ones kept.

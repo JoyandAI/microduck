@@ -182,11 +182,18 @@ pub enum Error {
     /// Carries what it *does* have, because the number was almost certainly a typo or a
     /// guess: a bare "no such run" leaves the caller with nowhere to go next, and the list
     /// is three lines away in the same directory.
-    #[error("{}", crate::transcript::no_such_run(*.run, .available))]
+    #[error("{}", crate::transcript::no_such_run(*.run, .available, *.earlier))]
     NoSuchRun {
         /// `None` when the caller asked for the most recent run and there is none.
         run: Option<u64>,
         available: Vec<u64>,
+        /// Attempts the update log holds with no transcript behind them.
+        ///
+        /// Every board passes through this state exactly once: the release that added
+        /// transcripts cannot have recorded its own installation, because the `updaterd` that
+        /// performed it was the one before. Saying "no update has recorded a transcript" to
+        /// somebody looking at a log full of updates is true and reads as a broken feature.
+        earlier: usize,
     },
 
     #[error("on-disk state is inconsistent: {0}")]

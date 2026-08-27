@@ -524,10 +524,19 @@ impl Engine {
         let mut available = Transcript::ids(&self.config.state_dir);
         let id = match run {
             Some(id) => id,
-            None => *available.last().ok_or(Error::NoSuchRun {
-                run: None,
-                available: Vec::new(),
-            })?,
+            None => match available.last() {
+                Some(id) => *id,
+                None => {
+                    return Err(Error::NoSuchRun {
+                        run: None,
+                        available: Vec::new(),
+                        // What the log holds with nothing behind it, so the message can tell
+                        // "nothing has happened" apart from "this is the first release that
+                        // records what happened".
+                        earlier: self.log(LOG_CAPACITY).map(|log| log.len()).unwrap_or(0),
+                    });
+                }
+            },
         };
 
         let events = Transcript::read(&self.config.state_dir, id)?;
