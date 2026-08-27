@@ -68,19 +68,25 @@
   .hint { margin: .5rem 0 0; font-size: 12px; opacity: .6; }
 
   /* 16/9 is the placeholder, held until the robot says what the video is. The camera is mounted a
-     quarter turn off and nothing on the robot rotates the picture — so this does, on the GPU. */
-  #videobox { display: grid; justify-content: center; line-height: 0; container-type: size;
-              aspect-ratio: 16/9; width: 100%; }
-  #videobox > video { grid-area: 1 / 1; width: 100%; height: 100%; background: #111;
+     quarter turn off and nothing on the robot rotates the picture — so this does, on the GPU.
+
+     **The wrapper is the only box in flow.** A rotated element still takes up its *pre-transform*
+     box, so the turned video — landscape, inside a portrait wrapper — used to be the widest thing in
+     the grid cell and sized it: the wrapper came out landscape, the video fitted its picture back
+     into that with `object-fit: contain`, and anything drawn over the wrapper (the detector's boxes)
+     landed below and wider than the picture it described. Absolutely positioned, the video cannot
+     size anything, and the wrapper is exactly the upright picture. */
+  #videobox { position: relative; width: 100%; max-width: 100%; line-height: 0;
+              container-type: size; aspect-ratio: 16/9; }
+  #videobox > video { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                      width: 100%; height: 100%; background: #111;
                       border-radius: 4px; display: block; touch-action: none; cursor: crosshair; }
-  /* A rotated element still occupies its pre-transform box, so a quarter turn needs the video sized
-     to the *swapped* axes. `100cqh`/`100cqw` are the wrapper's own height and width — exactly that
-     swap, done by the browser, and it survives a resize with no JavaScript. */
-  #videobox > video.turn90, #videobox > video.turn270 { width: 100cqh; height: 100cqw;
-                                                        place-self: center; }
-  #videobox > video.turn90  { transform: rotate(90deg); }
-  #videobox > video.turn270 { transform: rotate(-90deg); }
-  #videobox > video.turn180 { transform: rotate(180deg); }
+  /* `100cqh`/`100cqw` are the wrapper's own height and width — the quarter turn's axis swap, done by
+     the browser, and it survives a resize with no JavaScript. */
+  #videobox > video.turn90, #videobox > video.turn270 { width: 100cqh; height: 100cqw; }
+  #videobox > video.turn90  { transform: translate(-50%, -50%) rotate(90deg); }
+  #videobox > video.turn270 { transform: translate(-50%, -50%) rotate(-90deg); }
+  #videobox > video.turn180 { transform: translate(-50%, -50%) rotate(180deg); }
   .stats { margin-top: .5rem; font: 12px/1.4 ui-monospace, monospace; gap: .75rem; }
   .stats b { font-weight: 600; opacity: .55; font-size: 11px; text-transform: uppercase; }
 
@@ -413,16 +419,8 @@ function newPeerConnection() {
   const fitVideoBox = () => {
     // `onVideoInfo` owns the sizing when the camera is mounted off upright.
     if (mountRotation) return;
-    const element = $("video");
-    const { videoWidth: w, videoHeight: h } = element;
-    if (!w || !h) return;
-    element.style.aspectRatio = `${w} / ${h}`;
-    // Landscape fills the column; portrait is capped by height instead, or `width: 100%` on a
-    // 9:16 stream makes a box nearly twice the column's width tall and pushes everything else
-    // off the screen.
-    const portrait = h > w;
-    element.style.width = portrait ? "auto" : "100%";
-    element.style.height = portrait ? "min(70vh, 80vw)" : "auto";
+    const { videoWidth: w, videoHeight: h } = $("video");
+    sizeVideoBox(w, h);
   };
   $("video").addEventListener("loadedmetadata", fitVideoBox);
   $("video").addEventListener("resize", fitVideoBox);
@@ -819,14 +817,22 @@ function onVideoInfo({ width, height, rotate }) {
 
   const quarter = mountRotation === 90 || mountRotation === 270;
   const [uw, uh] = quarter ? [height, width] : [width, height];
-  const box = $("videobox");
-
-  // Portrait is capped by height so a tall picture cannot push the rest of the page off screen;
-  // landscape fills the column as it always did.
-  box.style.aspectRatio = `${uw} / ${uh}`;
-  box.style.width = uh > uw ? "auto" : "100%";
-  box.style.height = uh > uw ? "min(70vh, 80vw)" : "auto";
+  sizeVideoBox(uw, uh);
   $("video").className = mountRotation ? `turn${mountRotation}` : "";
+}
+
+// The wrapper's size, and the only place it is set. Its **width is always definite** so that
+// `aspect-ratio` can derive the height from it: a block box with `width: auto` fills its column and
+// ignores the ratio entirely, which is how a 9:16 picture used to end up in a 16:9 box. Portrait is
+// capped by height instead of filling the column, or a tall picture pushes the rest of the page off
+// the screen.
+const PORTRAIT_HEIGHT = "min(70vh, 80vw)";
+
+function sizeVideoBox(uw, uh) {
+  if (!uw || !uh) return;
+  const box = $("videobox");
+  box.style.aspectRatio = `${uw} / ${uh}`;
+  box.style.width = uh > uw ? `calc(${PORTRAIT_HEIGHT} * ${uw} / ${uh})` : "100%";
 }
 
 function aim(event) {
