@@ -25,22 +25,22 @@ Wants=robotd.service
 
 [Service]
 Type=exec
-# `--camera`, so a robot streams its camera rather than a test pattern nobody asked for.
+# **No video flags here, on purpose.** What this daemon streams — camera or test pattern, frame
+# size, rate, bitrate — is `[media]` in /etc/robot/robotd.toml, edited with `robotctl configure`
+# and applied by `systemctl restart mediad`.
 #
-# **The consequence, stated because it is not obvious:** the control datachannel is bundled with
-# the video track, so a robot whose camera is absent — unplugged, or the device-tree overlay not
-# enabled — fails to start this service and loses its WebRTC control surface along with its video.
-# BLE and the local pad are unaffected. `--camera` can be dropped through a drop-in for a board
-# with no camera:
+# They were flags on this line. The release installer rewrites this file, so changing one meant a
+# systemd drop-in — `systemctl edit --full` puts the edit exactly where it will be overwritten —
+# and nobody reaches for a drop-in to answer "why is the video soft?". The config file is the one
+# place per-board settings survive an update *and* a rollback (architecture.md §3).
 #
-#     /etc/systemd/system/mediad.service.d/test-pattern.conf
-#     [Service]
-#     ExecStart=
-#     ExecStart=/opt/robot/daemon/current/bin/mediad
-#
-# A drop-in rather than editing this file, because the release installer rewrites this file and
-# `systemctl edit --full` puts the edit exactly where it will be overwritten.
-ExecStart=/opt/robot/daemon/current/bin/mediad --camera
+# **The consequence of the camera being on by default, stated because it is not obvious:** the
+# control datachannel is bundled with the video track, so a robot whose camera is absent —
+# unplugged, or the device-tree overlay not enabled — fails to start this service and loses its
+# WebRTC control surface along with its video. BLE and the local pad are unaffected. The fix on
+# such a board is `camera = false` in `[media]`, which streams a test pattern: the pipeline starts,
+# so the control channel exists.
+ExecStart=/opt/robot/daemon/current/bin/mediad
 
 # Unprivileged, with two supplementary groups and nothing else.
 #
@@ -126,8 +126,8 @@ RuntimeDirectory=mediad
 #     board reaching this state has had both fail, most likely for want of network. The pipeline
 #     cannot start, `Restart=always` retries every five seconds, and re-running it by hand is
 #     `sudo /usr/local/sbin/robot-setup-gstreamer`.
-#   * **A board with no camera**, because `ExecStart` carries `--camera`. Same shape, and the
-#     drop-in above is the fix.
+#   * **A board with no camera**, because `[media] camera` defaults to on. Same shape, and
+#     `sudo robotctl configure` → `media.camera` off is the fix.
 #
 # `WantedBy=multi-user.target` rather than a `.wants` symlink somebody adds: the release owns which
 # units exist and systemd owns whether they are enabled, and a robot whose enablement was done by

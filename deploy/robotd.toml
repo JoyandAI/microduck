@@ -324,3 +324,36 @@ mode = "walk"
 #
 # Needs [audio] on, since a duck with no voice has nothing to sing with.
 # accept = false
+
+[media]
+# What mediad streams: the camera, and at what quality. Read by mediad at startup, so a change
+# here needs `systemctl restart mediad` — not robotd. `robotctl configure` offers the right one.
+#
+# These were flags on mediad.service's ExecStart line, which the release installer rewrites: the
+# only supported way to change one was a systemd drop-in, and nobody reaches for a drop-in to
+# answer "why is the video soft?".
+
+# Stream the head camera. Off streams a test pattern instead, which is what a board with no
+# camera wants — the pipeline still starts, so the WebRTC *control* channel still exists. It is
+# bundled with the video track, so a pipeline that will not start costs both.
+# camera = true
+
+# Frame size and rate, as one name: 1080p30, 720p30, 720p15 or 360p30.
+#
+# One key rather than a width, a height and an fps, because they do not vary independently — a
+# rung the capture path cannot produce is a mediad that will not start, and every rung here is
+# 16:9 so that "smaller" never means "cropped".
+#
+# 720p30 is the rung every measurement in mediad was taken at: 29.3 fps off the ISP main path,
+# with a capture format and a buffer depth that took three bench sessions to find. The sensor is
+# pinned to a 1920x1080 mode that runs at 30 and the ISP scales down from it, so 1080p30 asks for
+# no scaling at all — what is unmeasured is whether the capture path and the encoder hold 30 fps
+# at 2.25x the pixels. A rung that does not hold runs slower rather than failing.
+# quality = "720p30"
+
+# Starting video bitrate, bits per second. Unset follows the quality — 4 Mb/s at 1080p30,
+# 2 Mb/s at 720p30, 1 Mb/s at 720p15, 800 kb/s at 360p30 — which is what almost every robot
+# wants. webrtcsink's congestion control moves from here, so it is a starting point rather than
+# a ceiling. The unit is bits: 2 Mb/s is 2000000, and a value below 100000 is refused as
+# somebody who meant kilobits.
+# bitrate = 2000000

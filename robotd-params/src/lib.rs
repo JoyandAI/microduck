@@ -40,6 +40,152 @@ pub struct Params {
     pub audio: AudioParams,
     pub theremin: ThereminParams,
     pub chorale: ChoraleParams,
+    pub media: MediaParams,
+}
+
+/// The one video mode a robot streams in, as a name rather than four numbers.
+///
+/// **Frame size, rate and a matching bitrate move together or not at all.** They are not
+/// independent settings: 1080p at the 2 Mb/s that suits 720p is a smear, and 720p at 6 Mb/s
+/// spends a link's headroom on nothing. Offering `width`, `height`, `fps` and `bitrate` as four
+/// keys would make every wrong combination of them expressible — including the ones the capture
+/// path cannot produce at all, and a pipeline that will not start costs the WebRTC *control*
+/// channel along with the video, because the two are bundled (`remote-webrtc.md`).
+///
+/// So the ladder is fixed, and every rung is 16:9 — the sensor's own aspect. A mode that changed
+/// the shape of the picture would be cropping or squashing rather than lowering quality, which is
+/// not what anybody picking "smaller" is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Quality {
+    /// The sensor's full frame. The most detail, and the rung least likely to hold 30 fps on
+    /// this ISP path — [`MediaParams`] says what is measured and what is not.
+    #[serde(rename = "1080p30")]
+    Q1080p30,
+    /// What every measurement in `mediad` was taken at, and the default.
+    #[default]
+    #[serde(rename = "720p30")]
+    Q720p30,
+    /// Same picture, half the frames: the rung for a link that cannot carry 30.
+    #[serde(rename = "720p15")]
+    Q720p15,
+    /// Small and cheap, for a bad link or a busy CPU.
+    #[serde(rename = "360p30")]
+    Q360p30,
+}
+
+/// Every mode, in the order an editor cycles them — and the strings the file uses.
+///
+/// One list, so the registry's choices, the file's values and [`Quality`] itself cannot disagree;
+/// [`tests::every_quality_label_round_trips`] pins it to the enum in both directions.
+pub const QUALITY_LABELS: &[&str] = &["1080p30", "720p30", "720p15", "360p30"];
+
+impl Quality {
+    /// The modes, in [`QUALITY_LABELS`] order.
+    pub const ALL: [Quality; 4] = [
+        Quality::Q1080p30,
+        Quality::Q720p30,
+        Quality::Q720p15,
+        Quality::Q360p30,
+    ];
+
+    /// The name this mode has in the file.
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::Q1080p30 => "1080p30",
+            Quality::Q720p30 => "720p30",
+            Quality::Q720p15 => "720p15",
+            Quality::Q360p30 => "360p30",
+        }
+    }
+
+    /// Frame size in pixels. Every rung is 16:9 and every dimension is a multiple of 8, which
+    /// is what the ISP's scaler and the encoder's macroblocks both want.
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            Quality::Q1080p30 => (1920, 1080),
+            Quality::Q720p30 | Quality::Q720p15 => (1280, 720),
+            Quality::Q360p30 => (640, 360),
+        }
+    }
+
+    pub fn width(self) -> u32 {
+        self.size().0
+    }
+
+    pub fn height(self) -> u32 {
+        self.size().1
+    }
+
+    pub fn fps(self) -> u32 {
+        match self {
+            Quality::Q720p15 => 15,
+            _ => 30,
+        }
+    }
+
+    /// What this mode streams at when `[media] bitrate` is unset — bits per second.
+    ///
+    /// Scaled with the pixel rate rather than picked per rung: 720p30 is the measured 2 Mb/s
+    /// `mediad` has always used, and the others are that number times their share of the pixels
+    /// per second, rounded to something a human can read. Congestion control moves from here, so
+    /// this is a starting point rather than a cap.
+    pub fn default_bitrate(self) -> u32 {
+        match self {
+            Quality::Q1080p30 => 4_000_000,
+            Quality::Q720p30 => 2_000_000,
+            Quality::Q720p15 => 1_000_000,
+            Quality::Q360p30 => 800_000,
+        }
+    }
+}
+
+/// `[media]` — what `mediad` streams.
+///
+/// **These were command-line flags in `mediad.service`, and that is why this section exists.**
+/// The release installer rewrites that unit file, so the only supported way to change a flag was
+/// a systemd drop-in — a mechanism nobody reaches for to answer "why is the video soft?". Here
+/// they are three keys in the file `robotctl configure` already edits.
+///
+/// `mediad` reads this file at startup and nothing else does anything to it, so a change needs
+/// `systemctl restart mediad` — not `robotd`. The editor offers the right one.
+///
+/// **What is measured and what is not.** 720p30 is the rung every number in `mediad::pipeline`
+/// comes from: 29.3 fps off the ISP main path, with the capture format and buffer depth that took
+/// three bench sessions to find. The sensor is pinned to a 1920x1080 mode that runs at 30 and the
+/// ISP scales down from it, so 1080p30 asks for no scaling at all — what is unmeasured there is
+/// whether the capture path and the encoder hold 30 fps at 2.25x the pixels. A rung that does not
+/// hold runs slower; it is not a pipeline that fails to start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MediaParams {
+    /// Stream the head camera. `false` streams a test pattern instead, which is what a board
+    /// with no camera wants: the pipeline starts, so the WebRTC control channel exists.
+    pub camera: bool,
+    /// Frame size and rate, as one name. [`Quality`] says why it is one key and not four.
+    pub quality: Quality,
+    /// Starting video bitrate, bits per second. Unset follows the quality —
+    /// [`Quality::default_bitrate`] — which is what almost every robot wants.
+    pub bitrate: Option<u32>,
+}
+
+impl Default for MediaParams {
+    fn default() -> Self {
+        Self {
+            // On, because a robot with a camera is the case, and a board without one shows a
+            // test pattern rather than nothing only if somebody turns this off.
+            camera: true,
+            quality: Quality::default(),
+            bitrate: None,
+        }
+    }
+}
+
+impl MediaParams {
+    /// The bitrate the daemon will actually start at.
+    pub fn bitrate_resolved(&self) -> u32 {
+        self.bitrate
+            .unwrap_or_else(|| self.quality.default_bitrate())
+    }
 }
 
 /// `[chorale]` — several ducks singing one piece.
@@ -609,7 +755,26 @@ pub enum ParamsError {
     },
     #[error("{path}: control.hz must be between 1 and 1000, got {got}")]
     Rate { path: String, got: u32 },
+    #[error(
+        "{path}: media.bitrate must be between {min} and {max} bits per second, got {got} — \
+         the unit is bits, so 2 Mb/s is 2000000"
+    )]
+    Bitrate {
+        path: String,
+        got: u32,
+        min: u32,
+        max: u32,
+    },
 }
+
+/// The band `media.bitrate` is accepted in, bits per second.
+///
+/// The floor is not taste: it is where a typo lands. `bitrate = 2000` is somebody who meant
+/// kilobits, and 2 kb/s is a stream that never produces a picture — far better refused at the
+/// editor than debugged off a board. The ceiling is what the link and the VPU are for; above it
+/// the encoder is being asked for something no robot's wifi will carry.
+pub const BITRATE_MIN: u32 = 100_000;
+pub const BITRATE_MAX: u32 = 20_000_000;
 
 impl Params {
     /// Load from `path`. A missing file at the *default* location is not an error — an
@@ -674,6 +839,18 @@ impl Params {
             return Err(ParamsError::Rate {
                 path: path.display().to_string(),
                 got: self.control.hz,
+            });
+        }
+        // Checked here rather than in `mediad`, so `robotctl configure` refuses to write it:
+        // the daemon that would choke on this one is not the daemon whose gate the editor runs.
+        if let Some(bitrate) = self.media.bitrate
+            && !(BITRATE_MIN..=BITRATE_MAX).contains(&bitrate)
+        {
+            return Err(ParamsError::Bitrate {
+                path: path.display().to_string(),
+                got: bitrate,
+                min: BITRATE_MIN,
+                max: BITRATE_MAX,
             });
         }
         Ok(())
@@ -807,6 +984,59 @@ mod tests {
         assert_eq!(p.update_gate.stall_periods, 25);
     }
 
+    /// [`QUALITY_LABELS`] is what the registry offers and what the file may contain, and
+    /// [`Quality::ALL`] is what the daemon can do — a rung in one and not the other is either a
+    /// choice the editor writes and `mediad` cannot read, or a mode nobody can select.
+    #[test]
+    fn every_quality_label_round_trips() {
+        assert_eq!(QUALITY_LABELS.len(), Quality::ALL.len());
+        for (label, quality) in QUALITY_LABELS.iter().zip(Quality::ALL) {
+            assert_eq!(*label, quality.label());
+            let parsed: Params =
+                toml::from_str(&format!("[media]\nquality = \"{label}\"\n")).expect("parses");
+            assert_eq!(parsed.media.quality, quality);
+        }
+    }
+
+    /// The starting bitrate follows the picture unless somebody says otherwise — the whole
+    /// reason `bitrate` is optional rather than a number to keep in step by hand.
+    #[test]
+    fn an_unset_bitrate_follows_the_quality() {
+        let mut media = MediaParams::default();
+        for quality in Quality::ALL {
+            media.quality = quality;
+            assert_eq!(media.bitrate_resolved(), quality.default_bitrate());
+        }
+        media.bitrate = Some(3_000_000);
+        assert_eq!(media.bitrate_resolved(), 3_000_000);
+    }
+
+    /// A bitrate in the wrong unit is the mistake this band exists to catch: `2000` is somebody
+    /// who meant kilobits, and it would produce a stream with no picture in it.
+    #[test]
+    fn a_bitrate_in_kilobits_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[media]\nbitrate = 2000\n");
+        assert!(Params::load(&path, true).is_err());
+        let path = write(dir.path(), "[media]\nbitrate = 2000000\n");
+        assert_eq!(
+            Params::load(&path, true).unwrap().media.bitrate_resolved(),
+            2_000_000
+        );
+    }
+
+    /// Today's shipped behaviour, pinned: a robot with no `[media]` section streams its camera
+    /// at exactly what `mediad`'s flags used to default to. This section changed where those
+    /// numbers live and must not have changed the numbers.
+    #[test]
+    fn the_defaults_are_what_mediad_streamed_before_the_section_existed() {
+        let media = Params::default().media;
+        assert!(media.camera, "mediad.service carried --camera");
+        assert_eq!(media.quality.size(), (1280, 720));
+        assert_eq!(media.quality.fps(), 30);
+        assert_eq!(media.bitrate_resolved(), 2_000_000);
+    }
+
     /// The shipped example must agree with the built-in defaults, or the file documents a
     /// robot that does not exist — and an operator reading it would draw wrong conclusions
     /// about what their board is actually doing.
@@ -837,6 +1067,12 @@ mod tests {
         assert_eq!(
             from_file.update_gate.max_consecutive_errors,
             built_in.update_gate.max_consecutive_errors
+        );
+        assert_eq!(from_file.media.camera, built_in.media.camera);
+        assert_eq!(from_file.media.quality, built_in.media.quality);
+        assert_eq!(
+            from_file.media.bitrate_resolved(),
+            built_in.media.bitrate_resolved()
         );
     }
 

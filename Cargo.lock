@@ -2394,6 +2394,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "gstreamer-webrtc",
+ "robotd-params",
  "serde_json",
  "tempfile",
  "tokio",

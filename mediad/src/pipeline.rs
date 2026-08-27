@@ -906,7 +906,7 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
 /// This shells out to `media-ctl` once at startup, because the switch is a subdev ioctl on an
 /// entity whose name embeds its I2C bus and address (`m00_b_imx219 2-0010`) and therefore has to
 /// be discovered from the topology rather than named. Doing it here rather than in the unit means
-/// a `--camera`-less run needs no camera at all.
+/// a run with `[media] camera` off needs no camera at all.
 fn pin_sensor_mode(fps: u32) -> Result<()> {
     let (media, entity) = find_sensor()?;
 

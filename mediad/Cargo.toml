@@ -17,6 +17,10 @@ description = "Camera, mic, WebRTC — and the remote gateway"
 
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# `[media]` in /etc/robot/robotd.toml — what this daemon streams. The same crate `robotd` parses
+# that file with and the same one `robotctl configure` edits it through, so the schema, the
+# defaults and the editor cannot drift from what is read here.
+robotd-params = { path = "../robotd-params" }
 anyhow = "1"
 # The console's one route. Already in `Cargo.lock` — `updater` uses it for its test mirror — so it
 # is known-good against this toolchain and the cross build. The alternative was a hand-rolled
@@ -56,6 +60,8 @@ gstreamer-video = { version = "0.24", features = ["v1_22"] }
 glib = "0.21"
 
 [dev-dependencies]
+# `[media]` from a real file on disk, which is how `config::load`'s fall-back-to-defaults rule is
+# tested without a board.
 # `every_call()`, so this crate's exhaustive-match tests use the same list every other
 # transport's do rather than growing a third copy of it.
 duck-ipc-proto = { path = "../duck-ipc-proto", features = ["test-support"] }

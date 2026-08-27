@@ -86,6 +86,30 @@ which is why several of these questions were answered the slow way.
 
 What is still untested: anything at all through a bridge.
 
+### Picking a quality, and why it is one setting rather than four
+
+What the stream is — camera or test pattern, frame size, rate, bitrate — is `[media]` in
+`/etc/robot/robotd.toml`, the per-board config file `robotd` already reads. `sudo robotctl
+configure` edits it and offers the `systemctl restart mediad` it needs; `mediad` reads it once at
+startup, like every other daemon here reads its config.
+
+**One `quality` key naming a rung — `1080p30`, `720p30`, `720p15`, `360p30` — rather than a width,
+a height and an fps.** Those three do not vary independently: a combination the capture path
+cannot produce is a pipeline that does not start, and that costs the *control* channel along with
+the video, because the datachannel is bundled with the video track (§2). Every rung is 16:9, the
+sensor's own aspect, so "smaller" never quietly means "cropped". `bitrate` is the one number that
+can still be set on its own, and left unset it follows the rung — 2 Mb/s at 720p30, the rate every
+measurement above was taken at.
+
+The numbers were `ExecStart` flags in `mediad.service` until the section existed. The release
+installer rewrites that unit file, so changing one meant a systemd drop-in — a mechanism for a
+board that is *wired* differently, not for someone asking why the picture is soft.
+
+**720p30 is the only measured rung.** The sensor is pinned to a 1920x1080 mode that runs at 30 and
+the ISP scales down from it, so 1080p30 asks for no scaling at all; what nobody has measured is
+whether the capture path and the encoder hold 30 fps at 2.25x the pixels of the table above. A
+rung that does not hold runs slower — it is not a failure to start.
+
 ## 1. What this is not
 
 `webrtcbin` is not used. `mediad` uses **`webrtcsink`** from `gst-plugins-rs`, and the difference

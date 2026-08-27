@@ -763,14 +763,16 @@ install_units() {
     # says `After=` them. It is safe to have running with nobody connected — `webrtcsink` listens
     # and the pipeline sits at PLAYING.
     #
-    # Allowed to fail like btd and padd, and for a sharper reason than either: `ExecStart` carries
-    # `--camera`, and it needs the GStreamer stack `setup-gstreamer.sh` installs. A board missing
-    # either has no WebRTC gateway and is still a robot that updates, walks and pairs.
+    # Allowed to fail like btd and padd, and for a sharper reason than either: it streams the
+    # camera by default (`[media] camera` in robotd.toml) and it needs the GStreamer stack
+    # `setup-gstreamer.sh` installs. A board missing either has no WebRTC gateway and is still a
+    # robot that updates, walks and pairs.
     if [ -f "${UNIT_DIR}/mediad.service" ]; then
         enable_unit mediad.service || warn "mediad did not start; check:
     journalctl -u mediad -b
   A board with no camera, or provisioned before the GStreamer stack existed, is the usual cause:
-    sudo /usr/local/sbin/robot-setup-gstreamer
+    sudo /usr/local/sbin/robot-setup-gstreamer          # the stack
+    sudo robotctl configure                             # [media] camera off, for no camera
   The robot works without it — only the camera and the WebRTC console are unavailable."
     fi
 
