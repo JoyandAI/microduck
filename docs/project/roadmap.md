@@ -75,9 +75,9 @@ there, and a trusted key only counts as a dev key if its filename ends `.dev.pub
 over the network, and a customer-robot config refused the same build.
 
 **One thing it left open, now decided:** a private repo's release assets are reachable with a
-token and a customer robot has none, so until this week robots in the field could not download
-anything. **The repository goes public**, which resolves it and changes no code — the API path
-the engine uses works for public repos too
+token and a customer robot has none, so while this repository is private robots in the field
+cannot download anything. **The decision is to publish it**, which resolves that and changes no
+code — the API path the engine uses works for public repos too
 ([`updater-design.md`](../design/updater-design.md) §6.1).
 
 ### M3 — `robotd` for real · **done**, in two slices
@@ -163,9 +163,8 @@ frame and send an intent in a few dozen lines.
 
 ### M6 — Ship readiness
 
-What a stranger needs. Preorders are open and shipping is a few months out, so this is ordered
-by **lead time** rather than by difficulty — the items with the least code have the longest
-lead.
+What a stranger needs. Preorders are open, so this is ordered by **lead time** rather than by
+difficulty — the items with the least code have the longest lead.
 
 - **The pairing PIN.** BLE pairing security rests on a per-robot PIN; the factory default is
   `000000` and public in this repository, so out of the box pairing proves physical presence and
@@ -186,11 +185,11 @@ lead.
   `hello`, authenticate, `system.info` with `--require-pairing` on, on a real iPhone and a real
   Android — because §5.5 is currently a fact about CoreBluetooth on a laptop.
 
-One item left M6 by being decided: where a customer robot downloads from. The repository goes
-public, so a shipped robot reaches its releases with no token and no second host. The follow-up
-it leaves is a budget rather than a blocker — anonymous GitHub API requests are capped at 60 an
-hour per IP, which one duck is nowhere near and a room of twenty on one wifi is not
-(§6.1).
+One item left M6 by being decided: where a customer robot downloads from. The decision is to
+publish this repository, so a shipped robot reaches its releases with no token and no second
+host. The follow-up it leaves is a budget rather than a blocker — anonymous GitHub API requests
+are capped at 60 an hour per IP, which one duck is nowhere near and a room of twenty on one wifi
+is not (§6.1).
 
 **Done when:** a non-developer updates the robot from the phone, and a deliberately bricked
 release recovers without a laptop.
@@ -234,9 +233,9 @@ something that names the part at fault, or says the hardware is fine.
 Today every policy ships **inside the daemon artifact** — `robotd` loads
 `.../current/policies/alpha_walking.onnx` and friends — so a new gait needs a daemon release,
 and a policy trained on a laptop reaches a duck only through CI or a sideload of the whole
-daemon. The point of this milestone is that a policy trained in
-[`microduck_rl`](https://github.com/pollen-robotics/microduck_rl) can be published, installed,
-tried and rolled back on its own version line.
+daemon. The point of this milestone is that a policy trained in `microduck_rl` — the training
+repository, which is private — can be published, installed, tried and rolled back on its own
+version line.
 
 **The engine was designed for that arrangement and most of it is already built:**
 
@@ -369,9 +368,9 @@ The numbers above are identifiers. This is the order.
    process rather than code (M6).
 4. **Privacy** — consent is M5 and unblocked; the indicator is a hardware question and should be
    asked as one.
-5. ~~**Where a customer robot downloads from**~~ — **decided 2026-08-26:** the repository goes
-   public. §6.1 keeps the options and the reasoning, because they are the fallback if the source
-   ever has to close again.
+5. ~~**Where a customer robot downloads from**~~ — **decided 2026-08-26:** publish this
+   repository, and a robot downloads from it directly. §6.1 keeps the other options and the
+   reasoning, because they are the fallback if the source ever has to close again.
 6. **Whether policies leave the daemon artifact** — **leaning yes**, not settled. They leave, a
    missing model reports `degraded` rather than unhealthy so the gate commits, and provisioning
    installs the bootstrap set. M8 says what the alternative buys if this turns out fragile.

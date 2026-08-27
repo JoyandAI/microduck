@@ -471,12 +471,12 @@ done only when genuinely needed, never unconditionally on every update.
 - CI side: `cargo-dist` can build and publish signed artifacts to GitHub
   Releases; we host manifests as additional assets.
 
-### 6.1 A private repository cannot serve the fleet — so this one goes public
+### 6.1 A private repository cannot serve the fleet — so this one does not stay private
 
-**Decided (2026-08-26): `pollen-robotics/microduck` becomes public.** Until it does, a robot
-in the field cannot download anything, and the reason is worth keeping because it is not
-obvious: a private repo's `releases/download/<tag>/<asset>` URL returns **404 with or without
-a token**. Verified directly:
+**Decided (2026-08-26): publish `pollen-robotics/microduck`.** While it is private a robot in
+the field cannot download anything, and the reason is worth keeping because it is not obvious:
+a private repo's `releases/download/<tag>/<asset>` URL returns **404 with or without a token**.
+Verified directly:
 
 | URL | private repo |
 |---|---|
