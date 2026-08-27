@@ -77,7 +77,7 @@ impl Backend {
         let rknn = path.extension().is_some_and(|ext| ext == "rknn");
         if rknn {
             let model = duck_detect::rknn::Model::open(path)?;
-            tracing::warn!(
+            tracing::info!(
                 model = %path.display(),
                 api = %model.api_version,
                 driver = %model.driver_version,
@@ -86,7 +86,7 @@ impl Backend {
             Ok(Self::Npu(model))
         } else {
             let model = duck_detect::onnx::Model::open(path)?;
-            tracing::warn!(
+            tracing::info!(
                 model = %path.display(),
                 "duck detector on the cpu — an .onnx model, or an .rknn the npu would not take"
             );
@@ -180,6 +180,7 @@ pub fn spawn(
             let mut ticks = 0u64;
             let mut starved = 0u64;
             let mut took_ms = 0.0f64;
+            let (mut reported_looks, mut reported_seen) = (0u64, 0u64);
 
             loop {
                 // Paced from the deadline rather than by sleeping a period after the work, so a
@@ -201,15 +202,23 @@ pub fn spawn(
 
                 ticks += 1;
                 if ticks >= REPORT_LOOKS {
+                    // **Every count on this line is since the last one.** A heartbeat answers "is
+                    // it seeing a duck *now*", and a cumulative `seen` cannot: one found twenty
+                    // minutes ago and one found this second both read `seen=1`, for ever. The
+                    // totals are on the end, named as totals, for the different question of how
+                    // long this detector has been up.
                     let (looked, found) =
                         (looks.load(Ordering::Relaxed), seen.load(Ordering::Relaxed));
                     tracing::info!(
-                        looks = looked,
-                        seen = found,
+                        looks = looked - reported_looks,
+                        seen = found - reported_seen,
                         starved,
                         took_ms = format!("{took_ms:.1}"),
+                        total_looks = looked,
+                        total_seen = found,
                         "duck detector"
                     );
+                    (reported_looks, reported_seen) = (looked, found);
                     ticks = 0;
                     starved = 0;
                 }
