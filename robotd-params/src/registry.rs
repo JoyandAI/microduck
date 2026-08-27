@@ -375,6 +375,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::OptionalInteger,
         "Starting video bitrate, bits/s — unset follows the quality",
     ),
+    entry(
+        "media.congestion_control",
+        Kind::Choice(crate::CONGESTION_LABELS),
+        "Adapt the send rate to the link — disabled costs adaptivity and saves a core's worth",
+    ),
 ];
 
 /// The registry entry for a key, if it is one.

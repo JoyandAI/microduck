@@ -141,6 +141,11 @@ offers. `media.camera` off streams a test pattern instead, which is what a board
 wants: the WebRTC *control* channel rides on the video track, so a pipeline that cannot start
 costs both. `media.bitrate` follows the quality unless you set it; the unit is bits per second.
 
+`media.congestion_control` is the other knob in that section, and it is the one that moves CPU:
+`disabled` drops the bandwidth estimator, which is the largest single consumer in `mediad` (7.6% of
+a core against capture's 0.3%), and makes `media.bitrate` the rate rather than a starting point. It
+costs adaptivity — on a link that degrades, the picture stalls instead of the rate falling.
+
 720p30 is the rung the pipeline was measured at; a rung that does not hold runs slower rather
 than failing. `robotctl monitor` reports the achieved rate on the bottom border, in yellow with
 `of <target>` beside it when it is under 90% of what was asked for. What was applied:

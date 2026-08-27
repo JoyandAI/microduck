@@ -105,6 +105,36 @@ The numbers were `ExecStart` flags in `mediad.service` until the section existed
 installer rewrites that unit file, so changing one meant a systemd drop-in — a mechanism for a
 board that is *wired* differently, not for someone asking why the picture is soft.
 
+### Congestion control is a CPU setting too
+
+`[media] congestion_control` — `gcc`, `homegrown` or `disabled` — is `webrtcsink`'s own
+`congestion-control` property, set rather than inherited. `gcc` is the element's default, so naming
+it changes nothing; what it buys is that the day upstream changes that default is not the day every
+robot's send rate changes with it.
+
+**It is the largest single CPU consumer in the process.** Per-thread, with one peer connected on
+the board:
+
+| thread | %CPU (of one core) |
+|---|---|
+| `rtpgccbwe1:src` | 7.6 |
+| `queue1:src` | 6.0 |
+| `mpph264enc2:src` | 5.0 |
+| … | |
+| `v4l2src0:src` | **0.3** |
+| `queue3:src` (the raw tee branch) | **0.3** |
+
+~25% of one core in total, and the shape of it is the point: capture and the raw-branch frame copy
+— the only two things that scale with *pixels* — are 0.6% between them. Everything else is packet
+work, which scales with bitrate. That is why picking a smaller rung does not lower CPU: on a link
+that never saturates, the estimator ramps a 360p stream to about the bitrate the 720p one was
+using, and spends it on quality per pixel instead.
+
+`disabled` deletes the `rtpgccbwe` thread. It costs adaptivity, which is the whole reason
+`webrtcsink` is handed raw video rather than pre-encoded H.264 (§1) — on a degrading link it is
+what keeps a picture instead of a stall. It also makes `bitrate` mean what it says: nothing moves
+it, so it is the rate rather than a starting point.
+
 **720p30 is the only measured rung.** The sensor is pinned to a 1920x1080 mode that runs at 30 and
 the ISP scales down from it, so 1080p30 asks for no scaling at all; what nobody has measured is
 whether the capture path and the encoder hold 30 fps at 2.25x the pixels of the table above. A

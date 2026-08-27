@@ -140,6 +140,7 @@ fn main() -> ExitCode {
         height = media.quality.height(),
         fps = media.quality.fps(),
         bitrate = media.bitrate_resolved(),
+        congestion_control = media.congestion_control.nick(),
         "streaming"
     );
 
@@ -205,6 +206,7 @@ fn main() -> ExitCode {
             host: args.host.clone(),
             port: args.port,
             bitrate: media.bitrate_resolved(),
+            congestion_control: media.congestion_control,
             width: media.quality.width(),
             height: media.quality.height(),
             fps: media.quality.fps(),

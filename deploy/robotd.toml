@@ -357,3 +357,21 @@ mode = "walk"
 # a ceiling. The unit is bits: 2 Mb/s is 2000000, and a value below 100000 is refused as
 # somebody who meant kilobits.
 # bitrate = 2000000
+
+# Whether the send rate adapts to the link, and by what: gcc, homegrown or disabled.
+#
+# **A CPU setting as much as a network one.** The estimator is the largest single consumer in
+# mediad: with one peer connected, `rtpgccbwe` measures 7.6% of a core against v4l2src's 0.3% —
+# it works per packet, where capture works per DMABuf handle. `disabled` deletes that thread.
+#
+# What that costs is adaptivity, and it is not small: adapting the rate to the link is the whole
+# reason webrtcsink is handed raw video rather than pre-encoded H.264. On a link that stays good —
+# a robot one hop away on its own LAN — the estimator spends CPU discovering a ceiling it never
+# hits. On a link that degrades, it is what keeps a picture instead of a stall.
+#
+# `disabled` is also what makes `bitrate` above mean what it says: nothing moves it, so it is the
+# rate rather than a starting point. `homegrown` is webrtcsink's own sender-side heuristic —
+# cheaper than gcc, blunter than it.
+#
+# gcc is webrtcsink's own default, so this line changes nothing; it is here to be found.
+# congestion_control = "gcc"

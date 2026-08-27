@@ -139,6 +139,59 @@ impl Quality {
     }
 }
 
+/// How `mediad` decides what bitrate to actually send at.
+///
+/// **This is a CPU setting as much as a network one.** The estimator is not free: on the board,
+/// with one peer connected, `rtpgccbwe` is the single largest consumer in the process — 7.6% of a
+/// core against `v4l2src`'s 0.3% — because it works per packet while capture works per DMABuf
+/// handle. Turning it off deletes that thread.
+///
+/// What it costs is adaptivity, and that is not a small thing: adapting the rate to the link is
+/// the whole reason `webrtcsink` is handed raw video rather than pre-encoded H.264
+/// (`mediad::pipeline`). On a link that stays good — a robot one hop away on its own LAN — the
+/// estimator spends CPU discovering a ceiling it will never hit. On a link that degrades, it is
+/// what keeps a picture rather than a stall.
+///
+/// **It also decides what `bitrate` means.** With an estimator running, `bitrate` is a starting
+/// point it ramps away from within seconds. Disabled, nothing moves it, and `bitrate` is the rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CongestionControl {
+    /// Nothing adapts. `bitrate` is exactly what is sent, and a link that degrades degrades the
+    /// picture rather than the rate.
+    Disabled,
+    /// `webrtcsink`'s own sender-side heuristic. Cheaper than the estimator, blunter than it.
+    Homegrown,
+    /// Google Congestion Control, and `webrtcsink`'s own default — so this is what every robot has
+    /// been running, and naming it here changes nothing.
+    #[default]
+    Gcc,
+}
+
+/// Every mode, in the order an editor cycles them.
+///
+/// These are `webrtcsink`'s own property nicknames rather than names of ours: they are what gets
+/// set on the element, and a second vocabulary in between would be one more thing to get wrong.
+/// Note `gcc`, not `googcc` — [`tests::every_congestion_label_round_trips`] pins the spelling.
+pub const CONGESTION_LABELS: &[&str] = &["disabled", "homegrown", "gcc"];
+
+impl CongestionControl {
+    pub const ALL: [CongestionControl; 3] = [
+        CongestionControl::Disabled,
+        CongestionControl::Homegrown,
+        CongestionControl::Gcc,
+    ];
+
+    /// The `congestion-control` nickname `webrtcsink` knows this by.
+    pub fn nick(self) -> &'static str {
+        match self {
+            CongestionControl::Disabled => "disabled",
+            CongestionControl::Homegrown => "homegrown",
+            CongestionControl::Gcc => "gcc",
+        }
+    }
+}
+
 /// `[media]` — what `mediad` streams.
 ///
 /// **These were command-line flags in `mediad.service`, and that is why this section exists.**
@@ -165,7 +218,13 @@ pub struct MediaParams {
     pub quality: Quality,
     /// Starting video bitrate, bits per second. Unset follows the quality —
     /// [`Quality::default_bitrate`] — which is what almost every robot wants.
+    ///
+    /// A *starting* point unless `congestion_control` is `disabled`, which is the one setting that
+    /// makes this the rate.
     pub bitrate: Option<u32>,
+    /// Whether the send rate adapts to the link, and by what. [`CongestionControl`] has the
+    /// trade — it is the largest single CPU consumer in this process.
+    pub congestion_control: CongestionControl,
 }
 
 impl Default for MediaParams {
@@ -176,6 +235,10 @@ impl Default for MediaParams {
             camera: true,
             quality: Quality::default(),
             bitrate: None,
+            // `webrtcsink`'s own default, named rather than inherited: what the element defaults
+            // to is a fact about a plugin we ship from a pinned release, and the day it changes
+            // should not be the day every robot's send rate changes with it.
+            congestion_control: CongestionControl::default(),
         }
     }
 }
@@ -998,6 +1061,27 @@ mod tests {
         }
     }
 
+    /// The labels are `webrtcsink`'s own property nicknames — the strings that get set on the
+    /// element. `gcc`, not `googcc`: a nickname this file spelled its own way would be a config
+    /// key that parses, validates, saves, and then silently leaves the element on its default.
+    #[test]
+    fn every_congestion_label_round_trips() {
+        assert_eq!(CONGESTION_LABELS.len(), CongestionControl::ALL.len());
+        for (label, mode) in CONGESTION_LABELS.iter().zip(CongestionControl::ALL) {
+            assert_eq!(*label, mode.nick());
+            let parsed: Params =
+                toml::from_str(&format!("[media]\ncongestion_control = \"{label}\"\n"))
+                    .expect("parses");
+            assert_eq!(parsed.media.congestion_control, mode);
+        }
+        // `gcc` is webrtcsink's own default, so a robot with no key set must land there — naming
+        // it must not change what every robot has been running.
+        assert_eq!(
+            MediaParams::default().congestion_control,
+            CongestionControl::Gcc
+        );
+    }
+
     /// The starting bitrate follows the picture unless somebody says otherwise — the whole
     /// reason `bitrate` is optional rather than a number to keep in step by hand.
     #[test]
@@ -1073,6 +1157,10 @@ mod tests {
         assert_eq!(
             from_file.media.bitrate_resolved(),
             built_in.media.bitrate_resolved()
+        );
+        assert_eq!(
+            from_file.media.congestion_control,
+            built_in.media.congestion_control
         );
     }
 

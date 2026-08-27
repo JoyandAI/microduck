@@ -167,8 +167,12 @@ pub struct Settings {
     pub host: String,
     /// The signalling server's port, which is *not* the console's: [`crate::web`] owns that one.
     pub port: u32,
-    /// Starting video bitrate, bits per second. Congestion control moves it from here.
+    /// Starting video bitrate, bits per second. Congestion control moves it from here — unless
+    /// it is `disabled`, which is what makes this the rate rather than a starting point.
     pub bitrate: u32,
+    /// Whether the send rate adapts to the link, and by what. `robotd_params::CongestionControl`
+    /// has the trade, and it is a CPU one as much as a network one.
+    pub congestion_control: robotd_params::CongestionControl,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -251,6 +255,7 @@ pub fn start(
     let &Settings {
         port,
         bitrate,
+        congestion_control,
         width,
         height,
         fps,
@@ -431,8 +436,11 @@ pub fn start(
 
     // The starting bitrate. `webrtcsink` moves it from here as congestion control learns the
     // link — which is the whole point of letting it own the encoder, so this is a starting
-    // point rather than the setting it was when we encoded ourselves.
+    // point rather than the setting it was when we encoded ourselves. Unless the estimator is
+    // off, and then nothing moves it and this is the rate.
     sink.set_property("start-bitrate", bitrate);
+
+    set_congestion_control(&sink, congestion_control);
 
     // The encoder settings, applied through the hook that exists for it.
     //
@@ -1004,6 +1012,41 @@ fn find_sensor() -> Result<(String, String)> {
         "read {nodes} media device(s) and none has an imx219 entity. The overlay loaded something, \
          so DUCK_CAMERA_OVERLAY may name the wrong module for this camera."
     )
+}
+
+/// Tell `webrtcsink` whether to adapt the send rate to the link, and by what.
+///
+/// **Set rather than inherited.** `gcc` is the element's own default, so naming it changes nothing
+/// today — which is the point: what a plugin we ship from a pinned release defaults to is not a
+/// decision this robot should discover it inherited on the day upstream changes it.
+///
+/// **And set defensively, because this is the one value in this function that comes from a config
+/// file rather than a literal.** `set_property_from_str` panics both on a property the element
+/// lacks and on a nickname its enum does not know, and a panic here is a daemon that will not
+/// start — costing the video *and* the control channel to gain a setting. So the property is
+/// looked up and the nickname resolved through the enum's own class; either failing leaves the
+/// element on its default and says so, which is a far better failure than no robot at all. Same
+/// reasoning as the `meta` property above.
+fn set_congestion_control(sink: &gst::Element, mode: robotd_params::CongestionControl) {
+    let Some(pspec) = sink.find_property("congestion-control") else {
+        tracing::warn!(
+            "webrtcsink has no congestion-control property on these plugins, so the send rate \
+             adapts however this build defaults. Everything else is unaffected."
+        );
+        return;
+    };
+    let Some(value) = glib::EnumClass::with_type(pspec.value_type())
+        .and_then(|class| class.to_value_by_nick(mode.nick()))
+    else {
+        tracing::warn!(
+            nick = mode.nick(),
+            "webrtcsink's congestion-control has no such value on these plugins; leaving its own \
+             default"
+        );
+        return;
+    };
+    sink.set_property_from_value("congestion-control", &value);
+    tracing::info!(congestion_control = mode.nick(), "send rate");
 }
 
 /// Configure each encoder `webrtcsink` builds, before it runs.
