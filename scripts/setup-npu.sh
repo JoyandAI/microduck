@@ -15,23 +15,34 @@
 #   --runtime TAG   which rknn-toolkit2 tag to take librknnrt.so from (default below). It has to be
 #                   at least as new as the toolkit that converted the model: a runtime older than
 #                   its model fails at `rknn_init` with a number and no explanation.
-#   --enable-node   install the device-tree overlay that turns the NPU on, because Armbian's
-#                   rk3566-radxa-zero3.dtb ships `npu@fde40000` as `status = "disabled"`. **Takes
+#   --no-enable-node  leave the device tree alone. The default is to enable the NPU node, because
+#                   Armbian's rk3566-radxa-zero3.dtb ships `npu@fde40000` as `status = "disabled"`
+#                   on *every* Radxa Zero 3 — so a runtime installed without it can never run
+#                   anything, which is not a useful thing for this script to have done. **Takes
 #                   effect on the next boot**, and this script never reboots anything. Undone by
 #                   removing `npu-enable` from `overlays=` in /boot/armbianEnv.txt.
+#                   `--enable-node` is still accepted, and now says out loud what already happens.
 #   --help
 #
 # Idempotent: the runtime is only downloaded when it is missing or a different version is asked for.
 #
-# **Deliberately not run by provisioning or the update hook.** Everything else in `scripts/` is
-# needed to make a robot a robot; this is needed to make it *see*, the model is not shipped in a
-# release yet, and a download nobody is waiting for does not belong on the update path. It becomes a
-# provisioning step when the detector ships as part of a behaviour.
+# **Deliberately not run by provisioning or the update hook**, and for one reason only: the runtime
+# is a download. Provisioning that fetches from github.com is provisioning that fails in a room with
+# no route to it, and a robot that will not come up because a blob it does not yet need was
+# unreachable is a bad trade. The device-tree half has no such excuse — it is offline, idempotent
+# and needed by every board — which is why it happens here by default rather than on request.
 set -e
 
 # Keep in step with `[workspace.metadata.rknpu]` in Cargo.toml — a test asserts they agree.
 RUNTIME="v2.3.2"
-ENABLE_NODE=""
+
+# **On by default, because the node is disabled on every board this will ever run on.** Off, this
+# script installs a runtime that cannot reach an NPU and reports that it cannot — which is a
+# diagnosis, not a setup. The change it makes is one property, appended to a list rather than
+# replacing it, compiled by `dtc` before it is installed, with the previous /boot/armbianEnv.txt
+# kept beside it; and the failure mode of getting it wrong is a driver that does not probe, which
+# is where an untouched board already is.
+ENABLE_NODE=1
 
 SELF=/usr/local/sbin/robot-setup-npu
 LIB=/usr/lib/librknnrt.so
@@ -46,10 +57,26 @@ usage() {
     exit 0
 }
 
+# `dtc`, installed rather than demanded.
+#
+# The sibling setup scripts install what they need — `setup-gstreamer.sh` its plugins,
+# `setup-board.sh` the DKMS toolchain — and a script that stops to tell somebody to run one
+# `apt install` is a round trip for nothing. Returns non-zero rather than dying: the runtime is
+# still worth installing on a board where apt cannot reach a mirror.
+ensure_dtc() {
+    command -v dtc >/dev/null 2>&1 && return 0
+    command -v apt-get >/dev/null 2>&1 || return 1
+    say "installing device-tree-compiler"
+    apt-get update -qq || true
+    apt-get install -y -qq device-tree-compiler || return 1
+    command -v dtc >/dev/null 2>&1
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --runtime) RUNTIME="${2:?--runtime needs a tag}"; shift 2 ;;
         --enable-node) ENABLE_NODE=1; shift ;;
+        --no-enable-node) ENABLE_NODE=""; shift ;;
         --help|-h) usage ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
@@ -57,21 +84,48 @@ done
 
 [ "$(id -u)" = 0 ] || die "run as root: sudo sh $0"
 
-# ── the driver, which we can only report on ───────────────────────────────────
+# ── what the board already has ────────────────────────────────────────────────
 #
-# It comes with the vendor kernel. Mainline has no rknpu driver at all, so a board that booted a
-# mainline kernel has no NPU as far as userspace is concerned — and that is worth saying plainly
-# here rather than discovering through `rknn_init` returning -1.
+# Read before anything is changed, because it decides whether anything needs to be. The driver
+# comes with the vendor kernel; mainline has no rknpu driver at all, so a board that booted a
+# mainline kernel has no NPU as far as userspace is concerned — worth saying plainly here rather
+# than discovering it through `rknn_init` returning -1.
 
-# ── the device tree, when asked ───────────────────────────────────────────────
+DRIVER=""
+if [ -r /sys/kernel/debug/rknpu/version ]; then
+    DRIVER=$(cat /sys/kernel/debug/rknpu/version 2>/dev/null || true)
+elif [ -r /proc/rknpu/version ]; then
+    DRIVER=$(cat /proc/rknpu/version 2>/dev/null || true)
+fi
+if [ -z "$DRIVER" ]; then
+    DRIVER=$(dmesg 2>/dev/null | sed -n 's/.*RKNPU driver: v\([0-9.]*\).*/\1/p' | tail -1)
+fi
+
+NODE_STATUS=""
+if [ -r /proc/device-tree/npu@fde40000/status ]; then
+    NODE_STATUS=$(tr -d '\0' < /proc/device-tree/npu@fde40000/status)
+fi
+
+# ── the device tree ───────────────────────────────────────────────────────────
 #
-# One property, `status = "okay"`, on a node whose clocks, resets, power domain, IOMMU and regulator
-# are all already described. The failure mode is a driver that does not probe — which is where a
-# board without this already is — and it is undone by deleting one word from armbianEnv.txt.
+# One property, `status = "okay"`, on a node whose clocks, resets, power domain, IOMMU and
+# regulator are all already described. It is undone by deleting one word from armbianEnv.txt.
 #
-# Never automatic: it needs a reboot to take effect, and rebooting somebody's robot is not a thing a
-# setup script decides.
-if [ -n "$ENABLE_NODE" ]; then
+# **Only when the driver is not already bound.** A board that has an NPU has nothing to gain from
+# an edit to its boot configuration, and a re-run of this script should not be a reason to touch
+# /boot at all.
+#
+# It still never reboots: the change lands on the next boot, and rebooting somebody's robot is not
+# a thing a setup script decides.
+if [ -n "$DRIVER" ]; then
+    say "npu driver: ${DRIVER}"
+elif [ -z "$ENABLE_NODE" ]; then
+    warn "--no-enable-node: leaving the device tree alone.
+  On a stock Armbian image that means the NPU stays disabled and nothing can use the runtime."
+elif [ "$NODE_STATUS" = enabled ] || [ "$NODE_STATUS" = okay ]; then
+    warn "the device tree says the NPU node is enabled, but no driver has bound to it. That is a
+  kernel question rather than a device-tree one, and this script cannot answer it."
+else
     ENV=/boot/armbianEnv.txt
     OVERLAY_DIR=/boot/dtb/rockchip/overlay
     # Where the .dts might be, in the order it turns up. **Beside the script first**, because that
@@ -90,61 +144,46 @@ if [ -n "$ENABLE_NODE" ]; then
             break
         fi
     done
-    [ -n "$SOURCE" ] || die "cannot find rk3568-npu-enable.dts. It lives beside this script:
+
+    # **Warned about rather than fatal, and that is the point of doing this by default.** A script
+    # copied to a board on its own has no overlay beside it; dying here would cost it the runtime
+    # install too, which is the half it can still do.
+    if [ -z "$SOURCE" ]; then
+        warn "cannot find rk3568-npu-enable.dts, so the NPU node stays disabled. It lives beside
+  this script:
     scp scripts/setup-npu.sh deploy/overlays/rk3568-npu-enable.dts ${USER:-microduck}@<robot>:/tmp/
-  or name it: OVERLAY_DTS=/path/to/rk3568-npu-enable.dts sudo -E sh $0 --enable-node"
-    command -v dtc >/dev/null 2>&1 || die "dtc is needed to compile the overlay: apt install device-tree-compiler"
-    [ -d "$OVERLAY_DIR" ] || die "no ${OVERLAY_DIR}; this is not an Armbian layout"
-    [ -f "$ENV" ] || die "no ${ENV}; this is not an Armbian layout"
-
-    say "compiling the npu overlay"
-    dtc -I dts -O dtb -o "${OVERLAY_DIR}/rk3568-npu-enable.dtbo" "$SOURCE" 2>/dev/null \
-        || die "dtc could not compile ${SOURCE}"
-    install -m 644 "$SOURCE" /usr/local/lib/rk3568-npu-enable.dts
-
-    if grep -qE '^overlays=.*\bnpu-enable\b' "$ENV"; then
-        say "npu-enable is already in ${ENV}"
+  or name it: OVERLAY_DTS=/path/to/rk3568-npu-enable.dts sudo -E sh $0
+  The runtime installs regardless."
+    elif ! ensure_dtc; then
+        warn "no dtc and apt would not install device-tree-compiler, so the NPU node stays
+  disabled. The runtime installs regardless."
+    elif [ ! -d "$OVERLAY_DIR" ] || [ ! -f "$ENV" ]; then
+        warn "no ${ENV} or ${OVERLAY_DIR}; this is not an Armbian layout, so the NPU node stays
+  disabled. Load the overlay by whatever means this image provides.
+  The runtime installs regardless."
     else
-        cp "$ENV" "${ENV}.before-npu"
-        # Appended to the existing list rather than replacing it: those other overlays are the
-        # camera, the audio codec and the uart, and a robot without them is a brick of a different
-        # kind.
-        awk '/^overlays=/ { print $0 " npu-enable"; next } { print }' "${ENV}.before-npu" > "$ENV"
-        say "added npu-enable to ${ENV} (previous file kept as ${ENV}.before-npu)"
-    fi
-    printf '\n'
-    warn "the NPU is enabled on the NEXT BOOT. Nothing here reboots.
+        say "compiling the npu overlay"
+        dtc -I dts -O dtb -o "${OVERLAY_DIR}/rk3568-npu-enable.dtbo" "$SOURCE" 2>/dev/null \
+            || die "dtc could not compile ${SOURCE}"
+        install -m 644 "$SOURCE" /usr/local/lib/rk3568-npu-enable.dts
+
+        if grep -qE '^overlays=.*\bnpu-enable\b' "$ENV"; then
+            say "npu-enable is already in ${ENV}"
+        else
+            cp "$ENV" "${ENV}.before-npu"
+            # Appended to the existing list rather than replacing it: those other overlays are the
+            # camera, the audio codec and the uart, and a robot without them is a brick of a
+            # different kind.
+            awk '/^overlays=/ { print $0 " npu-enable"; next } { print }' "${ENV}.before-npu" > "$ENV"
+            say "added npu-enable to ${ENV} (previous file kept as ${ENV}.before-npu)"
+        fi
+        NEEDS_REBOOT=1
+        printf '\n'
+        warn "the NPU is enabled on the NEXT BOOT. Nothing here reboots.
   To undo: remove 'npu-enable' from overlays= in ${ENV} (or restore ${ENV}.before-npu) and reboot.
   If the board does not come back, that file is what to fix from a card reader."
-    printf '\n'
-fi
-
-DRIVER=""
-if [ -r /sys/kernel/debug/rknpu/version ]; then
-    DRIVER=$(cat /sys/kernel/debug/rknpu/version 2>/dev/null || true)
-elif [ -r /proc/rknpu/version ]; then
-    DRIVER=$(cat /proc/rknpu/version 2>/dev/null || true)
-fi
-if [ -z "$DRIVER" ]; then
-    DRIVER=$(dmesg 2>/dev/null | sed -n 's/.*RKNPU driver: v\([0-9.]*\).*/\1/p' | tail -1)
-fi
-
-NODE_STATUS=""
-if [ -r /proc/device-tree/npu@fde40000/status ]; then
-    NODE_STATUS=$(tr -d '\0' < /proc/device-tree/npu@fde40000/status)
-fi
-
-if [ -n "$DRIVER" ]; then
-    say "npu driver: ${DRIVER}"
-elif [ "$NODE_STATUS" = disabled ]; then
-    warn "the NPU is present but DISABLED in the device tree, which is how Armbian ships the
-  Radxa Zero 3 — so the driver never binds and nothing can use it. One property fixes it:
-    sudo ${SELF} --enable-node   (then reboot)
-  The runtime installs regardless; it is the driver that decides whether it can run."
-else
-    warn "no NPU driver found (/sys/kernel/debug/rknpu, /proc/rknpu, dmesg), and the device tree
-  does not say the node is disabled either. A kernel that is not the vendor one is the usual
-  cause. The runtime installs anyway."
+        printf '\n'
+    fi
 fi
 
 # ── the runtime ───────────────────────────────────────────────────────────────
@@ -194,6 +233,10 @@ printf 'runtime  %s (%s)\n' "$LIB" "$RUNTIME"
 printf 'driver   %s\n' "${DRIVER:-not found}"
 printf '\nbenchmark it with a model and some frames:\n'
 printf '  duck-bench --model /var/tmp/duck.rknn --frames /var/tmp/frames\n'
-if [ -z "$DRIVER" ]; then
+if [ -n "${NEEDS_REBOOT:-}" ]; then
+    printf '\nREBOOT FIRST. The NPU node was just enabled and binds on the next boot:\n'
+    printf '  sudo reboot\n'
+    printf 'Then `dmesg | grep rknpu` should say the driver initialised.\n'
+elif [ -z "$DRIVER" ]; then
     printf '\nExpect `rknn_init` to fail until the NPU driver is there.\n'
 fi

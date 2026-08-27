@@ -323,8 +323,8 @@ mode = "walk"
 
 # Which model, and therefore which processor: a `.rknn` runs on the NPU, an `.onnx` on the CPU.
 # Unset tries the release's own, NPU first — and falls through to the CPU on a board whose NPU is
-# switched off in its device tree, which is how Armbian ships the Radxa Zero 3. `sudo
-# /usr/local/sbin/robot-setup-npu --enable-node` turns it on, and needs a reboot.
+# switched off in its device tree, which is how Armbian ships the Radxa Zero 3. `sudo sh
+# /opt/robot/daemon/current/scripts/setup-npu.sh` turns it on, and needs a reboot.
 # model = "/home/microduck/my_detector.rknn"
 
 # Looks per second. **2 is a thermal limit, not a preference**: flat out this reaches 95 °C on a

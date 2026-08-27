@@ -13,7 +13,7 @@ kept 2 of 2 detections at 95% box overlap against the float model on the desk.
 | | |
 |---|---|
 | `duck-detect` | The letterbox, the runtime binding, and the decode — plus `duck-bench`. |
-| `scripts/setup-npu.sh` | Installs `librknnrt.so`, and reports whether the NPU driver is there at all. |
+| `scripts/setup-npu.sh` | Enables the NPU node, installs `librknnrt.so`, and reports on the driver. |
 
 Two decisions worth knowing before reading either:
 
@@ -31,10 +31,19 @@ The driver is the gate: it is part of the vendor kernel, mainline has none, and 
 can work around its absence.
 
 ```bash
-sudo sh /tmp/setup-npu.sh          # or /usr/local/sbin/robot-setup-npu
+sudo sh /opt/robot/daemon/current/scripts/setup-npu.sh
 ```
 
-It prints the driver version and installs the runtime. Then, from a clone on your machine:
+**Expect it to ask for a reboot the first time.** Armbian ships `npu@fde40000` as
+`status = "disabled"` on every Radxa Zero 3, so a stock board has the hardware, the kernel and the
+driver and still no NPU. The script writes the overlay that fixes it and says so; the node binds on
+the next boot. `--no-enable-node` installs only the runtime, and `dmesg | grep rknpu` is how you
+confirm afterwards.
+
+Run the release copy rather than `/usr/local/sbin/robot-setup-npu`: the overlay source lives beside
+the script, and the copy left in `/usr/local/sbin` has nothing beside it on a first run.
+
+Then, from a clone on your machine:
 
 ```bash
 cargo board --bins -p duck-detect
