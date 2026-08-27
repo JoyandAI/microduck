@@ -13,12 +13,14 @@
 #
 # Not a substitute for hardware, but it catches everything that only appears off the
 # dev machine: cross-linking (notably `zstd`'s C code), glibc floors, unix-socket and
-# file-permission semantics, and anything that quietly depended on macOS. On an Apple
-# Silicon host these containers run arm64 *natively*, so it's fast and not emulated.
+# file-permission semantics, and anything that quietly depended on macOS. On an arm64 host —
+# an Apple Silicon Mac, or CI's runner — these containers run *natively*, so it's fast. On
+# x86_64 every process inside them is emulated, and the shell-heavy checks below dominate.
 #
 # Usage:  scripts/board-test.sh
 #
-# Requires: cargo-zigbuild, zig, docker.
+# Requires: cargo-zigbuild, zig, docker — and on an x86_64 host, binfmt registered for arm64,
+# or the containers fail to exec at all.
 
 set -eu
 
