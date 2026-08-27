@@ -33,3 +33,8 @@ pub mod pipeline;
 /// [`pipeline`]'s reason — it meters the frames the pipeline taps off the tee.
 #[cfg(target_os = "linux")]
 pub mod exposure;
+
+/// Looking for other ducks in the frames on the tee. Linux only for [`exposure`]'s reason: it
+/// reads the same raw branch, in the same pixel format the pipeline names.
+#[cfg(target_os = "linux")]
+pub mod detect;

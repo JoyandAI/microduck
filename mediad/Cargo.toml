@@ -17,11 +17,13 @@ description = "Camera, mic, WebRTC — and the remote gateway"
 
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
-# `[media]` in /etc/robot/robotd.toml — what this daemon streams. The same crate `robotd` parses
-# that file with and the same one `robotctl configure` edits it through, so the schema, the
-# defaults and the editor cannot drift from what is read here.
+# `[media]` and `[detect]` in /etc/robot/robotd.toml — what this daemon streams, and what it looks
+# for. The same crate `robotd` parses that file with and the same one `robotctl configure` edits it
+# through, so the schema, the defaults and the editor cannot drift from what is read here.
 robotd-params = { path = "../robotd-params" }
 anyhow = "1"
+# The detector itself: the letterbox+turn, the NPU binding, the ONNX fallback and the decoder.
+duck-detect = { path = "../duck-detect" }
 # The console's one route. Already in `Cargo.lock` — `updater` uses it for its test mirror — so it
 # is known-good against this toolchain and the cross build. The alternative was a hand-rolled
 # HTTP/1.1 responder: about sixty lines of hand-written request parsing bound to 0.0.0.0, written to

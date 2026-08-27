@@ -68,7 +68,7 @@ pub enum Health {
     /// Reusing `Unreachable` for it cost an hour: the gate reported "not healthy within 30s:
     /// unreachable" about a `robotd` that was serving its socket and running its loop at
     /// 50 Hz, and had merely omitted one JSON field a newer parser required. See
-    /// `docs/install-path-gap.md`.
+    /// `docs/project/install-path-gap.md`.
     ///
     /// Carries serde's own message. It names the missing or unexpected field, which is the
     /// single most useful string available at that moment.

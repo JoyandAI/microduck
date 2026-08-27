@@ -176,6 +176,37 @@ install_rkaiq() {
     fi
 }
 
+# The NPU: the runtime `duck-detect` dlopens, and the device-tree node it needs to reach one.
+#
+# Same terms as the two above, and here for the same reason they are: the script owns the pinned
+# runtime tag, the overlay, and the driver report, and a robot should not need somebody to remember
+# a command before the model in this very release can run. A board provisioned before the NPU
+# existed is fixed by an ordinary update.
+#
+# **It can ask for a reboot, and that is why this says so rather than doing it.** Armbian ships
+# `npu@fde40000` disabled on every Radxa Zero 3, so the first update carrying this enables the node
+# and the NPU binds on the next boot. Until then the detector runs on the CPU via the `.onnx`, which
+# is the whole reason `DetectParams::models()` is a list rather than a choice.
+#
+# Never fatal, for the reason in the header: a board with no NPU still walks, still streams, and
+# still sees — just on its CPU.
+install_npu() {
+    script=scripts/setup-npu.sh
+    if [ ! -f "$script" ]; then
+        say "no ${script} in this release; skipping the NPU"
+        return 0
+    fi
+
+    say "checking the NPU runtime"
+    if sh "$script"; then
+        say "NPU runtime ready"
+    else
+        say "the NPU did not finish setting up — the duck detector will run on the CPU, which is
+  slower and warmer but works, and everything else is unaffected. To retry:
+    sudo sh /opt/robot/daemon/current/scripts/setup-npu.sh"
+    fi
+}
+
 have="$(installed_onnx)"
 
 if at_least "$have" "$ONNX_FLOOR"; then
@@ -196,3 +227,4 @@ fi
 
 install_gstreamer
 install_rkaiq
+install_npu

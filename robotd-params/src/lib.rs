@@ -41,6 +41,7 @@ pub struct Params {
     pub theremin: ThereminParams,
     pub chorale: ChoraleParams,
     pub media: MediaParams,
+    pub detect: DetectParams,
 }
 
 /// The one video mode a robot streams in, as a name rather than four numbers.
@@ -243,11 +244,83 @@ impl Default for MediaParams {
     }
 }
 
+/// `[detect]` — finding other ducks in the camera.
+///
+/// **Read by `mediad`, not by `robotd`**, which is a first for this file: the frames are on
+/// `mediad`'s tee and perception belongs next to the sensor. It lives here anyway, because this is
+/// the file `robotctl configure` edits and a robot has one place where its switches are — a second
+/// config file for the second daemon that wants one is how a fleet ends up with settings nobody can
+/// find.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DetectParams {
+    /// Off by default. The detector costs a model in the release, ~50 ms of CPU per frame and some
+    /// heat; a robot that nothing asks to look for ducks should not be paying for it.
+    pub enabled: bool,
+    /// Where to look, and therefore *what runs it*: a `.rknn` goes to the NPU, an `.onnx` runs on
+    /// the CPU. Absent means the release's own model, NPU first — see [`DetectParams::model`].
+    pub model: Option<PathBuf>,
+    /// Frames per second to run the detector at.
+    ///
+    /// **2 Hz is a thermal number, not a taste.** Flat out on a Radxa Zero 3 this reaches 95 °C and
+    /// the CPU throttles to 408 MHz, which is a robot that walks badly to see well. Two looks a
+    /// second is plenty for "is there a duck over there", and costs about a tenth of one core.
+    pub hz: f64,
+    /// Confidence a detection needs, against **this** model.
+    ///
+    /// A quantised model's output tensor carries its own scale, so the number that means 0.9 on the
+    /// float model does not mean 0.9 here — the INT8 scores of the shipped model saturate around
+    /// 1.4. Tuned on the board, not inherited from training.
+    pub threshold: f32,
+}
+
+impl Default for DetectParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            hz: 2.0,
+            threshold: 0.35,
+        }
+    }
+}
+
 impl MediaParams {
     /// The bitrate the daemon will actually start at.
     pub fn bitrate_resolved(&self) -> u32 {
         self.bitrate
             .unwrap_or_else(|| self.quality.default_bitrate())
+    }
+}
+
+impl DetectParams {
+    /// The models to try, best first. Empty when the detector is off.
+    ///
+    /// **A list, not a choice**, because whether the NPU works is not something this file can know.
+    /// The `.rknn` is preferred — it is why the detector is cheap — but a board whose NPU is
+    /// disabled in its device tree (which is how Armbian ships the Radxa Zero 3) or which never ran
+    /// `setup-npu.sh` has no runtime to load it with. Falling through to the `.onnx` means such a
+    /// board still sees, on the CPU, instead of logging one warning and doing nothing for ever.
+    ///
+    /// An explicit `model` is the operator being specific, so it is tried alone.
+    pub fn models(&self) -> Vec<PathBuf> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        if let Some(path) = &self.model {
+            if is_none_sentinel(path) {
+                return Vec::new();
+            }
+            return vec![path.clone()];
+        }
+        let release = PathBuf::from(RELEASE_DIR).join("models");
+        [
+            release.join("duck_detect.rknn"),
+            release.join("duck_detect.onnx"),
+        ]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
     }
 }
 
