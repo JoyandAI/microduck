@@ -40,6 +40,18 @@ use crate::pipeline::{CAPTURE_FORMAT, Frame, Frames};
 /// corridor, slow enough that the damped step never rings.
 const INTERVAL: Duration = Duration::from_millis(500);
 
+/// How many quiet ticks before the current values are written again anyway. 20 is ten seconds.
+///
+/// **Because this loop is not the only thing that writes the sensor.** `v4l2src` applies
+/// `--exposure`/`--analogue-gain` through `extra-controls` whenever the device is opened, including
+/// a re-open nobody here initiated, and a fresh IQ file or a re-enabled engine could put rkaiq back
+/// in the same business. Skipping a write because we already wrote that value assumes what we wrote
+/// is still there, which is exactly the assumption that leaves a camera dark and a log saying it
+/// converged. So the assumption is re-checked on a slow heartbeat — at 43 ms of CPU a call, ten
+/// seconds apart is under half a percent of a core, against the tenth of a core that writing every
+/// tick cost.
+const REASSERT_TICKS: u32 = 20;
+
 /// Mean-luma setpoint, 8-bit and *after* the ISP's gamma curve.
 const TARGET_Y: f64 = 90.0;
 
@@ -138,6 +150,14 @@ impl Ae {
         Some(next)
     }
 
+    /// The values as they stand, for the periodic re-assert — and they count as written, so the
+    /// heartbeat restarts rather than firing every tick from here on.
+    pub fn current(&mut self) -> Controls {
+        let controls = self.controls();
+        self.written = Some(controls);
+        controls
+    }
+
     fn controls(&self) -> Controls {
         Controls {
             exposure: self.exposure as u32,
@@ -201,6 +221,8 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
             let mut ae = Ae::starting_at(exposure_lines, analogue_gain_reg);
             let mut proven = false;
             let mut waiting_logged = false;
+            // Ticks since the last write, for the re-assert heartbeat.
+            let mut quiet = 0u32;
 
             while !mine.stopped() {
                 std::thread::sleep(INTERVAL);
@@ -215,9 +237,17 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
                     }
                     continue;
                 };
-                let Some(controls) = ae.step(mean) else {
-                    continue;
+                let controls = match ae.step(mean) {
+                    Some(controls) => controls,
+                    // Nothing to change — but say it to the sensor again every so often, in case
+                    // something else has been talking to it. See `REASSERT_TICKS`.
+                    None if quiet >= REASSERT_TICKS => ae.current(),
+                    None => {
+                        quiet += 1;
+                        continue;
+                    }
                 };
+                quiet = 0;
 
                 match write(&device, controls) {
                     Err(e) if proven => {
@@ -431,6 +461,21 @@ mod tests {
             ae.step(TARGET_Y * 4.0).is_some(),
             "a bright scene must move it"
         );
+    }
+
+    #[test]
+    fn the_re_assert_writes_the_same_values_and_restarts_the_heartbeat() {
+        let mut ae = Ae::starting_at(600, 1024);
+        for _ in 0..50 {
+            ae.step(1.0);
+        }
+        let quiet = ae.controls();
+        assert_eq!(ae.step(1.0), None, "settled");
+        // What the heartbeat sends: the values as they stand, not a recomputation.
+        assert_eq!(ae.current(), quiet);
+        // And it counts as written, so the next quiet tick is quiet again rather than a second
+        // write.
+        assert_eq!(ae.step(1.0), None);
     }
 
     #[test]
