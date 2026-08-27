@@ -151,7 +151,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// answer, and the policy names in the `robot.subscribe` acknowledgement, can now *change* during
 /// a session. A client that read either once and cached it forever was already making an
 /// assumption this method breaks; nothing about a frame's shape changes.
-pub const API_VERSION: u32 = 15;
+///
+/// # v16 — `update.show`
+///
+/// The per-run update transcript: what `updaterd` actually did, phase by phase, with the
+/// manifest it verified, the hook output it collected and the units it restarted. Additive
+/// as a method — a client that never asks is unaffected — and `update.log`'s entries gain a
+/// `run` number pointing at one, which an older client ignores as an unknown member because
+/// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
+/// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
+/// handshake refusal.
+pub const API_VERSION: u32 = 16;
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -258,6 +268,7 @@ pub mod method {
     pub const STATUS: &str = "update.status";
     pub const LIST_INSTALLED: &str = "update.listInstalled";
     pub const LOG: &str = "update.log";
+    pub const SHOW: &str = "update.show";
     pub const SUBSCRIBE: &str = "update.subscribe";
 
     /// Server → client notification. Never carries an `id`.
@@ -583,6 +594,8 @@ pub enum Call {
     Status,
     ListInstalled(ComponentParams),
     Log(LogParams),
+    /// One run's full transcript. `update.log` says which runs exist; this says what one did.
+    Show(ShowParams),
     /// Turns the connection into a stream of [`method::PROGRESS`] notifications.
     Subscribe,
 
@@ -732,6 +745,7 @@ impl Call {
             Call::Status => method::STATUS,
             Call::ListInstalled(_) => method::LIST_INSTALLED,
             Call::Log(_) => method::LOG,
+            Call::Show(_) => method::SHOW,
             Call::Subscribe => method::SUBSCRIBE,
             Call::RobotSafeToRestart => method::ROBOT_SAFE_TO_RESTART,
             Call::RobotHealth => method::ROBOT_HEALTH,
@@ -843,6 +857,10 @@ impl Call {
             // so it answers during an apply — which is wasted if the request is queued behind one.
             Call::Status => (Updater, Prompt),
             Call::Pin(_) | Call::Log(_) | Call::ListInstalled(_) => (Updater, Prompt),
+            // Reads a file, like `log`. Bounded by the per-run caps `updater::transcript`
+            // enforces at write time, so the answer cannot grow without limit however long
+            // a hook talked for.
+            Call::Show(_) => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -944,6 +962,7 @@ impl Call {
             Call::Select(p) => encode(p),
             Call::Pin(p) => encode(p),
             Call::Log(p) => encode(p),
+            Call::Show(p) => encode(p),
             Call::RobotMove(p) => encode(p),
             Call::RobotHead(p) => encode(p),
             Call::RobotLook(p) => encode(p),
@@ -1011,6 +1030,7 @@ impl Call {
             method::STATUS => Call::Status,
             method::LIST_INSTALLED => Call::ListInstalled(decode(params)?),
             method::LOG => Call::Log(decode(params)?),
+            method::SHOW => Call::Show(decode(params)?),
             method::SUBSCRIBE => Call::Subscribe,
             method::ROBOT_SAFE_TO_RESTART => Call::RobotSafeToRestart,
             method::ROBOT_HEALTH => Call::RobotHealth,
@@ -1125,6 +1145,7 @@ pub mod test_support {
             Call::Status,
             Call::ListInstalled(ComponentParams { component }),
             Call::Log(LogParams { limit: 20 }),
+            Call::Show(ShowParams { run: Some(42) }),
             Call::Subscribe,
             Call::RobotSafeToRestart,
             Call::RobotHealth,
@@ -1899,6 +1920,15 @@ pub struct LogParams {
     pub limit: usize,
 }
 
+/// Which run to transcribe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShowParams {
+    /// `None` means the most recent run, which is what someone debugging an update that has
+    /// just happened wants and should not have to look up first.
+    pub run: Option<u64>,
+}
+
 /// Join a wifi network.
 ///
 /// [`Debug`] is hand-written to redact `psk`, and that is the point of the type. Every other
@@ -2146,12 +2176,21 @@ pub enum ApplyResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
-    /// Unix seconds.
+    /// Unix seconds. Stamped when the attempt *finished*, not when it started — the entry is
+    /// written on the way out of `apply`. Anyone reading backwards from here for the run's own
+    /// logs has to walk backwards; [`RunTranscript`] carries both ends and spares them that.
     pub at: i64,
     pub component: ComponentId,
     pub from: Option<semver::Version>,
     pub to: Option<semver::Version>,
     pub outcome: Outcome,
+    /// Which transcript holds what this attempt actually did — [`Call::Show`]'s argument.
+    ///
+    /// `None` for entries written before transcripts existed, and for an attempt that failed
+    /// before one could be opened. `default` and `skip_serializing_if`, so an old log file still
+    /// parses and a new one still means something to an older client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2165,6 +2204,123 @@ pub enum Outcome {
     Aborted {
         reason: String,
     },
+}
+
+/// One line of an update's transcript.
+///
+/// **On disk, not only in the journal**, for the reason the update log itself is
+/// (`updater::journal`): the record of what an update did must survive the symlink swap, the
+/// rollback, and the power loss the update may itself have provoked. `/var/log` on this board is
+/// zram, so the journal survives a clean reboot and not a power cut — and a power cut is one of
+/// the likelier endings of exactly the updates someone needs this for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecord {
+    /// Unix seconds.
+    pub at: i64,
+    /// Flattened, so a line of the file reads as one flat object. This file is meant to be
+    /// `cat`ed and `grep`ed on a board where `robotctl` may itself be the thing that is broken,
+    /// and `{"at":…,"event":{"event":"phase",…}}` is worse to read than `{"at":…,"event":"phase",…}`.
+    #[serde(flatten)]
+    pub event: RunEvent,
+}
+
+/// What happened, at one moment of one update.
+///
+/// Typed rather than a free-text line, because the renderer aligns and colours these and a
+/// machine reading `--json` should not have to parse prose. [`Self::Note`] is the escape hatch
+/// for the genuinely shapeless, and a variant this release does not know decodes as
+/// [`Self::Unrecognised`] rather than failing the whole transcript — a newer `updaterd`'s
+/// record must stay readable by the `robotctl` that is on the board asking about it, which
+/// during a partial update is precisely the pairing that exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum RunEvent {
+    /// The run opened: what was asked for, by whom, and what was live at the time.
+    Began {
+        component: ComponentId,
+        /// The target as the caller named it — `latest`, `0.1.4`, `ref my-branch`, `staging`,
+        /// `dir /home/pi/push`. Rendered, not structured: it exists to be read back to whoever
+        /// is asking "what did I actually run", and `Target` already carries the structure.
+        target: String,
+        /// The release live when the run began.
+        installed: Option<semver::Version>,
+        /// Where the manifest was going to be fetched from.
+        source: String,
+        /// `uid=1000 gid=1000 pid=2317`, from `SO_PEERCRED`. `None` for the unattended path and
+        /// for the sideload CLI, where there is no peer.
+        requested_by: Option<String>,
+    },
+    /// A phase boundary. The backbone of the transcript.
+    Phase {
+        phase: Phase,
+        detail: Option<String>,
+    },
+    /// The manifest that passed its signature check — every fact that decides what follows.
+    Manifest {
+        version: semver::Version,
+        sha256: String,
+        bytes: Option<u64>,
+        url: Option<String>,
+        /// Which trusted key verified it. A set of keys is allowed, so which one matters.
+        signed_by: Option<String>,
+        source_revision: Option<String>,
+    },
+    /// A hook ran, with its output verbatim. The richest thing in the file: this is the ONNX
+    /// Runtime and GStreamer install talking, and its whole report is the answer to "can this
+    /// board encode H.264 at this release".
+    Hook {
+        hook: String,
+        exit_code: Option<i32>,
+        output: String,
+    },
+    /// A unit was restarted, reloaded, or scheduled for restart, and how that went.
+    Unit {
+        unit: String,
+        action: String,
+        detail: Option<String>,
+    },
+    /// The health gate's verdict — the thing that decides commit versus rollback.
+    Health {
+        passed: bool,
+        detail: Option<String>,
+    },
+    /// Worth writing down, with no shape of its own.
+    Note { text: String },
+    /// How the run ended. Absent from a transcript whose run was cut short — by the deferred
+    /// restart of `updaterd` itself, or by the power going away — and that absence is the point:
+    /// a transcript with no `ended` is a run whose verdict is elsewhere.
+    Ended {
+        /// The update log's verdict, where this run produced one. `None` for the two outcomes the
+        /// log deliberately does not keep — a dry run, and an apply that found nothing to do —
+        /// which are still perfectly good runs to have a transcript of.
+        outcome: Option<Outcome>,
+        /// One sentence, always. What `robotctl update show` prints as the last line, and what
+        /// spares a reader from having to interpret the tagged outcome above it.
+        summary: String,
+    },
+    /// The per-run caps stopped the writer, and this many events were dropped after it.
+    ///
+    /// A typed event rather than a flag on the transcript, because it has a *place*: everything
+    /// before it was recorded, everything between it and the end was not. A boolean could say
+    /// that something was missing but not where the hole is.
+    Truncated { dropped: u64 },
+    /// A variant from a later release. Kept as a placeholder so one unknown line does not cost
+    /// the reader the rest of the run.
+    #[serde(other)]
+    Unrecognised,
+}
+
+/// Answer to [`Call::Show`]: one run, in full.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTranscript {
+    pub run: u64,
+    pub component: ComponentId,
+    /// Oldest first. This is a story and it is read forwards.
+    pub events: Vec<RunRecord>,
+    /// Every run still on disk, newest first — so a client that asked for the latest can say
+    /// what else there is without a second call.
+    #[serde(default)]
+    pub available: Vec<u64>,
 }
 
 /// Answer to [`Call::RobotSafeToRestart`].
@@ -3689,7 +3845,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            45,
+            46,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -4599,6 +4755,50 @@ mod tests {
             assert_eq!(line, expected, "{target:?}");
             assert_eq!(serde_json::from_str::<Target>(&line).unwrap(), target);
         }
+    }
+
+    /// A transcript line is one flat object, because it is read with `cat` at least as often
+    /// as with `robotctl`.
+    #[test]
+    fn a_run_record_is_one_flat_line() {
+        let record = RunRecord {
+            at: 1_700_000_000,
+            event: RunEvent::Phase {
+                phase: Phase::Downloading,
+                detail: Some("184.2 MB".into()),
+            },
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            line,
+            r#"{"at":1700000000,"event":"phase","phase":"downloading","detail":"184.2 MB"}"#
+        );
+        assert_eq!(serde_json::from_str::<RunRecord>(&line).unwrap(), record);
+    }
+
+    /// One line from a later release must not cost the reader the rest of the run.
+    ///
+    /// The pairing is not hypothetical: during a daemon update the `robotctl` on the board and
+    /// the `updaterd` that wrote the file can come from different releases, and that window is
+    /// exactly when someone is reading a transcript.
+    #[test]
+    fn an_unknown_run_event_keeps_the_rest_of_the_transcript() {
+        let from_the_future = r#"{"at":1700000001,"event":"quantum_realignment","spin":7}"#;
+        let record: RunRecord = serde_json::from_str(from_the_future).unwrap();
+        assert_eq!(record.at, 1_700_000_001);
+        assert_eq!(record.event, RunEvent::Unrecognised);
+    }
+
+    /// An `update.log` entry written before transcripts existed still parses, and still means
+    /// what it meant.
+    #[test]
+    fn a_log_entry_without_a_run_still_parses() {
+        let old = r#"{"at":1,"component":"daemon","from":"0.1.3","to":"0.1.4","outcome":{"kind":"success"}}"#;
+        let entry: LogEntry = serde_json::from_str(old).unwrap();
+        assert_eq!(entry.run, None);
+        // And it round-trips back to the same line: an absent run must not become `"run":null`
+        // in a file an older `updaterd` may still read.
+        assert_eq!(serde_json::to_string(&entry).unwrap(), old);
     }
 
     /// A branch name with slashes is a valid git ref and must survive verbatim. `feature/foo`

@@ -576,8 +576,46 @@ robotctl update log
 ```
 
 ```
+robotctl update show
+```
+
+```
 robotctl update watch
 ```
+
+`log` lists attempts, one line each, newest first; the first column is the run number. `show`
+takes one of those numbers — or nothing, for the most recent — and prints everything that run
+did, then the journal for the same window:
+
+```
+run 42 · daemon · 2025-08-27 13:06:40 UTC
+  applied 0.1.3 → 0.1.4
+  asked for latest, from github.com/pollen-robotics/microduck, onto 0.1.3
+  requested by uid=1000 gid=1000 pid=2317
+
+  13:06:41      +1s  manifest     0.1.4 · 184.2 MB · sha256 3f9a1c2b… · signed by release.pub · rev 88efc03
+  13:06:41           downloading
+  13:07:58   +1m17s  note         downloaded 184.2 MB to /opt/robot/daemon/staging/0.1.4/dl/…
+  13:08:02      +4s  note         hash matches; signature verifies against release.pub
+  13:08:20     +18s  pre-hook
+  13:10:12   +1m52s  hook         hooks/preinstall
+                                 │ onnxruntime 1.20.1 already present
+                                 │ gstreamer: h264 encode ok
+  13:10:12           swapping     0.1.3 → 0.1.4
+  13:10:14      +1s  unit         robotd: restart
+  13:10:23      +8s  health       the robot reported healthy
+  13:10:24           ended        applied 0.1.3 → 0.1.4
+
+  ── journal · 2025-08-27 13:06:40 to 2025-08-27 13:11:24 UTC ──
+```
+
+Times are UTC, and so is the journal underneath. The `+` column is the gap since the line above,
+which is how you find the two minutes.
+
+Reading the journal needs privileges the `robot` group does not carry, so the second half comes
+back empty unless you are root. It prints the `journalctl` line when that happens; `sudo` in front
+of it is the fix. `--no-journal` prints that line without trying, and `--json` gives the transcript
+alone.
 
 The component is `daemon` — one component covering every binary. `apply daemon` installs what the
 stable channel offers; branch builds and release candidates need
@@ -725,6 +763,20 @@ The update history is separate from the journal on purpose — `fsync`ed per ent
 
 ```
 robotctl update log
+```
+
+The last twenty runs keep a full transcript there too, under `runs/`, written as they happened:
+
+```
+robotctl update show 42
+```
+
+Both outlive the swap, the rollback, and a power cut, which the journal on this board does not —
+`/var/log` is zram. If `robotctl` itself is what is broken, the files are newline-delimited JSON
+and read fine with `cat`:
+
+```
+sudo cat /var/lib/robot/updater/runs/000042.jsonl
 ```
 
 ### Tab completion

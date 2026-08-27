@@ -434,6 +434,7 @@ mod tests {
             from: None,
             to: Some(semver::Version::parse(to).unwrap()),
             outcome,
+            run: None,
         }
     }
 
