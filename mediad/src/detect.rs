@@ -52,6 +52,16 @@ impl Detector {
     }
 }
 
+/// How often to say out loud what the detector is seeing. 20 looks is ten seconds at 2 Hz.
+///
+/// **At info, and for [`crate::exposure`]'s `REPORT_TICKS` reason: the question "is the detector
+/// alive?" should not need a browser.** A detector that finds nothing writes nothing, and from
+/// outside the process that is indistinguishable from three different states — a thread that died,
+/// a tee that went quiet, and a detector working perfectly in a room with no ducks in it. Only this
+/// line separates them, and `starved` is what separates the middle one: looks that had no frame to
+/// look at, which is otherwise a bare `continue`.
+const REPORT_LOOKS: u64 = 20;
+
 /// Which runtime is doing the work.
 ///
 /// Chosen by the model's own extension rather than by a config switch: a `.rknn` only runs on the
@@ -166,6 +176,10 @@ pub fn spawn(
             let mut raw = Vec::new();
             let mut next = Instant::now();
             let mut last_error: Option<String> = None;
+            // Since the last report, not for ever: what matters is whether the tee is quiet *now*.
+            let mut ticks = 0u64;
+            let mut starved = 0u64;
+            let mut took_ms = 0.0f64;
 
             loop {
                 // Paced from the deadline rather than by sleeping a period after the work, so a
@@ -185,7 +199,23 @@ pub fn spawn(
                     return;
                 }
 
+                ticks += 1;
+                if ticks >= REPORT_LOOKS {
+                    let (looked, found) =
+                        (looks.load(Ordering::Relaxed), seen.load(Ordering::Relaxed));
+                    tracing::info!(
+                        looks = looked,
+                        seen = found,
+                        starved,
+                        took_ms = format!("{took_ms:.1}"),
+                        "duck detector"
+                    );
+                    ticks = 0;
+                    starved = 0;
+                }
+
                 let Some(frame) = frames.latest() else {
+                    starved += 1;
                     continue;
                 };
                 if frame.format != crate::pipeline::CAPTURE_FORMAT {
@@ -222,11 +252,12 @@ pub fn spawn(
                         // scaling them against the *camera's* dimensions would have them sideways.
                         let (upright_w, upright_h) =
                             turn.upright(frame.width as usize, frame.height as usize);
+                        took_ms = started.elapsed().as_secs_f64() * 1e3;
                         let _ = sightings.send(Arc::new(Sighting {
                             width: upright_w as u32,
                             height: upright_h as u32,
                             found,
-                            took_ms: started.elapsed().as_secs_f64() * 1e3,
+                            took_ms,
                         }));
                     }
                     Err(error) => {
