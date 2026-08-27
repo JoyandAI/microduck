@@ -30,11 +30,16 @@ carrying the scale into the decoder and getting it wrong once, quietly.
 The driver is the gate: it is part of the vendor kernel, mainline has none, and nothing in userspace
 can work around its absence.
 
+**An ordinary `robotctl update` does this.** `hooks/preinstall` runs the release's own copy beside
+`setup-gstreamer.sh` and `setup-rkaiq.sh`, never fatally, with its report in the update log — so a
+board provisioned before the NPU existed is fixed by an update rather than by somebody remembering
+a command. Running it by hand is a retry:
+
 ```bash
 sudo sh /opt/robot/daemon/current/scripts/setup-npu.sh
 ```
 
-**Expect it to ask for a reboot the first time.** Armbian ships `npu@fde40000` as
+**Expect the first update carrying this to ask for a reboot.** Armbian ships `npu@fde40000` as
 `status = "disabled"` on every Radxa Zero 3, so a stock board has the hardware, the kernel and the
 driver and still no NPU. The script writes the overlay that fixes it and says so; the node binds on
 the next boot. `--no-enable-node` installs only the runtime, and `dmesg | grep rknpu` is how you

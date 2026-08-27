@@ -148,6 +148,35 @@ pub struct Model {
 // does not support.
 unsafe impl Send for Model {}
 
+/// Why `rknn_init` failed, in the order the causes actually occur.
+///
+/// **The device tree first, because it is the one every board starts in.** Armbian ships
+/// `npu@fde40000` as `status = "disabled"` on the Radxa Zero 3, so a robot that nobody has run
+/// `setup-npu.sh` on has the hardware, the kernel, the driver and the runtime, and still no NPU —
+/// and the runtime's own log line for it is "failed to open rknpu module, need to insmod rknpu
+/// dirver!", which sends people looking for a module that is built in.
+///
+/// The two causes this used to name are real and are still here, but they are what is left once
+/// there is a device to talk to at all. Naming them first cost a bring-up session.
+fn why_init_failed() -> String {
+    match std::fs::read("/proc/device-tree/npu@fde40000/status") {
+        Ok(bytes) if bytes.starts_with(b"disabled") => {
+            "The NPU is DISABLED in this board's device \
+             tree, which is how Armbian ships the Radxa Zero 3 — so the driver never bound and \
+             there is nothing to open. Enable it and reboot: sudo sh \
+             /opt/robot/daemon/current/scripts/setup-npu.sh"
+                .to_owned()
+        }
+        // No node at all: not an RK3566, or a kernel whose device tree does not describe one.
+        Err(_) => "There is no npu@fde40000 in this board's device tree at all — a kernel that is \
+             not the Armbian vendor one is the usual cause, and mainline has no rknpu driver."
+            .to_owned(),
+        _ => "The node is enabled, so this is the model or the driver: a model built for another \
+             platform, or an NPU driver older than the runtime, are the two usual causes."
+            .to_owned(),
+    }
+}
+
 impl Model {
     /// Load `librknnrt.so`, then the model, and ask the model what shape it wants.
     pub fn open(path: &Path) -> Result<Self> {
@@ -208,9 +237,9 @@ impl Model {
             );
             if code != 0 || context.is_null() {
                 bail!(
-                    "rknn_init failed ({code}) on {}. A model built for another platform, or an \
-                     NPU driver older than the runtime, are the two usual causes.",
-                    path.display()
+                    "rknn_init failed ({code}) on {}. {}",
+                    path.display(),
+                    why_init_failed()
                 );
             }
 

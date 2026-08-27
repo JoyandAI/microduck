@@ -26,11 +26,13 @@
 #
 # Idempotent: the runtime is only downloaded when it is missing or a different version is asked for.
 #
-# **Deliberately not run by provisioning or the update hook**, and for one reason only: the runtime
-# is a download. Provisioning that fetches from github.com is provisioning that fails in a room with
-# no route to it, and a robot that will not come up because a blob it does not yet need was
-# unreachable is a bad trade. The device-tree half has no such excuse — it is offline, idempotent
-# and needed by every board — which is why it happens here by default rather than on request.
+# **Run by `hooks/preinstall` on every update**, beside `setup-gstreamer.sh` and `setup-rkaiq.sh`
+# and on the same terms: never fatally, with its report in the update log. That is what the split
+# between provisioning and updating is for — a board provisioned before the NPU existed is fixed by
+# an ordinary update rather than by somebody remembering a command, and a release that ships a model
+# should not also ship a manual step before the model can run.
+#
+# Running it by hand is then a retry, not the mechanism.
 set -e
 
 # Keep in step with `[workspace.metadata.rknpu]` in Cargo.toml — a test asserts they agree.

@@ -1303,6 +1303,39 @@ mod tests {
         }
     }
 
+    /// `setup-npu.sh` compiles a device-tree overlay from a .dts beside it, so the .dts has to be
+    /// packaged too.
+    ///
+    /// The same shape as `the_rkaiq_shim_travels_with_its_script`, and not covered by
+    /// `every_script_the_hooks_run_is_packaged` for the same reason: the overlay is not a script
+    /// anything runs, it is a source the script compiles. Packaged without it, the hook installs
+    /// the runtime, cannot find the .dts, and leaves the NPU node disabled — so the detector runs
+    /// on the CPU for ever and the log line saying why is one warning in an update that succeeded.
+    #[test]
+    fn the_npu_overlay_travels_with_its_script() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+
+        const OVERLAY: &str = "deploy/overlays/rk3568-npu-enable.dts";
+        assert!(root.join(OVERLAY).exists(), "{OVERLAY} is missing");
+
+        let script = std::fs::read_to_string(root.join("scripts/setup-npu.sh")).unwrap();
+        assert!(
+            script.contains("rk3568-npu-enable.dts"),
+            "setup-npu.sh must name the overlay source it compiles"
+        );
+
+        for workflow in PACKAGING_SITES {
+            let text = std::fs::read_to_string(root.join(workflow))
+                .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+            assert!(
+                text.contains(&format!("={OVERLAY}")),
+                "{workflow} packages setup-npu.sh but not {OVERLAY}, which it cannot run without"
+            );
+        }
+    }
+
     /// `setup-npu.sh` pins the NPU runtime, and Cargo.toml pins it too.
     ///
     /// Third instance of the same trap — after ONNX Runtime and the GStreamer plugins — and the
