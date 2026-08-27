@@ -153,8 +153,8 @@ jobs:
     # cost was not in the binaries under test — thirty of those checks went by in nine seconds —
     # but in the shell-heavy ones, where every `sh`, `sed` and `grep` is emulated: the first
     # setup-board.sh run alone took 148s, each later variant ~17s, and the install.sh block ran
-    # for four and a half minutes. That was more than half of this job, and this job is what the
-    # whole run waits on.
+    # for four and a half minutes. Natively that phase is 30s, and the job went 550s -> 196s —
+    # enough that `check` is now what the run waits on rather than this.
     #
     # Moving back to an x86_64 runner means restoring `docker/setup-qemu-action` with
     # `platforms: arm64`, dropped below. Without it `docker run --platform linux/arm64` does not
