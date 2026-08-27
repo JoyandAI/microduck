@@ -16,9 +16,12 @@
  * reads for IQ file selection.
  *
  * Build:   gcc -shared -fPIC -O2 -o rkaiq_modinfo_shim.so rkaiq-modinfo-shim.c -ldl
- * Install: see scripts/setup-rkaiq.sh, which builds it on the board — the
- *          struct size it probes for is a property of the running kernel, so a
- *          binary built anywhere else would be guessing. The systemd drop-in
+ * Install: see scripts/setup-rkaiq.sh, which builds it on the board because it
+ *          must be aarch64 — and for no other reason. The struct size is a
+ *          property of the running kernel, but this probes for it at *runtime*
+ *          on the first intercepted ioctl, so the object does not depend on the
+ *          kernel it was compiled against and setup-rkaiq.sh only rebuilds it
+ *          when the source changes. The systemd drop-in
  *          sets LD_PRELOAD for the rkaiq_3A service alone; nothing else on the
  *          board has this ioctl intercepted.
  *

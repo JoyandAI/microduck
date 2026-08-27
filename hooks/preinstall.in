@@ -134,7 +134,8 @@ install_onnx() {
 # This is what the split between provisioning and updating is for. `provision.sh` installs the
 # stack on a new board; every board provisioned before that existed, and every board whose
 # plugins are older than the version this release was built against, is fixed by an ordinary
-# update instead of by somebody remembering a command.
+# update instead of by somebody remembering a command. `docs/design/updater-design.md` §9.1
+# owns that rule and the four times it has been broken.
 #
 # Never fatal, for the reason in the header. Its report goes to the update log either way, which
 # is where "this board cannot encode H.264 in hardware" belongs.

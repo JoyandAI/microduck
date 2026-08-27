@@ -201,9 +201,25 @@ if ! command -v gcc >/dev/null 2>&1; then
         || die "could not install gcc, so the shim cannot be built"
 fi
 
-say "building the ioctl shim"
-gcc -shared -fPIC -O2 -o "$SHIM_SO" "$SHIM_SRC" -ldl \
-    || die "could not build ${SHIM_SRC}"
+# Only when there is something to build. `hooks/preinstall` runs this script on every update, so
+# an unconditional `gcc` is a compile on every release for ever on a board that already has the
+# shim — the cost updater-design.md §9.1 says a hook step may not have. The built source is kept
+# beside the object, the way `setup-npu.sh` keeps its `.dts`, and a release that changes the C
+# file rebuilds because the copy no longer matches.
+#
+# Keyed on the source alone, and not on `uname -r`, because the shim does not depend on the
+# kernel it was built against: it brute-forces the kernel's struct size at *runtime*, once, on
+# the first intercepted ioctl. It is built on the board because it must be aarch64, which is the
+# only reason.
+SHIM_BUILT_SRC=/usr/local/lib/rkaiq-modinfo-shim.c
+if [ -f "$SHIM_SO" ] && cmp -s "$SHIM_SRC" "$SHIM_BUILT_SRC"; then
+    say "the ioctl shim is current"
+else
+    say "building the ioctl shim"
+    gcc -shared -fPIC -O2 -o "$SHIM_SO" "$SHIM_SRC" -ldl \
+        || die "could not build ${SHIM_SRC}"
+    install -m 644 "$SHIM_SRC" "$SHIM_BUILT_SRC"
+fi
 
 # ── the sensor-mode pin ───────────────────────────────────────────────────────
 #

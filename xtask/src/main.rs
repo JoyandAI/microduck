@@ -981,6 +981,146 @@ mod tests {
         }
     }
 
+    /// `install_*` steps a hook performs too, and where it does it.
+    const ALSO_ON_UPDATE: [(&str, &str); 1] = [(
+        "install_units",
+        "hooks/postinstall installs, enables and starts every unit the release ships. Not the \
+         journald drop-in and not the robotctl symlink, which the hook deliberately leaves alone \
+         — board-test.sh pins that asymmetry, and it is the one thing here §9.1 does not cover",
+    )];
+
+    /// `install_*` steps only a fresh install performs, and why a board that only updates does
+    /// not need them. Each of these is a decision belonging to the board rather than to a
+    /// release, which is the only reason a release may leave it alone.
+    const FIRST_INSTALL_ONLY: [(&str, &str); 3] = [
+        (
+            "install_config",
+            "/etc/robot/*.toml belongs to the board: install.sh will not overwrite an existing \
+             updater.toml, and an update must not either",
+        ),
+        (
+            "install_dev_key",
+            "a trust anchor is the operator's decision. A release that installed trusted keys \
+             would be granting itself trust",
+        ),
+        (
+            "install_token_dropin",
+            "the fetch credential is supplied by whoever runs the install and is never in an \
+             artifact; a customer robot never has one at all",
+        ),
+    ];
+
+    /// Every step `install.sh` performs on a board is performed on an updated board too.
+    ///
+    /// This is the direction `docs/design/updater-design.md` §9.1 is about, and the one nothing
+    /// watched. `every_script_the_hooks_run_is_packaged` above checks that a script a hook
+    /// *already names* ships; it cannot notice a step no hook names at all. That is the mistake,
+    /// four times: units left where systemd never looks, a GStreamer stack only provisioning
+    /// installed, a `setup-npu.sh` packaged beside its model and never called, and a
+    /// `/etc/profile.d` snippet that sat in `install.sh` alone while every board in the fleet
+    /// updated past it. The fourth went unnoticed for a month because it is cosmetic — the
+    /// robot works, the prompt is just wrong — which is the argument for a test rather than for
+    /// a rule people are supposed to remember.
+    ///
+    /// Two halves, because the step can be missing in two shapes: a function `install.sh` runs
+    /// and no hook does, and a shared `setup-*.sh` only `install.sh` calls.
+    ///
+    /// This is a forcing function, not a proof. An author can satisfy it by adding a name to
+    /// `FIRST_INSTALL_ONLY` — but they have to write down why an already-provisioned board does
+    /// not need the thing they just added, and every one of the four would have failed at that
+    /// sentence.
+    #[test]
+    fn every_install_sh_step_reaches_an_updated_board() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let install = std::fs::read_to_string(root.join("scripts/install.sh"))
+            .expect("scripts/install.sh must exist");
+
+        // ── half one: every `install_*` step is accounted for ──
+        //
+        // Call sites, not definitions: a function that is defined and never called does nothing
+        // to a board. `    install_foo` on a line of its own is how this script calls one.
+        let mut called: Vec<&str> = install
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim();
+                let indented = line.starts_with(' ') || line.starts_with('\t');
+                (indented
+                    && name.starts_with("install_")
+                    && !name.contains(|c: char| !(c.is_ascii_lowercase() || c == '_')))
+                .then_some(name)
+            })
+            .collect();
+        called.sort();
+        called.dedup();
+        assert!(
+            !called.is_empty(),
+            "no install_* call sites found in install.sh; this test is watching nothing"
+        );
+
+        let mut accounted: Vec<&str> = ALSO_ON_UPDATE
+            .iter()
+            .chain(FIRST_INSTALL_ONLY.iter())
+            .map(|(name, _)| *name)
+            .collect();
+        accounted.sort();
+
+        for name in &called {
+            assert!(
+                accounted.contains(name),
+                "install.sh calls {name}, and nothing says whether an already-provisioned board \
+                 ever gets it.\n\
+                 Read docs/design/updater-design.md §9.1. Then either move the step into a \
+                 scripts/setup-*.sh that hooks/postinstall runs too — which is what \
+                 setup-login.sh is — or add {name} to FIRST_INSTALL_ONLY here with the reason a \
+                 board that only updates does not need it."
+            );
+        }
+        for name in &accounted {
+            assert!(
+                called.contains(name),
+                "{name} is listed here but install.sh no longer calls it; drop the entry"
+            );
+        }
+
+        // ── half two: a shared setup script both paths run ──
+        //
+        // `install.sh` runs one out of the installed release, as `current/scripts/setup-x.sh`.
+        // Matching that exact form and not the bare name on purpose: the script also *names*
+        // setup-board.sh in a message telling an operator to go run it, which is not the same
+        // thing as running it.
+        let mut shared: Vec<String> = Vec::new();
+        for (_, rest) in install
+            .split("current/scripts/setup-")
+            .skip(1)
+            .map(|r| ("", r))
+        {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || "._-".contains(*c))
+                .collect();
+            if name.ends_with(".sh") {
+                shared.push(format!("scripts/setup-{name}"));
+            }
+        }
+        shared.sort();
+        shared.dedup();
+
+        let hooks: String = ["hooks/preinstall.in", "hooks/postinstall"]
+            .iter()
+            .map(|h| std::fs::read_to_string(root.join(h)).unwrap_or_else(|e| panic!("{h}: {e}")))
+            .collect();
+        for script in &shared {
+            assert!(
+                hooks.contains(&format!("script={script}")),
+                "install.sh runs {script} out of the release and no hook does. A board that only \
+                 updates never gets it — see docs/design/updater-design.md §9.1. Add \
+                 `script={script}` to hooks/postinstall."
+            );
+        }
+    }
+
     /// Every policy file in `policies/` must be packaged, at every packaging site.
     ///
     /// The `--include` list exists in three copies (the two workflows and `dev-push.sh`), and

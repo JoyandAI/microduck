@@ -4,11 +4,13 @@ Status: closed · Date: 2026-08-05, revised 2026-08-07 and 2026-08-11 · Owner: 
 
 Four bugs in a row reached a board, all in the install path, none caught by 418 tests or by
 `board-test.sh`. This records why, and what closed it. The general rule this taught — anything a
-board needs before a release works belongs in a hook, because that is the only thing that runs on
-every board on every update — outgrew this document and now lives in `updater-design.md` §9.1,
-where it has since caught two more instances. Written the same day, while the reasons were
-still concrete, and kept in the past tense it has earned rather than rewritten as reference — what it
-is useful for now is the shape of the mistake, not the state of the tree.
+fresh install does to a board belongs in a hook too, because that is the only thing that runs on
+every board on every update — outgrew this document and now lives in `updater-design.md` §9.1.
+**That is where to read it; this page is the story, not the rule.** It has been got wrong twice
+more since, so §9.1 is worth reading before adding an install step rather than after. Written the
+same day, while the reasons were still concrete, and kept in the past tense it has earned rather
+than rewritten as reference — what it is useful for now is the shape of the mistake, not the state
+of the tree.
 
 A second section covers two findings that *look* like the same thing and are not: version skew
 between a daemon that is already running and a release that has just been installed. Neither would
