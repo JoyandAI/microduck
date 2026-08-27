@@ -755,11 +755,67 @@ even under "latest-for-all" (where a robot otherwise only updates when tapped):
   re-fetch. The robot must always be able to phone home rather than require an
   RMA / truck roll.
 
-### 8.3 On-device update log
+### 8.3 On-device update log, and the run transcript
 
 Persist the last N update attempts (timestamp, channel, from→to version,
 outcome, error) to disk, retrievable over BLE/HTTP. This is the first thing
 support needs when a client reports "update failed."
+
+The log answers *that* an attempt happened and how it ended. What it cannot answer is what the
+attempt **did**, and that question has one honest home too.
+
+**Why not the journal.** `updaterd` logs its notable events to systemd, and for watching an
+update happen that is the right place — `journalctl -f` needs no machinery. It is the wrong place
+to *keep* them. `/var/log` on this board is a zram device, so the `Storage=persistent` drop-in
+buys survival of a clean reboot and not of a power cut — and the updates anyone needs this for
+are disproportionately the ones that end in a power cut. That is the same argument that put the
+update log outside the journal in the first place; the transcript is its second application.
+
+Worse, the phase timeline was never in the journal at all. Phases were emitted only as
+`update.progress` notifications, so the state machine's own account of itself existed for exactly
+as long as a client held a socket open, and a `robotctl update apply` that nobody watched left an
+outline with the middle missing.
+
+**What a run records.** One file per run, `runs/<id>.jsonl` in `state_dir`, `fsync`ed per line
+under the same rule as the log — outside every `install_dir`, so a swap or a rollback cannot
+destroy the account of the swap or the rollback (§5.7):
+
+- the run's opening: the target as the caller named it, the source, what was live, and who asked,
+  from `SO_PEERCRED`;
+- the manifest that passed its signature check — version, hash, size, URL, **which** trusted key
+  admitted it, and the revision it was built from;
+- every phase boundary, with a detail where there is one, and therefore the time each took;
+- hook output verbatim, with its exit code, on success as well as on failure;
+- each unit restarted, reloaded or deferred, and what systemd said;
+- the health gate's verdict, which is what decides commit against rollback;
+- how it ended.
+
+A log entry carries the run number, so the two compose the way `git log` and `git show` do:
+`robotctl update log` is the index and `robotctl update show` is the detail.
+
+**Recording never fails an update.** Every write is best-effort and reports failure to the
+journal. An update that completed and lost its diary is strictly better than one abandoned to
+keep the diary honest.
+
+**Runs that end elsewhere.** A daemon update restarts `updaterd` itself, so its transcript stops
+mid-flight by design and the verdict arrives minutes and a reboot later, from the boot-counter
+trial. That revert opens a **run of its own** rather than reopening the first — the first process
+is gone and cannot append. The pairing is legible instead: a transcript with no `ended` is a run
+whose verdict is elsewhere, `show` says so where the verdict would have been, and the next run is
+that verdict. The rescue-to-golden path, performed by a shell script before `updaterd` starts,
+gets a thin run reconstructed from the breadcrumb it leaves, marked as second-hand.
+
+**Bounds.** Twenty runs kept, 4000 events and 2 MiB per run, 64 KiB per event. Past a cap the
+writer stops and records how much it dropped, and the ending is written regardless — a transcript
+missing its tail must not read as a run that stopped there. `hooks::MAX_OUTPUT` already bounds the
+largest contributor at 8 KiB per hook, so an ordinary daemon run is a few kilobytes.
+
+**The journal is spliced in by the client, not the daemon.** `robotctl update show` runs
+`journalctl --utc` over the run's window, scoped to the units the run itself says it touched, and
+appends it. Reading the system journal is a privilege `updaterd` has and should not lend out over
+a socket whose read side is deliberately ungated — and it is the half that covers the *other*
+daemons, which the transcript never sees. An operator without journal access gets the transcript
+plus the command to run for the rest.
 
 ### 8.4 What signatures do and don't buy: downgrade and freeze
 

@@ -47,6 +47,7 @@ pub mod robot;
 pub mod source;
 mod spawn;
 pub mod store;
+pub mod transcript;
 pub mod verify;
 
 use std::path::PathBuf;
@@ -176,6 +177,18 @@ pub enum Error {
     #[error("artifact exceeds configured archive limits: {0}")]
     ArchiveTooLarge(String),
 
+    /// Asked to show a run this board has no transcript for.
+    ///
+    /// Carries what it *does* have, because the number was almost certainly a typo or a
+    /// guess: a bare "no such run" leaves the caller with nowhere to go next, and the list
+    /// is three lines away in the same directory.
+    #[error("{}", crate::transcript::no_such_run(*.run, .available))]
+    NoSuchRun {
+        /// `None` when the caller asked for the most recent run and there is none.
+        run: Option<u64>,
+        available: Vec<u64>,
+    },
+
     #[error("on-disk state is inconsistent: {0}")]
     Corrupt(String),
 
@@ -190,6 +203,11 @@ impl Error {
         match self {
             Error::UnknownComponent(_) => code::UNKNOWN_COMPONENT,
             Error::NotInstalled { .. } => code::NOT_INSTALLED,
+            // Shares `NOT_INSTALLED` rather than minting a code, for the reason `StagingBehind`
+            // and `WouldOrphanUnit` share theirs: it is the same answer in a different noun —
+            // the component is known, the specific thing named is not on this board — and what
+            // the caller needs is the message, which names the runs that are.
+            Error::NoSuchRun { .. } => code::NOT_INSTALLED,
             Error::WouldDowngrade { .. } => code::WOULD_DOWNGRADE,
             // Shares the downgrade code rather than adding one, for the reason `WouldOrphanUnit`
             // shares `INCOMPATIBLE` below: to a client this is the same answer — "refused, the

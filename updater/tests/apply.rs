@@ -2384,3 +2384,224 @@ async fn from_dir_that_does_not_exist_fails_before_anything_changes() {
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
     assert_eq!(fx.staging_leftovers(), 0);
 }
+
+// ── the run transcript ───────────────────────────────────────────────────────
+//
+// `docs/design/updater-design.md` §8.3. The update log says an attempt happened; these cover the
+// record of what it *did*, and the link between the two.
+
+/// Every event kind in a transcript, by name, for asserting on shape rather than on wording.
+fn event_names(events: &[updater::proto::RunRecord]) -> Vec<String> {
+    use updater::proto::RunEvent::*;
+    events
+        .iter()
+        .map(|record| match &record.event {
+            Began { .. } => "began".to_owned(),
+            Phase { phase, .. } => format!("{phase:?}"),
+            Manifest { .. } => "manifest".to_owned(),
+            Hook { .. } => "hook".to_owned(),
+            Unit { .. } => "unit".to_owned(),
+            Health { .. } => "health".to_owned(),
+            Note { .. } => "note".to_owned(),
+            Ended { .. } => "ended".to_owned(),
+            Truncated { .. } => "truncated".to_owned(),
+            Unrecognised => "?".to_owned(),
+        })
+        .collect()
+}
+
+/// The link that makes the pair usable: a log entry names the run that explains it.
+#[tokio::test]
+async fn an_apply_writes_a_transcript_its_log_entry_points_at() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    let entry = engine.log(1).unwrap().pop().expect("an entry");
+    let run = entry.run.expect("the entry must name its run");
+
+    let transcript = engine.show(Some(run)).unwrap();
+    assert_eq!(transcript.run, run);
+    assert_eq!(transcript.component.as_str(), "daemon");
+
+    // The backbone: opened, resolved a manifest, walked the phases, ended.
+    let names = event_names(&transcript.events);
+    for expected in ["began", "manifest", "Downloading", "Swapping", "ended"] {
+        assert!(
+            names.contains(&expected.to_owned()),
+            "missing {expected} in {names:?}"
+        );
+    }
+
+    // And the manifest facts are the ones a person is reading it for.
+    let manifest = transcript
+        .events
+        .iter()
+        .find_map(|record| match &record.event {
+            updater::proto::RunEvent::Manifest {
+                version, signed_by, ..
+            } => Some((version.clone(), signed_by.clone())),
+            _ => None,
+        })
+        .expect("the manifest must be recorded");
+    assert_eq!(manifest.0, semver::Version::new(1, 0, 0));
+    assert!(
+        manifest.1.is_some(),
+        "which key admitted it is the point of recording it"
+    );
+}
+
+/// With no run named, the most recent — the one someone debugging has just caused.
+#[tokio::test]
+async fn show_defaults_to_the_most_recent_run() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+    fx.publish("1.1.0", None);
+    apply_latest(&mut engine).await.unwrap();
+
+    let latest = engine.show(None).unwrap();
+    assert_eq!(latest.run, 2);
+    // And it says what else is there, newest first, so a client need not ask twice.
+    assert_eq!(latest.available, vec![2, 1]);
+}
+
+/// The rollback case, which is the whole reason for the feature: the gate's verdict and the
+/// reason for the revert are both in the run, not only in a journal that may be gone.
+#[tokio::test]
+async fn a_rolled_back_apply_records_the_gate_that_failed_it() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish("1.1.0", None);
+    let mut engine = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), "");
+    let result = apply_latest(&mut engine).await.unwrap();
+    assert!(
+        matches!(result, ApplyResult::RolledBack { .. }),
+        "{result:?}"
+    );
+
+    let transcript = engine.show(None).unwrap();
+    let names = event_names(&transcript.events);
+    assert!(names.contains(&"RollingBack".to_owned()), "{names:?}");
+
+    let health = transcript
+        .events
+        .iter()
+        .find_map(|record| match &record.event {
+            updater::proto::RunEvent::Health { passed, detail } => Some((*passed, detail.clone())),
+            _ => None,
+        })
+        .expect("the gate's verdict must be recorded");
+    assert!(!health.0);
+    assert!(health.1.is_some(), "a failed gate must say why");
+
+    match &transcript.events.last().unwrap().event {
+        updater::proto::RunEvent::Ended { outcome, summary } => {
+            assert!(
+                matches!(outcome, Some(Outcome::RolledBack { .. })),
+                "{outcome:?}"
+            );
+            assert!(summary.contains("1.1.0"), "{summary}");
+        }
+        other => panic!("a finished run must end with `ended`, got {other:?}"),
+    }
+}
+
+/// A refusal is one of the two runs anyone reads, and it must carry what it refused — not just
+/// that something was refused.
+#[tokio::test]
+async fn a_refused_apply_still_records_what_it_refused() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    fx.publish("2.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    // Newest first is 2.0.0; asking for 1.0.0 by `latest` is the downgrade guard's case, so
+    // provoke the refusal the way a stale mirror would: pin, then ask for something else.
+    engine
+        .pin("daemon", Some(semver::Version::new(2, 0, 0)))
+        .await
+        .unwrap();
+    let refused = apply_exact(&mut engine, "1.0.0").await;
+    assert!(refused.is_err(), "{refused:?}");
+
+    let transcript = engine.show(None).unwrap();
+    let names = event_names(&transcript.events);
+    assert!(names.contains(&"manifest".to_owned()), "{names:?}");
+    match &transcript.events.last().unwrap().event {
+        updater::proto::RunEvent::Ended { summary, .. } => {
+            assert!(summary.contains("refused"), "{summary}");
+            assert!(summary.contains("pinned"), "{summary}");
+        }
+        other => panic!("expected an ending, got {other:?}"),
+    }
+}
+
+/// The hook's output is the richest thing an update produces and used to survive only in the
+/// journal, dropped by both call sites.
+#[tokio::test]
+async fn the_post_install_hook_output_is_kept() {
+    let fx = Fixture::new();
+    fx.publish(
+        "1.0.0",
+        Some("#!/bin/sh\necho 'onnxruntime 1.20.1 already present'\necho 'gstreamer: h264 ok'\n"),
+    );
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    let transcript = engine.show(None).unwrap();
+    let output = transcript
+        .events
+        .iter()
+        .find_map(|record| match &record.event {
+            updater::proto::RunEvent::Hook { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("the hook that ran must be in the transcript");
+    assert!(
+        output.contains("onnxruntime 1.20.1 already present"),
+        "{output}"
+    );
+    assert!(output.contains("gstreamer: h264 ok"), "{output}");
+}
+
+/// A rollback is an update event too, and the one someone asks about when a robot is mysteriously
+/// on an old release.
+#[tokio::test]
+async fn an_explicit_rollback_gets_its_own_run() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+    fx.publish("1.1.0", None);
+    apply_latest(&mut engine).await.unwrap();
+
+    engine.rollback("daemon").await.unwrap();
+
+    let transcript = engine.show(None).unwrap();
+    assert_eq!(transcript.run, 3);
+    match &transcript.events.first().unwrap().event {
+        updater::proto::RunEvent::Began { target, .. } => assert_eq!(target, "rollback"),
+        other => panic!("expected the run to open, got {other:?}"),
+    }
+    assert!(event_names(&transcript.events).contains(&"ended".to_owned()));
+}
+
+/// Asking for a run that is not there says which ones are, because the number was a guess.
+#[tokio::test]
+async fn asking_for_a_run_that_is_not_there_says_which_are() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    let message = engine.show(Some(99)).unwrap_err().to_string();
+    assert!(message.contains("run 99"), "{message}");
+    assert!(message.contains("run 1 is the only one kept"), "{message}");
+}

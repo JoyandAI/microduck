@@ -97,6 +97,14 @@ fn permits(call: &proto::Call) -> bool {
         // Read-only, and what support asks for first. `update.log` is the record that
         // survives a wiped journal (§8.2), so a phone able to read it is worth having.
         Log(_) => true,
+        // The detail behind one of those log lines, and the same claim: read-only, and the
+        // question an owner whose update failed actually has. Bigger than every other reply here
+        // — a few kilobytes for an ordinary run, since `hooks::MAX_OUTPUT` bounds the largest
+        // part of it, against a `updater::transcript` ceiling of two megabytes for a pathological
+        // one — so an app should ask for it on a tap rather than on a refresh. That is the app's
+        // decision to make: what this function decides is whether a phone in the room may see it,
+        // and a phone that may read the log may read what is behind it.
+        Show(_) => true,
         ListInstalled(_) => true,
 
         // Going back. Both are permitted, and both are less consequential than the `Apply`

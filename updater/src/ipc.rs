@@ -512,6 +512,10 @@ impl Server {
                 .with_engine(id.clone(), |engine| engine.log(params.limit))
                 .await
                 .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
+            Call::Show(params) => self
+                .with_engine(id.clone(), |engine| engine.show(params.run))
+                .await
+                .map_or_else(|e| e, |v| Response::ok(Some(id), &v)),
             Call::ListInstalled(params) => self
                 .with_engine(id.clone(), |engine| {
                     engine.list_installed(params.component.as_str())
@@ -538,6 +542,18 @@ impl Server {
             // ── mutating ─────────────────────────────────────────────────────
             Call::Apply(params) => {
                 let component = params.component.0.clone();
+                // The same three numbers `authorise` has already logged, kept for the transcript.
+                // A month later "who ran this?" has no other answer: the journal line that carried
+                // them may be gone, and the transcript that outlived it is where the question gets
+                // asked.
+                let requested_by = peer.map(|p| {
+                    format!(
+                        "uid={} gid={} pid={}",
+                        p.uid(),
+                        p.gid(),
+                        p.pid().map(|pid| pid.to_string()).unwrap_or_else(|| "?".into())
+                    )
+                });
                 self.run_mutating(id, out, move |engine, tx| {
                     Box::pin(async move {
                         engine
@@ -548,6 +564,7 @@ impl Server {
                                     dry_run: params.options.dry_run,
                                     interrupt_sessions: params.options.interrupt_sessions,
                                     from_dir: params.options.from_dir.map(std::path::PathBuf::from),
+                                    requested_by,
                                 },
                                 tx,
                             )

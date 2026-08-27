@@ -118,7 +118,9 @@ fn permits(call: &proto::Call) -> bool {
         // ── reading the robot's software ─────────────────────────────────────
         //
         // All read-only, all useful to a remote client, none of them touching `current`.
-        Check(_) | Status | Subscribe | Log(_) | ListInstalled(_) => true,
+        // `Show` is the largest reply in this list — a run's whole transcript — and a
+        // datachannel is the one transport here with the room for it.
+        Check(_) | Status | Subscribe | Log(_) | Show(_) | ListInstalled(_) => true,
 
         // ── identity and status ─────────────────────────────────────────────
         SystemInfo | SystemServices | SystemSetName(_) => true,

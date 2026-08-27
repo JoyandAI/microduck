@@ -42,6 +42,7 @@ mod configure;
 mod duck;
 mod monitor;
 mod path_map;
+mod show;
 
 /// Exit codes. Stable — CI asserts on these.
 mod exit {
@@ -855,10 +856,35 @@ enum UpdateCommand {
     /// Per-component state.
     Status(StatusArgs),
 
-    /// Recent update attempts and outcomes.
+    /// Recent update attempts and outcomes, one line each, newest first.
+    ///
+    /// The first column is the run number — pass it to `update show` for what that attempt
+    /// actually did.
     Log {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+    },
+
+    /// Everything one update run did: phases, timings, the manifest, hook output, restarts.
+    ///
+    /// The question `update log` cannot answer. A log line says an update happened and how it
+    /// ended; this says what it *did*, from the record `updaterd` wrote to `/var/lib` as it went —
+    /// which survives the swap, the rollback, and the power cut a bad update can provoke, none of
+    /// which the journal on this board survives (`/var/log` is zram).
+    ///
+    /// The journal for the same window is appended, scoped to the units the run touched, so the
+    /// account covers the daemons that were restarted and not only `updaterd`'s side of it.
+    Show {
+        /// Which run. Omit for the most recent, which is nearly always the one meant.
+        run: Option<u64>,
+
+        /// Emit the transcript as JSON. No journal is spliced in — that half is a rendering.
+        #[arg(long)]
+        json: bool,
+
+        /// Skip the journal, and print the `journalctl` line instead of running it.
+        #[arg(long)]
+        no_journal: bool,
     },
 
     /// Follow progress until interrupted.
@@ -2867,6 +2893,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }),
         UpdateCommand::Status(_) => proto::Call::Status,
         UpdateCommand::Log { limit } => proto::Call::Log(proto::LogParams { limit: *limit }),
+        UpdateCommand::Show { run, .. } => proto::Call::Show(proto::ShowParams { run: *run }),
         // Streams until interrupted, so it never reaches the single-response path below.
         UpdateCommand::Watch => return watch(&mut client),
     };
@@ -2944,14 +2971,93 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
             match serde_json::from_value::<Vec<proto::LogEntry>>(result.clone()) {
                 Err(_) => json(&result),
                 Ok(entries) => {
+                    // Was one compact JSON object per line, which is what a diagnostic command
+                    // prints when it cannot parse what it got — not what it should print when it
+                    // can. The same entries have rendered as prose in `robotctl health` for as
+                    // long as that command has existed.
                     for entry in entries {
-                        println!("{}", compact(&entry));
+                        println!("{}", show::log_line(&entry));
                     }
+                }
+            }
+        }
+        UpdateCommand::Show { json: true, .. } => json(&result),
+        UpdateCommand::Show { no_journal, .. } => {
+            match serde_json::from_value::<proto::RunTranscript>(result.clone()) {
+                Err(_) => json(&result),
+                Ok(transcript) => {
+                    print!("{}", show::render(&transcript));
+                    print!("{}", journal_for(&transcript, *no_journal));
                 }
             }
         }
         _ => json(&result),
     }
+}
+
+/// The journal for a run's window, spliced under its transcript.
+///
+/// **Run here rather than served by `updaterd`.** Reading the system journal is a privilege the
+/// daemon has and should not lend out over a socket whose read side is deliberately ungated, and
+/// `robotctl` is where every other shell-out in this binary already lives. The cost is that an
+/// operator who is not in `systemd-journal` gets nothing back — so that case prints the command
+/// rather than an empty heading, and `sudo` in front of it is the whole fix.
+fn journal_for(transcript: &proto::RunTranscript, skip: bool) -> String {
+    let Some((since, until)) = show::window(transcript) else {
+        return String::new();
+    };
+    let argv = show::journal_command(since, until, &show::units(transcript));
+    let printed = argv.join(" ");
+
+    let mut out = format!(
+        "\n  ── journal · {} to {} UTC ──\n",
+        show::full_stamp(since),
+        show::full_stamp(until)
+    );
+
+    if skip {
+        out.push_str(&format!("  {printed}\n"));
+        return out;
+    }
+
+    let captured = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .output();
+    let text = match captured {
+        Ok(done) if done.status.success() => String::from_utf8_lossy(&done.stdout).into_owned(),
+        // A journal that cannot be read is not an error worth failing the command over: the
+        // transcript above it is the durable half and is already printed. What this owes the
+        // reader is the command, so the missing half is one `sudo` away.
+        Ok(done) => {
+            let why = String::from_utf8_lossy(&done.stderr);
+            out.push_str(&format!("  could not be read: {}\n", why.trim()));
+            out.push_str(&format!("  {printed}\n"));
+            return out;
+        }
+        Err(e) => {
+            out.push_str(&format!("  could not run journalctl: {e}\n"));
+            out.push_str(&format!("  {printed}\n"));
+            return out;
+        }
+    };
+
+    // journalctl exits 0 and says "-- No entries --" both for a window with nothing in it and for
+    // a caller who may not read system logs, and those need different advice. Neither is an error.
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("-- No entries --"))
+        .collect();
+    if lines.is_empty() {
+        out.push_str(
+            "  nothing, which on this board usually means no permission to read system logs \n               rather than an update that logged nothing. Try it directly:\n",
+        );
+        out.push_str(&format!("  sudo {printed}\n"));
+        return out;
+    }
+    for line in lines {
+        out.push_str(&format!("  {line}\n"));
+    }
+    out
 }
 
 fn compact(value: &impl serde::Serialize) -> String {
@@ -3727,6 +3833,7 @@ mod tests {
             from: Some(semver::Version::new(0, 1, 9)),
             to: Some(semver::Version::new(0, 2, 0)),
             outcome,
+            run: None,
         };
 
         assert_eq!(
