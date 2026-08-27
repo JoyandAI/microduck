@@ -47,9 +47,10 @@
 #   --no-gstreamer    skip the GStreamer stack `mediad` needs. Installed by default, with a
 #                     report of what this board can encode. It needs no reboot, so it can also
 #                     be added or re-run later:  sudo /usr/local/sbin/robot-setup-gstreamer
-#   --no-rkaiq        skip the camera's 3A engine (auto exposure, white balance, denoise).
+#   --no-rkaiq        skip the camera's 3A engine (white balance, colour, denoise; exposure is
+#                     mediad's own software loop, not this).
 #                     Installed by default. Without it the camera runs on raw ISP defaults:
-#                     green, noisy and stuck at one exposure. Re-run later with:
+#                     green and noisy. Re-run later with:
 #                     sudo /usr/local/sbin/robot-setup-rkaiq
 #   --weird-ble       for a Radxa Zero 3W whose Bluetooth cannot bond a gamepad at all, even with
 #                     `btd` paused. Implies `--pause-btd-on-pair`, and additionally sets

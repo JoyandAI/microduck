@@ -96,6 +96,17 @@ struct Args {
     #[arg(long, default_value_t = 90)]
     rotate: u32,
 
+    /// Leave the exposure where `--exposure` and `--analogue-gain` put it, instead of metering.
+    ///
+    /// **The software loop is on by default because the board's 3A engine only does this once.**
+    /// `rkaiq_3A_server` owns white balance, gamma and noise reduction, and its AE converges the
+    /// sensor at stream start and then stops responding — and skips even that on a boot where it
+    /// missed the stream-start event, which is the "3A stopped working" shape. `mediad::exposure`
+    /// is the loop. Turn it off for a fixed exposure: a calibration capture, or a board whose
+    /// engine really does keep converging.
+    #[arg(long)]
+    no_auto_exposure: bool,
+
     /// Rotate in the pipeline as well, so the *encoded stream* comes out upright.
     ///
     /// **Off by default because it is expensive in a way that does not look like rotation.** It
@@ -203,12 +214,12 @@ fn main() -> ExitCode {
             rotation,
         };
 
-        // `_frames` is the raw NV12 tap off the tee. Nothing reads it yet — perception and the
-        // `get_frame` surface in `architecture.md` §5.3 are what it is for — but the branch runs
-        // from the start rather than being added later, because a tee inserted into a live
+        // `frames` is the raw tap off the tee: the auto-exposure loop meters it, and the
+        // `get_frame` surface in `architecture.md` §5.3 is what the rest of it is for. The branch
+        // runs from the start rather than being added later, because a tee inserted into a live
         // pipeline is a different and much harder problem than a tee that was always there.
-        let (_pipeline, mut channels, _frames) =
-            match mediad::pipeline::start(source, &producer, &settings) {
+        let (_pipeline, mut channels, frames) =
+            match mediad::pipeline::start(source.clone(), &producer, &settings) {
                 Ok(started) => started,
                 Err(e) => {
                     // The message names which step failed and what usually causes it — a missing
@@ -218,6 +229,30 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+        // After the pipeline, because it meters the pipeline's own frames — and only with a real
+        // camera, since a test pattern has no sensor to write and the loop would spend the daemon's
+        // life reporting that it cannot.
+        //
+        // `_exposure` is the handle that stops the thread; it lives as long as this scope, which is
+        // as long as the daemon.
+        let _exposure = match (&source, args.no_auto_exposure) {
+            (mediad::pipeline::Source::Camera(camera), false) => Some(mediad::exposure::spawn(
+                camera.device.clone(),
+                frames.clone(),
+                camera.exposure,
+                camera.analogue_gain,
+            )),
+            (mediad::pipeline::Source::Camera(_), true) => {
+                tracing::info!(
+                    exposure = args.exposure,
+                    analogue_gain = args.analogue_gain,
+                    "--no-auto-exposure: the picture stays at the starting exposure"
+                );
+                None
+            }
+            (mediad::pipeline::Source::Test, _) => None,
+        };
 
         // What every peer is told about the picture. The geometry is the *encoded* frame — the
         // pipeline does not rotate, so it is the capture geometry — and the rotation is the mount.

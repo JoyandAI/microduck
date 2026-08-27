@@ -191,11 +191,11 @@ pub enum Source {
 ///
 /// **These are a starting exposure, not a policy.** A capture with the driver's boot defaults
 /// comes out black, so something has to write the sensor before the first frame — that is what
-/// these are for, and they are the difference between a picture and no picture on a board with
-/// no 3A. Where `scripts/setup-rkaiq.sh` has run, Rockchip's engine owns exposure from its first
-/// statistics onward and these hold for the few frames before that; where it has not, they are
-/// all there is and the picture stays at one exposure. Values are in the sensor's own units:
-/// exposure in lines (~19 µs each) and analogue gain where 256 is 1x, up to 2816 for 11x.
+/// these are for. From there [`crate::exposure`] meters the picture and takes over, because
+/// Rockchip's 3A engine converges once at stream start and then stops — and does not manage even
+/// that if it missed the stream-start event. With `--no-auto-exposure` these are all there is and
+/// the picture stays at one brightness. Values are in the sensor's own units: exposure in lines (~19 µs each)
+/// and analogue gain where 256 is 1x, up to 2816 for 11x.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Camera {
     pub device: String,
@@ -225,6 +225,15 @@ pub struct Frame {
 pub struct Frames(Arc<Mutex<Option<Frame>>>);
 
 impl Frames {
+    /// Read the latest frame in place, without copying it. `None` until the first one arrives.
+    ///
+    /// For a reader that wants a number out of a frame rather than the frame — the auto-exposure
+    /// loop wants a mean, and cloning 1.8 MB twice a second to average 11k bytes of it is a memcpy
+    /// nobody needs.
+    pub fn inspect<T>(&self, read: impl FnOnce(&Frame) -> T) -> Option<T> {
+        self.0.lock().expect("frame lock").as_ref().map(read)
+    }
+
     /// The latest frame, cloned. `None` until the first one arrives.
     pub fn latest(&self) -> Option<Frame> {
         self.0.lock().expect("frame lock").clone()
