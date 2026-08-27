@@ -48,6 +48,20 @@ for script in robot-rescue robot-boot-check; do
         || echo "postinstall: cannot install ${script}; the board keeps the previous copy" >&2
 done
 
+# The login-shell files: the `robotctl` completions, the motd banner naming the release actually
+# live, and the robot's name in the prompt. `install.sh` runs this same script on a fresh board;
+# running it here is the only reason a board provisioned before one of them was written ever gets
+# it, which is the whole of `docs/design/updater-design.md` §9.1 — and its fourth instance was
+# exactly this file, missing for months on a board whose release contained the feature.
+#
+# Never fatal, and not because it is unlikely to fail: a shell prompt is not worth rolling an
+# update back for.
+script=scripts/setup-login.sh
+if [ -f "$script" ]; then
+    sh "$script" \
+        || echo "postinstall: the login-shell files did not install; they are cosmetic" >&2
+fi
+
 # The robot's voice bank, rendered from the SoC serial by the release's own generator.
 # Idempotent — a marker records the seed and bank version, and a current bank is a no-op —
 # so this runs on every install and only actually renders on the first one (or when the

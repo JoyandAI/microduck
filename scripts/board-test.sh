@@ -504,10 +504,18 @@ chmod +x /stub/curl /stub/find /stub/systemctl
 touch /usr/local/lib/libonnxruntime.so.9.9.9
 ln -sf libonnxruntime.so.9.9.9 /usr/local/lib/libonnxruntime.so
 
-# The motd directory the login banner installs into. Present on the image, so the fixture has to
-# have it too or install_login_banner correctly does nothing and the assertion below would be
-# testing the fixture rather than the installer.
-mkdir -p /etc/update-motd.d
+# The directories the login-shell files install into. All three are present on the image, so the
+# fixture has to have them too or `setup-login.sh` correctly does nothing and the assertions below
+# would be testing the fixture rather than the installer.
+mkdir -p /etc/update-motd.d /etc/profile.d /etc/bash_completion.d
+
+# A named robot, which is what the prompt snippet reads. Without it the snippet falls back to
+# `duck-xxxx` off the SoC serial, and a container has no /proc/device-tree — so the interesting
+# half of the assertion below would be skipped on exactly the machine running it.
+mkdir -p /var/lib/robot/config
+cat > /var/lib/robot/config/config.json <<"NAMED"
+{"name": "coincoin"}
+NAMED
 
 # A BlueZ config with [General] but no Privacy key — the insert-after-[General] branch, which
 # is the one a stock Armbian image takes.
@@ -834,6 +842,35 @@ grep -q "robotctl update status" /etc/update-motd.d/40-robot \
     || { echo "    [FAIL] the banner does not report a rolled-back update"; exit 1; }
 echo "    [ok] the login banner is installed and reports a rolled-back update"
 
+# The name of the robot in the prompt: the fourth instance of updater-design.md §9.1, and the
+# reason `setup-login.sh` exists: it lived in install.sh alone, so no board that had only ever
+# updated had it.
+test -f /etc/profile.d/robot-name-prompt.sh \
+    || { echo "    [FAIL] the prompt snippet was not installed"; exit 1; }
+test -f /etc/bash_completion.d/robotctl \
+    || { echo "    [FAIL] the robotctl completions were not installed"; exit 1; }
+
+# Not just present — actually injecting. The snippet cannot edit PS1 directly, because ~/.bashrc
+# sets PS1 after /etc/profile.d has run; it hooks PROMPT_COMMAND and rewrites PS1 at the first
+# prompt instead. That indirection is the part that silently does nothing when it is wrong, so
+# drive it: source the snippet against a stock Debian PS1 and run what PROMPT_COMMAND would run.
+#
+# In a file rather than `bash -c`, and double quotes throughout: this whole check runs inside a
+# single-quoted string, where one apostrophe ends the script early and the error names a line
+# three hundred below.
+cat > /tmp/prompt-check.sh <<"CHECK"
+. /etc/profile.d/robot-name-prompt.sh
+PS1="\u@\h:\w\$ "
+_robot_name_inject
+printf "%s" "$PS1"
+CHECK
+prompt="$(bash /tmp/prompt-check.sh)"
+case "$prompt" in
+    *"(coincoin)"*) ;;
+    *) echo "    [FAIL] the prompt does not name the robot: ${prompt}"; exit 1 ;;
+esac
+echo "    [ok] the login shell has the completions, and the prompt names the robot"
+
 # Through `current`, not at a versioned directory: the symlink has to follow the active
 # release, or robotctl on PATH silently pins to whichever release installed it.
 link="$(readlink /usr/local/bin/robotctl)"
@@ -970,6 +1007,9 @@ rm -f /etc/systemd/system/*.service /etc/systemd/system/*.timer /usr/lib/sysuser
 # The journald drop-in and the robotctl symlink go too, so the asymmetry asserted at the end is
 # a real absence rather than a leftover from the install above.
 rm -f /etc/systemd/journald.conf.d/10-robot.conf /usr/local/bin/robotctl
+# And the login-shell files, for the opposite reason: the hook is supposed to put these back, and
+# leaving the ones install.sh wrote in place would make that assertion vacuous.
+rm -f /etc/profile.d/robot-name-prompt.sh /etc/bash_completion.d/robotctl /etc/update-motd.d/40-robot
 ( cd "$REL" && PATH="/stub:$PATH" sh "$REL"/hooks/postinstall > /tmp/hook.log 2>&1 ) || {
     echo "    [FAIL] hooks/postinstall exited non-zero, which fails an update"
     cat /tmp/hook.log
@@ -1017,6 +1057,16 @@ for script in robot-rescue robot-boot-check; do
         || { echo "    [FAIL] postinstall did not install ${script}"; exit 1; }
 done
 echo "    [ok] postinstall refreshes the recovery scripts in /usr/local/sbin"
+
+# The login-shell files, which is the reason setup-login.sh exists: they lived in install.sh alone,
+# so no board that had only ever updated had them, and the one that made this obvious had been
+# running the release that added the prompt for a month with the stock prompt. An update puts them
+# on a board that was provisioned before they were written, which is the only path most boards have.
+for f in /etc/profile.d/robot-name-prompt.sh /etc/bash_completion.d/robotctl /etc/update-motd.d/40-robot; do
+    test -f "$f" \
+        || { echo "    [FAIL] postinstall alone did not install ${f}"; exit 1; }
+done
+echo "    [ok] postinstall alone installs the login-shell files"
 
 # The asymmetry, pinned because it is easy to assume otherwise: the hook places units and
 # accounts and nothing else. Both of these were deleted above and the hook did not restore

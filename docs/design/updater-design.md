@@ -922,8 +922,12 @@ are not a precedent; they are three instances.
   `install.sh`, where it is easy to test on the board being provisioned anyway, and the update
   path never learns about it. `install.sh` is not in the artifact and a hook cannot call it, so
   the shared step belongs in a `scripts/setup-*.sh` that both run — which is what
-  `setup-gstreamer.sh` already is. The three corollaries below have tests; this one does not
-  yet, and it is the one that would have caught all four.
+  `setup-gstreamer.sh` and `setup-login.sh` are.
+  `every_install_sh_step_reaches_an_updated_board` reads `install.sh`'s call sites and fails
+  unless each is either performed by a hook too or written down, with a reason, as something only
+  a fresh install does. It is a forcing function rather than a proof — the escape hatch is a line
+  in a table — but all four instances would have had to argue for that line, and none of them
+  could have.
 - **A script the hook runs must be packaged.** `every_script_the_hooks_run_is_packaged`
   reads `script=scripts/…` assignments out of both hooks and fails the build if any
   packaging site omits one.
