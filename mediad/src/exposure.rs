@@ -223,6 +223,7 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
             let mut waiting_logged = false;
             // Ticks since the last write, for the re-assert heartbeat.
             let mut quiet = 0u32;
+            let mut format_logged = false;
 
             while !mine.stopped() {
                 std::thread::sleep(INTERVAL);
@@ -230,13 +231,26 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
                     break;
                 }
 
-                let Some(mean) = frames.inspect(mean_luma).flatten() else {
+                let metered = frames.inspect(mean_luma);
+                if metered == Some(None) && !format_logged {
+                    format_logged = true;
+                    // The one way a frame can arrive and be unreadable: it is not what the capture
+                    // caps say. Loud, because the loop then meters nothing for ever and the only
+                    // other symptom is a camera that never changes exposure.
+                    tracing::error!(
+                        expected = CAPTURE_FORMAT,
+                        "the raw frames are not in the format this can meter; auto-exposure is inert"
+                    );
+                }
+                let Some(mean) = metered.flatten() else {
                     if !waiting_logged {
                         waiting_logged = true;
                         tracing::debug!("no frame to meter yet");
                     }
                     continue;
                 };
+                tracing::debug!(mean_luma = format!("{mean:.1}"), target = TARGET_Y, "metered");
+
                 let controls = match ae.step(mean) {
                     Some(controls) => controls,
                     // Nothing to change — but say it to the sensor again every so often, in case
