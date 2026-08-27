@@ -28,3 +28,8 @@ pub mod web;
 /// gate is by target rather than by feature.
 #[cfg(target_os = "linux")]
 pub mod pipeline;
+
+/// Auto-exposure, in software, because the board's 3A engine does not do it. Linux only for
+/// [`pipeline`]'s reason — it meters the frames the pipeline taps off the tee.
+#[cfg(target_os = "linux")]
+pub mod exposure;

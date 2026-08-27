@@ -1,11 +1,10 @@
 #!/bin/sh
-# Install Rockchip's rkaiq 3A engine and the IMX219 tuning, so the camera has auto exposure,
-# white balance and noise reduction instead of raw ISP defaults.
+# Install Rockchip's rkaiq 3A engine and the IMX219 tuning, so the camera has white balance,
+# colour and noise reduction instead of raw ISP defaults.
 #
-# Without this the ISP runs with no tuning and no 3A loop at all: the picture is green, noisy,
-# and fixed at whatever exposure `mediad` pinned at startup — which is a still photo of one
-# lighting condition, not a camera. The engine is what makes the head camera usable in a room
-# whose lights change.
+# Without this the ISP runs with no tuning and no 3A loop at all: the picture is green and noisy.
+# Exposure is *not* part of what this delivers — the engine's AE converges once at stream start
+# and then stops, so `mediad`'s `exposure` module owns the sensor. See the note below.
 #
 #   sudo sh /tmp/setup-rkaiq.sh
 #   sudo /usr/local/sbin/robot-setup-rkaiq          # later, to re-check
@@ -41,13 +40,21 @@
 #
 # ── What differs from the prototype's version of this script ──────────────────
 #
-# **rkaiq's auto exposure stays enabled here, and that is the whole point.** The prototype
-# patched `ae_calib CommCtrl.Enable` to 0 because its runtime owned sensor exposure: it ran a
-# software AE loop over decoded MJPEG frames, and pinned exposure outright in laser mode, where
-# rkaiq writing its own values at stream start turned the image black. Neither reason survives
-# here — there is no laser mode, and `mediad` has no AE of its own. So the engine owns exposure,
-# which is exactly the missing behaviour, and `mediad`'s `--exposure`/`--analogue-gain` become
-# the values the sensor holds for the few frames before the engine's first stats arrive.
+# **rkaiq's auto exposure is turned off here, as the prototype turned it off — because it fires
+# once and `mediad` needs it to keep firing.** This script first shipped with AE left enabled, on
+# the reasoning that the prototype only disabled it to stop the engine fighting a runtime that
+# owned exposure itself, and that nothing owned exposure here. Measured on a robot: the engine's
+# AE does write the sensor, once, at stream start — `mediad` pinned `exposure=600
+# analogue_gain=1024` and the sensor was found at `1589 / 1536`, which is the engine's answer and
+# not ours. But a hand-written `exposure=300 analogue_gain=256` on that same healthy boot held for
+# 25 seconds with no correction. One convergence is not auto-exposure, and a robot that walks from
+# a window into a corridor keeps the window's exposure.
+#
+# So `mediad::exposure` meters the frames and drives the sensor (the prototype's loop, ported),
+# and this leaves the engine the parts it does continuously: white balance, the colour matrix,
+# gamma and noise reduction. Its one-shot is disabled rather than tolerated because it lands at
+# stream start, which is exactly when mediad's loop is converging from its own starting values —
+# two writers, in a race, for one control.
 set -e
 
 SENSOR=imx219
@@ -132,8 +139,8 @@ if ! ls "${IQ_DIR}/${SENSOR}"_*.json >/dev/null 2>&1; then
 fi
 
 # Two enum names in Radxa's IQ file are newer than the parser in Radxa's own engine deb. Left
-# alone they are warnings, except that the AE strategy field silently falls back to a default —
-# and AE is what this script exists to deliver, so it is not a warning we can shrug at.
+# alone they are warnings, except that a field the parser cannot read silently falls back to a
+# default — an engine that starts on half the tuning is worse than one that refuses.
 #
 # Only characterised for imx219: another sensor's file may not contain these names at all, and
 # rewriting enums in tuning nobody has read is how you get an image that is subtly wrong.
@@ -160,19 +167,19 @@ if changed:
 else:
     print("   enum names already match the parser")
 
-# The prototype zeroed `ae_calib CommCtrl.Enable` here, to stop rkaiq's AE from fighting a
-# runtime that owned exposure itself. Nothing owns exposure now, so AE must be ON — and these
-# are the same physical boards, so a file left at 0 by that script (or by an apt upgrade, or by
-# hand) is the likeliest way to end up with an engine running and still no auto exposure.
-# Assert it rather than assume it: turning it back on is the entire point of this port.
+# `ae_calib CommCtrl.Enable` to 0: exposure belongs to `mediad`'s software loop, for the reason at
+# the top of this file — the engine's AE converges once at stream start and then stops, which is
+# the same moment mediad's loop is converging. Two writers for one control is worse than one that
+# keeps working, so the switch is asserted rather than assumed; an apt upgrade or a fresh IQ file
+# arrives with it on.
 import re
-m = re.search(rb'("CommCtrl":\s*\{\s*"Enable":\s*)0', raw)
+m = re.search(rb'("CommCtrl":\s*\{\s*"Enable":\s*)1', raw)
 if m:
-    raw = raw[: m.start()] + m.group(1) + b"1" + raw[m.end() :]
+    raw = raw[: m.start()] + m.group(1) + b"0" + raw[m.end() :]
     open(path, "wb").write(raw)
-    print("   auto exposure was DISABLED in this file — turned it back on")
+    print("   rkaiq AE was enabled in this file — disabled it; mediad owns exposure")
 else:
-    print("   auto exposure is enabled")
+    print("   rkaiq AE is off, as mediad's exposure loop needs")
 PY
 fi
 
@@ -253,12 +260,24 @@ chmod 755 "$PIN"
 say "wiring the shim and the pin into rkaiq_3A.service"
 mkdir -p "$DROP_IN_DIR"
 cat > "${DROP_IN_DIR}/robot.conf" <<DROPIN
-# Installed by scripts/setup-rkaiq.sh. Both lines are load-bearing: LD_PRELOAD is what keeps
-# the engine from segfaulting on this kernel, and the pin is what keeps it from programming the
-# ISP with the sensor's boot resolution.
+# Installed by scripts/setup-rkaiq.sh. All three lines are load-bearing.
+#
+# LD_PRELOAD is what keeps the engine from segfaulting on this kernel, and the pin is what keeps it
+# from programming the ISP with the sensor's boot resolution.
+#
+# **The third is an ordering invariant, and it was learned the hard way.** The engine attaches to the
+# ISP and then waits for a *stream start* event — and it misses one that already happened. Restart it
+# while \`mediad\` is streaming (which every \`robotctl update apply\` did, because the pre-install hook
+# runs this script) and it sits on "wait stream start event..." for ever: no stats loop, no auto
+# exposure, no white balance, and a green picture that a reboot fixes only because the reboot happens
+# to order the two correctly. So whenever the engine starts, the camera stream is bounced behind it.
+#
+# \`try-restart\`, so a board with no \`mediad\` running is left alone, and \`--no-block\`, because a unit
+# waiting on another unit's job inside its own start transaction is how you deadlock systemd.
 [Service]
 Environment=LD_PRELOAD=${SHIM_SO}
 ExecStartPre=${PIN}
+ExecStartPost=-/bin/systemctl --no-block try-restart mediad.service
 DROPIN
 
 systemctl daemon-reload
@@ -280,8 +299,9 @@ if [ -e /dev/video8 ] && [ -e /dev/video9 ]; then
     # single fact worth reporting. A second is enough for the latter.
     sleep 1
     if pgrep rkaiq_3A_server >/dev/null 2>&1; then
-        say "rkaiq_3A_server is running — restart the camera stream for it to take effect:
-    sudo systemctl restart mediad"
+        say "rkaiq_3A_server is running, and the camera stream has been bounced behind it so the
+  engine sees it start — that is the ExecStartPost in the drop-in above, not something to do by
+  hand. \`journalctl -fu rkaiq_3A\` should say 'wait stream start event success'."
     else
         warn "rkaiq_3A_server is not running. The camera still works, with no 3A:
     journalctl -t rkaiq -b --no-pager | tail -40

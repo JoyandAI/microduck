@@ -355,6 +355,89 @@ puts the old behaviour back for a consumer that cannot rotate for itself and can
 
 The proper fix, if an upright stream is ever genuinely needed, is an RGA element in the plugin set:
 the 2D engine rotates for nothing, which is why the encoder can afford to use it.
+### The 3A engine has to be waiting before the stream starts
+
+`rkaiq_3A_server` attaches to the ISP and then waits for a **stream start** event — and it misses one
+that already happened. Restart it while `mediad` is streaming and it sits on
+
+```
+DBG: /dev/media0: wait stream start event...
+```
+
+for ever: no stats loop, so no auto exposure and no white balance, and a green picture. A reboot
+"fixes" it only because a reboot happens to order the two correctly.
+
+Which made it a regression with no obvious cause, because **every `robotctl update apply` restarted
+the engine underneath a running stream**: the pre-install hook runs `setup-rkaiq.sh`, and that script
+restarts `rkaiq_3A`. It even printed "restart the camera stream for it to take effect" — advice
+nobody follows and nothing enforced.
+
+So the drop-in that script installs carries the invariant now:
+
+```ini
+ExecStartPost=-/bin/systemctl --no-block try-restart mediad.service
+```
+
+Whenever the engine starts, the stream is bounced behind it, so the event it waits for is one that
+has not happened yet. `try-restart` leaves a board with no `mediad` alone, and `--no-block` is what
+keeps a unit waiting on another unit's job from deadlocking systemd. To rescue a board by hand, the
+order is the whole trick:
+
+```bash
+sudo systemctl stop mediad && sudo systemctl restart rkaiq_3A && sleep 2 && sudo systemctl start mediad
+```
+
+### rkaiq's auto-exposure fires once, and only if it caught the stream
+
+`scripts/setup-rkaiq.sh` first shipped leaving rkaiq's AE **enabled**, on this reasoning: the
+prototype disabled it only to stop the engine fighting a runtime that owned exposure itself, and
+nothing owned exposure in `mediad`, so the engine should own it. It does write the sensor. It does
+not keep writing it.
+
+Measured on a robot, on a boot where the units started in the right order — `rkaiq_3A` at 17:24:01,
+`mediad` at 17:24:11, `wait stream start event success` at 17:24:17:
+
+| what | value |
+|---|---|
+| `mediad` wrote, at 17:24:17 | `exposure=600 analogue_gain=1024` |
+| `/dev/v4l-subdev3`, minutes later | `exposure: 1589  analogue_gain: 1536` |
+| a hand-written `exposure=300 analogue_gain=256`, then 25 s of watching | `300 / 256`, uncorrected |
+
+So the engine converged once, to an answer that is plainly its own and not ours, and then stopped:
+a picture made four times darker underneath it drew no response at all. One convergence at stream
+start is not auto-exposure — a robot that walks from a window into a corridor keeps the window's
+exposure.
+
+**And on a boot where the engine missed the stream-start event — the section above — even the one
+shot does not happen.** That was measured first and read wrongly: the sensor sat at exactly
+`600 / 1024` for as long as it was watched and a manual write stuck, which looked like an AE that had
+never worked, when it was an AE that had never been given a stream. The two states are
+indistinguishable from a single reading of the sensor, which is why the two fixes belong together:
+the ordering fix is what makes the difference between them observable at all.
+
+`mediad::exposure` is what closes the loop, ported from the prototype's `ae_loop`: mean luma off the
+tee's raw branch twice a second against a setpoint of 90, and a damped multiplicative step split
+across three controls in noise order — shutter to 600 lines (≈11 ms, short enough not to smear a
+walking robot), then analogue gain to 11×, then shutter to 1200 lines, then ISP digital gain. The
+hard shutter cap is a real ceiling: the driver answers an exposure longer than the frame length by
+*stretching the frame time* rather than clamping, so 3500 lines silently gives 15 fps.
+
+Two things it does differently, because `mediad` is a better place for it than the prototype was.
+Luma comes from the frames already tapped off the tee for the duck detector, so there is no JPEG
+decode and nothing opens the camera a second time — the prototype's first version metered by
+sampling the ISP self path with a parallel `v4l2-ctl`, which contended with its own capture at the
+driver level and killed the pipeline intermittently. And the first write is read back: every way this
+can fail (a node without the control, a denial, no `v4l2-ctl`) otherwise leaves a camera at one
+exposure, which is indistinguishable from the bug it fixes.
+
+`setup-rkaiq.sh` now asserts `CommCtrl.Enable = 0`. Not because the engine's AE does nothing, but
+because what it does lands at stream start — exactly when mediad's loop is converging from its own
+starting values, which is two writers racing for one control.
+
+**One thing `v4l2-ctl` will do to you while measuring any of this:** a single unknown control name
+fails the whole `--set-ctrl` or `--get-ctrl`. `--get-ctrl=exposure,analogue_gain,digital_gain`
+returns `unknown control 'digital_gain'` and no exposure, which reads as a node that carries neither.
+`mediad::exposure` writes the sensor pair and the ISP's digital gain in two calls for that reason.
 
 ### Two things known to be unfinished
 
