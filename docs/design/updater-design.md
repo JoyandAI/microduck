@@ -928,6 +928,17 @@ are not a precedent; they are three instances.
   a fresh install does. It is a forcing function rather than a proof — the escape hatch is a line
   in a table — but all four instances would have had to argue for that line, and none of them
   could have.
+- **A hook step must be idempotent, and it must be cheap when there is nothing to do.** The
+  first because it runs on every board on every update rather than once, so "already done" is the
+  normal case and not the exception. The second because the cost is paid on every update for
+  ever: a step that takes ten seconds on a board that already has everything is ten seconds added
+  to every future release, and the hook phase grows by one step per feature while the budget does
+  not move. The budgets are 600s for pre-install (`UPDATE_MAX_SILENCE_SECONDS`, a contract with
+  every client — it is the longest an apply may go silent) and 120s for post-install, shared with
+  the units, the accounts and the restart. The shape that works is a stamp: `setup-npu.sh` writes
+  the runtime version to `/usr/lib/librknnrt.version` and compares it, `setup-gstreamer.sh`
+  compares a stamp and two `dpkg -s` calls, and both do nothing measurable on a board that is
+  already set up.
 - **A script the hook runs must be packaged.** `every_script_the_hooks_run_is_packaged`
   reads `script=scripts/…` assignments out of both hooks and fails the build if any
   packaging site omits one.
