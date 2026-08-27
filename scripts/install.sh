@@ -799,6 +799,12 @@ install_units() {
         case "$unit" in
             updaterd.service|robotd.service|configd.service|btd.service|padd.service) ;;
             mediad.service) ;;
+            # No `enable_unit` of its own, unlike the three above: `postinstall` enabled every
+            # unit carrying an `[Install]` section a step earlier, and nothing depends on this
+            # one — `robotd` does not read depth and `monitor` says "no depth stream" and
+            # carries on. Naming it here is what stops that being reported as a daemon this
+            # script forgot, which is how it read on every fresh install.
+            tofd.service) ;;
             robot-boot-check.timer) ;;
             # Started by its timer, never enabled. See above.
             robot-boot-check.service) ;;

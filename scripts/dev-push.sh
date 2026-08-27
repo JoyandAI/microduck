@@ -461,11 +461,11 @@ fi
 # ── did every daemon actually move? ──
 #
 # The apply reporting success means the swap happened and the health gate passed. It does not mean
-# the five daemons are running the release that was swapped in, and the gap between those two is
+# the seven daemons are running the release that was swapped in, and the gap between those two is
 # where an afternoon goes: four wifi fixes were once verified as broken against a `configd` that
-# had never restarted. `robotd`, `configd` and `padd` restart during the update; `updaterd` and
-# `btd` restart five seconds after it replies, because the first cannot restart itself mid-update
-# and the second may be carrying the reply (docs/design/restart-order.md).
+# had never restarted. `robotd`, `configd`, `padd`, `mediad` and `tofd` restart during the update;
+# `updaterd` and `btd` restart five seconds after it replies, because the first cannot restart
+# itself mid-update and the second may be carrying the reply (docs/design/restart-order.md).
 #
 # So this is the one check that observes the whole mechanism end to end, on real systemd, with real
 # timing — and nothing else in the repository can. A container cannot: the transient timer, the
@@ -501,7 +501,7 @@ echo "    current -> $want"
 # no socket at all, so for that one it is the only answer available.
 deadline=$(($(date +%s) + 30))
 stale=""
-for svc in robotd configd padd updaterd btd mediad; do
+for svc in robotd configd padd updaterd btd mediad tofd; do
     while :; do
         if [ ! -f "/run/${svc}/identity.json" ]; then
             state="silent"
@@ -527,7 +527,8 @@ for svc in robotd configd padd updaterd btd mediad; do
         silent)
             # Not treated as a failure: systemd removes the runtime directory when a unit stops, so
             # this is what a deliberately disabled `padd` looks like, and what `mediad` looks like on
-            # a board with no camera. The GStreamer stack is not a cause any more — the preinstall
+            # a board with no camera. `tofd` runs whether or not a sensor is fitted, so silent there
+            # is a release from before it published an identity at all — one push fixes it. The GStreamer stack is not a cause any more — the preinstall
             # hook this push just ran installs it — so a silent `mediad` here is worth
             # `journalctl -u mediad -b` rather than a command to type.
             echo "    [--] $svc published nothing — stopped, or a build too old to say"

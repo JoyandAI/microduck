@@ -401,8 +401,9 @@ unchanged: a stopped unit and a daemon that published nothing are still not stal
    gamepad or no camera still updates and walks. Then `robot-boot-check.timer` is enabled *without*
    `--now`. Redundant with the hook and harmless; it is also the path for a release older than the
    hook. A unit the release ships that this function does not know is installed, reported, and left
-   alone — which is what `tofd` currently gets, having been added to the release and not to this
-   list. The hook enabled it a step earlier, so the warning is noise rather than a missing daemon.
+   alone. `tofd` is named as known but gets no `enable_unit` of its own: the hook enabled it a step
+   earlier and nothing depends on it, so there is no ordering for this function to have an opinion
+   about.
 4. `install_token_dropin`: write the `GITHUB_TOKEN` drop-in, `daemon-reload`, and
    `systemctl try-restart updaterd` — `daemon-reload` alone would leave the *running* `updaterd`
    without the token, which is every board.

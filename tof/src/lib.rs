@@ -25,6 +25,12 @@
 //! prototype reached the older sensor through a pip package and a `.so` loaded by
 //! ctypes; nothing here needs either.
 //!
+//! Which makes the driver **Linux-only**, and deliberately visibly so: on any
+//! other target `build.rs` compiles none of the C and [`Sensor`] is uninhabited,
+//! so `open` refuses rather than a build failing. `tofd --fake` is how this daemon
+//! runs off a board, and it is unaffected — as is `cargo test --workspace`, which
+//! is the point.
+//!
 //! ## What a frame is, and is not
 //!
 //! Raw zone distances and ST's per-zone status, in the sensor's own frame. There

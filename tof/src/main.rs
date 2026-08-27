@@ -136,13 +136,15 @@ async fn main() -> std::process::ExitCode {
         )
         .init();
 
+    // The shared one, not a private copy: as well as the journal line, it publishes
+    // `/run/tofd/identity.json`, which is where `robotctl health` and
+    // `scripts/dev-push.sh` read the release a daemon is actually running from.
+    // `tofd` was the one daemon that published nothing, so both reported it as
+    // silent — the exact gap the macro was written for, one daemon later.
+    duck_ipc_proto::log_startup_identity!("tofd");
+
     let args = Args::parse();
-    tracing::warn!(
-        service = "tofd",
-        build = env!("CARGO_PKG_VERSION"),
-        socket = %args.socket.display(),
-        "starting"
-    );
+    tracing::info!(socket = %args.socket.display(), hz = args.hz, "starting");
 
     let status = Arc::new(Status::new(args.hz));
     let (frames, _) = tokio::sync::broadcast::channel(FRAME_BUFFER);

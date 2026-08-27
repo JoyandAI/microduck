@@ -26,13 +26,11 @@ sudo apt-get install -y libudev-dev libgstreamer1.0-dev
 sudo apt-get install -y libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 ```
 
-**On macOS** `tof` does not build at all: its vendored ST driver compiles `vendor/platform.c`,
-which includes `linux/i2c.h`, and `build.rs` has no `cfg` around it. Exclude the crate. That is
-**936 tests passing**, and the eight it leaves out are the ToF driver's own:
-
-```bash
-cargo test --workspace --exclude tof
-```
+**On macOS** the command above is the whole of it — **942 tests passing**, nothing excluded. Two
+of the ToF driver's own tests do not run there, because there is no driver to run them against:
+`vendor/platform.c` reaches the bus through `linux/i2c.h`, so `build.rs` compiles it on Linux
+targets only and `sensor.rs` offers a `Sensor` that cannot be opened. `tofd` still builds and
+`tofd --fake` still serves frames, which is the only way it runs off a board anyway.
 
 Those tests are also where the engine's failure paths are: a bad signature, a release that comes
 up unhealthy, a post-install hook that fails, power loss between the swap and the health gate.

@@ -90,6 +90,7 @@ key, copies it to `~/duck-sideload` on the board, and applies it there through
     [ok] updaterd
     [ok] btd
     [ok] mediad
+    [ok] tofd
 ==> every daemon on radxa@192.168.1.42 is running 0.5.1-dev.local.1763400000.g7fc1444
 ```
 
@@ -97,10 +98,9 @@ key, copies it to `~/duck-sideload` on the board, and applies it there through
 to arrive. A `[--] padd published nothing` is not a failure — it is also what a stopped or
 deliberately disabled daemon looks like, and what `mediad` looks like on a board with no camera.
 
-`tofd` is **not** on that list, and its absence is the script's rather than the board's: the update
-restarted it like every other unit with an `[Install]` section
-([`restart-order.md`](../design/restart-order.md) §1), and `dev-push.sh` simply does not ask it.
-`robotctl version` on the board does.
+A `[--] tofd published nothing` means a release from before `tofd` published an identity at all —
+one more push fixes it — rather than a sensor that is missing: `tofd` runs whether or not one is
+fitted.
 
 On the board, that version is what `robotctl version` reports:
 
