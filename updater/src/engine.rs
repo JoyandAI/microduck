@@ -26,10 +26,11 @@ use crate::journal::{BootCounter, Journal, PendingUpdate, Pins, UpdateLock, now_
 use crate::manifest::{Capabilities, Compatibility, Manifest};
 use crate::proto::{
     ApplyResult, CheckResult, ComponentId, ComponentStatus, InstalledRelease, LogEntry, Outcome,
-    Phase, Progress,
+    Phase, Progress, RunEvent,
 };
 use crate::robot::RobotClient;
 use crate::store::Store;
+use crate::transcript::Transcript;
 use crate::verify::KeyRing;
 use crate::{Error, hooks, preflight, source, verify};
 
@@ -144,6 +145,14 @@ const MIN_REQUIRED_BYTES: u64 = 32 * 1024 * 1024;
 /// Entries retained in the update log.
 const LOG_CAPACITY: usize = 200;
 
+/// Run transcripts retained beside it.
+///
+/// Far fewer than [`LOG_CAPACITY`], because they are not the same kind of record: a log entry is
+/// one line and answers "what has this board been through", while a transcript is kilobytes and
+/// answers "what did *that* one do". Nobody reads the ninetieth-most-recent transcript, and the
+/// log still names every attempt that far back.
+const TRANSCRIPTS_KEPT: usize = 20;
+
 /// Highest on-disk/config schema this build understands.
 ///
 /// A release declaring a higher `schema_version` expects migrations this engine has
@@ -199,6 +208,120 @@ pub struct Engine {
     unit_dir: PathBuf,
 }
 
+/// Where an operation says what it is doing — to whoever is watching, and to the record that
+/// outlives them.
+///
+/// **One object rather than a `ProgressTx` and an `emit` closure side by side.** They were always
+/// the same event seen twice, and two parameters made it possible to tell one and not the other —
+/// which is exactly what had happened: every phase reached the subscriber and none of them reached
+/// the disk, so the phase timeline existed only for as long as somebody held a socket open.
+pub struct Recorder {
+    component: ComponentId,
+    /// `None` for the paths with no subscriber — `rollback`, `select`, `reset-to-golden`, and the
+    /// sideload CLI. They still get a transcript; what they do not get is a live stream, which is
+    /// unchanged from before this existed.
+    progress: Option<ProgressTx>,
+    /// `None` when the transcript could not be opened. An update whose diary cannot be written
+    /// still runs — see `crate::transcript`.
+    transcript: Option<Transcript>,
+}
+
+impl Recorder {
+    fn begin(
+        component: &str,
+        progress: Option<ProgressTx>,
+        state_dir: &Path,
+        opening: RunEvent,
+    ) -> Self {
+        let transcript = match Transcript::begin(state_dir, TRANSCRIPTS_KEPT) {
+            Ok(transcript) => Some(transcript),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not open a transcript for this run; it will not be in `update show`");
+                None
+            }
+        };
+        let rec = Self {
+            component: ComponentId::new(component),
+            progress,
+            transcript,
+        };
+        rec.note(opening);
+        rec
+    }
+
+    /// The run this is recording, for the log entry that points at it.
+    fn run(&self) -> Option<u64> {
+        self.transcript.as_ref().map(Transcript::id)
+    }
+
+    /// A phase boundary: to the subscriber and to the transcript both.
+    fn phase(&self, phase: Phase, detail: Option<String>) {
+        if let Some(progress) = &self.progress {
+            let _ = progress.send(Progress {
+                component: self.component.clone(),
+                phase,
+                percent: None,
+                detail: detail.clone(),
+            });
+        }
+        self.note(RunEvent::Phase { phase, detail });
+    }
+
+    /// Transcript only — too big for a notification, or too dull for one.
+    fn note(&self, event: RunEvent) {
+        if let Some(transcript) = &self.transcript {
+            transcript.record(event);
+        }
+    }
+
+    /// One sentence, where there is no shape worth inventing.
+    fn say(&self, text: impl Into<String>) {
+        self.note(RunEvent::Note { text: text.into() });
+    }
+
+    /// The channel the download pump writes percentages to.
+    ///
+    /// Deliberately not routed through [`Self::phase`]: a download reports hundreds of times and
+    /// the transcript wants the phase, not the percentages. What it records instead is how big the
+    /// artifact turned out to be, once.
+    fn progress_tx(&self) -> Option<ProgressTx> {
+        self.progress.clone()
+    }
+
+    /// A recorder that records nowhere, for tests about something else.
+    #[cfg(test)]
+    fn silent() -> Self {
+        Self {
+            component: ComponentId::new("test"),
+            progress: None,
+            transcript: None,
+        }
+    }
+
+    /// Close the run with the outcome the update log is about to record.
+    fn finish(&self, outcome: &Result<ApplyResult, Error>) {
+        self.note(RunEvent::Ended {
+            outcome: journal_outcome(outcome).map(|(_, outcome)| outcome),
+            summary: summarise(outcome),
+        });
+    }
+}
+
+/// How the health gate passed.
+///
+/// **Two outcomes, not one.** `HealthCheck::Socket` commits a release onto a robot reporting
+/// *degraded* whenever the degradation is something the release cannot have caused and a rollback
+/// cannot fix — servo power off, a sensor unplugged. That is the right call and it has been logged
+/// at `warn` since it was written, precisely so nobody has to guess afterwards that it is what
+/// happened. Collapsing it into `Ok(())` meant the transcript then said "the robot reported
+/// healthy" on a board whose own journal, at the same second, said it was degraded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatePassed {
+    Healthy,
+    /// Committed anyway, with the reason the robot gave.
+    Degraded(String),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
     pub dry_run: bool,
@@ -217,6 +340,13 @@ pub struct ApplyOptions {
     /// identically. A locally built release installs because the dev key is trusted on that
     /// board, not because a check was skipped.
     pub from_dir: Option<std::path::PathBuf>,
+
+    /// Who asked, as `uid=1000 gid=1000 pid=2317`, for the transcript's opening line.
+    ///
+    /// `None` on the paths with no peer — the unattended timer, and the sideload CLI. A string
+    /// because nothing branches on it: it exists so that "who ran this?" is answerable months
+    /// later, and `SO_PEERCRED`'s three numbers are what there is to answer it with.
+    pub requested_by: Option<String>,
 }
 
 impl Engine {
@@ -400,6 +530,40 @@ impl Engine {
         self.journal.recent(limit)
     }
 
+    /// One run's transcript, or the most recent when none is named.
+    ///
+    /// Defaulting to the latest is the whole ergonomics of the command: the question is almost
+    /// always about the update that just happened, and making someone look its number up first
+    /// would put a step between them and the answer at the exact moment they are least patient.
+    pub fn show(&self, run: Option<u64>) -> Result<crate::proto::RunTranscript, Error> {
+        let mut available = Transcript::ids(&self.config.state_dir);
+        let id = match run {
+            Some(id) => id,
+            None => match available.last() {
+                Some(id) => *id,
+                None => {
+                    return Err(Error::NoSuchRun {
+                        run: None,
+                        available: Vec::new(),
+                        // What the log holds with nothing behind it, so the message can tell
+                        // "nothing has happened" apart from "this is the first release that
+                        // records what happened".
+                        earlier: self.log(LOG_CAPACITY).map(|log| log.len()).unwrap_or(0),
+                    });
+                }
+            },
+        };
+
+        let events = Transcript::read(&self.config.state_dir, id)?;
+        available.reverse();
+        Ok(crate::proto::RunTranscript {
+            run: id,
+            component: Transcript::component_of(&events),
+            events,
+            available,
+        })
+    }
+
     /// Versions whose most recent recorded outcome was a rollback.
     ///
     /// Derived from the journal rather than stored, so it self-heals: a version that
@@ -441,21 +605,25 @@ impl Engine {
         let store = self.store(component)?;
         let installed = store.current()?;
 
-        let emit = |phase: Phase, percent: Option<u8>| {
-            let _ = progress.send(Progress {
+        let rec = Recorder::begin(
+            component,
+            Some(progress),
+            &self.config.state_dir,
+            RunEvent::Began {
                 component: ComponentId::new(component),
-                phase,
-                percent,
-                detail: None,
-            });
-        };
+                target: describe_target(&target),
+                installed: installed.clone(),
+                source: describe_source(&cfg.source, options.from_dir.as_deref()),
+                requested_by: options.requested_by.clone(),
+            },
+        );
 
         let outcome = self
-            .apply_inner(component, &cfg, &store, target, &options, &progress, &emit)
+            .apply_inner(component, &cfg, &store, target, &options, &rec)
             .await;
 
         // Every operation logs through `record`, which owns what `to` means per outcome.
-        self.record(component, installed, &outcome);
+        self.record(component, installed, &outcome, rec.run());
 
         // The lock is released before anything is spawned, and that ordering is load-bearing: a
         // fork duplicates every open descriptor in the process, so spawning while holding the
@@ -463,7 +631,12 @@ impl Engine {
         // parallel, copies of *other* engines' locks too. It surfaced as unrelated operations
         // failing with `Busy`. Nothing below this point touches the store.
         drop(lock);
-        schedule_restarts_if_needed(self.deferred_restarts, &outcome).await;
+        schedule_restarts_if_needed(self.deferred_restarts, &outcome, &rec).await;
+
+        // Closed *after* the restarts, not after the outcome, so the transcript ends where the run
+        // does. The deferred units are the last thing an apply causes, and a reader who saw
+        // `ended` above them would reasonably conclude they belonged to something else.
+        rec.finish(&outcome);
         outcome
     }
 
@@ -475,8 +648,7 @@ impl Engine {
         store: &Store,
         target: crate::proto::Target,
         options: &ApplyOptions,
-        progress: &ProgressTx,
-        emit: &impl Fn(Phase, Option<u8>),
+        rec: &Recorder,
     ) -> Result<ApplyResult, Error> {
         let installed = store.current()?;
         // A per-call source override, so the configured one stays in place: a dev board keeps
@@ -491,11 +663,11 @@ impl Engine {
         //    fetch is HTTPS, and on a board with no battery-backed RTC it fails
         //    certificate-date validation with an opaque TLS error — the clock check
         //    exists precisely to diagnose that, so it has to run first.
-        emit(Phase::Preflight, None);
+        rec.phase(Phase::Preflight, None);
         self.preflight(None, options, store).await?;
 
         // 1. Manifest, and its signature. Nothing else happens until this passes.
-        emit(Phase::Checking, None);
+        rec.phase(Phase::Checking, None);
         let signed = match &target {
             crate::proto::Target::Latest => source.latest_manifest().await?,
             crate::proto::Target::Exact(v) => source.manifest_for(v).await?,
@@ -503,8 +675,20 @@ impl Engine {
             crate::proto::Target::Staging => source.staging_manifest().await?,
             crate::proto::Target::StagingExact(v) => source.staging_manifest_for(v).await?,
         };
-        self.verify_manifest(&signed)?;
+        let signed_by = self.verify_manifest(&signed)?;
         let manifest = signed.parsed.clone();
+
+        // Recorded here rather than at the end, and before any of the refusals below: a run that
+        // was *refused* is one of the two runs anyone reads, and "which release, from where,
+        // signed by which key" is what the refusal has to be read against.
+        rec.note(RunEvent::Manifest {
+            version: manifest.version.clone(),
+            sha256: manifest.sha256.clone(),
+            bytes: manifest.size,
+            url: Some(manifest.url.clone()),
+            signed_by: Some(signed_by),
+            source_revision: manifest.source_revision.clone(),
+        });
 
         Self::check_channel(&manifest, component)?;
 
@@ -603,7 +787,7 @@ impl Engine {
 
         // 2. Space preflight. Deferred to here because the requirement comes from
         //    the manifest, which we now have and have verified.
-        emit(Phase::Preflight, None);
+        rec.phase(Phase::Preflight, None);
         self.preflight(Some(&manifest), options, store).await?;
 
         // 3. Download into staging. Staging lives beside the release tree so the
@@ -625,8 +809,7 @@ impl Engine {
                 &download_dir,
                 &extract_dir,
                 options,
-                progress,
-                emit,
+                rec,
             )
             .await;
 
@@ -650,21 +833,23 @@ impl Engine {
         download_dir: &Path,
         extract_dir: &Path,
         options: &ApplyOptions,
-        progress: &ProgressTx,
-        emit: &impl Fn(Phase, Option<u8>),
+        rec: &Recorder,
     ) -> Result<ApplyResult, Error> {
         let previous = store.current()?;
 
-        emit(Phase::Downloading, Some(0));
+        rec.phase(Phase::Downloading, None);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
         // The source takes a clone; this handle exists so the channel closes exactly
         // when we say so, letting the pump drain rather than be aborted.
         let tx_keepalive = tx.clone();
         let pump = {
-            let progress = progress.clone();
+            let progress = rec.progress_tx();
             let component = component.to_owned();
             tokio::spawn(async move {
                 let send = |percent| {
+                    let Some(progress) = &progress else {
+                        return;
+                    };
                     let _ = progress.send(Progress {
                         component: ComponentId::new(component.clone()),
                         phase: Phase::Downloading,
@@ -716,7 +901,17 @@ impl Engine {
         // seconds on this class of board. Run on the async worker they would stall
         // the IPC tasks that are meant to keep answering `status`/`subscribe` while
         // the update runs, so both go to `spawn_blocking`.
-        emit(Phase::Verifying, None);
+        // The size the download actually turned out to be, which a manifest need not have
+        // declared and a resumed transfer makes worth stating outright.
+        if let Ok(meta) = std::fs::metadata(&fetched.artifact) {
+            rec.say(format!(
+                "downloaded {} to {}",
+                describe_bytes(meta.len()),
+                fetched.artifact.display()
+            ));
+        }
+
+        rec.phase(Phase::Verifying, None);
         let artifact = fetched.artifact.clone();
         let expected = manifest.sha256.clone();
         blocking(move || verify::verify_sha256(&artifact, &expected)).await?;
@@ -727,10 +922,17 @@ impl Engine {
         })?;
         let keys = std::sync::Arc::clone(&self.keys);
         let artifact = fetched.artifact.clone();
-        blocking(move || keys.verify_file(&artifact, &signature).map(|_| ())).await?;
+        let signed_by = blocking(move || {
+            keys.verify_file(&artifact, &signature)
+                .map(|key| key.id.clone())
+        })
+        .await?;
+        rec.say(format!(
+            "hash matches; signature verifies against {signed_by}"
+        ));
 
         // 5. Extract to the side, never over a live path. Also CPU-bound (zstd).
-        emit(Phase::Extracting, None);
+        rec.phase(Phase::Extracting, None);
         let artifact = fetched.artifact.clone();
         let dest = extract_dir.to_path_buf();
         let limits = self.config.archive_limits();
@@ -773,7 +975,7 @@ impl Engine {
         }
 
         // 6. Pre-install hook, before the release becomes live.
-        emit(Phase::RunningPreHook, None);
+        rec.phase(Phase::RunningPreHook, None);
         let ctx = hooks::HookContext {
             component: component.to_owned(),
             old_version: previous.clone(),
@@ -786,13 +988,15 @@ impl Engine {
                 .map(|m| m.schema_version),
             new_schema_version: manifest.schema_version,
         };
-        hooks::run(
+        let hook = hooks::run(
             extract_dir,
             hooks::HookKind::PreInstall,
             &ctx,
             PRE_INSTALL_HOOK_TIMEOUT,
         )
-        .await?;
+        .await;
+        record_hook(rec, hooks::HookKind::PreInstall.relative_path(), &hook);
+        hook?;
 
         // 7. Publish the release directory with one rename, then arm the boot
         //    counter *before* the symlink swap so a crash in between is
@@ -817,7 +1021,17 @@ impl Engine {
             boots: 0,
         })?;
 
-        emit(Phase::Swapping, None);
+        rec.phase(
+            Phase::Swapping,
+            Some(format!(
+                "{} → {}",
+                previous
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "nothing".into()),
+                manifest.version
+            )),
+        );
         store.swap_to(&manifest.version)?;
 
         if self.faults.abort_after_swap {
@@ -829,12 +1043,12 @@ impl Engine {
 
         // 8. Everything from here rolls back on failure.
         let gate = self
-            .post_swap(component, cfg, store, &ctx, &release_dir, emit)
+            .post_swap(component, cfg, store, &ctx, &release_dir, rec)
             .await;
 
         match gate {
             Ok(()) => {
-                emit(Phase::Committing, None);
+                rec.phase(Phase::Committing, None);
                 self.boot_counter.confirm(component)?;
                 // Pruning is best-effort — the update has already succeeded — but a
                 // failure must be visible, or a robot slowly filling its eMMC looks
@@ -842,6 +1056,14 @@ impl Engine {
                 match store.prune(cfg.keep_previous, cfg.golden.as_ref()) {
                     Ok(removed) if !removed.is_empty() => {
                         tracing::info!(?removed, "pruned old releases");
+                        rec.say(format!(
+                            "pruned {}",
+                            removed
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
                     }
                     Ok(_) => {}
                     Err(e) => tracing::error!(error = %e, "could not prune old releases"),
@@ -852,9 +1074,9 @@ impl Engine {
                 })
             }
             Err(reason) => {
-                emit(Phase::RollingBack, None);
+                rec.phase(Phase::RollingBack, Some(reason.to_string()));
                 match self
-                    .rollback_to(component, cfg, store, previous.as_ref())
+                    .rollback_to(component, cfg, store, previous.as_ref(), rec)
                     .await?
                 {
                     Some(reverted) => Ok(ApplyResult::RolledBack {
@@ -884,29 +1106,35 @@ impl Engine {
         _store: &Store,
         ctx: &hooks::HookContext,
         release_dir: &Path,
-        emit: &impl Fn(Phase, Option<u8>),
+        rec: &Recorder,
     ) -> Result<(), Error> {
-        emit(Phase::RunningPostHook, None);
+        rec.phase(Phase::RunningPostHook, None);
         if self.faults.fail_post_hook {
             return Err(Error::Hook {
                 hook: hooks::POST_INSTALL.into(),
                 detail: "injected failure".into(),
             });
         }
-        hooks::run(release_dir, hooks::HookKind::PostInstall, ctx, HOOK_TIMEOUT).await?;
+        let hook = hooks::run(release_dir, hooks::HookKind::PostInstall, ctx, HOOK_TIMEOUT).await;
+        record_hook(rec, hooks::HookKind::PostInstall.relative_path(), &hook);
+        hook?;
 
-        emit(Phase::Applying, None);
-        self.run_apply_action(&cfg.on_apply, release_dir).await?;
+        rec.phase(Phase::Applying, None);
+        self.run_apply_action(&cfg.on_apply, release_dir, rec)
+            .await?;
 
         // Only where daemons are actually being replaced. `ApplyAction::None` means this component
         // has none to restart — a model, or the bootstrap install, which forces it precisely
         // because nothing is installed yet and there is no running daemon to make stale.
         if matches!(cfg.on_apply, ApplyAction::Restart { .. }) {
             self_test_updaterd(release_dir, self.config.loaded_from.as_deref()).await?;
+            rec.say("the new updaterd passed its self-test");
         }
 
-        emit(Phase::HealthGate, None);
-        self.health_gate(cfg).await
+        rec.phase(Phase::HealthGate, None);
+        let verdict = self.health_gate(cfg).await;
+        record_gate(rec, &verdict);
+        verdict.map(|_| ())
     }
 
     /// Swap back to `previous` and re-run the apply action.
@@ -968,6 +1196,7 @@ impl Engine {
         cfg: &ComponentConfig,
         store: &Store,
         previous: Option<&semver::Version>,
+        rec: &Recorder,
     ) -> Result<Option<Reverted>, Error> {
         if self.faults.fail_rollback {
             return Err(Error::RollbackFailed("injected rollback failure".into()));
@@ -1012,7 +1241,7 @@ impl Engine {
             Some("injected apply-action failure during rollback".to_owned())
         } else {
             match self
-                .run_apply_action(&cfg.on_apply, &store.release_dir(previous))
+                .run_apply_action(&cfg.on_apply, &store.release_dir(previous), rec)
                 .await
             {
                 Ok(()) => None,
@@ -1052,7 +1281,8 @@ impl Engine {
         let current = store.current()?;
         let previous = self.rollback_target(component, &store, current.as_ref())?;
 
-        self.transition_to(component, &cfg, &store, &previous, current)
+        let rec = self.begin_transition(component, "rollback", current.clone());
+        self.transition_to(component, &cfg, &store, &previous, current, &rec)
             .await
     }
 
@@ -1069,7 +1299,8 @@ impl Engine {
             .ok_or_else(|| Error::Config(format!("component {component} has no golden release")))?;
         let current = store.current()?;
 
-        self.transition_to(component, &cfg, &store, &golden, current)
+        let rec = self.begin_transition(component, "reset to golden", current.clone());
+        self.transition_to(component, &cfg, &store, &golden, current, &rec)
             .await
     }
 
@@ -1121,12 +1352,40 @@ impl Engine {
 
         // `select` can move to a release carrying newer binaries, so the deferred units are as
         // stale afterwards as they are after an `apply`. Lock released first, as above.
+        let rec = self.begin_transition(component, &format!("select {version}"), current.clone());
         let outcome = self
-            .transition_to(component, &cfg, &store, version, current)
+            .transition_to(component, &cfg, &store, version, current, &rec)
             .await;
         drop(lock);
-        schedule_restarts_if_needed(self.deferred_restarts, &outcome).await;
+        schedule_restarts_if_needed(self.deferred_restarts, &outcome, &rec).await;
         outcome
+    }
+
+    /// Open a transcript for one of the three transitions that move between releases already on
+    /// the board.
+    ///
+    /// No progress channel: these paths have never streamed phases to a subscriber and this does
+    /// not change that. They are recorded all the same, because "the robot is on an old release
+    /// and nobody knows why" is answered by a rollback's transcript at least as often as by an
+    /// apply's.
+    fn begin_transition(
+        &self,
+        component: &str,
+        asked_as: &str,
+        installed: Option<semver::Version>,
+    ) -> Recorder {
+        Recorder::begin(
+            component,
+            None,
+            &self.config.state_dir,
+            RunEvent::Began {
+                component: ComponentId::new(component),
+                target: asked_as.to_owned(),
+                installed,
+                source: "already installed on this board".into(),
+                requested_by: None,
+            },
+        )
     }
 
     /// Shared tail of rollback / reset-to-golden / select: swap, apply, gate, and
@@ -1138,15 +1397,18 @@ impl Engine {
         store: &Store,
         to: &semver::Version,
         from: Option<semver::Version>,
+        rec: &Recorder,
     ) -> Result<ApplyResult, Error> {
         // Validate *before* arming. Arming for a version that then fails to link
         // would leave a trial referring to something never live, which a later boot
         // would "recover" from with a spurious rollback and a bogus log entry.
         if !store.release_dir(to).is_dir() {
-            return Err(Error::NotInstalled {
+            let failed = Err(Error::NotInstalled {
                 component: component.to_owned(),
                 version: to.clone(),
             });
+            rec.finish(&failed);
+            return failed;
         }
 
         // Armed before the swap, so a crash in between is still recoverable.
@@ -1157,22 +1419,41 @@ impl Engine {
             boots: 0,
         })?;
 
+        rec.phase(
+            Phase::Swapping,
+            Some(format!(
+                "{} → {to}",
+                from.as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "nothing".into())
+            )),
+        );
+
         // From here the trial is armed, so any early return must disarm it —
         // otherwise a later boot reverts an update that never went live.
         if let Err(e) = store.swap_to(to) {
             let _ = self.boot_counter.confirm(component);
-            return Err(e);
+            let failed = Err(e);
+            rec.finish(&failed);
+            return failed;
         }
+        rec.phase(Phase::Applying, None);
         if let Err(e) = self
-            .run_apply_action(&cfg.on_apply, &store.release_dir(to))
+            .run_apply_action(&cfg.on_apply, &store.release_dir(to), rec)
             .await
         {
             let _ = self.boot_counter.confirm(component);
-            return Err(e);
+            let failed = Err(e);
+            rec.finish(&failed);
+            return failed;
         }
 
-        let outcome = match self.health_gate(cfg).await {
-            Ok(()) => {
+        rec.phase(Phase::HealthGate, None);
+        let gate = self.health_gate(cfg).await;
+        record_gate(rec, &gate);
+
+        let outcome = match gate {
+            Ok(_) => {
                 self.boot_counter.confirm(component)?;
                 Ok(ApplyResult::Applied {
                     from: from.clone(),
@@ -1180,8 +1461,9 @@ impl Engine {
                 })
             }
             Err(reason) => {
+                rec.phase(Phase::RollingBack, Some(reason.to_string()));
                 match self
-                    .rollback_to(component, cfg, store, from.as_ref())
+                    .rollback_to(component, cfg, store, from.as_ref(), rec)
                     .await?
                 {
                     Some(reverted) => Ok(ApplyResult::RolledBack {
@@ -1200,7 +1482,8 @@ impl Engine {
         // Every class of outcome is journalled, matching `apply`. Logging only
         // successes here meant support could see a rollback that happened via an
         // update but not one via `rollback`/`select`/`reset-to-golden`.
-        self.record(component, from, &outcome);
+        self.record(component, from, &outcome, rec.run());
+        rec.finish(&outcome);
         outcome
     }
 
@@ -1226,31 +1509,10 @@ impl Engine {
         component: &str,
         from: Option<semver::Version>,
         outcome: &Result<ApplyResult, Error>,
+        run: Option<u64>,
     ) {
-        let (to, outcome) = match outcome {
-            Ok(ApplyResult::Applied { to, .. }) => (Some(to.clone()), Outcome::Success),
-            Ok(ApplyResult::RolledBack {
-                attempted, reason, ..
-            }) => (
-                // The version that failed — see the doc comment.
-                Some(attempted.clone()),
-                Outcome::RolledBack {
-                    reason: reason.clone(),
-                },
-            ),
-            Ok(ApplyResult::Stuck { version, reason }) => (
-                Some(version.clone()),
-                Outcome::Aborted {
-                    reason: format!("stuck on {version}: {reason}"),
-                },
-            ),
-            Ok(ApplyResult::AlreadyCurrent { .. } | ApplyResult::DryRunPassed { .. }) => return,
-            Err(e) => (
-                None,
-                Outcome::Aborted {
-                    reason: e.to_string(),
-                },
-            ),
+        let Some((to, outcome)) = journal_outcome(outcome) else {
+            return;
         };
 
         let entry = LogEntry {
@@ -1259,6 +1521,7 @@ impl Engine {
             from,
             to,
             outcome,
+            run,
         };
         if let Err(e) = self.journal.append(&entry) {
             tracing::error!(error = %e, "could not write the update log");
@@ -1482,6 +1745,28 @@ impl Engine {
 
             let store = self.store(&pending.component)?;
 
+            // Its own run, and not a continuation of the apply that armed the trial — because it
+            // is one. That apply ended when `updaterd` restarted itself, minutes and a reboot ago,
+            // and its transcript says so by having no ending. This is the verdict arriving, and it
+            // is what someone reading `update show` after a robot came back on an older release
+            // needs to find.
+            let rec = Recorder::begin(
+                &pending.component,
+                None,
+                &self.config.state_dir,
+                RunEvent::Began {
+                    component: ComponentId::new(pending.component.clone()),
+                    target: format!("boot-counter revert from {}", pending.version),
+                    installed: Some(pending.version.clone()),
+                    source: "already installed on this board".into(),
+                    requested_by: None,
+                },
+            );
+            rec.say(format!(
+                "this release was armed for trial and never reported healthy across {} boots",
+                pending.boots
+            ));
+
             // §8.2's chain: previous → golden. Escalate past `previous` when it is
             // absent, gone from disk, or itself recorded as bad — otherwise a robot
             // whose previous release is also broken reverts onto a second failure and
@@ -1507,7 +1792,7 @@ impl Engine {
                 cfg.golden.clone().filter(|g| store.release_dir(g).is_dir())
             };
             let reverted = self
-                .rollback_to(&pending.component, &cfg, &store, target.as_ref())
+                .rollback_to(&pending.component, &cfg, &store, target.as_ref(), &rec)
                 .await?;
 
             let reason = format!("never reported healthy across {} boots", pending.boots);
@@ -1529,6 +1814,8 @@ impl Engine {
                 },
             };
 
+            rec.finish(&Ok(outcome.clone()));
+
             let logged = LogEntry {
                 at: now_unix(),
                 component: ComponentId::new(pending.component.clone()),
@@ -1545,6 +1832,7 @@ impl Engine {
                         reason: reason.clone(),
                     },
                 },
+                run: rec.run(),
             };
             if let Err(e) = self.journal.append(&logged) {
                 tracing::error!(error = %e, "could not write the update log");
@@ -1621,17 +1909,45 @@ impl Engine {
 
         match component {
             Some(name) => {
+                let because = format!(
+                    "boot recovery swapped to golden without updaterd ({})",
+                    crumb.because.as_deref().unwrap_or("no reason recorded")
+                );
+
+                // A transcript for a run this process did not perform. Thin by necessity — the
+                // rescue is a shell script that ran before `updaterd` existed on this boot, and
+                // the breadcrumb is everything it left behind — but a run someone can find, which
+                // beats a rollback in the log with nothing behind it.
+                let rec = Recorder::begin(
+                    &name,
+                    None,
+                    &self.config.state_dir,
+                    RunEvent::Began {
+                        component: crate::proto::ComponentId(name.clone()),
+                        target: "reset to golden, by robot-rescue".into(),
+                        installed: crumb.from.as_deref().and_then(|v| v.parse().ok()),
+                        source: "already installed on this board".into(),
+                        requested_by: None,
+                    },
+                );
+                rec.say(
+                    "performed outside updaterd, before it started; this transcript is what the \
+                     breadcrumb it left recorded, not a first-hand account",
+                );
+                rec.note(RunEvent::Ended {
+                    outcome: Some(crate::proto::Outcome::RolledBack {
+                        reason: because.clone(),
+                    }),
+                    summary: because.clone(),
+                });
+
                 let entry = crate::proto::LogEntry {
                     at: crate::journal::now_unix(),
                     component: crate::proto::ComponentId(name.clone()),
                     from: crumb.from.as_deref().and_then(|v| v.parse().ok()),
                     to: crumb.to.as_deref().and_then(|v| v.parse().ok()),
-                    outcome: crate::proto::Outcome::RolledBack {
-                        reason: format!(
-                            "boot recovery swapped to golden without updaterd ({})",
-                            crumb.because.as_deref().unwrap_or("no reason recorded")
-                        ),
-                    },
+                    outcome: crate::proto::Outcome::RolledBack { reason: because },
+                    run: rec.run(),
                 };
                 if let Err(e) = self.journal.append(&entry) {
                     tracing::error!(error = %e, "could not record the rescue in the update log");
@@ -1733,19 +2049,41 @@ impl Engine {
         &self,
         action: &ApplyAction,
         release_dir: &Path,
+        rec: &Recorder,
     ) -> Result<(), Error> {
         match action {
-            ApplyAction::None => Ok(()),
+            ApplyAction::None => {
+                rec.say("this component restarts nothing");
+                Ok(())
+            }
             ApplyAction::Restart { units } => {
                 for unit in units_to_restart(release_dir, units) {
-                    restart_one(SYSTEMCTL, &unit).await?;
+                    let result = restart_one(SYSTEMCTL, &unit).await;
+                    rec.note(RunEvent::Unit {
+                        unit: unit.clone(),
+                        action: "restart".into(),
+                        detail: match &result {
+                            Ok(()) => None,
+                            Err(e) => Some(e.to_string()),
+                        },
+                    });
+                    result?;
                 }
                 Ok(())
             }
             ApplyAction::Reload { unit, signal } => {
                 let mut c = tokio::process::Command::new(SYSTEMCTL);
                 c.arg("kill").arg(format!("--signal={signal}")).arg(unit);
-                run_systemctl(c, "apply action").await
+                let result = run_systemctl(c, "apply action").await;
+                rec.note(RunEvent::Unit {
+                    unit: unit.clone(),
+                    action: format!("reload ({signal})"),
+                    detail: match &result {
+                        Ok(()) => None,
+                        Err(e) => Some(e.to_string()),
+                    },
+                });
+                result
             }
         }
     }
@@ -1754,14 +2092,14 @@ impl Engine {
     ///
     /// A timeout is a **failure**: unproven is not healthy, or auto-rollback would
     /// never fire on a release that hangs.
-    async fn health_gate(&self, cfg: &ComponentConfig) -> Result<(), Error> {
+    async fn health_gate(&self, cfg: &ComponentConfig) -> Result<GatePassed, Error> {
         if self.faults.fail_health {
             return Err(Error::Health("injected health failure".into()));
         }
 
         let Some(timeout) = cfg.health.timeout() else {
             // HealthCheck::None — nothing to gate on.
-            return Ok(());
+            return Ok(GatePassed::Healthy);
         };
 
         if self.faults.hang_health {
@@ -1773,7 +2111,7 @@ impl Engine {
         }
 
         match &cfg.health {
-            HealthCheck::None => Ok(()),
+            HealthCheck::None => Ok(GatePassed::Healthy),
             HealthCheck::Socket { .. } => {
                 // The socket path lives in `Config::robot_socket` and is used to build
                 // the RobotClient in `main`; here we just ask the client.
@@ -1781,7 +2119,7 @@ impl Engine {
                 let mut last = String::from("no answer");
                 while tokio::time::Instant::now() < deadline {
                     match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
-                        crate::robot::Health::Healthy => return Ok(()),
+                        crate::robot::Health::Healthy => return Ok(GatePassed::Healthy),
                         // Passes. Logged at warn, not swallowed: committing a release onto a
                         // robot that cannot move is the right call, but nobody should have to
                         // guess afterwards that that is what happened.
@@ -1791,7 +2129,7 @@ impl Engine {
                                 "committing: the robot is degraded for a reason this release \
                                  cannot have caused and a rollback cannot fix"
                             );
-                            return Ok(());
+                            return Ok(GatePassed::Degraded(reason));
                         }
                         crate::robot::Health::Unhealthy(reason) => last = reason,
                         // Fails, like `Unreachable`, and reads nothing like it. "unreachable"
@@ -1832,7 +2170,9 @@ impl Engine {
                     })?
                     .map_err(|e| Error::Health(format!("could not run probe: {e}")))?;
                 if output.status.success() {
-                    Ok(())
+                    // An exec probe reports pass or fail and has no way to say "degraded but
+                    // not my fault" — that distinction is `robot.health`'s, over the socket.
+                    Ok(GatePassed::Healthy)
                 } else {
                     Err(Error::Health(format!(
                         "probe exited {}: {}",
@@ -1936,10 +2276,13 @@ impl Engine {
     /// source, and both are diagnosable only if the message says *which* version and
     /// channel it was. The parsed fields are untrusted here — they are used for the
     /// message only, never for a decision.
-    fn verify_manifest(&self, signed: &source::SignedBytes<Manifest>) -> Result<(), Error> {
+    /// Returns the id of the trusted key that admitted it. A *set* of keys is allowed, so which
+    /// one signed a release is a fact about that release — and [`crate::verify::TrustedKey::id`]
+    /// has said it was for the log since the day it was written.
+    fn verify_manifest(&self, signed: &source::SignedBytes<Manifest>) -> Result<String, Error> {
         self.keys
             .verify_bytes(&signed.bytes, &signed.signature)
-            .map(|_| ())
+            .map(|key| key.id.clone())
             .map_err(|e| {
                 Error::Verification(format!(
                     "manifest for {} {} (unverified): {e}. \
@@ -2165,6 +2508,176 @@ async fn self_test_updaterd(release_dir: &Path, config: Option<&Path>) -> Result
 /// Pure, and separated from the scheduling below for the reason `reconcile::verdict_for` is: which
 /// outcomes owe what is the part that can be wrong, and arranging each of them on a board costs an
 /// afternoon apiece.
+/// The update log's verdict for an outcome, or `None` for the outcomes it deliberately does not
+/// record — a dry run, and an apply that found nothing to do.
+///
+/// Extracted from `Engine::record` so that the transcript's closing line and the log entry cannot
+/// disagree about how a run ended. They are the same judgement written in two places, which is
+/// exactly the shape that drifts.
+///
+/// The version returned names **the version the entry is about**: the one now running for a
+/// success, and the one that *failed* for a rollback — see `Engine::record`, which explains why
+/// [`crate::journal::Journal::known_bad`] depends on that.
+/// Put the gate's verdict in the transcript, both ways it can pass.
+fn record_gate(rec: &Recorder, verdict: &Result<GatePassed, Error>) {
+    rec.note(RunEvent::Health {
+        passed: verdict.is_ok(),
+        detail: match verdict {
+            Ok(GatePassed::Healthy) => None,
+            Ok(GatePassed::Degraded(reason)) => Some(format!(
+                "degraded, and committed anyway — this release cannot have caused it and a \
+                 rollback cannot fix it: {reason}"
+            )),
+            Err(e) => Some(e.to_string()),
+        },
+    });
+}
+
+fn journal_outcome(
+    outcome: &Result<ApplyResult, Error>,
+) -> Option<(Option<semver::Version>, Outcome)> {
+    Some(match outcome {
+        Ok(ApplyResult::Applied { to, .. }) => (Some(to.clone()), Outcome::Success),
+        Ok(ApplyResult::RolledBack {
+            attempted, reason, ..
+        }) => (
+            Some(attempted.clone()),
+            Outcome::RolledBack {
+                reason: reason.clone(),
+            },
+        ),
+        Ok(ApplyResult::Stuck { version, reason }) => (
+            Some(version.clone()),
+            Outcome::Aborted {
+                reason: format!("stuck on {version}: {reason}"),
+            },
+        ),
+        Ok(ApplyResult::AlreadyCurrent { .. } | ApplyResult::DryRunPassed { .. }) => return None,
+        Err(e) => (
+            None,
+            Outcome::Aborted {
+                reason: e.to_string(),
+            },
+        ),
+    })
+}
+
+/// One sentence for how a run ended, including the two the update log does not keep.
+///
+/// Always present, unlike [`journal_outcome`]: a dry run that verified a release and stopped is a
+/// perfectly good thing to have a transcript of, and "no outcome recorded" would be a poor way to
+/// describe the run that told you the release was fine.
+fn summarise(outcome: &Result<ApplyResult, Error>) -> String {
+    match outcome {
+        Ok(ApplyResult::Applied { from, to }) => match from {
+            Some(from) => format!("applied {from} → {to}"),
+            None => format!("installed {to}"),
+        },
+        Ok(ApplyResult::AlreadyCurrent { version, stale }) if stale.is_empty() => {
+            format!("already on {version}; nothing to do")
+        }
+        Ok(ApplyResult::AlreadyCurrent { version, stale }) => format!(
+            "already on {version}, but {} was not running it; restarting",
+            stale.join(", ")
+        ),
+        Ok(ApplyResult::DryRunPassed { candidate }) => {
+            format!("dry run: {candidate} verified, and nothing was changed")
+        }
+        Ok(ApplyResult::RolledBack {
+            attempted,
+            reverted_to,
+            reason,
+        }) => format!(
+            "{attempted} failed and was rolled back to {}: {reason}",
+            reverted_to
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "nothing".into())
+        ),
+        Ok(ApplyResult::Stuck { version, reason }) => {
+            format!("stuck on {version}: {reason}")
+        }
+        Err(e) => format!("refused: {e}"),
+    }
+}
+
+/// The target as the caller named it, for the transcript's opening line.
+///
+/// Rendered rather than structured, because it exists to be read back to whoever is asking what
+/// they actually ran — and `Target` already carries the structure for anything that branches.
+fn describe_target(target: &crate::proto::Target) -> String {
+    match target {
+        crate::proto::Target::Latest => "latest".to_owned(),
+        crate::proto::Target::Exact(v) => v.to_string(),
+        crate::proto::Target::Ref(git_ref) => format!("branch {git_ref}"),
+        crate::proto::Target::Staging => "latest release candidate".to_owned(),
+        crate::proto::Target::StagingExact(v) => format!("release candidate {v}"),
+    }
+}
+
+/// Where the bytes were going to come from.
+///
+/// `from_dir` shadows the configured source for one call, so it is what this run's source *was* —
+/// reporting the configured one would be a lie in exactly the case (a laptop push that went wrong)
+/// where somebody is reading the transcript to find out where a release came from.
+fn describe_source(source: &crate::config::SourceConfig, from_dir: Option<&Path>) -> String {
+    use crate::config::SourceConfig;
+    if let Some(dir) = from_dir {
+        return format!(
+            "{} (--from, overriding the configured source)",
+            dir.display()
+        );
+    }
+    match source {
+        SourceConfig::GithubReleases { repo, .. } => format!("github.com/{repo}"),
+        SourceConfig::HfHub { repo, revision, .. } => {
+            format!("huggingface.co/{repo} at {revision}")
+        }
+        SourceConfig::LocalDir { path } => path.display().to_string(),
+    }
+}
+
+/// Bytes as a person reads them. Two significant figures is all anyone wants from a download size.
+fn describe_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "kB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Put a hook's output in the transcript whether it passed or failed.
+///
+/// **Both, and that is the point.** `hooks::run` logs its output to the journal either way, but a
+/// caller takes the outcome with `?` and drops it — so on the failure path the output survives only
+/// inside the error message, and on the success path it survived nowhere the update itself could
+/// point at. This is the hook that installs ONNX Runtime and the GStreamer stack; its output is the
+/// answer to "can this board encode H.264, at this release".
+fn record_hook(rec: &Recorder, hook: &str, outcome: &Result<hooks::HookOutcome, Error>) {
+    match outcome {
+        Ok(run) if !run.ran => rec.say(format!("this release ships no {hook}")),
+        Ok(run) => rec.note(RunEvent::Hook {
+            hook: hook.to_owned(),
+            exit_code: run.exit_code,
+            output: run.output.clone(),
+        }),
+        // The failure carries the output in its message, which is where `hooks::run` puts it.
+        Err(Error::Hook { detail, .. }) => rec.note(RunEvent::Hook {
+            hook: hook.to_owned(),
+            exit_code: None,
+            output: detail.clone(),
+        }),
+        Err(e) => rec.say(format!("{hook} could not be run: {e}")),
+    }
+}
+
 fn restarts_owed(outcome: &Result<ApplyResult, Error>) -> Vec<&str> {
     match outcome {
         Ok(ApplyResult::Applied { .. }) => RESTART_AFTER_REPLYING.to_vec(),
@@ -2174,7 +2687,11 @@ fn restarts_owed(outcome: &Result<ApplyResult, Error>) -> Vec<&str> {
 }
 
 /// Schedule what [`restarts_owed`] says the outcome owes.
-async fn schedule_restarts_if_needed(enabled: bool, outcome: &Result<ApplyResult, Error>) {
+async fn schedule_restarts_if_needed(
+    enabled: bool,
+    outcome: &Result<ApplyResult, Error>,
+    rec: &Recorder,
+) {
     if !enabled {
         // A test binary. See `Engine::without_deferred_restarts` for why this is about forking.
         tracing::debug!("deferred restarts suppressed");
@@ -2191,7 +2708,7 @@ async fn schedule_restarts_if_needed(enabled: bool, outcome: &Result<ApplyResult
             "this release is already installed, and these are not running it; restarting them"
         );
     }
-    schedule_deferred_restarts(SYSTEMD_RUN, &units).await;
+    schedule_deferred_restarts(SYSTEMD_RUN, &units, rec).await;
 }
 
 /// The program that schedules the deferred restarts.
@@ -2221,7 +2738,7 @@ const SYSTEMD_RUN: &str = "systemd-run";
 /// cost a mechanism. Nor does this need [`restart_one`]'s absent-unit handling: a unit is named here
 /// either because the release ships it or because it published an identity, and a process that
 /// published one is running.
-async fn schedule_deferred_restarts(systemd_run: &str, units: &[&str]) {
+async fn schedule_deferred_restarts(systemd_run: &str, units: &[&str], rec: &Recorder) {
     for unit in units.iter().copied() {
         let mut command = tokio::process::Command::new(systemd_run);
         command
@@ -2240,23 +2757,39 @@ async fn schedule_deferred_restarts(systemd_run: &str, units: &[&str]) {
             Ok(mut child) => child.wait().await,
             Err(e) => Err(e),
         };
-        match waited {
+        let detail = match waited {
             Ok(status) if status.success() => {
                 tracing::info!(unit, delay = DEFERRED_RESTART_DELAY, "restart scheduled");
+                None
             }
-            Ok(status) => tracing::warn!(
-                unit,
-                %status,
-                "could not schedule the restart; it keeps the old binary until the next updaterd \
-                 start notices"
-            ),
-            Err(e) => tracing::warn!(
-                unit,
-                error = %e,
-                "could not run systemd-run; the unit keeps the old binary until the next updaterd \
-                 start notices"
-            ),
-        }
+            Ok(status) => {
+                tracing::warn!(
+                    unit,
+                    %status,
+                    "could not schedule the restart; it keeps the old binary until the next updaterd \
+                     start notices"
+                );
+                Some(format!(
+                    "systemd-run exited {status}; the unit keeps the old binary until the next updaterd start notices"
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    unit,
+                    error = %e,
+                    "could not run systemd-run; the unit keeps the old binary until the next updaterd \
+                     start notices"
+                );
+                Some(format!(
+                    "could not run systemd-run: {e}; the unit keeps the old binary until the next updaterd start notices"
+                ))
+            }
+        };
+        rec.note(RunEvent::Unit {
+            unit: unit.to_owned(),
+            action: format!("restart in {DEFERRED_RESTART_DELAY}"),
+            detail,
+        });
     }
 }
 
@@ -3044,7 +3577,12 @@ exit 1
         let dir = tempfile::tempdir().unwrap();
         let systemd_run = stub_recorder(dir.path(), "systemd-run");
 
-        schedule_deferred_restarts(systemd_run.to_str().unwrap(), &RESTART_AFTER_REPLYING).await;
+        schedule_deferred_restarts(
+            systemd_run.to_str().unwrap(),
+            &RESTART_AFTER_REPLYING,
+            &Recorder::silent(),
+        )
+        .await;
 
         let log = calls(dir.path());
         let lines: Vec<&str> = log.lines().collect();
@@ -3085,7 +3623,12 @@ exit 1
         let dir = tempfile::tempdir().unwrap();
         let systemd_run = stub_recorder(dir.path(), "systemd-run");
 
-        schedule_deferred_restarts(systemd_run.to_str().unwrap(), &["configd"]).await;
+        schedule_deferred_restarts(
+            systemd_run.to_str().unwrap(),
+            &["configd"],
+            &Recorder::silent(),
+        )
+        .await;
 
         let log = calls(dir.path());
         assert!(log.ends_with("-- systemctl restart configd\n"), "{log}");
@@ -3144,6 +3687,7 @@ exit 1
         schedule_deferred_restarts(
             dir.path().join("absent").to_str().unwrap(),
             &RESTART_AFTER_REPLYING,
+            &Recorder::silent(),
         )
         .await;
     }

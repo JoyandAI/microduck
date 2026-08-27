@@ -461,6 +461,10 @@ async fn install(
         // health gate off, which is the difference between it and `apply --from`, and it must
         // not be reachable by an option that leaves them on.
         from_dir: None,
+        // No peer to name: this is a shell running as root, not a client on the socket. What ran
+        // it is worth saying anyway, because a transcript that says nothing here reads as an
+        // unattended update rather than as the sideload it was.
+        requested_by: Some("updaterd install --from, on this board".into()),
     };
 
     let result = engine

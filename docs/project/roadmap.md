@@ -210,6 +210,8 @@ collecting one subsystem's whole story into something a person can paste; `board
 
 - **A support bundle.** One command, after a fault, producing a file someone can send. Nothing
   collects health, versions, the journal, the update history and the unit states together.
+  `robotctl update show` is the shape of it for one subsystem — a durable per-run record with
+  the journal for that window spliced in — and covers updates only.
 - **A hardware pass/fail a non-developer can run.** Bus scan and a per-servo answer, IMU sanity,
   ToF present, camera present, NPU present, mic and speaker, battery under load. Closer to
   `board-test.sh` in spirit, aimed at the hardware rather than the release.
