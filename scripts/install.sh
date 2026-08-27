@@ -721,6 +721,14 @@ install_units() {
         fi
     done
 
+    # The login-shell files: bash completions, the motd banner, and the robot's name in the
+    # prompt.
+    #
+    # Before adding a fourth line here, read `docs/design/updater-design.md` §9.1. This script
+    # runs once, on a board being set up, so a step only it performs is a step that every board
+    # provisioned earlier never gets. And the update path cannot reach this file — `install.sh`
+    # is not in the artifact — so anything that must also arrive by update belongs in a
+    # `scripts/setup-*.sh` that this script and a hook both run.
     install_completions
     install_login_banner
     install_name_prompt

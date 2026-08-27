@@ -95,7 +95,9 @@ the tools
 
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
 policies/       the ONNX networks a release ships
-hooks/          preinstall · postinstall — what runs inside an update, from the artifact
+hooks/          preinstall · postinstall — what runs inside an update, from the artifact,
+                and the only thing that runs on every board on every update: anything
+                install.sh does to a board belongs here too (updater-design.md §9.1)
 scripts/        provision-board.sh · dev-push.sh + dev-build.Dockerfile (from your machine) ·
                 provision.sh → setup-board.sh → setup-gstreamer.sh · setup-rkaiq.sh ·
                 migrate-network.sh · install.sh (on the board) ·

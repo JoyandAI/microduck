@@ -868,7 +868,7 @@ so no unsigned code ever runs. Rust binary or shell script — the engine just
   config-schema migrations, `udev`/permission tweaks, data conversions across
   `schema_version` bumps.
 
-### 9.1 If a board needs it, the hook does it
+### 9.1 If a fresh install does it, the hook does it
 
 **A release is not installed until everything it needs is on the board.** Shipping a file
 into the release directory is not installing it; shipping a script into the release
@@ -876,7 +876,16 @@ directory is not running it. The hook is the only thing that runs on every board
 update, so it is where "this board must have X before this release works" belongs — not in
 a provisioning script that ran once before X existed, and not in a human's memory.
 
-This has now been got wrong three times, in three different shapes:
+**The question is not whether the release needs it. It is whether a fresh install does it.**
+"Needs" is a judgement, and it has already let a case through: a snippet that puts the robot's
+name in the shell prompt is not something a release *needs*, so it went into `install.sh` and
+nowhere else, and no board that has only ever updated has it. Ask the mechanical question
+instead — **does
+`scripts/install.sh` write this file or run this command?** — because that one can be answered
+by grepping a single file, and because a board that is not brand new gets exactly what the
+hooks do and nothing else.
+
+This has now been got wrong four times, in four different shapes:
 
 1. **Units.** A release that added a daemon put its `.service` inside the artifact and
    nowhere systemd looks. `btd` failed with `203/EXEC` on a board where the release was
@@ -890,13 +899,31 @@ This has now been got wrong three times, in three different shapes:
    into the release beside the model — and never called it. Every board would have shipped
    a detector that could not reach the NPU until somebody SSH'd in, and the way you find
    that out is `rknn_init` returning a number.
+4. **The login shell.** `install.sh` grew a `/etc/profile.d` snippet putting the robot's name
+   beside the hostname — `microduck@radxa-zero3 (coincoin):~$` — so that three ssh windows to
+   three ducks are not three identical prompts. Nothing else installs it, and `install.sh` is
+   not packaged into a release, so no hook *could*. A board provisioned before it was written
+   took every update since and never got it; the way you find that out is `ls: cannot access
+   '/etc/profile.d/robot-name-prompt.sh'` on a board whose release contains the feature.
 
 The shape is the same every time: the work was *done*, and the thing that makes the work
 reach a board was left out. It is invisible in review, because the diff that adds the
 script looks complete.
 
-**Corollaries, each of which has a test.**
+The fourth adds a way it can look *right*. Its two neighbours in `install.sh` — the login
+banner and the `robotctl` completions — have the same gap and are older, so the surrounding
+code read as the pattern to follow. Three functions in a row that only a fresh install runs
+are not a precedent; they are three instances.
 
+**Corollaries.**
+
+- **Anything `install.sh` does to a board, a hook does too.** The other three are instances of
+  this one, and its direction is the one the mistake is actually made in: a step is added to
+  `install.sh`, where it is easy to test on the board being provisioned anyway, and the update
+  path never learns about it. `install.sh` is not in the artifact and a hook cannot call it, so
+  the shared step belongs in a `scripts/setup-*.sh` that both run — which is what
+  `setup-gstreamer.sh` already is. The three corollaries below have tests; this one does not
+  yet, and it is the one that would have caught all four.
 - **A script the hook runs must be packaged.** `every_script_the_hooks_run_is_packaged`
   reads `script=scripts/…` assignments out of both hooks and fails the build if any
   packaging site omits one.
@@ -909,10 +936,11 @@ script looks complete.
   board with no camera, no Bluetooth adapter or no NPU is still a robot; those install
   steps say what was lost, name the command to retry, and return success.
 
-**This is what the split between provisioning and updating is for.** `provision.sh` sets up
-a new board. Every board provisioned before a thing existed is fixed by an ordinary update
-— which means a release may assume nothing about when its board was provisioned, and a
-setup step that only provisioning performs is a step half the fleet will never get.
+**This is what the split between provisioning and updating is for.** `provision.sh` and
+`install.sh` set up a new board, and they run once. Every board provisioned before a thing
+existed is fixed by an ordinary update — which means a release may assume nothing about when
+its board was provisioned, and a setup step that only provisioning performs is a step half the
+fleet will never get.
 
 ## 10. Reusable, config-driven engine
 
