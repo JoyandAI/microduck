@@ -408,12 +408,12 @@ a picture made four times darker underneath it drew no response at all. One conv
 start is not auto-exposure — a robot that walks from a window into a corridor keeps the window's
 exposure.
 
-**And on a boot where the engine missed the stream-start event, even the one shot does not happen.**
-That was measured first and read wrongly: the sensor sat at exactly `600 / 1024` for as long as it
-was watched and a manual write stuck, which looked like an AE that had never worked, when it was an
-AE that had never been given a stream. The two states are indistinguishable from a single reading of
-the sensor, and only the ordering fix above tells them apart. This is the "3A stopped working, and a
-reboot sometimes fixes it" shape.
+**And on a boot where the engine missed the stream-start event — the section above — even the one
+shot does not happen.** That was measured first and read wrongly: the sensor sat at exactly
+`600 / 1024` for as long as it was watched and a manual write stuck, which looked like an AE that had
+never worked, when it was an AE that had never been given a stream. The two states are
+indistinguishable from a single reading of the sensor, which is why the two fixes belong together:
+the ordering fix is what makes the difference between them observable at all.
 
 `mediad::exposure` is what closes the loop, ported from the prototype's `ae_loop`: mean luma off the
 tee's raw branch twice a second against a setpoint of 90, and a damped multiplicative step split

@@ -10,11 +10,12 @@
 //! seconds with no correction. One convergence at stream start is not auto-exposure. A robot that
 //! walks from a window into a corridor keeps the window's exposure.
 //!
-//! And when the engine misses the stream-start event (it waits for one and does not notice one that
-//! already fired — `docs/project/media-bringup.md`), even that one shot does not happen and the
-//! picture stays at whatever `mediad` pinned. That is the "3A stopped working, a reboot sometimes
-//! fixes it" shape, and it is why this module is worth having even once the ordering is fixed:
-//! exposure stops depending on which order two units started in.
+//! And when the engine misses the stream-start event — it waits for one and does not notice one that
+//! already fired, which is the other half of this branch — even that one shot does not happen and
+//! the picture stays at whatever `mediad` pinned. That is the "3A stopped working, a reboot sometimes
+//! fixes it" shape. Fixing the ordering brings the one shot back; it does not make it a loop, which
+//! is why both halves are here. With this module, exposure stops depending on the order two units
+//! started in at all.
 //!
 //! So this is the loop, ported from the prototype (`microduck_runtime`'s `camera.rs`), where it ran
 //! for months: sample luma twice a second, compare it against a setpoint, and steer the sensor with
