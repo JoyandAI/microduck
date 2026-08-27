@@ -148,7 +148,18 @@ jobs:
 
   board:
     # The target is aarch64; this is the only job that proves the binaries run there.
-    runs-on: ubuntu-latest
+    #
+    # On an aarch64 runner, so the containers further down run natively. Under QEMU on x86_64 the
+    # cost was not in the binaries under test — thirty of those checks went by in nine seconds —
+    # but in the shell-heavy ones, where every `sh`, `sed` and `grep` is emulated: the first
+    # setup-board.sh run alone took 148s, each later variant ~17s, and the install.sh block ran
+    # for four and a half minutes. That was more than half of this job, and this job is what the
+    # whole run waits on.
+    #
+    # Moving back to an x86_64 runner means restoring `docker/setup-qemu-action` with
+    # `platforms: arm64`, dropped below. Without it `docker run --platform linux/arm64` does not
+    # fall back to anything — it fails with an exec format error.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -200,13 +211,11 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
-      - run: cargo install cargo-zigbuild --locked
 
-      # arm64 containers on an x86_64 runner need emulation; on arm64 runners this is
-      # a no-op. Kept so the job works on either.
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+      # A prebuilt binary, not `cargo install cargo-zigbuild --locked`. Building it from source
+      # appeared free only because rust-cache had already restored ~/.cargo/bin; on a cold cache
+      # it is minutes, and changing the runner architecture is exactly what makes the cache cold.
+      - uses: taiki-e/install-action@cargo-zigbuild
 
       - run: ./scripts/board-test.sh
 
