@@ -26,6 +26,23 @@ const JOURNAL_TAIL: i64 = 60;
 /// with no unit events (a refusal, a dry run) it is the only thing that logged anything.
 const ALWAYS_SPLICED: &str = "updaterd";
 
+/// Journal lines the transcript above has already shown, verbatim.
+///
+/// `hooks::run` writes the hook's output to the journal a line at a time — deliberately, so it is
+/// greppable — and the transcript records the same output as one event. Splicing both puts the
+/// pre-install hook's ninety lines on screen twice in a row, which on the first real board run
+/// was more than a third of the output.
+///
+/// Matched on the `tracing` target as journald renders it. If that rendering ever changes the
+/// filter stops matching and the duplicates come back, which is the right way for this to fail:
+/// the log is intact and merely repeated, rather than silently dropped.
+const ALREADY_IN_THE_TRANSCRIPT: &str = "updater::hooks:";
+
+/// Whether a journal line is worth showing under a transcript that already contains it.
+pub fn worth_splicing(line: &str) -> bool {
+    !line.contains(ALREADY_IN_THE_TRANSCRIPT) && !line.trim_start().starts_with("-- No entries --")
+}
+
 /// Render one run.
 pub fn render(transcript: &RunTranscript) -> String {
     let mut out = String::new();
@@ -193,7 +210,11 @@ fn event_line(record: &RunRecord, previous: Option<i64>) -> Option<String> {
         RunEvent::Health { passed, detail } => (
             "health".to_owned(),
             match (passed, detail) {
-                (true, _) => "the robot reported healthy".to_owned(),
+                (true, None) => "the robot reported healthy".to_owned(),
+                // Passing and being healthy are not the same fact, and rounding one to the other
+                // is how a transcript ends up saying "healthy" about a board whose own journal
+                // says "degraded" at the same second. See `engine::GatePassed`.
+                (true, Some(why)) => format!("passed — {why}"),
                 (false, Some(why)) => format!("FAILED — {why}"),
                 (false, None) => "FAILED".to_owned(),
             },
@@ -464,6 +485,51 @@ mod tests {
         assert!(argv.contains(&"--since=@100".to_owned()), "{argv:?}");
         assert!(argv.contains(&"--unit=mediad".to_owned()), "{argv:?}");
         assert!(argv.contains(&"--utc".to_owned()), "{argv:?}");
+    }
+
+    /// The hook's own journal lines are already above, as one event with its output intact.
+    ///
+    /// On the first board run this was a third of the screen, printed twice in a row.
+    #[test]
+    fn the_splice_drops_what_the_transcript_already_showed() {
+        let hook_line = "Aug 27 14:00:43 duck updaterd[2327]: 2026-08-27T14:00:43.876034Z  INFO \
+                         updater::hooks: preinstall: checking the GStreamer stack \
+                         hook=hooks/preinstall";
+        assert!(!worth_splicing(hook_line));
+
+        // Everything else `updaterd` says stays: the engine's own lines are not in the transcript.
+        let engine_line = "Aug 27 14:00:55 duck updaterd[2327]: 2026-08-27T14:00:55.382481Z  WARN \
+                           updater::engine: committing: the robot is degraded";
+        assert!(worth_splicing(engine_line));
+        // And so does every other daemon, which is the half the transcript never sees.
+        assert!(worth_splicing(
+            "Aug 27 14:00:54 duck systemd[1]: Started robotd.service - Robot control daemon."
+        ));
+        assert!(!worth_splicing("-- No entries --"));
+    }
+
+    /// Passing the gate and being healthy are different facts.
+    #[test]
+    fn a_degraded_commit_does_not_render_as_healthy() {
+        let degraded = RunTranscript {
+            run: 9,
+            component: ComponentId::new("daemon"),
+            events: vec![at(
+                100,
+                RunEvent::Health {
+                    passed: true,
+                    detail: Some(
+                        "degraded, and committed anyway — this release cannot have caused it: no \
+                         robot on the motor bus"
+                            .into(),
+                    ),
+                },
+            )],
+            available: vec![9],
+        };
+        let out = render(&degraded);
+        assert!(out.contains("no robot on the motor bus"), "{out}");
+        assert!(!out.contains("reported healthy"), "{out}");
     }
 
     /// A run cut short must say so where the verdict would have been, or it reads as a robot that

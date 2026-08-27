@@ -3043,9 +3043,11 @@ fn journal_for(transcript: &proto::RunTranscript, skip: bool) -> String {
 
     // journalctl exits 0 and says "-- No entries --" both for a window with nothing in it and for
     // a caller who may not read system logs, and those need different advice. Neither is an error.
+    // Hook output is dropped here because the transcript above carries it in full — see
+    // `show::ALREADY_IN_THE_TRANSCRIPT`.
     let lines: Vec<&str> = text
         .lines()
-        .filter(|line| !line.trim_start().starts_with("-- No entries --"))
+        .filter(|line| show::worth_splicing(line))
         .collect();
     if lines.is_empty() {
         out.push_str(

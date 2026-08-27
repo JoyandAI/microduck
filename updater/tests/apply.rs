@@ -2605,3 +2605,35 @@ async fn asking_for_a_run_that_is_not_there_says_which_are() {
     assert!(message.contains("run 99"), "{message}");
     assert!(message.contains("run 1 is the only one kept"), "{message}");
 }
+
+/// Passing the gate and being healthy are different facts, and the transcript must not round one
+/// to the other.
+///
+/// `HealthCheck::Socket` commits a release onto a robot reporting *degraded* when the degradation
+/// is something the release cannot have caused — servo power off is the everyday case. Recording
+/// that as a plain pass produced a transcript saying "the robot reported healthy" while the same
+/// board's journal, at the same second, said it was degraded. Found on a robot.
+#[tokio::test]
+async fn a_degraded_commit_says_so_rather_than_reporting_healthy() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine(Box::new(DegradedRobot), Faults::none(), "");
+
+    let result = apply_latest(&mut engine).await.unwrap();
+    assert!(matches!(result, ApplyResult::Applied { .. }), "{result:?}");
+
+    let transcript = engine.show(None).unwrap();
+    let (passed, detail) = transcript
+        .events
+        .iter()
+        .find_map(|record| match &record.event {
+            updater::proto::RunEvent::Health { passed, detail } => Some((*passed, detail.clone())),
+            _ => None,
+        })
+        .expect("the gate's verdict must be recorded");
+
+    assert!(passed, "the release was committed, so the gate passed");
+    let detail = detail.expect("a pass that was not a clean bill of health must say why");
+    assert!(detail.contains("motor bus"), "{detail}");
+    assert!(detail.contains("cannot have caused"), "{detail}");
+}

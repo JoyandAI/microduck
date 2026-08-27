@@ -307,6 +307,21 @@ impl Recorder {
     }
 }
 
+/// How the health gate passed.
+///
+/// **Two outcomes, not one.** `HealthCheck::Socket` commits a release onto a robot reporting
+/// *degraded* whenever the degradation is something the release cannot have caused and a rollback
+/// cannot fix — servo power off, a sensor unplugged. That is the right call and it has been logged
+/// at `warn` since it was written, precisely so nobody has to guess afterwards that it is what
+/// happened. Collapsing it into `Ok(())` meant the transcript then said "the robot reported
+/// healthy" on a board whose own journal, at the same second, said it was degraded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatePassed {
+    Healthy,
+    /// Committed anyway, with the reason the robot gave.
+    Degraded(String),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOptions {
     pub dry_run: bool,
@@ -1118,11 +1133,8 @@ impl Engine {
 
         rec.phase(Phase::HealthGate, None);
         let verdict = self.health_gate(cfg).await;
-        rec.note(RunEvent::Health {
-            passed: verdict.is_ok(),
-            detail: verdict.as_ref().err().map(ToString::to_string),
-        });
-        verdict
+        record_gate(rec, &verdict);
+        verdict.map(|_| ())
     }
 
     /// Swap back to `previous` and re-run the apply action.
@@ -1438,13 +1450,10 @@ impl Engine {
 
         rec.phase(Phase::HealthGate, None);
         let gate = self.health_gate(cfg).await;
-        rec.note(RunEvent::Health {
-            passed: gate.is_ok(),
-            detail: gate.as_ref().err().map(ToString::to_string),
-        });
+        record_gate(rec, &gate);
 
         let outcome = match gate {
-            Ok(()) => {
+            Ok(_) => {
                 self.boot_counter.confirm(component)?;
                 Ok(ApplyResult::Applied {
                     from: from.clone(),
@@ -2083,14 +2092,14 @@ impl Engine {
     ///
     /// A timeout is a **failure**: unproven is not healthy, or auto-rollback would
     /// never fire on a release that hangs.
-    async fn health_gate(&self, cfg: &ComponentConfig) -> Result<(), Error> {
+    async fn health_gate(&self, cfg: &ComponentConfig) -> Result<GatePassed, Error> {
         if self.faults.fail_health {
             return Err(Error::Health("injected health failure".into()));
         }
 
         let Some(timeout) = cfg.health.timeout() else {
             // HealthCheck::None — nothing to gate on.
-            return Ok(());
+            return Ok(GatePassed::Healthy);
         };
 
         if self.faults.hang_health {
@@ -2102,7 +2111,7 @@ impl Engine {
         }
 
         match &cfg.health {
-            HealthCheck::None => Ok(()),
+            HealthCheck::None => Ok(GatePassed::Healthy),
             HealthCheck::Socket { .. } => {
                 // The socket path lives in `Config::robot_socket` and is used to build
                 // the RobotClient in `main`; here we just ask the client.
@@ -2110,7 +2119,7 @@ impl Engine {
                 let mut last = String::from("no answer");
                 while tokio::time::Instant::now() < deadline {
                     match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
-                        crate::robot::Health::Healthy => return Ok(()),
+                        crate::robot::Health::Healthy => return Ok(GatePassed::Healthy),
                         // Passes. Logged at warn, not swallowed: committing a release onto a
                         // robot that cannot move is the right call, but nobody should have to
                         // guess afterwards that that is what happened.
@@ -2120,7 +2129,7 @@ impl Engine {
                                 "committing: the robot is degraded for a reason this release \
                                  cannot have caused and a rollback cannot fix"
                             );
-                            return Ok(());
+                            return Ok(GatePassed::Degraded(reason));
                         }
                         crate::robot::Health::Unhealthy(reason) => last = reason,
                         // Fails, like `Unreachable`, and reads nothing like it. "unreachable"
@@ -2161,7 +2170,9 @@ impl Engine {
                     })?
                     .map_err(|e| Error::Health(format!("could not run probe: {e}")))?;
                 if output.status.success() {
-                    Ok(())
+                    // An exec probe reports pass or fail and has no way to say "degraded but
+                    // not my fault" — that distinction is `robot.health`'s, over the socket.
+                    Ok(GatePassed::Healthy)
                 } else {
                     Err(Error::Health(format!(
                         "probe exited {}: {}",
@@ -2507,6 +2518,21 @@ async fn self_test_updaterd(release_dir: &Path, config: Option<&Path>) -> Result
 /// The version returned names **the version the entry is about**: the one now running for a
 /// success, and the one that *failed* for a rollback — see `Engine::record`, which explains why
 /// [`crate::journal::Journal::known_bad`] depends on that.
+/// Put the gate's verdict in the transcript, both ways it can pass.
+fn record_gate(rec: &Recorder, verdict: &Result<GatePassed, Error>) {
+    rec.note(RunEvent::Health {
+        passed: verdict.is_ok(),
+        detail: match verdict {
+            Ok(GatePassed::Healthy) => None,
+            Ok(GatePassed::Degraded(reason)) => Some(format!(
+                "degraded, and committed anyway — this release cannot have caused it and a \
+                 rollback cannot fix it: {reason}"
+            )),
+            Err(e) => Some(e.to_string()),
+        },
+    });
+}
+
 fn journal_outcome(
     outcome: &Result<ApplyResult, Error>,
 ) -> Option<(Option<semver::Version>, Outcome)> {
