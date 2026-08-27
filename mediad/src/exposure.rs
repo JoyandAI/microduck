@@ -84,6 +84,8 @@ pub struct Ae {
     exposure: f64,
     analogue: f64,
     digital: f64,
+    /// What was last handed out, so the same values are never written twice.
+    written: Option<Controls>,
 }
 
 impl Ae {
@@ -94,10 +96,20 @@ impl Ae {
             exposure: (exposure_lines as f64).clamp(4.0, HARD_LINES),
             analogue: (analogue_gain_reg as f64 / 256.0).clamp(1.0, MAX_ANALOGUE),
             digital: 1.0,
+            written: None,
         }
     }
 
-    /// One step towards the setpoint, or `None` inside the deadband.
+    /// One step towards the setpoint. `None` inside the deadband, and `None` when the step lands on
+    /// the values already written.
+    ///
+    /// **That second case is not an optimisation.** A room darker than the sensor can reach — the
+    /// shutter at 1200 lines, analogue gain at 11x, digital gain at its ceiling — leaves the ratio
+    /// permanently outside the deadband, because the setpoint is unreachable rather than merely far
+    /// away. Without this the loop writes the same three numbers twice a second for as long as the
+    /// robot is in that room, and each write is a `v4l2-ctl` process: measured on the board at 43 ms
+    /// of CPU a call, which at the throttled 408 MHz is most of a tenth of a core spent achieving
+    /// nothing.
     ///
     /// The step is multiplicative on the *product* of the three controls, because that product is
     /// what luma is proportional to; the split back into three is where the noise ordering lives.
@@ -118,7 +130,12 @@ impl Ae {
         self.exposure = (budget / self.analogue).clamp(self.exposure, HARD_LINES);
         self.digital = (budget / (self.exposure * self.analogue)).clamp(1.0, MAX_DIGITAL);
 
-        Some(self.controls())
+        let next = self.controls();
+        if self.written == Some(next) {
+            return None;
+        }
+        self.written = Some(next);
+        Some(next)
     }
 
     fn controls(&self) -> Controls {
@@ -380,11 +397,40 @@ mod tests {
             exposure: 4.0,
             analogue: 1.0,
             digital: 1.0,
+            written: None,
         };
         let step = ae.step(2.0).expect("a step");
         assert!(step.exposure > 4);
         assert!(step.exposure as f64 <= SOFT_LINES);
         assert_eq!((step.analogue_gain, step.gain), (256, 256));
+    }
+
+    #[test]
+    fn a_room_darker_than_the_sensor_can_reach_stops_being_written_to() {
+        // The bug this catches, seen on a robot in a dark room: pinned at every ceiling, the ratio
+        // stays outside the deadband for ever because the setpoint is unreachable — so the loop kept
+        // writing the same three numbers twice a second, and each write is a process.
+        let mut ae = Ae::starting_at(600, 1024);
+        let mut steps = 0;
+        for _ in 0..200 {
+            if ae.step(1.0).is_some() {
+                steps += 1;
+            }
+        }
+        assert!(
+            steps < 10,
+            "still writing after settling at the ceiling: {steps} writes"
+        );
+        // And it is at the ceiling, not merely quiet.
+        let pinned = ae.controls();
+        assert_eq!(pinned.exposure as f64, HARD_LINES);
+        assert_eq!(pinned.analogue_gain as f64, MAX_ANALOGUE * 256.0);
+
+        // Light returns: the next step must write again rather than stay stuck on "unchanged".
+        assert!(
+            ae.step(TARGET_Y * 4.0).is_some(),
+            "a bright scene must move it"
+        );
     }
 
     #[test]
