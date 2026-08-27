@@ -201,47 +201,46 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
                     continue;
                 };
 
-                let wrote = write(&device, controls);
-
-                // **The first write is checked against the sensor**, and only the first: every
-                // failure mode here is otherwise silent — a node that does not carry the control, a
-                // denial, a `v4l2-ctl` that is not installed — and all of them leave the camera at
-                // one exposure, which is exactly the bug this module exists to fix.
-                if !proven {
-                    proven = true;
-                    match (&wrote, read_exposure(&device)) {
-                        (Err(e), _) => tracing::error!(
+                match write(&device, controls) {
+                    Err(e) if proven => {
+                        // At debug, not an error twice a second for as long as the daemon runs: the
+                        // first one already said what is wrong.
+                        tracing::debug!(error = %e, "exposure write failed");
+                    }
+                    Err(e) => {
+                        proven = true;
+                        tracing::error!(
                             %device, error = %e,
                             "auto-exposure cannot write the sensor; the picture stays at one \
                              brightness. `v4l2-ctl -d {device} --list-ctrls` says which controls \
                              this node carries."
-                        ),
-                        (Ok(()), Some(landed)) if landed == controls.exposure => tracing::info!(
-                            exposure = landed,
-                            "auto-exposure is driving the sensor"
-                        ),
-                        (Ok(()), landed) => tracing::error!(
-                            %device,
-                            asked = controls.exposure,
-                            landed = landed.unwrap_or_default(),
-                            "the exposure write reported success and the sensor did not take it — \
-                             the picture will stay at one brightness"
-                        ),
+                        );
                     }
-                } else if let Err(e) = &wrote {
-                    // Once a step at debug, not an error twice a second for as long as the daemon
-                    // runs: the first one already said what is wrong.
-                    tracing::debug!(error = %e, "exposure write failed");
-                }
-
-                if wrote.is_ok() {
-                    tracing::debug!(
-                        mean_luma = format!("{mean:.0}"),
-                        exposure = controls.exposure,
-                        analogue_gain = controls.analogue_gain,
-                        gain = controls.gain,
-                        "exposure step"
-                    );
+                    Ok(()) => {
+                        if worth_reading_back(proven, controls.exposure, exposure_lines) {
+                            proven = true;
+                            match read_exposure(&device) {
+                                Some(landed) if landed == controls.exposure => tracing::info!(
+                                    exposure = landed,
+                                    "auto-exposure is driving the sensor"
+                                ),
+                                landed => tracing::error!(
+                                    %device,
+                                    asked = controls.exposure,
+                                    landed = landed.unwrap_or_default(),
+                                    "the exposure write reported success and the sensor did not \
+                                     take it — the picture will stay at one brightness"
+                                ),
+                            }
+                        }
+                        tracing::debug!(
+                            mean_luma = format!("{mean:.0}"),
+                            exposure = controls.exposure,
+                            analogue_gain = controls.analogue_gain,
+                            gain = controls.gain,
+                            "exposure step"
+                        );
+                    }
                 }
             }
             tracing::debug!("auto-exposure stopped");
@@ -292,6 +291,17 @@ fn set(device: &str, controls: &str) -> std::io::Result<()> {
         "{controls}: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     )))
+}
+
+/// Whether a successful write is worth reading back from the sensor.
+///
+/// **Once, and not for a step that asks for the value already there.** Every way the write path can
+/// fail is silent, and all of them leave the sensor at the value `mediad` pinned at startup — so a
+/// read-back that finds the pin proves nothing if the pin is also what we asked for. The check would
+/// pass on the strength of somebody else's write. That is not hypothetical: the first step on a
+/// robot landed on exactly the 600 lines `mediad` had pinned, and reported success.
+fn worth_reading_back(proven: bool, asked: u32, pinned: u32) -> bool {
+    !proven && asked != pinned
 }
 
 /// What the sensor says its exposure is now, for the one check above.
@@ -391,6 +401,15 @@ mod tests {
             "{pinned:?}"
         );
         assert!(pinned.gain as f64 <= MAX_DIGITAL * 256.0, "{pinned:?}");
+    }
+
+    #[test]
+    fn the_sensor_is_only_believed_about_a_value_it_was_not_already_at() {
+        // The pin is 600. A step that asks for 600 tells us nothing about whether the write landed.
+        assert!(!worth_reading_back(false, 600, 600));
+        assert!(worth_reading_back(false, 601, 600));
+        // And once, not every step.
+        assert!(!worth_reading_back(true, 900, 600));
     }
 
     #[test]
