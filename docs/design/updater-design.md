@@ -471,38 +471,46 @@ done only when genuinely needed, never unconditionally on every update.
 - CI side: `cargo-dist` can build and publish signed artifacts to GitHub
   Releases; we host manifests as additional assets.
 
-### 6.1 ⚠ A private repository cannot serve the fleet
+### 6.1 A private repository cannot serve the fleet — so this one does not stay private
 
-**Unresolved, and it constrains M4.** `pollen-robotics/microduck` is private, and a
-private repo's `releases/download/<tag>/<asset>` URL returns **404 — with or without a
-token**. Verified directly:
+**Decided (2026-08-26): publish `pollen-robotics/microduck`.** While it is private a robot in
+the field cannot download anything, and the reason is worth keeping because it is not obvious:
+a private repo's `releases/download/<tag>/<asset>` URL returns **404 with or without a token**.
+Verified directly:
 
 | URL | private repo |
 |---|---|
 | `https://github.com/<repo>/releases/download/<tag>/<asset>` | 404, authenticated or not |
 | `https://api.github.com/repos/<repo>/releases/assets/<id>` + `Accept: application/octet-stream` | 200 with a token |
 
-The engine now resolves every asset through the API endpoint, so a **developer's board**
-works: `GITHUB_TOKEN` is in the environment and `--ref` installs a branch build. Verified end
-to end against this repo.
+So the engine resolves every asset through the API endpoint, which works for a **developer's
+board** — `GITHUB_TOKEN` is in the environment and `--ref` installs a branch build — and for a
+public repo, but not for a customer robot, which has no token and should not have one: a
+fleet-wide credential baked into an image leaks and cannot be rotated without reflashing, the
+same problem the signing keys are tiered to avoid.
 
-**A customer robot has no token, and should not.** A fleet-wide credential baked into an
-image is a credential that leaks and cannot be rotated without reflashing — the same problem
-the signing keys are tiered to avoid. So as things stand, robots in the field cannot download
-anything. The options, none of them chosen yet:
+Three other options were on the table, and are recorded because the decision could be revisited
+if the source ever needs to close again:
 
 | option | keeps zero-backend | notes |
 |---|---|---|
-| A **public repo holding only release artifacts** | yes | signatures are what make an artifact safe, not obscurity — a public artifact repo leaks build metadata and nothing else. Source stays private. |
-| Make this repo public | yes | product source; presumably not. |
-| An object store or CDN with a plain HTTP source | mostly | one more thing to own and pay for; the engine's source trait already abstracts it. |
-| A read-only token in the image | yes | rejected reasoning above: an unrotatable fleet credential. |
+| A **public repo holding only release artifacts** | yes | signatures are what make an artifact safe, not obscurity — an artifact repo leaks build metadata and nothing else. Source stays private. The fallback if this repo ever goes private again. |
+| An object store or CDN with a plain HTTP source | mostly | one more thing to own and pay for; the source trait already abstracts it. |
+| A read-only token in the image | yes | rejected: an unrotatable fleet credential. |
 
-The first is the conventional answer and costs nothing but a second repository. It does not
-change the engine — only `repo` in `updater.toml` and where `release.yml` publishes.
+**Going public changes no code.** The API path stays correct — it is the one path for private
+and public alike, which is why it was written that way.
 
-Nothing about this blocks M2 or M3: dev boards have tokens and sim needs no downloads. It
-blocks the first robot that has to update itself without a developer present, which is M4.
+**What it does change is a budget.** Unauthenticated GitHub API requests are limited to 60 per
+hour *per IP*, and a token lifts that; a robot in someone's home has no token, so its checks
+spend from the anonymous pool shared by everything behind that address. At `check_interval =
+"6h"` and a handful of calls per check, one duck is nowhere near it — a room of twenty on the
+same wifi, updating together, can be. It is not a correctness problem: `http.rs` already reads
+403 and 429 as "come back later" and says so in the message. It is a reason to prefer
+`browser_download_url` for the bytes once the repo is public, since object downloads from
+`objects.githubusercontent.com` spend nothing from that pool, and to keep the API path for
+private repos and dev boards. Worth doing before a room full of ducks exists, not before the
+first one ships.
 
 ## 7. `updaterd` state machine
 

@@ -35,8 +35,9 @@ ssh-copy-id radxa@192.168.1.42
   advertising yet.
 - **ssh key access**, from the step above. Provisioning reboots the board and reconnects by
   itself, and a password prompt cannot survive that.
-- A **GitHub token**. This repository is private, so its release assets are unreachable without
-  one.
+- A **GitHub token**, while this repository is private: its release assets are unreachable
+  without one. Once it is public the token is optional and buys only a higher API rate limit
+  (`docs/design/updater-design.md` §6.1).
 - A **clone of this repo**. The dev key it needs is committed at `deploy/dev-key/team.dev.pub`,
   so there is nothing to ask anyone for.
 
@@ -220,7 +221,8 @@ sudo systemctl restart updaterd
 ## The token, by hand
 
 `scripts/install.sh` writes this for you when given `DUCK_TOKEN`. These steps are for a board
-provisioned some other way.
+provisioned some other way — and they are only needed while this repository is private, or on a
+board that fetches often enough to want the higher rate limit a token buys.
 
 `updaterd` reads `GITHUB_TOKEN` from its own environment, so exporting it in your shell does not
 reach the daemon — it needs a systemd drop-in.
@@ -252,8 +254,10 @@ sudo systemctl daemon-reload
 sudo systemctl restart updaterd
 ```
 
-A token on a *developer's* board is fine. A token on a customer robot is not, and is why
-artifact hosting is still an open question — see `docs/design/updater-design.md` §6.1.
+A token on a *developer's* board is fine. A token on a customer robot is not — a fleet-wide
+credential in an image cannot be rotated without reflashing — which is why the answer is a
+public repository rather than a shipped token (`docs/design/updater-design.md` §6.1). A board
+with no token can still install from a local directory or a dev push.
 
 ## Installing without a network
 
