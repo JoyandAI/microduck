@@ -1068,19 +1068,24 @@ for f in /etc/profile.d/robot-name-prompt.sh /etc/bash_completion.d/robotctl /et
 done
 echo "    [ok] postinstall alone installs the login-shell files"
 
-# The asymmetry, pinned because it is easy to assume otherwise: the hook places units and
-# accounts and nothing else. Both of these were deleted above and the hook did not restore
-# either, so a release that added a journald drop-in or moved robotctl delivers neither on an
-# update — only install.sh does those, and it runs once, by hand, at provisioning time.
+# What the hook does NOT place, which is now a short list and worth naming exactly: the journald
+# drop-in and the robotctl symlink. Both were deleted above and the hook restored neither, so a
+# release that changed either delivers it to no board that only updates — only install.sh does
+# those, and it runs once, by hand, at provisioning time.
+#
+# This comment used to say the hook placed "units and accounts and nothing else", which stopped
+# being true when it took on the recovery scripts, then the voice bank, then the login-shell
+# files. The contract is the two lines below, not the sentence above them.
 #
 # Asserted rather than merely documented because the reasonable next change to this hook is to
-# make it place everything install.sh places, and the person making it should find a test that
-# states the current contract instead of discovering it on a board.
+# make it place everything install.sh places — the remaining half of updater-design.md §9.1 —
+# and the person making it should find a test that states the current contract instead of
+# discovering it on a board.
 test ! -f /etc/systemd/journald.conf.d/10-robot.conf \
     || { echo "    [FAIL] postinstall now installs the journald drop-in"; exit 1; }
 test ! -e /usr/local/bin/robotctl \
     || { echo "    [FAIL] postinstall now creates the robotctl symlink"; exit 1; }
-echo "    [ok] postinstall covers units and accounts only, as documented"
+echo "    [ok] postinstall leaves the journald drop-in and the robotctl symlink alone"
 '
 
 for image in $IMAGES; do
