@@ -52,6 +52,15 @@ const INTERVAL: Duration = Duration::from_millis(500);
 /// tick cost.
 const REASSERT_TICKS: u32 = 20;
 
+/// How often to say out loud what the loop is seeing. 20 is ten seconds.
+///
+/// **At info, not debug, because the question "is auto-exposure alive?" should not need a drop-in.**
+/// A loop that has settled writes nothing, and from the sensor that is indistinguishable from a loop
+/// metering a frozen frame or one that never started — the difference is the measured luma, which
+/// only this line carries. Ten seconds of it is six lines a minute against a journal that already
+/// carries a capture-rate line.
+const REPORT_TICKS: u32 = 20;
+
 /// Mean-luma setpoint, 8-bit and *after* the ISP's gamma curve.
 const TARGET_Y: f64 = 90.0;
 
@@ -224,6 +233,7 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
             // Ticks since the last write, for the re-assert heartbeat.
             let mut quiet = 0u32;
             let mut format_logged = false;
+            let mut since_report = 0u32;
 
             while !mine.stopped() {
                 std::thread::sleep(INTERVAL);
@@ -250,6 +260,23 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
                     continue;
                 };
                 tracing::debug!(mean_luma = format!("{mean:.1}"), target = TARGET_Y, "metered");
+                since_report += 1;
+                if since_report >= REPORT_TICKS {
+                    since_report = 0;
+                    let at = ae.controls();
+                    tracing::info!(
+                        mean_luma = format!("{mean:.1}"),
+                        target = TARGET_Y,
+                        exposure = at.exposure,
+                        analogue_gain = at.analogue_gain,
+                        gain = at.gain,
+                        // Named, because "the numbers are not moving" has two very different causes
+                        // and this is the one that tells them apart.
+                        at_ceiling = at.exposure as f64 >= HARD_LINES
+                            && at.analogue_gain as f64 >= MAX_ANALOGUE * 256.0,
+                        "metering"
+                    );
+                }
 
                 let controls = match ae.step(mean) {
                     Some(controls) => controls,
