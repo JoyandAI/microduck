@@ -29,6 +29,9 @@ pub enum Kind {
     Float,
     /// A fractional number, or absent meaning "resolved per mode / measured / default".
     OptionalFloat,
+    /// A whole number, or absent meaning "follows something else" — `media.bitrate` follows
+    /// the quality. Editors show what it resolves to.
+    OptionalInteger,
     /// One of a fixed set of names.
     Choice(&'static [&'static str]),
     /// Free text (an ALSA device, a socket path...).
@@ -356,6 +359,27 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "…and ends below this one (hysteresis)",
     ),
+    // ── [media] ──────────────────────────────────────────────────────────────
+    feature(
+        "media.camera",
+        Kind::Bool,
+        "Stream the head camera — off is a test pattern, for a board with no camera",
+    ),
+    feature(
+        "media.quality",
+        Kind::Choice(crate::QUALITY_LABELS),
+        "Video frame size and rate; 720p30 is the rung mediad was measured at",
+    ),
+    entry(
+        "media.bitrate",
+        Kind::OptionalInteger,
+        "Starting video bitrate, bits/s — unset follows the quality",
+    ),
+    entry(
+        "media.congestion_control",
+        Kind::Choice(crate::CONGESTION_LABELS),
+        "Adapt the send rate to the link — disabled costs adaptivity and saves a core's worth",
+    ),
 ];
 
 /// The registry entry for a key, if it is one.
@@ -424,7 +448,15 @@ mod tests {
             .collect();
         // A sanity anchor so a serde message change cannot pass vacuously: the sections this
         // build certainly has must all be found.
-        for known in ["bus", "control", "update_gate", "policy", "safety", "audio"] {
+        for known in [
+            "bus",
+            "control",
+            "update_gate",
+            "policy",
+            "safety",
+            "audio",
+            "media",
+        ] {
             assert!(sections.contains(&known.to_owned()), "{top}");
         }
 
@@ -452,7 +484,7 @@ mod tests {
             let probe = match entry.kind {
                 Kind::Bool => format!("[{section}]\n{key} = true\n"),
                 Kind::TriBool => format!("[{section}]\n{key} = true\n"),
-                Kind::Integer => format!("[{section}]\n{key} = 1\n"),
+                Kind::Integer | Kind::OptionalInteger => format!("[{section}]\n{key} = 1\n"),
                 Kind::Float | Kind::OptionalFloat => format!("[{section}]\n{key} = 0.5\n"),
                 Kind::Choice(choices) => {
                     format!("[{section}]\n{key} = \"{}\"\n", choices[0])
@@ -525,6 +557,8 @@ mod tests {
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",
+                "media.camera",
+                "media.quality",
             ]
         );
     }

@@ -92,7 +92,7 @@ Where the state lives, and what survives an update:
 
 | | |
 |---|---|
-| `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration; the installer writes it once and never overwrites it |
+| `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration; the installer writes it once and never overwrites it. `robotd.toml` is read by `robotd` and — for `[media]` alone, what the camera streams — by `mediad`, so a change there restarts `mediad` rather than `robotd` |
 | `/var/lib/robot/config/config.json` | robot name and pairing PIN — a file plus `flock`, owned by `configd` (§3.1) |
 | NetworkManager profiles | wifi credentials; we never store them (§3) |
 | `/opt/robot/daemon/releases/<ver>/` | binaries, policies and shipped defaults — replaced atomically |

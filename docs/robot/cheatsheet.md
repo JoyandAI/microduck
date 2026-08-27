@@ -99,15 +99,15 @@ behave, and those numbers stay radians whatever the screen is set to. The joint 
 robotctl monitor --json --hz 50 > run.jsonl
 ```
 
-### Configuring `robotd`
+### Configuring the robot
 
 ```
 sudo robotctl configure
 ```
 
-An interactive editor over `/etc/robot/robotd.toml`: every key the daemon knows, the feature
+An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
-shutdown…), current value against default, one line of doc. SPACE toggles, ENTER types a
+shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
 value, `u` reverts a key to its default. Values in yellow (marked `•`) are the keys where
 this robot diverges from the defaults; everything else is the built-in default, and `unset`
 optionals show what they resolve to `(auto)`.
@@ -124,10 +124,35 @@ Three properties worth trusting:
 - **It cannot write a file robotd refuses to start on.** Every save is validated through the
   daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
 
-`robotd` reads the file once at startup, so saving offers a restart. `sudo`, because the file
+The daemons read the file once at startup, so saving offers a restart — of the ones that read
+what you changed: `[media]` is `mediad`, everything else is `robotd`. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
+
+#### Video quality
+
+```
+sudo robotctl configure
+```
+
+Set `media.quality` — `1080p30`, `720p30`, `720p15` or `360p30` — and take the restart it
+offers. `media.camera` off streams a test pattern instead, which is what a board with no camera
+wants: the WebRTC *control* channel rides on the video track, so a pipeline that cannot start
+costs both. `media.bitrate` follows the quality unless you set it; the unit is bits per second.
+
+`media.congestion_control` is the other knob in that section, and it is the one that moves CPU:
+`disabled` drops the bandwidth estimator, which is the largest single consumer in `mediad` (7.6% of
+a core against capture's 0.3%), and makes `media.bitrate` the rate rather than a starting point. It
+costs adaptivity — on a link that degrades, the picture stalls instead of the rate falling.
+
+720p30 is the rung the pipeline was measured at; a rung that does not hold runs slower rather
+than failing. `robotctl monitor` reports the achieved rate on the bottom border, in yellow with
+`of <target>` beside it when it is under 90% of what was asked for. What was applied:
+
+```
+journalctl -u mediad -b | grep streaming
+```
 
 #### Your own policy
 

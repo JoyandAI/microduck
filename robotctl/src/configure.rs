@@ -33,9 +33,13 @@
 //!
 //! ## Restart
 //!
-//! `robotd` reads the file **once at startup** (`robotd-params` docs) — so every change
-//! requires a restart, and the exit flow offers one whenever anything was written. The file is
-//! root-owned; run as `sudo robotctl configure` to actually write.
+//! The daemons read the file **once at startup** (`robotd-params` docs) — so every change
+//! requires a restart, and the exit flow offers one whenever anything was written. *Which*
+//! daemon is derived from the keys that changed, not assumed: `[media]` is `mediad` reading the
+//! same file, and a "restart robotd" offer over a video setting is an edit that reads as having
+//! done nothing at all. [`unit_for`] is that mapping and [`units_for`] applies it.
+//!
+//! The file is root-owned; run as `sudo robotctl configure` to actually write.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -186,6 +190,7 @@ impl Model {
             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
             "policy.ground_pick_period" => float(policy.ground_pick_period),
             "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
+            "media.bitrate" => Some(params.media.bitrate_resolved().to_string()),
             "audio.pet_detect" => Some(
                 params
                     .audio
@@ -206,7 +211,7 @@ impl Model {
         let input = input.trim();
         let optional = matches!(
             entry.kind,
-            Kind::TriBool | Kind::OptionalFloat | Kind::OptionalPath
+            Kind::TriBool | Kind::OptionalFloat | Kind::OptionalInteger | Kind::OptionalPath
         );
         if input == self.default_for(entry.key)
             || (optional && (input == "unset" || input.is_empty()))
@@ -220,7 +225,7 @@ impl Model {
                 "false" | "off" | "no" => false.into(),
                 _ => return Err(format!("{input:?} is not on/off")),
             },
-            Kind::Integer => input
+            Kind::Integer | Kind::OptionalInteger => input
                 .parse::<i64>()
                 .map(Into::into)
                 .map_err(|_| format!("{input:?} is not a whole number"))?,
@@ -379,16 +384,59 @@ fn writable_hint(path: &Path, e: &std::io::Error) -> String {
     }
 }
 
-/// Restart `robotd`, reporting rather than hiding the outcome.
-pub fn restart_robotd() -> Result<(), String> {
+/// Which daemon reads a section, and so which unit a change to it needs restarted.
+///
+/// `robotd` parses this file for itself; `[media]` is `mediad` reading the same file, because a
+/// per-board setting belongs in the per-board config rather than on a unit file the release
+/// installer rewrites. Being wrong here is an edit that appears to do nothing until the next
+/// reboot — which is exactly what the restart offer exists to prevent, so it is derived from the
+/// keys that changed rather than assumed.
+fn unit_for(section: &str) -> &'static str {
+    match section {
+        "media" => "mediad",
+        _ => "robotd",
+    }
+}
+
+/// The units the pending edits require restarting, in start order, without duplicates.
+///
+/// Empty is a real answer — no edits, nothing to restart — and the caller must not offer a
+/// restart for it.
+pub fn units_for(model: &Model) -> Vec<&'static str> {
+    // `robotd` first, because `mediad.service` is `After=robotd.service`: restarting in the
+    // other order means mediad reconnects to a robotd that is about to go away.
+    let mut units: Vec<&'static str> = Vec::new();
+    for key in model.pending.keys() {
+        let (section, _) = key.split_once('.').expect("registry keys are section.key");
+        let unit = unit_for(section);
+        if !units.contains(&unit) {
+            units.push(unit);
+        }
+    }
+    units.sort_unstable_by_key(|unit| *unit != "robotd");
+    units
+}
+
+/// Restart units, reporting rather than hiding the outcome.
+///
+/// One `systemctl` invocation for all of them: it starts them in the units' own declared order,
+/// which is what `After=` is for, and it means one password prompt rather than one per daemon.
+pub fn restart_units(units: &[&str]) -> Result<(), String> {
+    if units.is_empty() {
+        return Ok(());
+    }
     let status = std::process::Command::new("systemctl")
-        .args(["restart", "robotd"])
+        .arg("restart")
+        .args(units)
         .status()
         .map_err(|e| format!("cannot run systemctl: {e}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err("systemctl restart robotd failed — run it with sudo".to_owned())
+        Err(format!(
+            "systemctl restart {} failed — run it with sudo",
+            units.join(" ")
+        ))
     }
 }
 
@@ -438,8 +486,9 @@ enum Focus {
     },
     /// Deciding what to do with the pending edits on the way out.
     Confirm,
-    /// Everything written; offering the restart every change requires.
-    Restart,
+    /// Everything written; offering the restart every change requires — of the daemons that
+    /// actually read what changed, which is not always `robotd`.
+    Restart { units: Vec<&'static str> },
 }
 
 /// Run the editor. Returns once the user has left, with everything saved or discarded.
@@ -550,21 +599,26 @@ pub fn run(path: &Path) -> Result<(), String> {
                 _ => {}
             },
             Focus::Confirm => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => match model.save() {
-                    Ok(()) => {
-                        saved = true;
-                        focus = Focus::Restart;
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    // Read before the save, which clears `pending` — after it there is nothing
+                    // left to say which daemons were affected.
+                    let units = units_for(&model);
+                    match model.save() {
+                        Ok(()) => {
+                            saved = true;
+                            focus = Focus::Restart { units };
+                        }
+                        Err(e) => {
+                            status = Some(e);
+                            focus = Focus::List;
+                        }
                     }
-                    Err(e) => {
-                        status = Some(e);
-                        focus = Focus::List;
-                    }
-                },
+                }
                 KeyCode::Char('n') => break Ok(saved),
                 KeyCode::Esc => focus = Focus::List,
                 _ => {}
             },
-            Focus::Restart => match key.code {
+            Focus::Restart { .. } => match key.code {
                 // The restart itself happens after `ratatui::restore`, outside the alternate
                 // screen, so systemctl's output is visible.
                 KeyCode::Char('y') | KeyCode::Enter => break Ok(true),
@@ -576,17 +630,21 @@ pub fn run(path: &Path) -> Result<(), String> {
             },
         }
     };
-    let restart_wanted = matches!(&focus, Focus::Restart);
+    let restart_wanted = match &focus {
+        Focus::Restart { units } => units.clone(),
+        _ => Vec::new(),
+    };
     ratatui::restore();
 
     let saved = outcome?;
-    if restart_wanted {
-        println!("restarting robotd…");
-        restart_robotd()?;
-        println!("robotd restarted");
+    if !restart_wanted.is_empty() {
+        let names = restart_wanted.join(" and ");
+        println!("restarting {names}…");
+        restart_units(&restart_wanted)?;
+        println!("{names} restarted");
     } else if saved {
         println!(
-            "written to {} — changes apply on the next `systemctl restart robotd`",
+            "written to {} — changes apply on the next `systemctl restart …`",
             path.display()
         );
     }
@@ -750,10 +808,18 @@ fn draw(
                 Line::from("y save · n discard · ESC back"),
             ]
         }
-        Focus::Restart => vec![
-            Line::from("written. robotd reads its config once at startup —"),
-            Line::from("restart it now? y restart · n later"),
-        ],
+        // Which daemons, by name: `[media]` is read by `mediad`, and "restart it" over a
+        // change that needs the *other* daemon is how an edit reads as having done nothing.
+        Focus::Restart { units } => {
+            let names = units.join(" and ");
+            let reads = if units.len() == 1 { "reads" } else { "read" };
+            vec![
+                Line::from(format!(
+                    "written. {names} {reads} the config once at startup —"
+                )),
+                Line::from(format!("restart {names} now? y restart · n later")),
+            ]
+        }
         Focus::List => {
             let doc = match items.get(cursor) {
                 Some(Item::Key(index)) => rows[*index].entry.doc,
@@ -958,6 +1024,72 @@ mod tests {
         }
     }
 
+    /// The restart offer names the daemon that reads what changed. `[media]` is read by
+    /// `mediad`, and offering a `robotd` restart for it is an edit that reads as having done
+    /// nothing at all until somebody reboots.
+    #[test]
+    fn the_restart_offer_names_the_daemon_that_reads_the_change() {
+        let mut m = model("");
+        m.edit(entry("media.quality"), "360p30").expect("valid");
+        assert_eq!(units_for(&m), vec!["mediad"]);
+
+        let mut m = model("");
+        m.edit(entry("control.hz"), "60").expect("valid");
+        assert_eq!(units_for(&m), vec!["robotd"]);
+
+        // Both, and robotd first: mediad.service is After=robotd.service, so the other order
+        // reconnects mediad to a robotd that is about to go away.
+        let mut m = model("");
+        m.edit(entry("media.camera"), "false").expect("valid");
+        m.edit(entry("audio.enabled"), "false").expect("valid");
+        assert_eq!(units_for(&m), vec!["robotd", "mediad"]);
+
+        // Nothing pending is nothing to restart, and the caller must not offer one.
+        assert!(units_for(&model("")).is_empty());
+    }
+
+    /// An unset bitrate shows what it will actually stream at, and follows the quality as it
+    /// is cycled — the reason it is optional rather than a number to keep in step by hand.
+    #[test]
+    fn an_unset_bitrate_shows_what_the_quality_resolves_to() {
+        let mut m = model("");
+        let bitrate = |m: &Model| {
+            m.rows()
+                .into_iter()
+                .find(|row| row.entry.key == "media.bitrate")
+                .expect("known")
+        };
+        let row = bitrate(&m);
+        assert_eq!(row.set, None);
+        assert_eq!(row.resolved.as_deref(), Some("2000000"));
+
+        m.edit(entry("media.quality"), "1080p30").expect("valid");
+        assert_eq!(bitrate(&m).resolved.as_deref(), Some("4000000"));
+
+        // Set explicitly, it is a value like any other and no longer a hint.
+        m.edit(entry("media.bitrate"), "3000000").expect("valid");
+        let row = bitrate(&m);
+        assert_eq!(row.set.as_deref(), Some("3000000"));
+        assert_eq!(row.resolved, None);
+
+        // And `unset` puts it back to following the quality rather than pinning the default.
+        m.edit(entry("media.bitrate"), "unset").expect("valid");
+        assert_eq!(bitrate(&m).resolved.as_deref(), Some("4000000"));
+    }
+
+    /// The editor's own gate is `Params::load`, so a bitrate in the wrong unit never reaches
+    /// the disk — the mistake is caught while the file is still the one that works.
+    #[test]
+    fn a_bitrate_in_kilobits_is_not_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("robotd.toml");
+        let mut m = Model::load(&path).expect("empty is a model");
+        m.edit(entry("media.bitrate"), "2000")
+            .expect("parses as a number");
+        assert!(m.save().is_err(), "mediad would stream nothing at 2 kb/s");
+        assert!(!path.exists(), "and nothing was written");
+    }
+
     /// An inline comment is decor, not data: `hz = 50 # do not touch` is the value 50. This
     /// once rode into the value cell and made an at-default key look overridden and annotated.
     #[test]
@@ -1104,7 +1236,8 @@ mod tests {
                 "safety",
                 "chorale",
                 "theremin",
-                "audio"
+                "audio",
+                "media"
             ]
         );
     }

@@ -86,6 +86,60 @@ which is why several of these questions were answered the slow way.
 
 What is still untested: anything at all through a bridge.
 
+### Picking a quality, and why it is one setting rather than four
+
+What the stream is — camera or test pattern, frame size, rate, bitrate — is `[media]` in
+`/etc/robot/robotd.toml`, the per-board config file `robotd` already reads. `sudo robotctl
+configure` edits it and offers the `systemctl restart mediad` it needs; `mediad` reads it once at
+startup, like every other daemon here reads its config.
+
+**One `quality` key naming a rung — `1080p30`, `720p30`, `720p15`, `360p30` — rather than a width,
+a height and an fps.** Those three do not vary independently: a combination the capture path
+cannot produce is a pipeline that does not start, and that costs the *control* channel along with
+the video, because the datachannel is bundled with the video track (§2). Every rung is 16:9, the
+sensor's own aspect, so "smaller" never quietly means "cropped". `bitrate` is the one number that
+can still be set on its own, and left unset it follows the rung — 2 Mb/s at 720p30, the rate every
+measurement above was taken at.
+
+The numbers were `ExecStart` flags in `mediad.service` until the section existed. The release
+installer rewrites that unit file, so changing one meant a systemd drop-in — a mechanism for a
+board that is *wired* differently, not for someone asking why the picture is soft.
+
+### Congestion control is a CPU setting too
+
+`[media] congestion_control` — `gcc`, `homegrown` or `disabled` — is `webrtcsink`'s own
+`congestion-control` property, set rather than inherited. `gcc` is the element's default, so naming
+it changes nothing; what it buys is that the day upstream changes that default is not the day every
+robot's send rate changes with it.
+
+**It is the largest single CPU consumer in the process.** Per-thread, with one peer connected on
+the board:
+
+| thread | %CPU (of one core) |
+|---|---|
+| `rtpgccbwe1:src` | 7.6 |
+| `queue1:src` | 6.0 |
+| `mpph264enc2:src` | 5.0 |
+| … | |
+| `v4l2src0:src` | **0.3** |
+| `queue3:src` (the raw tee branch) | **0.3** |
+
+~25% of one core in total, and the shape of it is the point: capture and the raw-branch frame copy
+— the only two things that scale with *pixels* — are 0.6% between them. Everything else is packet
+work, which scales with bitrate. That is why picking a smaller rung does not lower CPU: on a link
+that never saturates, the estimator ramps a 360p stream to about the bitrate the 720p one was
+using, and spends it on quality per pixel instead.
+
+`disabled` deletes the `rtpgccbwe` thread. It costs adaptivity, which is the whole reason
+`webrtcsink` is handed raw video rather than pre-encoded H.264 (§1) — on a degrading link it is
+what keeps a picture instead of a stall. It also makes `bitrate` mean what it says: nothing moves
+it, so it is the rate rather than a starting point.
+
+**720p30 is the only measured rung.** The sensor is pinned to a 1920x1080 mode that runs at 30 and
+the ISP scales down from it, so 1080p30 asks for no scaling at all; what nobody has measured is
+whether the capture path and the encoder hold 30 fps at 2.25x the pixels of the table above. A
+rung that does not hold runs slower — it is not a failure to start.
+
 ## 1. What this is not
 
 `webrtcbin` is not used. `mediad` uses **`webrtcsink`** from `gst-plugins-rs`, and the difference

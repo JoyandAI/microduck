@@ -16,6 +16,7 @@
 //! takes an update, and is still reachable over Bluetooth. That is why it may depend on a plugin
 //! from a release asset and a device node's group while `updaterd` may not.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -45,17 +46,16 @@ struct Args {
     #[arg(long, default_value_t = 8080)]
     web_port: u16,
 
-    /// Target video bitrate, bits per second.
+    /// Params file. Defaults to `/etc/robot/robotd.toml`, which may be absent — a board with no
+    /// file streams its camera at the built-in defaults. A path given here must exist.
     ///
-    /// Explicit rather than the encoder's "auto calculate": `rc-mode` is already constant-bitrate,
-    /// which is what a lossy link wants, and leaving the rate unset is how a stream comes out
-    /// fifty times under what anyone expected.
-    #[arg(long, default_value_t = 2_000_000)]
-    bitrate: u32,
-
-    /// Stream the head camera instead of a test pattern.
+    /// **The same file `robotd` reads, and `[media]` is this daemon's section of it.** What the
+    /// stream looks like — camera or test pattern, frame size, rate, bitrate — used to be flags
+    /// on this unit's `ExecStart` line, which the release installer rewrites: changing one meant
+    /// a systemd drop-in, and nobody reaches for a drop-in to answer "why is the video soft?".
+    /// `robotctl configure` edits that file, so it now edits this.
     #[arg(long)]
-    camera: bool,
+    config: Option<PathBuf>,
 
     /// Which capture node. rkisp exposes several; `video0` is the main path.
     #[arg(long, default_value = "/dev/video0")]
@@ -72,20 +72,6 @@ struct Args {
 
     #[arg(long, default_value_t = 1024)]
     analogue_gain: u32,
-
-    /// Frame size and rate, pinned rather than negotiated.
-    ///
-    /// Both branches of the tee depend on the answer — the encoder and whatever reads raw NV12 —
-    /// so a consumer that had to guess would get it wrong the first time the source changed.
-    /// 1280x720 at 30 is what the hardware encoder was measured at.
-    #[arg(long, default_value_t = 1280)]
-    width: u32,
-
-    #[arg(long, default_value_t = 720)]
-    height: u32,
-
-    #[arg(long, default_value_t = 30)]
-    fps: u32,
 
     /// How far the camera is mounted from upright, clockwise: 0, 90, 180 or 270.
     ///
@@ -140,6 +126,24 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // What the stream is, from `[media]` — see `--config` and `mediad::config`.
+    let explicit = args.config.is_some();
+    let config = args
+        .config
+        .clone()
+        .unwrap_or_else(mediad::config::default_path);
+    let media = mediad::config::load(&config, explicit);
+    tracing::info!(
+        camera = media.camera,
+        quality = media.quality.label(),
+        width = media.quality.width(),
+        height = media.quality.height(),
+        fps = media.quality.fps(),
+        bitrate = media.bitrate_resolved(),
+        congestion_control = media.congestion_control.nick(),
+        "streaming"
+    );
+
     let rotation = if args.flip_in_pipeline {
         tracing::warn!(
             degrees = args.rotate,
@@ -183,7 +187,7 @@ fn main() -> ExitCode {
             "producing as"
         );
 
-        let source = if args.camera {
+        let source = if media.camera {
             mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
                 device: args.camera_device.clone(),
                 exposure: args.exposure,
@@ -193,13 +197,19 @@ fn main() -> ExitCode {
             mediad::pipeline::Source::Test
         };
 
+        // Frame size and rate are still pinned rather than negotiated — both branches of the tee
+        // depend on the answer, so a consumer that had to guess would get it wrong the first time
+        // the source changed. What changed is only where the numbers come from: one named quality
+        // in the config file rather than three flags nobody could set. `robotd_params::Quality`
+        // says why the three move together.
         let settings = mediad::pipeline::Settings {
             host: args.host.clone(),
             port: args.port,
-            bitrate: args.bitrate,
-            width: args.width,
-            height: args.height,
-            fps: args.fps,
+            bitrate: media.bitrate_resolved(),
+            congestion_control: media.congestion_control,
+            width: media.quality.width(),
+            height: media.quality.height(),
+            fps: media.quality.fps(),
             rotation,
         };
 
@@ -222,8 +232,8 @@ fn main() -> ExitCode {
         // What every peer is told about the picture. The geometry is the *encoded* frame — the
         // pipeline does not rotate, so it is the capture geometry — and the rotation is the mount.
         let video = mediad::session::Video {
-            width: args.width,
-            height: args.height,
+            width: media.quality.width(),
+            height: media.quality.height(),
             rotate: args.rotate,
         };
 
