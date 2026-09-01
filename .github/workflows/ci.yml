@@ -285,13 +285,11 @@ jobs:
       # staying over the floor no longer says so. The ratchet is the mechanism now — raise the
       # floor when the number rises, and a collapse still fails the job.
 
-      # Column 10 of the TOTAL row is line coverage. The whole table goes in the run
-      # summary, where it renders without anyone opening a log; the comment carries the
-      # number that matters.
-      - name: Report
+      # Column 10 of the TOTAL row is line coverage. The whole table goes in the run summary,
+      # where it renders without anyone opening a log, and into a file the step below posts as a
+      # comment wherever it is allowed to.
+      - name: Summary
         if: always() && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           pct() { awk '/^TOTAL/ {gsub("%","",$10); print $10}' "$1" 2>/dev/null; }
           head_pct=$(pct "$RUNNER_TEMP/head.txt")
@@ -317,6 +315,20 @@ jobs:
 
           cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
 
+      # Its own step, and skipped for a pull request from a fork. A fork's `pull_request` run
+      # gets a read-only `GITHUB_TOKEN` whatever this job's `permissions:` block asks for, so
+      # `gh pr comment` cannot post and fails with "Resource not accessible by integration
+      # (addComment)" — which turned every outside contribution red on the one step that merely
+      # decorates it, while `Coverage` above had already passed. The table is in the run summary
+      # either way; only the comment is missing, and it is a convenience, not the gate.
+      #
+      # Posting for a fork too would mean moving this into a `workflow_run` workflow, which runs
+      # with the base repository's token. That is a bigger change than a comment is worth.
+      - name: Comment
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           # Edit the previous comment rather than adding one per push, so a long-running
           # branch does not accumulate a wall of near-identical coverage reports.
           gh pr comment "${{ github.event.number }}" --body-file "$RUNNER_TEMP/comment.md" --edit-last \
