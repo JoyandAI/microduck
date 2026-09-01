@@ -231,7 +231,7 @@ jobs:
     env:
       # The floor, in one place. It is both enforced and quoted in the comment, and two copies
       # of a number are one copy and one thing to forget.
-      COVERAGE_FLOOR: 72
+      COVERAGE_FLOOR: 70
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -255,11 +255,25 @@ jobs:
       # below is set with them included, rather than hidden by widening the exclusion until
       # the number looks good.
       #
-      # The floor is a ratchet, not a target: raise it when the real number rises. It sits
-      # a few points under today's ~77% so ordinary work does not trip it, while a genuine
-      # collapse still fails. Lowering it should be a deliberate, explained commit.
+      # The floor is a ratchet, not a target: raise it when the real number rises. It sits a
+      # point under today's 71.03% so ordinary work does not trip it, while a genuine collapse
+      # still fails. Lowering it should be a deliberate, explained commit.
+      #
+      # This is that commit, for 72 -> 70. 72 was written when the number here was quoted as
+      # ~77%; line coverage has in fact been 71% since at least August, so the floor sat above
+      # the real number and every run should have been red. None were, because the status of
+      # `--fail-under-lines` was thrown away — see `set -o pipefail` below. So the floor was
+      # enforcing nothing, and the drift it existed to catch went unreported for weeks.
+      #
+      # `set -o pipefail`, because the default shell for a `run:` block is `bash -e` *without*
+      # it: the status of a pipeline is then `tee`'s, and `--fail-under-lines` exits 1 into a
+      # step that reports success. That is the whole of how the floor came to enforce nothing,
+      # and it is why the number is piped rather than written with `--output-path` — the table
+      # belongs in the log as well as the file, and now the exit code survives the pipe.
       - name: Coverage
-        run: cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' --fail-under-lines "$COVERAGE_FLOOR" | tee "$RUNNER_TEMP/head.txt"
+        run: |
+          set -o pipefail
+          cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' --fail-under-lines "$COVERAGE_FLOOR" | tee "$RUNNER_TEMP/head.txt"
 
       # There is deliberately no second run against the base branch. This job used to check
       # the base out separately and build it instrumented a second time, purely to subtract
