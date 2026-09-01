@@ -394,6 +394,12 @@ impl Drop for Model {
 }
 
 /// A NUL-terminated vendor string, without the noise.
+///
+/// the cast is needed and clippy cannot see it. `c_char` is `i8` on the x86_64 host and `u8` on
+/// the board, so on the board this is `u8 as u8` and `unnecessary_cast` fires, while taking the
+/// cast out stops the host compiling at all. lint the workspace for the board's own target, the
+/// way CONTRIBUTING asks, and `-D warnings` turns that into an error.
+#[allow(clippy::unnecessary_cast)]
 fn c_str(raw: &[c_char]) -> String {
     let bytes: Vec<u8> = raw
         .iter()
