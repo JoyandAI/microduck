@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use crate::io::{IoError, JointTargets, RobotIo, Sensors};
+use crate::io::{ImuIo, IoError, JointTargets, RobotIo, Sensors};
 use crate::model::NUM_JOINTS;
 use crate::obs::Command;
 
@@ -102,8 +102,9 @@ impl Applied {
     }
 }
 
-pub struct Safety<T: RobotIo> {
+pub struct Safety<T: RobotIo, U: ImuIo> {
     io: T,
+    imu: U,
     config: SafetyConfig,
     /// How long gravity has been past the threshold. Reset by any upright sample.
     falling_for: Duration,
@@ -113,10 +114,11 @@ pub struct Safety<T: RobotIo> {
     gain: Option<u16>,
 }
 
-impl<T: RobotIo> Safety<T> {
-    pub fn new(io: T, config: SafetyConfig) -> Self {
+impl<T: RobotIo, U: ImuIo> Safety<T, U> {
+    pub fn new(io: T, imu: U, config: SafetyConfig) -> Self {
         Self {
             io,
+            imu,
             config,
             falling_for: Duration::ZERO,
             fallen: false,
@@ -139,11 +141,24 @@ impl<T: RobotIo> Safety<T> {
     }
 
     pub fn imu_stale(&self) -> crate::io::ImuStale {
-        self.io.imu_stale()
+        self.imu.stale()
     }
 
     pub fn imu_ready(&self) -> bool {
-        self.io.imu_ready()
+        self.imu.ready()
+    }
+
+    /// The IMU half of the composition point.
+    ///
+    /// `robotd` calls [`RobotIo::read`] for the servo half and then this, on the same tick,
+    /// to fill [`Sensors::imu`] — the two buses are independent, so only the caller can say
+    /// "one sample of both". A failed [`ImuIo::read`] degrades the tick (the caller keeps its
+    /// last sample) rather than failing it.
+    ///
+    /// Exposing the IMU itself does not break safety's write-handle invariant: the IMU never
+    /// commands a motor, and the only `RobotIo` in the crate still lives here.
+    pub fn imu(&mut self) -> &mut U {
+        &mut self.imu
     }
 
     pub fn fallen(&self) -> bool {
@@ -195,7 +210,7 @@ impl<T: RobotIo> Safety<T> {
         // Holding the previous verdict is the safe default in both directions. At startup that
         // is "not fallen", which is what the robot standing on the bench actually is; and a
         // filter that stops being ready mid-run leaves a fallen robot fallen.
-        if !self.io.imu_ready() {
+        if !self.imu.ready() {
             return;
         }
 
@@ -290,7 +305,7 @@ impl<T: RobotIo> Safety<T> {
 mod tests {
     use super::*;
     use crate::imu::ImuData;
-    use crate::io::FakeIo;
+    use crate::io::{FakeImu, FakeIo};
     use crate::model::DEFAULT_POSITION;
 
     fn upright() -> Sensors {
@@ -307,8 +322,12 @@ mod tests {
         }
     }
 
-    fn safety() -> Safety<FakeIo> {
-        Safety::new(FakeIo::at(DEFAULT_POSITION), SafetyConfig::default())
+    fn safety() -> Safety<FakeIo, FakeImu> {
+        Safety::new(
+            FakeIo::at(DEFAULT_POSITION),
+            FakeImu::new(),
+            SafetyConfig::default(),
+        )
     }
 
     /// A hard footfall spikes gravity briefly. Treating that as a fall would drop the robot
@@ -345,9 +364,9 @@ mod tests {
     /// changes. Nothing in the observable state explained it.
     #[test]
     fn an_unconverged_imu_cannot_declare_a_fall() {
-        let mut io = FakeIo::at(DEFAULT_POSITION);
-        io.imu_ready = false;
-        let mut safety = Safety::new(io, SafetyConfig::default());
+        let mut imu = FakeImu::new();
+        imu.ready = false;
+        let mut safety = Safety::new(FakeIo::at(DEFAULT_POSITION), imu, SafetyConfig::default());
 
         // Gravity well above the threshold — what an unconverged filter reports, and what
         // a robot on its side reports. The difference is only whether the filter is ready.
@@ -367,9 +386,9 @@ mod tests {
     /// above would simply disable fall detection.
     #[test]
     fn a_converged_imu_still_detects_a_fall() {
-        let mut io = FakeIo::at(DEFAULT_POSITION);
-        io.imu_ready = true;
-        let mut safety = Safety::new(io, SafetyConfig::default());
+        let mut imu = FakeImu::new();
+        imu.ready = true;
+        let mut safety = Safety::new(FakeIo::at(DEFAULT_POSITION), imu, SafetyConfig::default());
 
         let mut sensors = Sensors::default();
         sensors.imu.gravity = [0.0, 0.0, 0.0];

@@ -9,7 +9,10 @@
 
 pub mod bus;
 pub mod fall;
+pub mod ftbus;
 pub mod imu;
+#[cfg(target_os = "linux")]
+pub mod imui2c;
 pub mod io;
 pub mod model;
 pub mod obs;
@@ -17,7 +20,9 @@ pub mod policy;
 pub mod safety;
 
 pub use imu::ImuData;
-pub use io::{FakeIo, IoError, JointTargets, RobotIo, Sensors, SlowSensors};
+pub use io::{
+    FakeImu, FakeIo, ImuIo, ImuStale, IoError, JointTargets, RobotIo, Sensors, SlowSensors,
+};
 pub use model::{
     BATTERY_EMPTY_V, BATTERY_FULL_V, DEFAULT_POSITION, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
     battery_percent,

@@ -37,3 +37,12 @@ rustypot = "1.6.0"
 # not have, so leaving it on breaks the aarch64 build outright. rustypot disables it for the
 # same reason; this crate has to as well, or cargo's feature unification turns it back on.
 serialport = { version = "4.8", default-features = false }
+
+# LSM6DSV16X on its own I²C bus (`imui2c`), linux-only. `default-features = false` turns the
+# async driver off; `blocking` is what `imui2c` uses. The chip's SFLP embedded-function page
+# switching lives behind the driver, so the host only provides an `embedded_hal::i2c::I2c`
+# (via `libc` + the `I2C_RDWR` ioctl) and a `DelayNs`.
+lsm6dsv16x-rs = { version = "2.1", default-features = false, features = ["blocking"] }
+embedded-hal = "1.0"
+st-mems-bus = "2.0"
+libc = "0.2"
