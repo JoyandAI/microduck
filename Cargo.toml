@@ -81,3 +81,10 @@ async-trait = "0.1"
 # `strip = true` in particular removes the symbol table, turning a panic backtrace in
 # journald into bare addresses, which is exactly what you need when diagnosing a robot
 # you cannot attach a debugger to. `lto`/`codegen-units` only lengthened builds.
+#
+# `bisync` (a transitive dependency of `lsm6dsv16x-rs`, which `duck-control::imui2c` uses
+# for the LSM6DSV16X I²C IMU) is yanked on crates.io in every published version, so cargo
+# will not resolve it from the index even though `lsm6dsv16x-rs` requires it. The crate is
+# vendored here and patched in, so the workspace resolves it locally.
+[patch.crates-io]
+bisync = { path = "vendor/bisync" }

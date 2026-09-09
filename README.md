@@ -80,6 +80,7 @@ It also sits, kicks a ball, rolls forward on command, and quacks in a voice that
 
 | | |
 |---|---|
+| [Onboarding](docs/onboarding.md) | New here? The path from "clone it" to "watch your code run on a duck": build, fake mode, dev board, dev push, release. |
 | [microduck_rl](https://github.com/pollen-robotics/microduck_rl) | Where the policies come from: MuJoCo, PPO, domain randomisation, and the ONNX export this repo loads. |
 | [How it works](docs/design/architecture.md) | The whole system on one page — the daemons, the bus, how an update reaches a robot — then a page per part. |
 | [Set up a dev board](docs/robot/install-dev.md) | From a blank board to a robot that takes branch builds. |
