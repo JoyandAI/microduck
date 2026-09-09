@@ -40,10 +40,11 @@ and the rest are transports and sensors that own nothing.
   │ loop      │        │ wifi, name, │           │ swap        │
   │ safety    │        │ pad bonding │           │ health gate │
   └─────┬─────┘        └──────┬──────┘           └──────┬──────┘
-        │ Dynamixel           │ D-Bus                   │ systemctl restart,
+        │ FT-SCS (servos)     │ D-Bus                   │ systemctl restart,
         ▼                     ▼                         │ then robot.health
-  15 servos + IMU      BlueZ · NetworkManager           ▼
-  on one UART                                    /opt/robot/daemon/current
+   15 servos only       BlueZ · NetworkManager           ▼
+   on one UART                                     /opt/robot/daemon/current
+   (IMU → /dev/i2c-imu, i2c4)
 
   ┌ publishes, answers nothing ───────────────────────────────────────┐
   │  tofd — the head's 8×8 depth matrix, on /run/tofd/tof.sock.       │
@@ -51,10 +52,15 @@ and the rest are transports and sensors that own nothing.
   └───────────────────────────────────────────────────────────────────┘
 ```
 
-**`robotd` is the only thing that touches the robot.** Fifteen servos and the IMU board
-share one serial bus, and the 50 Hz control loop owns it. Clients send *intents* — "go this
-fast", "look there", "stand up" — and the safety layer inside `robotd` decides what is
-actually executable. Nothing else in the system can command a motor
+> **Migration (2026-09-04, `hls2909-i2c-imu-migration.md`):** the servo protocol is now
+> Feetech **FT-SCS** (HL-2909-C001) and the **IMU no longer rides the servo bus** — it is on
+> **i2c4** as `/dev/i2c-imu` via a separate `ImuIo`, read at 0x6A. The servo UART is still
+> `class`-exclusive and still single-owner; the IMU is simply no longer a device on it.
+
+**`robotd` is the only thing that touches the robot.** Fifteen servos share one serial bus
+(FT-SCS), and the 50 Hz control loop owns it; the IMU is on its own I²C bus. Clients send
+*intents* — "go this fast", "look there", "stand up" — and the safety layer inside `robotd`
+decides what is actually executable. Nothing else in the system can command a motor
 ([`robotd-design.md`](robotd-design.md)).
 
 **Three of them survive a dead `robotd`.** `configd`, `updaterd` and `btd` have no systemd
@@ -79,7 +85,7 @@ counter ([`updater-design.md`](updater-design.md)).
 
 | service | owns | listens on | reaches out to |
 |---|---|---|---|
-| `robotd` | motor control, sensing, policies, safety, `robot.health` | `/run/robotd.sock` | the Dynamixel bus |
+| `robotd` | motor control, sensing, policies, safety, `robot.health` | `/run/robotd.sock` | the FT-SCS servo bus; and `/dev/i2c-imu` (i2c4) for the IMU |
 | `configd` | wifi, robot identity and name, pairing PIN, gamepad bonding, reboot | `/run/configd.sock` | BlueZ and NetworkManager over D-Bus |
 | `updaterd` | releases: verify, install, swap, health-gate, roll back | `/run/updaterd.sock` | GitHub releases, `systemctl`, `robotd` |
 | `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | `robotd`, `configd`, `updaterd` — not `padd` or `tofd`, whose streams a radio this narrow cannot carry |

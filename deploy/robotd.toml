@@ -13,10 +13,24 @@
 # is far easier to diagnose remotely than a daemon that will not run.
 
 [bus]
-# Serial port the 15 servos and the imu_to_dxl board share. /dev/ttyS2 is the Radxa
-# Zero 3W's wiring; a board wired differently can also be overridden per-invocation with
-# `robotd --port`, which is the dev escape hatch rather than the thing to edit here.
+# Serial port the servos share. /dev/ttyS2 is the Radxa Zero 3W's wiring; a board wired
+# differently can also be overridden per-invocation with `robotd --port`, which is the dev
+# escape hatch rather than the thing to edit here.
 port = "/dev/ttyS2"
+# Which driver the serial port speaks, i.e. which servo protocol it carries. `hls2909`
+# (the Feetech HL-2909-C001, FT-SCS framing) is the migration target and the default;
+# `xl330` (the Dynamixel XL330, Dynamixel 2.0 framing) is the fallback for a robot whose
+# servos were not migrated. A bus can only carry one protocol, so this is the whole
+# difference between them.
+driver = "hls2909"
+
+[imu]
+# The IMU on its own I²C bus, not the servo bus. The LSM6DSV16X sits on i2c4 (pins 27/28,
+# on-board pull-ups), aliased /dev/i2c-imu by the udev rule, at 0x6A by default.
+# i2c4 is dedicated to the IMU: the ToF rides the HAT's i2c3, whose 550 KB firmware upload
+# occupies that bus at boot — which is why the IMU no longer shares the servo bus.
+bus = "/dev/i2c-imu"
+address = 0x6A
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to

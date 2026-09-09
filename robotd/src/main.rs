@@ -35,18 +35,18 @@ use std::time::{Duration, Instant};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::{Parser, Subcommand};
 use duck_control::fall::{FallPredictor, FallPredictorConfig};
-use duck_control::io::RobotIo;
+use duck_control::io::{ImuIo, RobotIo};
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
 use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyPaths};
 use duck_control::safety::{Safety, SafetyConfig};
-use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS};
+use duck_control::{DEFAULT_POSITION, FakeImu, FakeIo, ImuData, NUM_JOINTS};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use control::{Controller, SkillTuning, Tuning};
 use intents::Intents;
-use params::{Mode, Params};
+use params::{Driver, Mode, Params};
 
 /// What to do when the shutdown sequence completes. Injected so the tests can observe the
 /// call instead of powering off the machine running them.
@@ -740,7 +740,7 @@ async fn main() -> ExitCode {
 /// Enable torque and ramp to the home pose.
 #[cfg(target_os = "linux")]
 fn run_init(params: &Params, duration: Duration) -> ExitCode {
-    let mut io = match duck_control::bus::DynamixelIo::open(&params.bus.port) {
+    let mut io = match BusIo::open(&params.bus.port, params.bus.driver) {
         Ok(io) => io,
         Err(e) => {
             tracing::error!(error = %e, port = %params.bus.port, "cannot open the bus");
@@ -818,6 +818,7 @@ fn spawn_control_thread(
                 tracing::warn!("--fake: no bus, no robot");
                 runtime.block_on(control_loop(
                     FakeIo::at(DEFAULT_POSITION),
+                    FakeImu::new(),
                     state,
                     intents,
                     params,
@@ -834,18 +835,148 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
-                if let Some(io) = open_bus_waiting(&port, &state).await {
-                    control_loop(io, state, intents, params, period, poweroff).await;
+                let imu_cfg = params.imu.clone();
+                if let Some(io) = open_bus_waiting(&port, params.bus.driver, &state).await {
+                    let imu = open_imu(&imu_cfg);
+                    control_loop(io, imu, state, intents, params, period, poweroff).await;
                 }
             });
         })
 }
 
-/// The real bus on the board; a fake elsewhere, so `open_bus_waiting` has one signature.
+/// The servo bus. The migration moves the robot onto the Feetech HL-2909-C001 (`driver =
+/// "hls2909"`), but a robot that is still on XL330 servos falls back to `driver = "xl330"`;
+/// the two speak different protocols and cannot share a bus, so the driver picks which one
+/// this process opens. Wrapped in an enum so the control loop's generic [`RobotIo`] has a
+/// single concrete type on the real path.
 #[cfg(target_os = "linux")]
-type BusIo = duck_control::bus::DynamixelIo;
+enum BusIo {
+    Hls(Box<duck_control::ftbus::HlsBusIo>),
+    Dxl(Box<duck_control::bus::DynamixelIo>),
+}
+
+#[cfg(target_os = "linux")]
+impl RobotIo for BusIo {
+    fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
+        match self {
+            BusIo::Hls(b) => b.read(),
+            BusIo::Dxl(b) => b.read(),
+        }
+    }
+    fn write(&mut self, targets: &duck_control::JointTargets) -> duck_control::io::Result<()> {
+        match self {
+            BusIo::Hls(b) => b.write(targets),
+            BusIo::Dxl(b) => b.write(targets),
+        }
+    }
+    fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
+        match self {
+            BusIo::Hls(b) => b.set_gain(kp),
+            BusIo::Dxl(b) => b.set_gain(kp),
+        }
+    }
+    fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
+        match self {
+            BusIo::Hls(b) => b.set_torque(on),
+            BusIo::Dxl(b) => b.set_torque(on),
+        }
+    }
+    fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
+        match self {
+            BusIo::Hls(b) => b.slow_sensors(),
+            BusIo::Dxl(b) => b.slow_sensors(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BusIo {
+    fn open(port: &str, driver: Driver) -> duck_control::io::Result<Self> {
+        match driver {
+            Driver::Hls2909 => Ok(BusIo::Hls(Box::new(duck_control::ftbus::HlsBusIo::open(
+                port,
+            )?))),
+            Driver::Xl330 => Ok(BusIo::Dxl(Box::new(duck_control::bus::DynamixelIo::open(
+                port,
+            )?))),
+        }
+    }
+
+    fn check_registers(&mut self) -> duck_control::io::Result<usize> {
+        match self {
+            BusIo::Hls(b) => b.check_registers(),
+            BusIo::Dxl(b) => b.check_registers(),
+        }
+    }
+
+    fn interpolate_to(
+        &mut self,
+        target: &[f64; NUM_JOINTS],
+        duration: Duration,
+        step: Duration,
+    ) -> duck_control::io::Result<()> {
+        match self {
+            BusIo::Hls(b) => b.interpolate_to(target, duration, step),
+            BusIo::Dxl(b) => b.interpolate_to(target, duration, step),
+        }
+    }
+}
+
+/// The real bus on the board; a fake elsewhere, so `open_bus_waiting` has one signature.
 #[cfg(not(target_os = "linux"))]
 type BusIo = FakeIo;
+
+/// A type-erased IMU so the control loop takes one concrete `U: ImuIo`.
+///
+/// The real IMU is [`duck_control::imui2c::ImuBus`]; when it cannot open (a board with no IMU,
+/// or a build off Linux) the loop falls back to a [`FakeImu`] that never reports ready, so fall
+/// detection and odometry-seeding gate off rather than judging an absent sensor.
+struct ImuIoBox(Box<dyn ImuIo>);
+
+impl ImuIo for ImuIoBox {
+    fn read(&mut self) -> duck_control::io::Result<ImuData> {
+        self.0.read()
+    }
+    fn ready(&self) -> bool {
+        self.0.ready()
+    }
+    fn stale(&self) -> duck_control::io::ImuStale {
+        self.0.stale()
+    }
+}
+
+/// A fake IMU that is deliberately not ready — the "no IMU at all" degraded stand-in.
+fn not_ready_imu() -> FakeImu {
+    let mut imu = FakeImu::new();
+    imu.ready = false;
+    imu
+}
+
+/// Open the IMU for the real control loop, falling back to a not-ready fake on failure.
+///
+/// A failed IMU open must not stop the robot: the whole point of the split is that the IMU is
+/// optional equipment — a robot without one walks identically, but with fall detection and
+/// odometry-seeding gated off.
+fn open_imu(cfg: &params::Imu) -> ImuIoBox {
+    #[cfg(target_os = "linux")]
+    match duck_control::imui2c::ImuBus::open(&cfg.bus, cfg.address) {
+        Ok(bus) => ImuIoBox(Box::new(bus)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                bus = %cfg.bus.display(),
+                "cannot open the IMU; running degraded"
+            );
+            ImuIoBox(Box::new(not_ready_imu()))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cfg;
+        tracing::warn!("no i2c-dev on this platform; running without an IMU");
+        ImuIoBox(Box::new(not_ready_imu()))
+    }
+}
 
 /// Open and verify the bus, waiting for a robot to answer.
 ///
@@ -854,13 +985,13 @@ type BusIo = FakeIo;
 /// one to abandon the control loop over.
 ///
 /// Returns `None` only if shutdown is requested while waiting.
-async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
+async fn open_bus_waiting(port: &str, driver: Driver, state: &RobotState) -> Option<BusIo> {
     let mut attempt = 0u32;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
-        if let Some(io) = open_bus(port, attempt) {
+        if let Some(io) = open_bus(port, driver, attempt) {
             state.startup_bus_failures.store(0, Ordering::Relaxed);
             return Some(io);
         }
@@ -880,11 +1011,11 @@ async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
+fn open_bus(port: &str, driver: Driver, attempt: u32) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
 
-    let mut io = match duck_control::bus::DynamixelIo::open(port) {
+    let mut io = match BusIo::open(port, driver) {
         Ok(io) => io,
         Err(e) => {
             if loud {
@@ -911,7 +1042,7 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_port: &str, _attempt: u32) -> Option<BusIo> {
+fn open_bus(_port: &str, _driver: Driver, _attempt: u32) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -992,8 +1123,8 @@ impl Bringup {
     }
 }
 
-async fn adopt_startup_pose<T: RobotIo>(
-    safety: &mut Safety<T>,
+async fn adopt_startup_pose<T: RobotIo, U: ImuIo>(
+    safety: &mut Safety<T, U>,
     state: &RobotState,
     period: Duration,
 ) -> Option<[f64; NUM_JOINTS]> {
@@ -1123,8 +1254,9 @@ fn build_controller(
     }
 }
 
-async fn control_loop<T: RobotIo>(
+async fn control_loop<T: RobotIo, U: ImuIo>(
     io: T,
+    imu: U,
     state: Arc<RobotState>,
     intents: Arc<Intents>,
     params: Params,
@@ -1136,6 +1268,7 @@ async fn control_loop<T: RobotIo>(
     let mut policy_cfg = params.policy.resolved();
     let mut safety = Safety::new(
         io,
+        imu,
         SafetyConfig {
             fall_gravity_z: params.safety.fall_gravity_z,
             fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
@@ -1235,6 +1368,13 @@ async fn control_loop<T: RobotIo>(
     let mut shutdown_sit: Option<Instant> = None;
     let mut powered_off = false;
     let mut warned_imu_warming = false;
+
+    // The IMU half of the composition point. The servo bus reads the joints; the IMU sits on
+    // its own I²C bus and is fused here on the same tick. A failed IMU read must degrade the
+    // tick — keep the last good sample and log at 1/10 — not fail it, which is the point of
+    // moving the IMU off the servo bus in the first place.
+    let mut last_imu = ImuData::default();
+    let mut imu_read_errors: u32 = 0;
 
     // Limp-fall (`[safety] limp_fall`): the predictor that sees a fall start, and where the
     // sequence it drives has got to. Built whether or not the mode is on — it costs a
@@ -1340,7 +1480,7 @@ async fn control_loop<T: RobotIo>(
         ticker.tick().await;
         let tick_start = Instant::now();
 
-        let fresh = match safety.read() {
+        let mut fresh = match safety.read() {
             Ok(sensors) => {
                 state.consecutive_errors.store(0, Ordering::Relaxed);
                 Some(sensors)
@@ -1356,6 +1496,30 @@ async fn control_loop<T: RobotIo>(
                 None
             }
         };
+
+        // Fuse the IMU sample into the same tick's [`Sensors`]. The IMU lives on its own I²C
+        // bus, so a failed read must degrade the tick rather than fail it: keep the last good
+        // orientation and count, logging at 1/10 — the migrate-to-I²C point.
+        if let Some(sensors) = fresh.as_mut() {
+            match safety.imu().read() {
+                Ok(imu) => {
+                    sensors.imu = imu;
+                    last_imu = imu;
+                    imu_read_errors = 0;
+                }
+                Err(e) => {
+                    sensors.imu = last_imu;
+                    imu_read_errors += 1;
+                    if imu_read_errors == 1 || imu_read_errors.is_multiple_of(10) {
+                        tracing::warn!(
+                            error = %e,
+                            consecutive = imu_read_errors,
+                            "imu read failed"
+                        );
+                    }
+                }
+            }
+        }
 
         // Coast over a dropped read on the last good sample — see [`COAST_TICKS`]. The
         // distinction between "fresh" and "what the policy steps from" matters twice below:
@@ -2367,7 +2531,7 @@ fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
 /// the bus: a transaction issued from the IPC side would interleave bytes with a tick and
 /// corrupt both. The IMU counters come from the same `io`, so they are mirrored here rather
 /// than reached for from the socket.
-fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
+fn publish_slow_sensors<T: RobotIo, U: ImuIo>(io: &mut Safety<T, U>, state: &RobotState) {
     let stale = io.imu_stale();
     state.imu_stale_blocks.store(stale.total, Ordering::Relaxed);
     state.imu_stale_run.store(stale.run, Ordering::Relaxed);
@@ -3666,6 +3830,7 @@ mod tests {
         let loop_state = Arc::clone(&s);
         let handle = tokio::spawn(control_loop(
             FakeIo::at(DEFAULT_POSITION),
+            FakeImu::new(),
             loop_state,
             Arc::clone(&intents),
             params,
@@ -3893,7 +4058,13 @@ mod tests {
         let loop_state = Arc::clone(&s);
         let handle = tokio::spawn(async move {
             let mut io = io;
-            control_loop_probe(&mut io, loop_state, Duration::from_millis(2)).await;
+            control_loop_probe(
+                &mut io,
+                &mut FakeImu::new(),
+                loop_state,
+                Duration::from_millis(2),
+            )
+            .await;
             tx.send(io.last_written).unwrap();
         });
 
@@ -3937,6 +4108,7 @@ mod tests {
         let loop_state = Arc::clone(&s);
         let handle = tokio::spawn(control_loop(
             FakeIo::at(resting).frozen(),
+            FakeImu::new(),
             loop_state,
             Arc::clone(&intents),
             params,
@@ -4006,6 +4178,7 @@ mod tests {
         let loop_state = Arc::clone(&s);
         let handle = tokio::spawn(control_loop(
             FakeIo::at(DEFAULT_POSITION),
+            FakeImu::new(),
             loop_state,
             Arc::clone(&intents),
             params,
@@ -4057,6 +4230,7 @@ mod tests {
         let loop_state = Arc::clone(&s);
         let handle = tokio::spawn(control_loop(
             FakeIo::at(DEFAULT_POSITION),
+            FakeImu::new(),
             loop_state,
             Arc::new(Intents::new()),
             params,
@@ -4096,7 +4270,13 @@ mod tests {
         let loop_state = Arc::clone(&s);
         let handle = tokio::spawn(async move {
             let mut io = io;
-            control_loop_probe(&mut io, loop_state, Duration::from_millis(2)).await;
+            control_loop_probe(
+                &mut io,
+                &mut FakeImu::new(),
+                loop_state,
+                Duration::from_millis(2),
+            )
+            .await;
             tx.send(io.last_written).unwrap();
         });
 
@@ -4284,9 +4464,13 @@ mod tests {
         let s = Arc::new(RobotState::new(&Params::default(), false, false));
         let waiter_state = Arc::clone(&s);
         let handle = tokio::spawn(async move {
-            open_bus_waiting("/dev/definitely-not-a-bus", &waiter_state)
-                .await
-                .is_none()
+            open_bus_waiting(
+                "/dev/definitely-not-a-bus",
+                Driver::default(),
+                &waiter_state,
+            )
+            .await
+            .is_none()
         });
 
         // Bounded, so a regression fails rather than hanging CI.
@@ -4356,7 +4540,13 @@ mod tests {
         let loop_state = Arc::clone(&s);
         let handle = tokio::spawn(async move {
             let mut io = io;
-            control_loop_probe(&mut io, loop_state, Duration::from_millis(2)).await;
+            control_loop_probe(
+                &mut io,
+                &mut FakeImu::new(),
+                loop_state,
+                Duration::from_millis(2),
+            )
+            .await;
         });
 
         // Let it fail at least once, so shutdown lands mid-wait rather than before the start.
@@ -4379,22 +4569,60 @@ mod tests {
         );
     }
 
-    /// `control_loop` takes its IO by value, which makes the fake unreachable afterwards.
-    /// This borrows instead so a test can inspect what was written.
-    async fn control_loop_probe<T: RobotIo>(io: &mut T, state: Arc<RobotState>, period: Duration) {
-        control_loop_probe_with(io, state, Arc::new(Intents::new()), period).await
+    /// **The migrate-to-I²C point.** A failed IMU read must degrade the tick, not fail it: the
+    /// loop keeps ticking at rate on its last good sample, and an IMU we cannot read never
+    /// reports *ready* (so fall detection and odometry seeding gate off rather than judging an
+    /// absent sensor).
+    #[tokio::test]
+    async fn a_failing_imu_degrades_the_tick_not_fails_it() {
+        let mut imu = FakeImu::new();
+        imu.ready = false;
+        imu.fail_reads = u32::MAX;
+
+        let s = Arc::new(RobotState::new(&Params::default(), false, false));
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = FakeIo::at(DEFAULT_POSITION).frozen();
+            control_loop_probe(&mut io, &mut imu, loop_state, Duration::from_millis(2)).await;
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.ticks.load(Ordering::Relaxed) < 5 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let ticks = s.ticks.load(Ordering::Relaxed);
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert!(
+            ticks >= 5,
+            "a failed IMU read must not fail the tick, got {ticks} ticks"
+        );
+    }
+
+    /// `control_loop` takes its IO and IMU by value, which makes the fakes unreachable
+    /// afterwards. This borrows instead so a test can inspect what was written and what the
+    /// IMU fused.
+    async fn control_loop_probe<T: RobotIo, U: ImuIo>(
+        io: &mut T,
+        imu: &mut U,
+        state: Arc<RobotState>,
+        period: Duration,
+    ) {
+        control_loop_probe_with(io, imu, state, Arc::new(Intents::new()), period).await
     }
 
     /// As above, with the intents the caller wants to drive — for the tests that need to press
     /// Start.
-    async fn control_loop_probe_with<T: RobotIo>(
+    async fn control_loop_probe_with<T: RobotIo, U: ImuIo>(
         io: &mut T,
+        imu: &mut U,
         state: Arc<RobotState>,
         intents: Arc<Intents>,
         period: Duration,
     ) {
-        struct Borrowed<'a, T>(&'a mut T);
-        impl<T: RobotIo> RobotIo for Borrowed<'_, T> {
+        struct BorrowedIo<'a, T>(&'a mut T);
+        impl<T: RobotIo> RobotIo for BorrowedIo<'_, T> {
             fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
                 self.0.read()
             }
@@ -4411,8 +4639,21 @@ mod tests {
                 self.0.slow_sensors()
             }
         }
+        struct BorrowedImu<'a, U>(&'a mut U);
+        impl<U: ImuIo> ImuIo for BorrowedImu<'_, U> {
+            fn read(&mut self) -> duck_control::io::Result<ImuData> {
+                self.0.read()
+            }
+            fn ready(&self) -> bool {
+                self.0.ready()
+            }
+            fn stale(&self) -> duck_control::io::ImuStale {
+                self.0.stale()
+            }
+        }
         control_loop(
-            Borrowed(io),
+            BorrowedIo(io),
+            BorrowedImu(imu),
             state,
             intents,
             Params::default(),
@@ -4436,7 +4677,13 @@ mod tests {
         let loop_state = Arc::clone(&s);
         let handle = tokio::spawn(async move {
             let mut io = io;
-            control_loop_probe(&mut io, loop_state, Duration::from_millis(2)).await;
+            control_loop_probe(
+                &mut io,
+                &mut FakeImu::new(),
+                loop_state,
+                Duration::from_millis(2),
+            )
+            .await;
             tx.send((io.torque, io.torque_writes)).unwrap();
         });
 
@@ -4472,8 +4719,14 @@ mod tests {
         let loop_intents = Arc::clone(&intents);
         let handle = tokio::spawn(async move {
             let mut io = io;
-            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
-                .await;
+            control_loop_probe_with(
+                &mut io,
+                &mut FakeImu::new(),
+                loop_state,
+                loop_intents,
+                Duration::from_millis(2),
+            )
+            .await;
             tx.send(io.torque).unwrap();
         });
 
@@ -4511,8 +4764,14 @@ mod tests {
         let loop_intents = Arc::clone(&intents);
         let handle = tokio::spawn(async move {
             let mut io = io;
-            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
-                .await;
+            control_loop_probe_with(
+                &mut io,
+                &mut FakeImu::new(),
+                loop_state,
+                loop_intents,
+                Duration::from_millis(2),
+            )
+            .await;
             tx.send((io.torque, io.torque_writes, io.last_written))
                 .unwrap();
         });
@@ -4554,8 +4813,14 @@ mod tests {
         let loop_intents = Arc::clone(&intents);
         let handle = tokio::spawn(async move {
             let mut io = io;
-            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
-                .await;
+            control_loop_probe_with(
+                &mut io,
+                &mut FakeImu::new(),
+                loop_state,
+                loop_intents,
+                Duration::from_millis(2),
+            )
+            .await;
             tx.send((io.torque, io.torque_writes)).unwrap();
         });
 

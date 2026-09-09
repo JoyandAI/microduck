@@ -73,10 +73,6 @@ pub fn mouth_target(open: f64) -> f64 {
     MOUTH_CLOSED + open * (MOUTH_OPEN - MOUTH_CLOSED)
 }
 
-/// The `imu_to_dxl` v2 board's Dynamixel ID. It rides the motor bus and is read in the
-/// same transaction as the servos ([`crate::bus`]).
-pub const IMU_DXL_ID: u8 = 200;
-
 pub const BAUD_RATE: u32 = 1_000_000;
 
 /// EEPROM registers asserted (and corrected) at startup.
@@ -86,6 +82,9 @@ pub const BAUD_RATE: u32 = 1_000_000;
 /// — spent waiting for servos to get around to answering. The rest are here because the
 /// runtime found them worth pinning; `shutdown = 52` is the error mask that latches on
 /// overload, overheating and input-voltage faults.
+///
+/// **This table has been superseded by the HLS register table in `ftbus.rs`.** It is kept
+/// only for the `bus.rs` Dynamixel XL330 backup path; new work must not fork from it.
 pub const EXPECTED_REGISTERS: &[(&str, u8)] = &[
     ("return_delay_time", 0),
     ("baud_rate", 3), // 3 = 1 Mbps, must agree with BAUD_RATE
@@ -150,12 +149,6 @@ mod tests {
         seen.sort_unstable();
         seen.windows(2)
             .for_each(|w| assert_ne!(w[0], w[1], "duplicate Dynamixel ID {}", w[0]));
-    }
-
-    /// The IMU board shares the bus with the servos, so its ID must not collide with one.
-    #[test]
-    fn imu_id_does_not_collide_with_a_joint() {
-        assert!(!JOINT_IDS.contains(&IMU_DXL_ID));
     }
 
     /// `MOUTH_INDEX` is used to skip a slot when mapping 14 policy actions onto 15 joints.

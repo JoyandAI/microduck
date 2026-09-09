@@ -1,0 +1,49 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * I2C4 (M0 pinmux) on header pins 27/28 — Radxa Zero 3W only.
+ *
+ * Brings up the RK3566's i2c4 controller at 400 kHz as the IMU bus,
+ * aliased /dev/i2c-imu (see the udev rule in scripts/setup-board.sh).
+ * The LSM6DSV16X (SparkFun SEN-21325 Qwiic, or the imu_to_dxl v2 board
+ * re-flashed as an I²C slave) answers at 0x6A, and the SFLP quaternion is
+ * read straight off this bus — the IMU no longer rides the servo bus.
+ *
+ * This overlay mirrors deploy/audio/i2c3-pihat.dts, which enables the
+ * HAT's i2c3 controller the same way. It is installed by the IMU step of
+ * scripts/setup-board.sh and its word is added to armbianEnv.txt's
+ * overlays= by configure_overlay (REQUIRED_OVERLAY_IMU).
+ *
+ * i2c4 vs the fusb302 story. The audio overlay's i2c3 is not free in the
+ * vendor DTB: it serves the FUSB302 USB-C PD controller, so that overlay
+ * re-muxes to M0 and explicitly disables the fusb302 node. i2c4 has no
+ * such conflict in the vendor DTB — it is not used by anything the board
+ * ships, so there is no FUSB302 (or any other) node to disable, and no
+ * re-mux of an in-use controller. Only its clock-frequency and its
+ * pinmux are set here. That said, pins 27/28 and the controller must
+ * still be verified free on a live duck (see §2.6 of the migration
+ * design): an i2cdetect on bus 4 that answers 0x6A is the confirmation.
+ *
+ * The pinmux name i2c4m0_xfer is the vendor DTB's; if the DTB in use
+ * names that mux differently (or exposes i2c4 in another mux), this
+ * overlay's pinctrl-0 has to match it. The KERNELS= address in the udev
+ * rule (fe5d0000.i2c) is indexed off the vendor DTB's i2c4 node and must
+ * stay in step with it.
+ */
+
+/ {
+    compatible = "radxa,zero-3w", "rockchip,rk3566";
+
+    fragment@0 {
+        target = <&i2c4>;
+        __overlay__ {
+            status = "okay";
+            clock-frequency = <400000>;
+            pinctrl-names = "default";
+            pinctrl-0 = <&i2c4m0_xfer>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+        };
+    };
+};
