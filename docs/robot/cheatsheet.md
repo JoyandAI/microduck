@@ -53,8 +53,10 @@ volts and as a fraction, the hottest servo and the board's own temperature. It c
 `robot.health`, polled every two seconds, because none of it is on the state stream — and it is
 where anything wrong gets named, whether that is `unhealthy: control loop at 43.9 Hz`, `degraded:
 no robot on the motor bus after 3 attempts` or `orientation frozen — 25 stale reads`. That last one
-is on this row and nowhere else on the frame: a board that has stopped fusing keeps answering the
-bus, so nothing errors and the gravity vector above holds a plausible attitude indefinitely.
+is on this row and nowhere else on the frame: a chip that has stopped fusing keeps answering the
+servo bus, and the IMU is a separate device on its own I²C bus (`/dev/i2c-imu`, i2c4) — so neither
+errors and the gravity vector above holds a plausible attitude indefinitely. (Since the IMU moved
+off the servo bus, a stale IMU degrades but never fails a tick, 2026-09-04.)
 
 0% is `BATTERY_EMPTY_V`, which is where `robotd` sits the robot down and cuts power, so the figure
 is a countdown rather than a gauge — yellow at 30%, red at 15%. A reading that has not been taken
@@ -494,6 +496,18 @@ The sensor shares the codec's I²C bus, so `setup-board.sh`'s audio section alre
 provisions the bus itself; the ToF step only adds the stable `/dev/i2c-pihat`
 name. Both sensor generations are supported — a VL53L5CX and a VL53L8CX are
 interchangeable on the board, and the daemon picks the driver from an ID read.
+
+**The IMU is not on the servo bus any more (2026-09-04).** It lives on its own I²C controller,
+i2c4, aliased `/dev/i2c-imu` (`setup-board.sh` installs the `i2c4-imu` overlay and the
+`99-robot-i2c-imu.rules` udev rule). Check it by hand:
+
+```
+sudo i2cdetect -y 4        # expect 0x6A (LSM6DSV16X)
+ls -l /dev/i2c-imu
+```
+
+An IMU that stops fusing shows up as `orientation frozen — N stale reads` in `robotctl health`
+and `monitor`, not as a servo-bus error.
 
 ### Wifi (`configd`)
 

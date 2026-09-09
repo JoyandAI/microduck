@@ -78,6 +78,18 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 pub const REGISTRY: &[Entry] = &[
     // ── [bus] ────────────────────────────────────────────────────────────────
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
+    entry(
+        "bus.driver",
+        Kind::Choice(&["hls2909", "xl330"]),
+        "Which servo driver: hls2909 (Feetech, default) or xl330 (Dynamixel fallback)",
+    ),
+    // ── [imu] ────────────────────────────────────────────────────────────────
+    entry(
+        "imu.bus",
+        Kind::Text,
+        "I²C bus device for the IMU (/dev/i2c-imu)",
+    ),
+    entry("imu.address", Kind::Integer, "IMU I²C address (0x6A)"),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(
@@ -471,6 +483,7 @@ mod tests {
         // build certainly has must all be found.
         for known in [
             "bus",
+            "imu",
             "control",
             "update_gate",
             "policy",

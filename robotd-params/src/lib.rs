@@ -33,6 +33,7 @@ pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
 #[serde(deny_unknown_fields, default)]
 pub struct Params {
     pub bus: Bus,
+    pub imu: Imu,
     pub control: Control,
     pub update_gate: UpdateGate,
     pub policy: PolicyParams,
@@ -788,9 +789,53 @@ impl Default for SafetyParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Bus {
-    /// Serial port the servos and the IMU board share. The Radxa Zero 3W wires them to
-    /// `/dev/ttyS2`.
+    /// Serial port the servos share. The Radxa Zero 3W wires them to `/dev/ttyS2`.
     pub port: String,
+    /// Which servo driver the serial bus speaks. [`Driver::Hls2909`] (the Feetech
+    /// HL-2909-C001) is the default and the migration target; [`Driver::Xl330`] (the
+    /// Dynamixel XL330) is the fallback for a robot whose servos were not migrated.
+    pub driver: Driver,
+}
+
+/// The servo bus driver — which protocol the serial port speaks.
+///
+/// A bus can only carry one protocol, so this is a choice rather than free text. The default
+/// is [`Driver::Hls2909`], the migration target; an old robot that is still on XL330 servos
+/// sets `driver = "xl330"` (the migration doc `docs/design/hls2909-i2c-imu-migration.md` §1
+/// keeps it as the fallback).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Driver {
+    /// Feetech HL-2909-C001 (FT-SCS framing).
+    #[default]
+    Hls2909,
+    /// Dynamixel XL330 (Dynamixel 2.0 framing).
+    Xl330,
+}
+
+impl Driver {
+    /// The name this driver has in the file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Driver::Hls2909 => "hls2909",
+            Driver::Xl330 => "xl330",
+        }
+    }
+}
+
+/// The IMU, on its own I²C bus rather than the servo bus.
+///
+/// The LSM6DSV16X rides i2c4 (pins 27/28, on-board pull-ups), aliased `/dev/i2c-imu` by a
+/// udev rule (`deploy/overlays/i2c4-imu.dts`), at 0x6A by default. It is independent of the
+/// servo bus: the two are fused on the same tick in `robotd`'s control loop
+/// ([`crate::Imu`]'s sibling `[bus] driver` picks the servo side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Imu {
+    /// The i2c-dev device for the IMU bus. `/dev/i2c-imu` is the udev alias for i2c4.
+    pub bus: PathBuf,
+    /// The chip's 7-bit I²C address. The LSM6DSV16X straps 0x6A or 0x6B.
+    pub address: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,6 +891,16 @@ impl Default for Bus {
     fn default() -> Self {
         Self {
             port: "/dev/ttyS2".into(),
+            driver: Driver::default(),
+        }
+    }
+}
+
+impl Default for Imu {
+    fn default() -> Self {
+        Self {
+            bus: PathBuf::from("/dev/i2c-imu"),
+            address: 0x6A,
         }
     }
 }

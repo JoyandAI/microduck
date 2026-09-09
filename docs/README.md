@@ -3,6 +3,9 @@
 The [README](../README.md) is the front door — what a microduck is, and where to go. If you have
 one in front of you and want to drive it, start at the [cheat sheet](robot/cheatsheet.md).
 
+New to the repo? [Onboarding](onboarding.md) is the entry path in one page — build it, run it
+without hardware, get a dev board, push a branch, release — with pointers to the pages below.
+
 ## `robot/` — you have a robot
 
 | | |

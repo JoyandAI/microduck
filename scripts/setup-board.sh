@@ -106,9 +106,16 @@ MIGRATE_SELF=/usr/local/sbin/robot-migrate-network
 NET_CHECK_UNIT=/etc/systemd/system/robot-net-check.service
 
 # Only what `robotd` needs. The prototype also enables i2c-gpio-pihat, aic3104-pihat and a
-# camera overlay; none apply here — our IMU rides the Dynamixel bus rather than I²C, and
+# camera overlay; none apply here — IMU 走 /dev/i2c-imu（i2c4），舵机总线无 IMU，and
 # `robotd` owns no camera or audio.
 REQUIRED_OVERLAY=uart2-m0
+
+# The IMU's I²C bus. i2c4 is the RK3566 controller behind the VDD_I2C pins on header 27/28
+# (aliased /dev/i2c-imu by the udev rule below); the LSM6DSV16X answers at 0x6A. The overlay
+# source lives in deploy/overlays/i2c4-imu.dts and is compiled+installed by configure_imu.
+# Overridable so a board that wires the IMU elsewhere can point at a different overlay, the
+# same way REQUIRED_OVERLAY is overridable.
+REQUIRED_OVERLAY_IMU="${REQUIRED_OVERLAY_IMU:-i2c4-imu}"
 
 needs_reboot=0
 # Whether we managed to leave a persistent copy, which decides what the reboot advice says.
@@ -260,6 +267,16 @@ configure_overlay() {
         # Appended rather than replacing the line: whatever else this image enables is not
         # ours to remove.
         sed -i "s/^overlays=\(.*\)\$/overlays=\1 ${REQUIRED_OVERLAY}/" "$ENV_TXT"
+        changed=1
+    fi
+
+    # The IMU overlay is a second required word. It is its own variable so boards wired
+    # differently can repoint it, and it rides the same overlays= line the uart2-m0 word
+    # does (kept separate from uart2-m0 above so that logic is untouched). A fresh line
+    # created by the block above already carries uart2-m0; this appends the IMU word after.
+    if ! grep -E '^overlays=' "$ENV_TXT" | grep -qw "$REQUIRED_OVERLAY_IMU"; then
+        say "adding ${REQUIRED_OVERLAY_IMU} to overlays"
+        sed -i "s/^overlays=\(.*\)\$/overlays=\1 ${REQUIRED_OVERLAY_IMU}/" "$ENV_TXT"
         changed=1
     fi
 
@@ -719,6 +736,59 @@ SUBSYSTEM=="i2c-dev", ATTR{name}=="i2c-gpio-pihat", SYMLINK+="i2c-pihat"'
     udevadm trigger --subsystem-match=i2c-dev 2>/dev/null || true
 }
 
+# ── the IMU's device-tree overlay and stable name ─────────────────────────────
+#
+# The LSM6DSV16X lives on i2c4 (header pins 27/28, VDD_I2C), aliased
+# /dev/i2c-imu — it is NOT on the servo bus any more. Two halves:
+#   1. Compile the vendored deploy/overlays/i2c4-imu.dts into the vendor
+#      kernel's overlay dir (the same dir configure_camera mirrors into), so
+#      the `i2c4-imu` word configure_overlay already put in overlays= is not a
+#      dangling name that the boot silently skips.
+#   2. The udev rule that names the controller /dev/i2c-imu.
+#
+# Needs the vendor kernel (which configure_audio installs), so call it after
+# configure_audio. `$1` is vendor_ver, like configure_camera.
+configure_imu() {
+    dtbo_dir="/boot/dtb-${1}/rockchip/overlay"
+    [ -d "$dtbo_dir" ] || dtbo_dir=$(find /boot -maxdepth 3 -type d -path '*/rockchip/overlay' 2>/dev/null | head -1)
+    if [ -z "$dtbo_dir" ]; then
+        warn "no rockchip overlay directory under /boot; the i2c4-imu overlay is not installed"
+        return 0
+    fi
+
+    ov_name="$REQUIRED_OVERLAY_IMU"
+    ov_tmp=$(mktemp -d)
+    if fetch_repo_file "deploy/overlays/${ov_name}.dts" "$ov_tmp/src.dts" \
+        && dtc -@ -I dts -O dtb -o "$ov_tmp/out.dtbo" "$ov_tmp/src.dts" 2>/dev/null; then
+        if [ ! -f "$dtbo_dir/rk3568-${ov_name}.dtbo" ] \
+            || ! cmp -s "$ov_tmp/out.dtbo" "$dtbo_dir/rk3568-${ov_name}.dtbo"; then
+            say "installing overlay rk3568-${ov_name}.dtbo"
+            cp "$ov_tmp/out.dtbo" "$dtbo_dir/rk3568-${ov_name}.dtbo"
+            needs_reboot=1
+        fi
+    else
+        warn "could not fetch or compile ${ov_name}.dts — the i2c4-imu overlay will be missing"
+    fi
+    rm -rf "$ov_tmp"
+
+    # The stable name: /dev/i2c-imu → the i2c4 controller, by its device-tree
+    # address. Kept in step with deploy/overlays/i2c4-imu.dts and the vendor
+    # DTB's i2c4 node (fe5d0000, per the migration design §2.6). Its own rule
+    # file so it coexists with — and never overwrites — the i2c-pihat rule
+    # configure_tof wrote: one stable symlink per bus, two separate files.
+    rule=/etc/udev/rules.d/99-robot-i2c-imu.rules
+    content='SUBSYSTEM=="i2c-dev", KERNELS=="fe5d0000.i2c", SYMLINK+="i2c-imu"'
+    if [ -f "$rule" ] && [ "$(cat "$rule")" = "$content" ]; then
+        say "IMU: /dev/i2c-imu rule already in place"
+    else
+        say "IMU: installing the /dev/i2c-imu udev rule"
+        printf '%s\n' "$content" > "$rule"
+        chmod 644 "$rule"
+        udevadm control --reload-rules 2>/dev/null || true
+        udevadm trigger --subsystem-match=i2c-dev 2>/dev/null || true
+    fi
+}
+
 # ── the head camera's device-tree overlay ──────────────────────────────────────
 #
 # Without it the sensor is never probed: no /dev/videoN, and nothing in dmesg either, which
@@ -1065,6 +1135,9 @@ main() {
     # capture driver lives only on that branch, and its overlay directory is the one to mirror
     # into. `vendor_ver` is what configure_audio resolved it to, or empty.
     configure_camera "${vendor_ver:-}"
+    # Same ordering reason as configure_camera: the i2c4-imu overlay must land in the vendor
+    # kernel's overlay dir, which configure_audio is what installs/makes available.
+    configure_imu "${vendor_ver:-}"
     install_onnxruntime
     report
 }

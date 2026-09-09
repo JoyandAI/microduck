@@ -12,6 +12,14 @@ four other IMUs, the three cameras and the Pi are dropped, and every shipped pol
 `alpha_*`. The wheeled configuration survives as one params switch — `policy.mode = "roller"`
 (§4.2) — because what it selects is a policy set and a tuning preset, not a hardware variant.
 
+> **Migration note (2026-09-04, `hls2909-i2c-imu-migration.md`).** The servos are now
+> Feetech **HL-2909-C001** on the FT-SCS bus (Dynamixel v2 → FT-SCS v1-style frames), and the
+> **IMU is off the servo bus** — it rides **i2c4** as `/dev/i2c-imu` (LSM6DSV16X at 0x6A), read
+> through a separate `ImuIo` trait rather than inside the motors' `sync_read`. `Sensors` and
+> every consumer (obs / safety / fall / odometry / state stream) are unchanged; `SflpDecoder`
+> is untouched. Sections below are updated to that shape; verifiable lines that still hold are
+> kept, and new/edited claims carry today's date.
+
 ## 1. The shape of it
 
 One process, one serial bus, one 50 Hz loop. The loop reads all sixteen devices on the bus in
@@ -20,28 +28,34 @@ clients, health, telemetry — hangs off that loop without ever being able to bl
 
 ### 1.1 The bus, and who owns the port
 
-Fifteen servos and the `imu_to_dxl` board share one UART. There is no second bus and no
-second port:
+The servo bus and the IMU are **two separate buses now** (2026-09-04). Fifteen HLS servos
+share the servo UART; the IMU is on I²C4, never on that UART:
 
 ```text
-                     robotd — control thread
-                              │
-                              │  duck_control::bus::DynamixelIo
-                              │  serialport · TIOCEXCL
-                              ▼
-         /dev/ttyS2 · 1 Mbps · Dynamixel protocol v2
-                              │
-    ┌────────────┬────────────┴───────┬──────────────────┐
-    │            │                    │                  │
-  id 200       20–24                30–34             10–14
- imu_to_dxl   left leg        neck · head · mouth     right leg
-  v2 board    5 servos             5 servos           5 servos
+   servo bus         robotd — control thread
+                           │
+                           │  duck_control::ftbus::HlsBusIo
+                           │  serialport · TIOCEXCL
+                           ▼
+      /dev/ttyS2 · 1 Mbps · FT-SCS protocol (Dynamixel v1-style frames)
+                           │
+     ┌────────────┬────────┴───────┬──────────────────┐
+     │            │                │                  │
+   20–24        30–34            10–14              (mouth 15th id)
+  left leg   neck·head·mouth    right leg
+   5 servos      5 servos         5 servos
+
+   IMU bus         ImuIo trait ──► imui2c::I2cDev (LSM6DSV16X)
+                           │        /dev/i2c-imu · i2c4 @ 400 kHz · addr 0x6A
+                           ▼
+                    Sensors.imu  (filled by the caller, same tick as servo read)
 ```
 
-The IMU is `id 200` and is read in the *same* `sync_read` as the servos, because that is what
-the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip SFLP
-quaternion out of the same register block the servos answer at. One board, one code path, no
-IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
+The servo loop is **`robotd`'s only serial bus again** — the old "no second bus" claim was
+about the motor port only, and still holds for I/O ownership, but the IMU now has its own I²C
+bus (i2c4, aliased `/dev/i2c-imu`) and its own code path (`ImuIo`). There is **no IMU on the
+Dynamixel/FT-SCS bus**: the hardware no longer embeds a Dynamixel-servicing IMU board, so the
+v2 `imu_to_dxl` board is gone and `id 200` is gone from the servo id vector.
 
 **One owner at a time, and nothing hard-enforces it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
@@ -127,27 +141,30 @@ targets and none of them can send one. That is the borrow checker, not a convent
 
 ### 1.4 The tick
 
-50 Hz, one `tokio` task on its own runtime so IPC work cannot sit in front of it. Two bus
-transactions per tick, plus a third once a second:
+50 Hz, one `tokio` task on its own runtime so IPC work cannot sit in front of it. Two servo-bus
+transactions per tick, plus a third once a second, and **one IMU read on its own bus**:
 
 ```text
-read()          one sync_read  · IMU board + 15 servos · registers 124–136   (§2.1)
+read()          one sync_read  · 15 servos · HLS regs 0x38–0x46 (15 B)   (§2.1)
+imu.read()      ImuIo → I²C  · LSM6DSV16X FIFO → 12-byte SFLP block      (§3)
 decide          observation → policy → targets → clamp                 (§2.2–§2.4)
-write()         one sync_write · goal positions
+write()         one sync_write · goal positions (0x2A)
 publish         atomics always; a state frame only if someone subscribed     (§4.1)
 
-every 1 s       slow_sensors() · registers 144–146 · voltage + temperature   (§2.1)
+every 1 s       slow_sensors() · per-servo volts/temps from the tick cache  (§2.1)
 ```
 
 Where the data goes, once per period:
 
 ```text
-  Dynamixel bus
-       │  one sync_read: IMU board + 15 servos, one transaction
+  servo bus (FT-SCS)
+       │  one sync_read: 15 servos, one transaction
        ▼
    Sensors ──────────┬──────────────────────► safety.observe ──► fallen? (debounced)
-   joints, IMU       │
-                     ▼
+    joints (by caller)│
+                      │   imu.read(): 12-byte SFLP block → SflpDecoder (unchanged)
+                      │   └─► s.imu = d  (IMU read failure degrades, never fails the tick)
+                      ▼
               Observation::build  ◄──── Command ◄── gate(deadman) ◄── intent snapshot
                      │              (twist, head, body = nominal)
                      │  [f32; 61]
@@ -166,9 +183,9 @@ Where the data goes, once per period:
         ║  · clamp to actuator range                   ║
         ║  · no fall gate — the verdict only reports   ║
         ╚═════════════════════════════════════════════╝
-                     │  sync_write goal positions
+                     │  sync_write goal positions (0x2A)
                      ▼
-              Dynamixel bus
+              servo bus
 ```
 
 And the decisions around it, which the dataflow above does not show:
@@ -243,31 +260,38 @@ intended:
 
 ### 2.1 The bus layer and `RobotIo`
 
-A thin layer over `rustypot`: open, one combined `sync_read`, `sync_write` goal positions,
-torque enable, gains, the slow sensor read, and the startup register check. Written fresh
-rather than lifted, but **the numbers are borrowed from the runtime**, each with a comment
-saying so:
+A thin layer over `rustypot`, used **as a pure FT-SCS transport**: open, one combined
+`sync_read`, `sync_write` goal positions, torque enable, gains, and the startup register check.
+The transport's own naming register table differs from the HLS in its 34/35/36 rows, so every
+register address is a constant defined in `duck-control/src/ftbus.rs`, never rustypot's names.
+Written fresh rather than lifted, but **the numbers are borrowed from the RL-side analysis**
+(`microduck_rl/docs/feetech_hls2915_servo_swap.md` §"运行时寄存器写入值"), each with a comment
+saying so (2026-09-04):
 
-- `RAD_PER_SEC_PER_COUNT = 0.229 × 2π/60`, and the position count↔radian conversion.
-- The EEPROM registers from `check_and_fix_config`, asserted *and corrected* at startup:
-  `return_delay_time=0`, `baud_rate=3`, `pwm_slope=255`, `shutdown=52`. The first is
-  load-bearing — at the XL330 default of 250 that is 500 µs of turnaround per device, so
-  sixteen devices cost ~8 ms per tick, 40% of the budget. A servo that was factory-reset or
-  swapped in arrives at 250, so the check is what removes a whole class of "why is it slow on
-  this robot". `shutdown = 52` is the error mask that latches on overload, overheating and
-  input-voltage faults.
-- The position P gain is written with I and D at **zero**, the runtime's `--ki`/`--kd`
-  defaults. These are RAM registers, so a power cycle restores the servo's factory values, and
-  the factory D is not zero: left in place it damps the servo's internal PID and the robot runs
-  measurably softer at the *same* kP. Not a tuning choice anyone made, so it is pinned rather
-  than exposed.
+- FT-SCS frame/checksum per `docs/ftscs_protocol.md`: `FF FF ID LEN INST PARAM CHECK`,
+  `CHECK = ~(ID+LEN+INST+PARAM) & 0xFF`, little-endian multi-byte. Instructions are
+  PING 0x01, READ 0x02, WRITE 0x03, SYNC_READ 0x82, SYNC_WRITE 0x83, position-calibrate 0x0B;
+  broadcast 0xFE.
+- Register constants (DEC, from `docs/feetech_hls_memtable.md`): mode 33, torque_enable 40,
+  accel 41, goal_position 42(2B), goal_current 44(2B), goal_speed 46(2B), torque_limit 48(2B),
+  Kp 50 / Kd 51 / Ki 52, lock 55, present_position 56(2B), present_speed 58(2B),
+  present_load 60(2B), present_voltage 62(1B), present_temperature 63(1B), moving 66,
+  present_current 69(2B), current_bias 73(2B), offset 31(2B), angle limits 9/11,
+  max_temperature 13, min/max voltage 15/14, max_torque 16.
+- Unit conversions (frozen, matching the RL side): position `rad = (2π·p/4096) − π` (i16,
+  single-turn 0..4095, BIT15 direction); speed `rad/s = v × 0.732 × 2π/60`; current
+  `mA = |raw| × 6.5`; voltage `V = u8 × 0.1`; temperature `°C = u8`; load `% = u16 × 0.1`.
+- The startup register check (`check_registers`, mirroring the old `EXPECTED_REGISTERS`):
+  baud 6=0(1M), angle limits 9/11=0/4095, max_temp 13=70, max_torque 16=980, mode 33=0,
+  accel 41=0, goal_speed 46=32767, torque_limit 48=980, lock 55=1. EEPROM writes unlock
+  (55=0) first and re-lock (55=1) after — only here and in the ID config flow.
 
-**Two bus transactions per tick, and a third once a second.** The tick reads a contiguous
-block at 124–136 (pwm, current, velocity, position). Voltage and temperature sit at 144–146,
-eight bytes past its end, with twelve bytes of trajectory registers nothing wants in between —
-so they are sampled together once a second in their own transaction (~1 ms) rather than
-widening the tick's read to 22 bytes per servo at 50 Hz. The sampling interval is the same
-window the achieved rate is measured over, so one clock drives both.
+**Two servo-bus transactions per tick, and a third once a second.** The tick reads a contiguous
+block at `0x38` for 15 bytes (present_position 56 … present_current 69: pos/speed/load/voltage/
+temp/async/status/moving/target/current). Voltage, temperature and load come back *inside that
+same block*, so `slow_sensors` no longer runs its own transaction — it returns the cached block
+from this tick (2026-09-04), keeping the "one read per tick" budget while the per-servo volts
+and temps are still carried at 1 Hz by the caller.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than
@@ -289,39 +313,47 @@ servos are the same symptom until you can see both numbers. The maximum across z
 than one zone by name, so a board that wires its sensors differently cannot silently omit the
 one that was climbing.
 
-**IMU staleness is tracked, permanently.** "The read succeeded but the board handed back the
-same sample" feeds dead orientation to the policy, is invisible unless someone counts it, and
-is known to happen. The bus layer remembers the last block, counts identical successors, and
-says so in the journal once a run is long enough to mean something — half a second, the same
-span the SFLP decoder waits before it will call the chip's output a measurement. Warning on the
-first repeated block is what teaches everyone to ignore the message; past the threshold it is
-rate-limited, because a board that has stopped refreshing produces one per tick and 50 Hz of
-identical warnings evicts the journal.
+**IMU staleness is tracked, permanently — but not by the servo bus.** "The read succeeded but
+the IMU handed back the same sample" feeds dead orientation to the policy, is invisible unless
+someone counts it, and is known to happen. Now that the IMU is off the servo bus this lives in
+`ImuIo` (2026-09-04), not `RobotIo`: the `ImuIo` implementation holds a `StaleImuTracker` over
+the composed 12-byte blocks, counts identical successors, and says so in the journal once a run
+is long enough to mean something — half a second, the same span the SFLP decoder waits before it
+will call the chip's output a measurement. Warning on the first repeated block is what teaches
+everyone to ignore the message; past the threshold it is rate-limited, because a chip that has
+stopped refreshing produces one per tick and 50 Hz of identical warnings evicts the journal.
 
-The seam:
+The seam — `RobotIo` no longer carries the IMU (two sources of truth is what the split is
+removing), and a separate `ImuIo` owns it:
 
 ```rust
 trait RobotIo {
-    fn read(&mut self) -> Result<Sensors>;                 // joints + IMU, one transaction
+    fn read(&mut self) -> Result<Sensors>;                 // servo feedback; imu filled by caller
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
     fn set_gain(&mut self, kp: u16) -> Result<()>;         // one write per joint, not per tick
     fn set_torque(&mut self, on: bool) -> Result<()>;      // idem
-    fn slow_sensors(&mut self) -> Result<SlowSensors>;     // voltage + per-joint temperature
-    fn imu_stale(&self) -> ImuStale;                       // defaulted
-    fn imu_ready(&self) -> bool;                           // defaulted
+    fn slow_sensors(&mut self) -> Result<SlowSensors>;     // voltage + per-joint temp, from tick cache
+}
+
+trait ImuIo {
+    fn read(&mut self) -> Result<ImuData>;                 // 50 Hz, same tick as servo read
+    fn ready(&self) -> bool;                               // converged; gates fall/odometry seed
+    fn stale(&self) -> ImuStale;                           // byte-repetition count for health
 }
 ```
 
 `set_gain` and `set_torque` are one transaction *per joint*, which is why neither is a
 per-tick call and why bring-up is a state machine rather than a flag the loop keeps applying
-(§3.3). Two inherent methods sit outside the trait because only `init` uses them:
+(§3.3). Two inherent methods sit outside `RobotIo` because only `init` uses them:
 `present_positions` (a lighter read, used once at startup to adopt the pose the robot is
 already in) and `interpolate_to` (a blocking linear ramp — deliberately blocking, since
 nothing else should be talking to the bus while it runs).
 
-Two implementations: `DynamixelIo` and `FakeIo` (scripted samples, optionally frozen or
-failing on demand). `FakeIo` is what the test suite runs against, and it is why `cargo test`
-needs no hardware, no network and no Docker.
+Two implementations: `HlsBusIo` (the migration target, `driver="hls2909"`), and `DynamixelIo`
+(the XL330 fallback, `driver="xl330"`, kept as reference and for legacy robots); plus `FakeIo`
+(scripted samples, optionally frozen or failing on demand). A `FakeImu` complements it for
+`robotd --fake` and the tests. `FakeIo` is what the test suite runs against, and it is why
+`cargo test` needs no hardware, no network and no Docker.
 
 **Neither is `cfg`-gated off macOS.** The gate was meant to keep `serialport` out of a
 laptop's dependency tree, but `rustypot` and `serialport` both build cleanly there, so it
@@ -330,6 +362,32 @@ exactly the code most likely to be edited by someone who does not have one. Only
 points that open a real port are gated, so a Mac build still refuses to pretend it has a
 robot: `robotd --fake` is the laptop path, and it must be asked for explicitly rather than
 fallen back to.
+
+**HLS register map (DEC, from `docs/feetech_hls_memtable.md`).** The tick reads `0x38` × 15
+bytes; the write targets `0x2A` × 2 bytes. Registers below are the ones `HlsBusIo` drives.
+
+| addr | name | bytes | unit | note |
+|---|---|---|---|---|
+| 5 / 6 | ID / baud | 1 | — / — | ID 0-253, baud 0=1M |
+| 9 / 11 | angle limits min/max | 2 | 0.087° | 0/4095 |
+| 16 | max torque | 2 | 0.1% | default 980 (98%) |
+| 31 | position offset | 2 | 0.087° | BIT15 sign |
+| 33 | mode | 1 | — | 0 = position servo |
+| 40 | torque enable | 1 | — | 0/1/2 (2=damper for limp) |
+| 41 | accel | 1 | 8.7°/s²/LSB | 0 = max |
+| 42 | goal position | 2 | 0.087° | BIT15 direction; every tick |
+| 44 | goal current | 2 | 6.5 mA | current limit in position mode |
+| 46 | goal speed | 2 | 0.732 RPM | 32767 = max |
+| 48 | torque limit | 2 | 0.1% | default 980 |
+| 50/51/52 | Kp / Kd / Ki | 1 | — | Kp 1/8, Kd 1/4 scale; Ki inert in position mode |
+| 55 | lock | 1 | — | 1 = locked; EEPROM writes unlock first |
+| 56 | present position | 2 | 0.087° | read block |
+| 58 | present speed | 2 | 0.732 RPM | read block |
+| 60 | present load | 2 | 0.1% | read block |
+| 62 | present voltage | 1 | 0.1 V | read block |
+| 63 | present temp | 1 | °C | read block |
+| 65 / 66 | status / moving | 1 | — | read block |
+| 69 | present current | 2 | 6.5 mA | read block |
 
 ### 2.2 One observation builder
 
@@ -665,7 +723,7 @@ robot.
 
 | method | answer |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, servo bus, IMU (now `ImuIo`: ready / stale counts), battery, servo and board temperature |
 | `robot.safeToRestart` | false while the policy is enabled and the robot is moving |
 | `robot.modelApi` | constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
@@ -681,7 +739,7 @@ distinction real is why the control loop was built before anything that walks (�
 inputs, so only conditions a *release* can be blamed for may set them — that is what `degraded`
 already exists to enforce for an unpowered bench board. Everything else on the answer is a
 **description**, and no automatic decision may read it: battery, motor temperature, and the
-loop/bus/IMU counters. Gating on the battery would mean a robot updated on a low pack rolls the
+loop/servo-bus/IMU counters. Gating on the battery would mean a robot updated on a low pack rolls the
 release back, then judges its replacement on the same low pack, and cannot be updated at all until
 someone works out why. Motor temperature would do the same on a hot afternoon.
 
@@ -786,8 +844,9 @@ the app will use.
 ### 4.4 Odometry, on the sample the loop already took
 
 `odometry::Odometry::alpha()` is stepped once per tick from the joint positions and the IMU
-quaternion the loop has just read, and its estimate goes out on the state stream as
-`odom: { position, yaw }`. `robotctl monitor` draws it as a path map under the 3D view.
+quaternion read from `ImuIo` (the sample the loop took this tick, on its own I²C bus), and its
+estimate goes out on the state stream as `odom: { position, yaw }`. `robotctl monitor` draws it
+as a path map under the 3D view.
 
 **Contact-based**, ported from the prototype runtime: one sole corner is the ground anchor, the
 trunk's world pose follows from it by forward kinematics through the `kinematics` crate's model,
@@ -915,7 +974,7 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 |---|---|
 | `duck-control` as a workspace crate | boundary enforced by the compiler, no second repo |
 | bus layer written fresh, constants borrowed | thin code, but the tuned numbers are not re-derived |
-| the IMU in the motors' `sync_read` | it is a device on the same bus; no IMU abstraction |
+| ~~the IMU in the motors' `sync_read`~~ reversed (2026-09-04) | IMU moved to its own I²C bus (`/dev/i2c-imu`, i2c4) and a separate `ImuIo` trait; `RobotIo` no longer carries the IMU |
 | Rust consts for the model | one robot exists |
 | params file, not watched | establishes the file and its location; the watcher is later |
 | policy path in params, default = release dir | updates carry the policy; devs override it |
@@ -931,7 +990,8 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 
 MuJoCo backend and the `RemoteIo` protocol · the skill abstraction · policy bundle manifests and
 `model_api` gating · `look`/`pose`/`do` intents · gaze IK · live params reload and the config store ·
-thermal limits · rate limits · per-device IMU calibration.
+thermal limits · rate limits · per-device IMU calibration (the new `ImuIo` shifts where this is
+plumbed, but the calibration itself is unchanged and still deferred).
 
 **Odometry has left this list.** It was deferred because nothing read it; `robotctl monitor`'s
 path map now does. §4.4.

@@ -3,10 +3,12 @@
 //! Everything between [`RobotIo::read`] and [`RobotIo::write`] is pure computation over
 //! plain data, which is what makes the loop testable without a robot.
 //!
-//! [`Sensors`] carries joints *and* IMU together because that is what the hardware does:
-//! the IMU board sits on the Dynamixel bus and is fetched in the same transaction as the
-//! servos. A trait that split them would invent a distinction the bus does not have, and
-//! would double the bus traffic to honour it.
+//! [`Sensors`] still carries joints *and* IMU, but they no longer come from the same bus:
+//! the servos live on the Dynamixel bus and the IMU on its own I²C bus. [`RobotIo::read`]
+//! returns the servo half and leaves [`Sensors::imu`] at its default; the caller fills it
+//! from [`ImuIo::read`] on the same tick. The composition point in `robotd` is the only
+//! place the two halves meet. Splitting them means one failed IMU read no longer fails the
+//! whole tick — the point of the move — and lets each bus keep its own cadence.
 
 use crate::imu::ImuData;
 use crate::model::NUM_JOINTS;
@@ -111,7 +113,12 @@ pub struct ImuStale {
 }
 
 pub trait RobotIo {
-    /// One transaction: joints and IMU together.
+    /// One transaction: the servo half of a tick.
+    ///
+    /// `imu` is left at [`ImuData::default`] here and is filled in by the caller from
+    /// [`ImuIo::read`] on the same tick — the IMU now lives on its own I²C bus, so it is not
+    /// part of this transaction. Every consumer of [`Sensors::imu`] reads it from the
+    /// composition point, not from here.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
@@ -141,21 +148,26 @@ pub trait RobotIo {
     /// costs a transaction of its own — about a millisecond. Negligible once a second, 5% of
     /// the budget at 50 Hz.
     fn slow_sensors(&mut self) -> Result<SlowSensors>;
+}
 
-    /// Diagnostics the bus keeps about itself. Default to "nothing to report" so a fake or a
-    /// future backend is not obliged to invent them.
+/// The IMU half of the seam.
+///
+/// The IMU lives on its own I²C bus rather than the servo bus, so it is a separate trait:
+/// the composition point in `robotd` calls [`RobotIo::read`] and [`ImuIo::read`] each tick,
+/// then merges the two into one [`Sensors`]. A failed [`ImuIo::read`] degrades the tick
+/// (the caller keeps its last sample) instead of failing it — that is the point of the split.
+pub trait ImuIo {
+    /// Read one IMU sample (50 Hz, called on the same tick as the servo read).
     ///
-    /// `sync_read` blocks identical to their predecessor: the board answered but did not
-    /// refresh, which means the policy would be fed dead orientation. Invisible unless
-    /// someone counts it, which is why it is counted.
-    fn imu_stale(&self) -> ImuStale {
-        ImuStale::default()
-    }
+    /// An error here must not fail the tick — the caller keeps its previous [`ImuData`].
+    fn read(&mut self) -> Result<ImuData>;
 
-    /// Has the orientation filter converged? False for the first moments after startup.
-    fn imu_ready(&self) -> bool {
-        true
-    }
+    /// Whether the orientation filter has converged. False for the first moments after
+    /// startup. Gates fall detection and odometry seeding.
+    fn ready(&self) -> bool;
+
+    /// Byte-identical repeat count, for health reporting.
+    fn stale(&self) -> ImuStale;
 }
 
 /// A robot made of nothing, for tests.
@@ -176,9 +188,6 @@ pub struct FakeIo {
     pub writes: usize,
     /// Last gain commanded, so a test can tell "went limp" from "stopped commanding".
     pub last_gain: Option<u16>,
-    /// Whether the orientation filter reports converged. False models the first seconds after
-    /// startup, when projected gravity is not yet a measurement.
-    pub imu_ready: bool,
     /// What [`RobotIo::slow_sensors`] reports. Mid-pack and hand-warm by default so `--fake`
     /// shows a plausible robot; set it to exercise a flat pack or a cooking servo. `None`
     /// fails the read, which is what a robot with no bus does.
@@ -209,7 +218,6 @@ impl FakeIo {
             reads: 0,
             writes: 0,
             last_gain: None,
-            imu_ready: true,
             slow: Some(SlowSensors {
                 volts: 7.4,
                 temps_c: [32.0; NUM_JOINTS],
@@ -284,12 +292,83 @@ impl RobotIo for FakeIo {
         Ok(())
     }
 
-    fn imu_ready(&self) -> bool {
-        self.imu_ready
-    }
-
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
         self.slow.ok_or(IoError::Simulated)
+    }
+}
+
+/// A fake IMU for tests and `--fake`.
+///
+/// Always compiled, like [`FakeIo`]. `ready` is controllable, [`ImuIo::read`] returns the
+/// last injected sample (default [`ImuData::default`]) or fails, and stale counts are
+/// settable — the three things a backend provides that `robotd`'s health report reads.
+pub struct FakeImu {
+    /// What [`ImuIo::read`] returns until changed.
+    sample: ImuData,
+    /// Set to make the next [`ImuIo::read`] fail, then cleared. For exercising the loop's
+    /// IMU-error path (which must degrade the tick, not fail it).
+    pub fail_next_read: bool,
+    /// Reads still to fail before this one starts answering, decremented per read.
+    pub fail_reads: u32,
+    /// Whether the orientation filter reports converged. False models the first seconds after
+    /// startup, when projected gravity is not yet a measurement.
+    pub ready: bool,
+    /// Stale counters [`ImuIo::stale`] reports.
+    pub stale: ImuStale,
+    /// How many reads have been answered.
+    pub reads: usize,
+}
+
+impl Default for FakeImu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FakeImu {
+    pub fn new() -> Self {
+        Self {
+            sample: ImuData::default(),
+            fail_next_read: false,
+            fail_reads: 0,
+            ready: true,
+            stale: ImuStale::default(),
+            reads: 0,
+        }
+    }
+
+    /// Inject a specific sample; [`ImuIo::read`] returns it until changed.
+    pub fn set_imu(&mut self, imu: ImuData) {
+        self.sample = imu;
+    }
+
+    /// Fail the next `n` reads, then behave normally.
+    pub fn failing_reads(mut self, n: u32) -> Self {
+        self.fail_reads = n;
+        self
+    }
+}
+
+impl ImuIo for FakeImu {
+    fn read(&mut self) -> Result<ImuData> {
+        if self.fail_next_read {
+            self.fail_next_read = false;
+            return Err(IoError::Simulated);
+        }
+        if self.fail_reads > 0 {
+            self.fail_reads -= 1;
+            return Err(IoError::Simulated);
+        }
+        self.reads += 1;
+        Ok(self.sample)
+    }
+
+    fn ready(&self) -> bool {
+        self.ready
+    }
+
+    fn stale(&self) -> ImuStale {
+        self.stale
     }
 }
 
@@ -331,5 +410,29 @@ mod tests {
         io.fail_next_read = true;
         assert!(io.read().is_err());
         assert!(io.read().is_ok());
+    }
+
+    /// The IMU fake must mirror the same one-shot contract so the loop's degrade-not-fail
+    /// path is testable: inject a sample, inject a failure, see it clear.
+    #[test]
+    fn fake_imu_reports_the_injected_sample_and_fails_once() {
+        let mut imu = FakeImu::new();
+        assert!(imu.ready());
+        assert_eq!(imu.read().unwrap(), ImuData::default());
+
+        let sample = ImuData {
+            gravity: [0.0, 0.0, -0.5],
+            ..ImuData::default()
+        };
+        imu.set_imu(sample);
+        assert_eq!(imu.read().unwrap(), sample);
+        assert_eq!(imu.reads, 2);
+
+        imu.fail_next_read = true;
+        assert!(imu.read().is_err());
+        assert!(
+            imu.read().is_ok(),
+            "a simulated IMU failure must be one-shot"
+        );
     }
 }
