@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Provision Feetech HL-2909-C001 (FT-SCS 总线) 舵机的 ID / 波特率，可选位置校准。
+"""Provision Feetech HD1910-C001 (FT-HLS 总线) 舵机的 ID / 波特率，可选位置校准。
 
 给批量换装舵机用：把每个舵机单独接到 USB-TTL 调试板，依次跑本脚本，把 15 个
 (或你给的) 目标 ID 写进每个舵机的 EPROM。**每次只接一台，不要广播写 ID**——
-FT-SCS 的 WRITE 走单个 ID；若强行用 0xFE 广播写 ID，总线上所有舵机会被改成同一个
+FT-HLS 的 WRITE 走单个 ID；若强行用 0xFE 广播写 ID，总线上所有舵机会被改成同一个
 ID（比如 id=5），此后彼此冲突，只能全部返厂或逐个 PING 排查。这条纪律是硬性的。
 
 使用：
@@ -19,7 +19,7 @@ ID（比如 id=5），此后彼此冲突，只能全部返厂或逐个 PING 排�
 接线/供电/波特率与 read_hls_registers.py 相同：舵机接 12V(9-14V)；GND/供电/信号
 按调试板丝印；出厂默认 1 Mbps。若目标舵机波特率已被改过，加 --baud 指定当前值。
 
-协议依据: docs/ftscs_protocol.md (FT-SCS 自定义协议: 帧 FF FF|ID|LEN|INST|PARA|CHK,
+协议依据: docs/ftscs_protocol.md (FT-HLS 自定义协议: 帧 FF FF|ID|LEN|INST|PARA|CHK,
 CHK = ~(ID+LEN+INST+PARA)&0xFF, 多字节小端)；寄存器依据: docs/feetech_hls_memtable.md
 (5=主ID, 6=波特率档位(0=1M), 55=锁标志(0=解锁/1=锁定), 0x0B=位置校准)。
 """
@@ -29,7 +29,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-# ---------------- FT-SCS 协议原语 (纯字节构造, 不依赖串口) ----------------
+# ---------------- FT-HLS 协议原语 (纯字节构造, 不依赖串口) ----------------
 #
 # These builders and the constant table are imported from the same style as
 # microduck_rl/scripts/read_hls_registers.py so the wire format stays
@@ -87,11 +87,11 @@ def _require_pyserial():
 
 
 class HlsBus:
-    """单台舵机的一条半双工 FT-SCS 总线连接。
+    """单台舵机的一条半双工 FT-HLS 总线连接。
 
     - `ping`: 探测一个 ID 是否存在。
     - `read`: 读 nbytes 个寄存器字节 (应答帧校验和校验通过才算成功)。
-    - `write`: 写寄存器字节 (FT-SCS 的 WRITE 返回状态包)。
+    - `write`: 写寄存器字节 (FT-HLS 的 WRITE 返回状态包)。
     - 只在 open/unlock/write/lock 间被一次配置流程使用；进程结束 close。
     """
 
@@ -168,7 +168,7 @@ def list_ports():
 def find_single_servo(bus: HlsBus) -> int:
     """找总线上"当前"的那一台舵机 (单台连接)。
 
-    FT-SCS 只有一条总线; 单台连接时应当恰好有一台响应。扫描 1..253 (跳过 0/广播):
+    FT-HLS 只有一条总线; 单台连接时应当恰好有一台响应。扫描 1..253 (跳过 0/广播):
       - 恰好一台 → 返回它的 id;
       - 多台 → 说明没做到"单台连接", 直接报错中止 (写 ID 会互相覆盖);
       - 零台 → 报错 (检查供电/信号/波特率)。

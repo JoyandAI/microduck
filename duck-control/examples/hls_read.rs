@@ -1,4 +1,4 @@
-//! Live FT-SCS servo status for the duck's fifteen joints.
+//! Live FT-HLS servo status for the duck's fifteen joints.
 //!
 //! Compile on a development machine (not on the board):
 //!
@@ -379,7 +379,7 @@ extern "C" fn handle_sigint(_: libc::c_int) {
 }
 
 const USAGE: &str = "\
-hls_read — live Feetech HL-2909 status on the duck's servo bus
+hls_read — live Feetech HD1910 status on the duck's servo bus
 
 Usage:
   cargo run -p duck-control --example hls_read -- <port>

@@ -16,7 +16,7 @@
 | RL 动作维度 | 14 outputs；跳过 mouth 关节 | 官方源码 | [obs.rs](../duck-control/src/obs.rs#L8-L19)、[model.rs](../duck-control/src/model.rs#L28-L31) | 高（软件接口）；不与 15 个物理执行器矛盾。14 是策略输出，嘴由上层控制。 |
 | 控制频率 | 50 Hz onboard policy/control loop | 官方产品页/Press Kit；官方配置注明沿用原型 | [Press Kit](https://pollen-robotics.com/microduck/press-kit/)、[robotd.toml](../deploy/robotd.toml#L27-L34) | 高（目标值）；代码注释明确称该频率继承 Raspberry Pi 原型、尚未在 Radxa 上重新推导，文章应注明。 |
 | IMU 数量 | 2 个（body + head） | 官方产品 Press Kit | [Press Kit](https://pollen-robotics.com/microduck/press-kit/) | 高（官方宣称）；具体芯片型号未公开。 |
-| IMU 软件实际使用情况 | 官方控制路径读取一个 IMU；**已迁移**（2026-09-04）：IMU 不再挂在舵机总线上，而是走独立 I²C 总线 `i2c4` → `/dev/i2c-imu`（LSM6DSV16X，0x6A），由单独的 `ImuIo` trait 读取；`Sensors.imu` 字段结构与 `SflpDecoder` 不变。此前源码注释为 “one IMU, one code path” | 官方源代码 | [imu.rs](../duck-control/src/imu.rs#L1-L20)、[io.rs](../duck-control/src/io.rs#L108-L120)、迁移方案 [hls2909-i2c-imu-migration.md](design/hls2909-i2c-imu-migration.md) | 高（软件行为）；与 Press Kit“2 IMUs”存在未解释差异。不能据此断言第二颗不存在，硬件是否焊接需实物证据。 |
+| IMU 软件实际使用情况 | 官方控制路径读取一个 IMU；**已迁移**（2026-09-04）：IMU 不再挂在舵机总线上，而是走独立 I²C 总线 `i2c4` → `/dev/i2c-imu`（LSM6DSV16X，0x6A），由单独的 `ImuIo` trait 读取；`Sensors.imu` 字段结构与 `SflpDecoder` 不变。此前源码注释为 “one IMU, one code path” | 官方源代码 | [imu.rs](../duck-control/src/imu.rs#L1-L20)、[io.rs](../duck-control/src/io.rs#L108-L120)、迁移方案 [hd1910-i2c-imu-migration.md](design/hd1910-i2c-imu-migration.md) | 高（软件行为）；与 Press Kit“2 IMUs”存在未解释差异。不能据此断言第二颗不存在，硬件是否焊接需实物证据。 |
 | IMU 具体芯片 | LSM6DSV16X（第三方逆向）；BMI088 在 HAT 设备树中被标为 dormant/unused（第三方解读） | 第三方逆向仓库 | [硬件规格速查.md](https://github.com/fanhao375/microduck-replica/blob/main/docs/%E7%A1%AC%E4%BB%B6%E8%A7%84%E6%A0%BC%E9%80%9F%E6%9F%A5.md#L295-L303) | 低/中；官方没有公布芯片料号，且“第二颗物理存在”是推断，不能写成定论。 |
 | ToF / LiDAR | 8×8 time-of-flight matrix | 官方产品 Press Kit；官方驱动支持两代 | [Press Kit](https://pollen-robotics.com/microduck/press-kit/)、[tof/lib.rs](../tof/src/lib.rs#L1-L11)、[tof/sensor.rs](../tof/src/sensor.rs#L8-L14) | 高（8×8）；具体是 VL53L5CX 还是 VL53L8CX 由运行时探测，官方未指定单一料号。 |
 | 摄像头 | 前置 camera，带 camera-use indicator | 官方产品 Press Kit | [Press Kit](https://pollen-robotics.com/microduck/press-kit/) | 高（功能）；分辨率、视场角官方明确“仍在定稿”。 |
@@ -26,7 +26,7 @@
 | 电池 | 可拆卸 NP-F550 摄像机电池，2600 mAh，约 1 小时（视使用而定） | 官方产品 Press Kit | [Press Kit](https://pollen-robotics.com/microduck/press-kit/) | 高；官方未在该段给出电芯品牌或完整电气参数。 |
 | NFC | 头部和喙各 1 个，共 2 天线 | 官方产品 Press Kit | [Press Kit](https://pollen-robotics.com/microduck/press-kit/) | 高；官方代码仓库当前未见 NFC 实现，硬件交互细节待发布。 |
 | 软件架构 | robotd（控制/运动/安全）、mediad（相机/音频/WebRTC）、tofd（ToF）、configd、btd、padd、updaterd 等独立守护进程；Unix socket 上 JSON-RPC | 官方源代码/设计文档 | [architecture.md](architecture.md#L31-L90)、[README.md](../README.md#L25-L27) | 高（软件仓库描述）；这是软件架构，不等于硬件设计开源。 |
-| 舵机总线 | 15 个舵机共用一条舵机总线（Dynamixel 2.0 / 迁移后 Feetech FT-SCS，端口 `/dev/ttyS2`）；**IMU 不在该总线上**，走 `i2c4` → `/dev/i2c-imu`（2026-09-04） | 官方源代码/配置 | [bus.rs](../duck-control/src/bus.rs#L1-L4)、[robotd.toml](../deploy/robotd.toml#L15-L19)、迁移方案 [hls2909-i2c-imu-migration.md](design/hls2909-i2c-imu-migration.md) | 高（实现）；协议、电平和 UART 映射是实现细节，不应外推为官方硬件 BOM。 |
+| 舵机总线 | 15 个舵机共用一条舵机总线（Dynamixel 2.0 / 迁移后 Feetech FT-HLS，端口 `/dev/ttyS2`）；**IMU 不在该总线上**，走 `i2c4` → `/dev/i2c-imu`（2026-09-04） | 官方源代码/配置 | [bus.rs](../duck-control/src/bus.rs#L1-L4)、[robotd.toml](../deploy/robotd.toml#L15-L19)、迁移方案 [hd1910-i2c-imu-migration.md](design/hd1910-i2c-imu-migration.md) | 高（实现）；协议、电平和 UART 映射是实现细节，不应外推为官方硬件 BOM。 |
 | 开源范围 | SDK、仿真和 RL 训练软件开源；机械/电子设计文件不属于开源声明 | 官方 Press Kit | [Press Kit](https://pollen-robotics.com/microduck/press-kit/) | 高；引用文章应避免使用“开源硬件”表述。 |
 
 ## 写作时的硬边界

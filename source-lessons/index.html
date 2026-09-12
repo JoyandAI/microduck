@@ -159,7 +159,7 @@
       <ul class="nav-subs">
         <li><a href="#08-ipc-cli-apply-1-duck-ipc-proto-机器人与外面唯一的-线协议">1. duck-ipc-proto：机器人与外面唯一的"线协议"</a></li>
         <li><a href="#08-ipc-cli-apply-2-robotctl-从终端走-unix-socket-看它">2. robotctl：从终端走 unix socket 看它</a></li>
-        <li><a href="#08-ipc-cli-apply-3-改造切入点-a-14-个-xl330-飞特-hl-2909">3. 改造切入点 A：14 个 XL330 → 飞特 HL-2909</a></li>
+        <li><a href="#08-ipc-cli-apply-3-改造切入点-a-14-个-xl330-飞特-hd1910">3. 改造切入点 A：14 个 XL330 → 飞特 HD1910</a></li>
         <li><a href="#08-ipc-cli-apply-4-改造切入点-b-imu-从伺服总线上拿下来直连">4. 改造切入点 B：IMU 从伺服总线上拿下来直连</a></li>
         <li><a href="#08-ipc-cli-apply-5-下刀顺序与规模评估">5. 下刀顺序与规模评估</a></li>
         <li><a href="#08-ipc-cli-apply-6-自己动手">6. 自己动手</a></li>
@@ -1971,7 +1971,7 @@ RPC 怎么分帧、<code>robotctl monitor</code> 怎么读回状态，以及对�
     <h1 id="08-ipc-cli-apply-08-ipc-robotctl-与你的改造切入点" class="h-1">08 · IPC、robotctl 与你的改造切入点</h1><blockquote>
 <p>目的：本讲收官，做两件事。<strong>(1) 从&quot;外面&quot;看这台机器人</strong>——<code>duck-ipc-proto</code> 定义了哪些
 上线消息，<code>robotctl</code> 怎么通过 unix socket 跟 <code>robotd</code> 说话，<code>monitor</code>/<code>health</code> 显示什么；
-<strong>(2) 把你在 <code>~/microduck_rl</code> 里评估过的两件改造——14 个 XL330 换飞特 HL-2909、IMU 从
+<strong>(2) 把你在 <code>~/microduck_rl</code> 里评估过的两件改造——14 个 XL330 换飞特 HD1910、IMU 从
 伺服总线上拿下来直连——落成 <code>~/microduck</code> 的&quot;下刀清单&quot;</strong>。前 7 讲教你读懂 20 ms 那一拍，
 这一讲回答：改那一拍要从哪几个文件动刀，哪些是搬运、哪些是重写。</p>
 </blockquote>
@@ -2215,7 +2215,7 @@ NDJSON 流：机器人侧 <code>robot.subscribe → robot.state</code> 是 NDJSO
 那是改动漏了线协议那一层。</p>
 </blockquote>
 <hr>
-<h2 id="08-ipc-cli-apply-3-改造切入点-a-14-个-xl330-飞特-hl-2909" class="h-2">3. 改造切入点 A：14 个 XL330 → 飞特 HL-2909</h2><p>你在 <code>~/microduck_rl</code> 的评估结论（<code>feetech_hls2915_servo_swap.md</code> §0/§3.5）已经写清：
+<h2 id="08-ipc-cli-apply-3-改造切入点-a-14-个-xl330-飞特-hd1910" class="h-2">3. 改造切入点 A：14 个 XL330 → 飞特 HD1910</h2><p>你在 <code>~/microduck_rl</code> 的评估结论（<code>feetech_hls2915_servo_swap.md</code> §0/§3.5）已经写清：
 <strong>动作空间不变</strong>——15 关节 / 14 动作 / 61 维 obs / ONNX 契约全不动；换的是<strong>协议层、寄存器
 语义、增益刻度、物理参数</strong>。这里只把它们落到 <code>~/microduck</code> 的文件。</p>
 <h3 id="08-ipc-cli-apply-3-1-model-rs-常数表整段换语义" class="h-3">3.1 model.rs：常数表整段换语义</h3><p><code>duck-control/src/model.rs</code> 是&quot;机器人=数据&quot;的第一站，飞特换装在这里动四块：</p>
@@ -2246,13 +2246,13 @@ NP-F550 2S Li-ion 标定的，<strong>而飞特是 12 V 系统（9–14 V）</st
 <ul>
 <li><strong>依赖与类型</strong>：<code>use rustypot::servo::dynamixel::xl330::Xl330Controller</code>
 （<code>bus.rs:18</code>）和 <code>Xl330Controller::new().with_protocol_v2().with_serial_port(serial)</code>
-（<code>bus.rs:110</code>）——Dynamixel Protocol 2.0 的控制器，<strong>整个换</strong>成说 FT-SCS 协议的控制器
+（<code>bus.rs:110</code>）——Dynamixel Protocol 2.0 的控制器，<strong>整个换</strong>成说 FT-HLS 协议的控制器
 （自己写一个薄后端，或 vendor 一个支持 HLS 的开源 SDK；你的 <code>ftscs_protocol.md</code> 已存档）。</li>
 <li><strong>每一拍读</strong>：<code>sync_read_raw_data(&amp;ids, READ_ADDR=124, READ_LEN=12)</code>（<code>bus.rs:236</code>）。飞特
 反馈区在<strong>地址 56–70</strong>（当前位置 56/57、当前速度 58/59、电压 62、温度 63、电流 69/70，
 <code>feetech_hls_memtable.md</code> §2.4），不是 124。<code>READ_ADDR</code>/<code>READ_LEN</code> 和 <code>read()</code> 里逐字节
 解码那段（<code>bus.rs:274</code>）都要按飞特反馈表重写。</li>
-<li><strong>好消息：一次事务的哲学能搬。</strong> FT-SCS 有 SYNC READ(0x82)/SYNC WRITE(0x83)
+<li><strong>好消息：一次事务的哲学能搬。</strong> FT-HLS 有 SYNC READ(0x82)/SYNC WRITE(0x83)
 （<code>ftscs_protocol.md</code> §4.6/§4.7），且写明&quot;所有查询长度与首地址必须相同、应答按指令包中 ID
 顺序返回&quot;——这正是 <code>sync_read</code> 的语义。但协议注明&quot;此指令针对部分串行总线舵机开放&quot;，你的
 G 阶段（<code>actuator_physics_swap_plan.md</code> §4 G4）要先拿单舵机验证 <strong>HLS 磁编码款支不支持同步
@@ -2280,7 +2280,7 @@ G 阶段（<code>actuator_physics_swap_plan.md</code> §4 G4）要先拿单舵�
 <li><strong>第 2/4 讲讲过的低通与&quot;下发即到&quot;假设要重新审视</strong>：飞特固件有目标速度+加速度&quot;缓起缓停&quot;
 （ACC@41，0=最大加速度；SPEED@46/47），50 Hz 下发的目标在真机内部按斜坡追——策略训练假设
 &quot;20 ms 内目标基本到位&quot;，慢舵机 + 固件限幅会引入<strong>额外的相位滞后</strong>。sim 侧建模是
-<code>~/microduck_rl</code> 的活（你的 §3.1 HLS2909Actuator），运行时侧要意识到：同一份 obs 布局，喂给
+<code>~/microduck_rl</code> 的活（你的 §3.1 HD1910Actuator），运行时侧要意识到：同一份 obs 布局，喂给
 策略的 <code>joint_pos</code>/<code>joint_vel</code> 的时间语义变了。</li>
 </ul>
 <h3 id="08-ipc-cli-apply-3-4-不改的部分-也列出来-免得下错刀" class="h-3">3.4 不改的部分，也列出来（免得下错刀）</h3><p><code>NUM_JOINTS=15</code> / <code>MOUTH_INDEX=9</code> / <code>ACTION_LEN=14</code> / 61 维 obs 布局 / <code>scatter_action</code> /
@@ -2413,7 +2413,7 @@ quaternion + gyro；你只是把&quot;这 12 字节从哪来&quot;从&quot;总�
 <tr>
 <td><code>duck-control/src/bus.rs</code></td>
 <td><code>Xl330Controller</code>+Protocol2.0+124/136 块</td>
-<td>FT-SCS 后端、反馈表 56–70、单位换算、增益刻度、<code>sync_write</code> 目标地址</td>
+<td>FT-HLS 后端、反馈表 56–70、单位换算、增益刻度、<code>sync_write</code> 目标地址</td>
 <td><strong>重写</strong>（协议整层）；但&quot;一次读 N 个&quot;哲学、stale 计数结构是搬运</td>
 </tr>
 <tr>
@@ -2431,7 +2431,7 @@ quaternion + gyro；你只是把&quot;这 12 字节从哪来&quot;从&quot;总�
 <tr>
 <td>新（或 vendor）</td>
 <td>—</td>
-<td>FT-SCS 协议后端（读写/寄存器 helper）</td>
+<td>FT-HLS 协议后端（读写/寄存器 helper）</td>
 <td>新写，参考 <code>ftscs_protocol.md</code> + memtable</td>
 </tr>
 <tr>

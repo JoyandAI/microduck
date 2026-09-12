@@ -1,7 +1,7 @@
 //! LSM6DSV16X IMU on its own I²C bus, driven directly from Linux i2c-dev.
 //!
 //! This is the linux-only half of the IMU move described in
-//! `docs/design/hls2909-i2c-imu-migration.md` §2.3: instead of the IMU riding the Dynamixel
+//! `docs/design/hd1910-i2c-imu-migration.md` §2.3: instead of the IMU riding the Dynamixel
 //! bus as a 12-byte block read at address 124, the chip is now reached over `/dev/i2c-imu`
 //! (the i2c4 bus) at 0x6A, and the host drives it with ST's official `lsm6dsv16x-rs`
 //! driver. The chip's on-sensor SFLP fusion still ships a game-rotation quaternion and its

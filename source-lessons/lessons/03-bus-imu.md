@@ -5,8 +5,8 @@
 > 谁把 12 字节块递给 `SflpDecoder`。
 > **这一讲最初是你"IMU 不上伺服总线"评估的直接依据；该评估 2026-09-04 已按迁移方案落地。**
 >
-> **迁移注记（2026-09-04，`hls2909-i2c-imu-migration.md`）。** 本讲描述的是**迁移后**结构：
-> 舵机换 Feetech HL-2909-C001（FT-SCS），IMU **不在舵机总线上**，改走 `i2c4` →
+> **迁移注记（2026-09-04，`hd1910-i2c-imu-migration.md`）。** 本讲描述的是**迁移后**结构：
+> 舵机换 Feetech HD1910-C001（FT-HLS），IMU **不在舵机总线上**，改走 `i2c4` →
 > `/dev/i2c-imu`（LSM6DSV16X，0x6A），由 `duck-control/src/imui2c.rs` 的 `ImuIo` 实现读取；
 > `SflpDecoder` **零行改动**（12 字节块契约不变）。§1 的"同一包读"是旧 XL330 时代的做法，
 > 保留作对照，标注哪几行已失效。
@@ -14,7 +14,7 @@
 ## 1. bus.rs：同一条总线、同一包读（—— XL330 时代的旧结构）
 
 > **迁移后：这条"同一包读"已被拆开（2026-09-04）。** 舵机总线改由
-> `duck-control/src/ftbus.rs`（`HlsBusIo`）驱动，用 rustypot 只当 FT-SCS 纯传输层；
+> `duck-control/src/ftbus.rs`（`HlsBusIo`）驱动，用 rustypot 只当 FT-HLS 纯传输层；
 > IMU 由 `duck-control/src/imui2c.rs` 的 `ImuIo` 在 `i2c4` 上单读。下面 §1 逐行描述的是
 > **旧 `bus.rs`（DynamixelIo/XL330）**，保留作对照——`Sensors` 结构与换算方向不变，
 > 只是 IMU 不再排在 `sync_read` 里；已失效的"和舵机同包读 IMU"相关行已在此标注。
@@ -149,13 +149,13 @@ pub fn ready(&self) -> bool { self.quat_samples >= 25 }  // ~0.25 s @ 100 Hz
 
 ### 2.4 迁移后的寄存器对照（ftbus.rs）
 
-| 旧 (Dynamixel XL330) | 新 (Feetech HLS, FT-SCS) |
+| 旧 (Dynamixel XL330) | 新 (Feetech HLS, FT-HLS) |
 |---|---|
 | 每拍 `sync_read` @ 124–136 (12 B) | 每拍 `sync_read` @ `0x38` (15 B = 位置/速度/负载/电压/温度/状态/moving/目标/电流) |
 | IMU 也在 124、各回 12 B | 无 IMU；IMU 走 `/dev/i2c-imu` |
 | 慢速传感器 144–146 单独事务 | `slow_sensors()` 直接返回本 tick 缓存块 |
 | 读写 `0x2A` 目标位置 | 同 `0x2A`（位置伺服 mode 0） |
-| 校验和 Dynamixel v2 | FT-SCS `~(ID+LEN+INST+PARAM)&0xFF` |
+| 校验和 Dynamixel v2 | FT-HLS `~(ID+LEN+INST+PARAM)&0xFF` |
 
 ## 3. 自己动手【无鸭可跑】
 
@@ -177,7 +177,7 @@ cargo test -p duck-control the_first_block_is_never_stale
 
 ## 4. 收尾检查
 
-- [ ] 旧 XL330 时代 IMU 板为什么能和舵机同包读？（答：Dynamixel `sync_read` 同地址同长度多 id；两者都服务 124 地址 12 字节。**迁移后已拆开**：IMU 走 `/dev/i2c-imu`，舵机走 FT-SCS。）
+- [ ] 旧 XL330 时代 IMU 板为什么能和舵机同包读？（答：Dynamixel `sync_read` 同地址同长度多 id；两者都服务 124 地址 12 字节。**迁移后已拆开**：IMU 走 `/dev/i2c-imu`，舵机走 FT-HLS。）
 - [ ] 一个全 0 的 quat 块意味着什么？解码器会怎么做？（答：SFLP 还没写表；保留上次好值，绝不回落 identity）
 - [ ] `gravity` 怎么来的？（答：把世界系 `[0,0,-1]` 用 `last_quat` 反旋回躯干系并单位化）
 - [ ] 迁移后 IMU 读失败会怎样？（答：只降级——保留上次 `ImuData`、错误计数、按 1/10 记日志，整拍不 fail；`imu.rs` 零改动）

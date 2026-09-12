@@ -1,6 +1,6 @@
-//! The Feetech HL-2909-C001 bus driver (FT-SCS protocol).
+//! The Feetech HD1910-C001 bus driver (FT-HLS protocol).
 //!
-//! The `HL-2909` speaks the vendor's `FT-SCS` framing, a Dynamixel-v1-style layout:
+//! The `HD1910` speaks the vendor's `FT-HLS` framing, a Dynamixel-v1-style layout:
 //! `FF FF ID LEN INST PARAMS CHK` with `CHK = ~(ID + LEN + INST + PARAMS) & 0xFF` and
 //! multi-byte values little-endian. We reuse `rustypot`'s `Sts3215Controller` **purely as a
 //! transport layer** (`with_protocol_v1()`); its named register table differs from the
@@ -9,7 +9,7 @@
 //! `write_raw_data` / `ping`) are used. rustypot's proto-1 `sync_read` is exactly "send the
 //! 0x82 packet, then collect each id's reply frame in order", its `StatusPacketV1` checksum
 //! is `~(ID+LEN+ERR+DATA) == CHK` and its params slice is `data[5..3+LEN]` — all aligned
-//! with the FT-SCS spec, and a non-zero status byte is surfaced via `errors()` rather than
+//! with the FT-HLS spec, and a non-zero status byte is surfaced via `errors()` rather than
 //! treated as a frame failure.
 //!
 //! The register addresses, units and conversion factors below are frozen against the
@@ -568,13 +568,13 @@ impl RobotIo for HlsBusIo {
 mod tests {
     use super::*;
 
-    // ── FT-SCS frame bits, checked against the protocol manual examples ─────
+    // ── FT-HLS frame bits, checked against the protocol manual examples ─────
     //
     // rustypot frames these for us; we still verify the byte layout and checksum are the
-    // FT-SCS ones (framing is the part most likely to drift if someone swaps the transport),
+    // FT-HLS ones (framing is the part most likely to drift if someone swaps the transport),
     // purely as an offline checksum exercise — no serial port is faked.
 
-    /// The FT-SCS checksum: `~(ID + LEN + INST + PARAMS) & 0xFF`, summing over bytes.
+    /// The FT-HLS checksum: `~(ID + LEN + INST + PARAMS) & 0xFF`, summing over bytes.
     fn checksum(parts: &[u8]) -> u8 {
         let mut sum: u8 = 0;
         for &p in parts {

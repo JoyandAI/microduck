@@ -844,8 +844,8 @@ fn spawn_control_thread(
         })
 }
 
-/// The servo bus. The migration moves the robot onto the Feetech HL-2909-C001 (`driver =
-/// "hls2909"`), but a robot that is still on XL330 servos falls back to `driver = "xl330"`;
+/// The servo bus. The migration moves the robot onto the Feetech HD1910-C001 (`driver =
+/// "hd1910"`), but a robot that is still on XL330 servos falls back to `driver = "xl330"`;
 /// the two speak different protocols and cannot share a bus, so the driver picks which one
 /// this process opens. Wrapped in an enum so the control loop's generic [`RobotIo`] has a
 /// single concrete type on the real path.
@@ -893,7 +893,7 @@ impl RobotIo for BusIo {
 impl BusIo {
     fn open(port: &str, driver: Driver) -> duck_control::io::Result<Self> {
         match driver {
-            Driver::Hls2909 => Ok(BusIo::Hls(Box::new(duck_control::ftbus::HlsBusIo::open(
+            Driver::Hd1910 => Ok(BusIo::Hls(Box::new(duck_control::ftbus::HlsBusIo::open(
                 port,
             )?))),
             Driver::Xl330 => Ok(BusIo::Dxl(Box::new(duck_control::bus::DynamixelIo::open(

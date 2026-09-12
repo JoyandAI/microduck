@@ -2,7 +2,7 @@
 
 > 目的：本讲收官，做两件事。**(1) 从"外面"看这台机器人**——`duck-ipc-proto` 定义了哪些
 > 上线消息，`robotctl` 怎么通过 unix socket 跟 `robotd` 说话，`monitor`/`health` 显示什么；
-> **(2) 把你在 `~/microduck_rl` 里评估过的两件改造——14 个 XL330 换飞特 HL-2909、IMU 从
+> **(2) 把你在 `~/microduck_rl` 里评估过的两件改造——14 个 XL330 换飞特 HD1910、IMU 从
 > 伺服总线上拿下来直连——落成 `~/microduck` 的"下刀清单"**。前 7 讲教你读懂 20 ms 那一拍，
 > 这一讲回答：改那一拍要从哪几个文件动刀，哪些是搬运、哪些是重写。
 
@@ -189,7 +189,7 @@ NDJSON 流：机器人侧 `robot.subscribe → robot.state` 是 NDJSON，`monito
 
 ---
 
-## 3. 改造切入点 A：14 个 XL330 → 飞特 HL-2909
+## 3. 改造切入点 A：14 个 XL330 → 飞特 HD1910
 
 你在 `~/microduck_rl` 的评估结论（`feetech_hls2915_servo_swap.md` §0/§3.5）已经写清：
 **动作空间不变**——15 关节 / 14 动作 / 61 维 obs / ONNX 契约全不动；换的是**协议层、寄存器
@@ -227,13 +227,13 @@ NDJSON 流：机器人侧 `robot.subscribe → robot.state` 是 NDJSON，`monito
 
 - **依赖与类型**：`use rustypot::servo::dynamixel::xl330::Xl330Controller`
   （`bus.rs:18`）和 `Xl330Controller::new().with_protocol_v2().with_serial_port(serial)`
-  （`bus.rs:110`）——Dynamixel Protocol 2.0 的控制器，**整个换**成说 FT-SCS 协议的控制器
+  （`bus.rs:110`）——Dynamixel Protocol 2.0 的控制器，**整个换**成说 FT-HLS 协议的控制器
   （自己写一个薄后端，或 vendor 一个支持 HLS 的开源 SDK；你的 `ftscs_protocol.md` 已存档）。
 - **每一拍读**：`sync_read_raw_data(&ids, READ_ADDR=124, READ_LEN=12)`（`bus.rs:236`）。飞特
   反馈区在**地址 56–70**（当前位置 56/57、当前速度 58/59、电压 62、温度 63、电流 69/70，
   `feetech_hls_memtable.md` §2.4），不是 124。`READ_ADDR`/`READ_LEN` 和 `read()` 里逐字节
   解码那段（`bus.rs:274`）都要按飞特反馈表重写。
-- **好消息：一次事务的哲学能搬。** FT-SCS 有 SYNC READ(0x82)/SYNC WRITE(0x83)
+- **好消息：一次事务的哲学能搬。** FT-HLS 有 SYNC READ(0x82)/SYNC WRITE(0x83)
   （`ftscs_protocol.md` §4.6/§4.7），且写明"所有查询长度与首地址必须相同、应答按指令包中 ID
   顺序返回"——这正是 `sync_read` 的语义。但协议注明"此指令针对部分串行总线舵机开放"，你的
   G 阶段（`actuator_physics_swap_plan.md` §4 G4）要先拿单舵机验证 **HLS 磁编码款支不支持同步
@@ -263,7 +263,7 @@ NDJSON 流：机器人侧 `robot.subscribe → robot.state` 是 NDJSON，`monito
 - **第 2/4 讲讲过的低通与"下发即到"假设要重新审视**：飞特固件有目标速度+加速度"缓起缓停"
   （ACC@41，0=最大加速度；SPEED@46/47），50 Hz 下发的目标在真机内部按斜坡追——策略训练假设
   "20 ms 内目标基本到位"，慢舵机 + 固件限幅会引入**额外的相位滞后**。sim 侧建模是
-  `~/microduck_rl` 的活（你的 §3.1 HLS2909Actuator），运行时侧要意识到：同一份 obs 布局，喂给
+  `~/microduck_rl` 的活（你的 §3.1 HD1910Actuator），运行时侧要意识到：同一份 obs 布局，喂给
   策略的 `joint_pos`/`joint_vel` 的时间语义变了。
 
 ### 3.4 不改的部分，也列出来（免得下错刀）
@@ -361,10 +361,10 @@ reads` 会在新硬件上要么永远不响、要么开机就误报。这正是�
 | 文件 | 现状 | 飞特 + IMU 直连后 | 搬运 or 重写 |
 |---|---|---|---|
 | `duck-control/src/model.rs` | 常数表（Dynamixel 语义） | `JOINT_IDS` 内容、`EXPECTED_REGISTERS` 整表、`BAUD_RATE` 含义、电池常数(8.2/6.6→12 V 域) | 重写（表换语义），但 `JOINT_NAMES`/`NUM_JOINTS`/`MOUTH_INDEX` 是搬运 |
-| `duck-control/src/bus.rs` | `Xl330Controller`+Protocol2.0+124/136 块 | FT-SCS 后端、反馈表 56–70、单位换算、增益刻度、`sync_write` 目标地址 | **重写**（协议整层）；但"一次读 N 个"哲学、stale 计数结构是搬运 |
+| `duck-control/src/bus.rs` | `Xl330Controller`+Protocol2.0+124/136 块 | FT-HLS 后端、反馈表 56–70、单位换算、增益刻度、`sync_write` 目标地址 | **重写**（协议整层）；但"一次读 N 个"哲学、stale 计数结构是搬运 |
 | `duck-control/src/imu.rs` | `SflpDecoder`（总线块解码） | 路线①：原样复用，换数据来源 | **搬运** |
 | `duck-control/src/io.rs` | `RobotIo::read` 一事务拿 joints+imu | 拆源后 trait 语义要改（读只回关节，IMU 走新源），`Sensors` 保留 | 半搬半写 |
-| 新（或 vendor） | — | FT-SCS 协议后端（读写/寄存器 helper） | 新写，参考 `ftscs_protocol.md` + memtable |
+| 新（或 vendor） | — | FT-HLS 协议后端（读写/寄存器 helper） | 新写，参考 `ftscs_protocol.md` + memtable |
 | `robotd/src/main.rs` + `robotd-params` | 单端口 `bus.port=/dev/ttyS2` | 第二 IMU 端口的打开、权限、`imu.port` 参数 | 小改（新增一个打开点） |
 | `obs.rs` / `policy.rs` / `safety.rs` / `fall.rs` / `duck-ipc-proto` | — | **完全不动** | 搬运（零改动） |
 
