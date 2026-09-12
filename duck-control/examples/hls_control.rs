@@ -54,21 +54,21 @@ const fn tune(limit_deg: f64, torque: u16) -> Tune {
 /// (id 12 kept the old 100 because that slot was `head_yaw`).
 const fn tune_for(id: u8) -> Tune {
     match id {
-        10 => tune(30.0, 100), // right_hip_yaw
-        11 => tune(24.0, 200), // right_hip_roll
-        12 => tune(30.0, 200), // right_hip_pitch
-        13 => tune(30.0, 100), // right_knee
-        14 => tune(30.0, 100), // right_ankle
-        20 => tune(30.0, 100), // left_hip_yaw
-        21 => tune(24.0, 200), // left_hip_roll
-        22 => tune(30.0, 200), // left_hip_pitch
-        23 => tune(30.0, 100), // left_knee
-        24 => tune(30.0, 100), // left_ankle
+        10 => tune(30.0, 100),  // right_hip_yaw
+        11 => tune(24.0, 200),  // right_hip_roll
+        12 => tune(30.0, 200),  // right_hip_pitch
+        13 => tune(30.0, 100),  // right_knee
+        14 => tune(30.0, 100),  // right_ankle
+        20 => tune(30.0, 100),  // left_hip_yaw
+        21 => tune(24.0, 200),  // left_hip_roll
+        22 => tune(30.0, 200),  // left_hip_pitch
+        23 => tune(30.0, 100),  // left_knee
+        24 => tune(30.0, 100),  // left_ankle
         30 => tune(30.0, 1000), // neck_pitch
-        31 => tune(30.0, 200), // head_pitch
-        32 => tune(30.0, 100), // head_yaw
-        33 => tune(30.0, 100), // head_roll
-        34 => tune(35.0, 80),  // mouth
+        31 => tune(30.0, 200),  // head_pitch
+        32 => tune(30.0, 100),  // head_yaw
+        33 => tune(30.0, 100),  // head_roll
+        34 => tune(35.0, 80),   // mouth
         _ => tune(0.0, 0),
     }
 }
@@ -299,7 +299,10 @@ fn park_at_zero(
         match farthest {
             None => return Ok(()),
             Some((id, _)) if Instant::now() >= deadline => {
-                eprintln!("id {id} did not reach 0° in {}s; continuing", LEG_TIMEOUT.as_secs());
+                eprintln!(
+                    "id {id} did not reach 0° in {}s; continuing",
+                    LEG_TIMEOUT.as_secs()
+                );
                 return Ok(());
             }
             _ => thread::sleep(POLL),
@@ -765,11 +768,7 @@ fn read_u16(
 
 fn sign_mag(v: i16) -> u16 {
     let mag = v.unsigned_abs();
-    if v < 0 {
-        mag | 0x8000
-    } else {
-        mag
-    }
+    if v < 0 { mag | 0x8000 } else { mag }
 }
 
 fn steps_per_s_to_deg_s(lsb: u16) -> f64 {
