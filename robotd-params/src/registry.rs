@@ -80,8 +80,8 @@ pub const REGISTRY: &[Entry] = &[
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
     entry(
         "bus.driver",
-        Kind::Choice(&["hls2909", "xl330"]),
-        "Which servo driver: hls2909 (Feetech, default) or xl330 (Dynamixel fallback)",
+        Kind::Choice(&["hd1910", "xl330"]),
+        "Which servo driver: hd1910 (Feetech, default) or xl330 (Dynamixel fallback)",
     ),
     // ── [imu] ────────────────────────────────────────────────────────────────
     entry(

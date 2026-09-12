@@ -1,4 +1,4 @@
-# HL-2909-C001 舵机 + I²C IMU 迁移方案（microduck 运行时）
+# HD1910-C001 舵机 + I²C IMU 迁移方案（microduck 运行时）
 
 > Status: **已实施（2026-09-07 晨完成并验证）** · 原计划多 agent 分阶段落地，≥18:00 开工。
 > 本文件是修改的唯一依据（契约冻结）。
@@ -29,10 +29,10 @@
   **注意**：宿主无 gstreamer 开发库，`cargo check --workspace` 会因 `mediad`
   （gstreamer-sys）失败——属既有环境限制，本地验证以"本方案涉及的各包"为范围，
   mediad 不在改动范围内；CI 会覆盖全量。
-- 舵机：**Feetech HL-2909-C001**（12V 9 kg·cm 铁芯恒力双轴 TTL 总线舵机，4096/圈、
+- 舵机：**Feetech HD1910-C001**（12V 9 kg·cm 铁芯恒力双轴 TTL 总线舵机，4096/圈、
   0.087°/unit、中位 2048、77 RPM、22.5 g）。权威资料在 **microduck_rl** 仓库：
   - `docs/feetech_hls_memtable.md` —— 官方内存表（寄存器地址 = 唯一定义）
-  - `docs/ftscs_protocol.md` —— FT-SCS 协议（帧格式、0x82 同步读、0x83 同步写、
+  - `docs/ftscs_protocol.md` —— FT-HLS 协议（帧格式、0x82 同步读、0x83 同步写、
     0x0B 位置校准；帧格式 = Dynamixel v1 风格：`FF FF ID LEN INST PARAMS CHK`，
     `CHK = ~(ID+LEN+INST+PARAMS) & 0xFF`，多字节小端）
   - `docs/feetech_hls2915_servo_swap.md` —— RL 侧完整分析（BAM/重训，**不在本仓库范围**，
@@ -56,7 +56,7 @@
    **开放问题 O1**：代码侧先保留映射并加注释、参数可调；机械/电气侧定案后回填。
 2. **IMU 总线 i2c4（引脚 27/28，板载上拉）**，别名 `/dev/i2c-imu`；地址 0x6A。
    备选（配置即支持）：HAT i2c3（注意 tofd 启动时 550 KB 固件上传占用总线）。
-3. **mouth（第 15 个）舵机**默认也换 HLS2909（同一总线只能一种协议；XL330 是 v2，
+3. **mouth（第 15 个）舵机**默认也换 HD1910（同一总线只能一种协议；XL330 是 v2，
    HLS 是 v1 风格帧，不能混）。**开放问题 O2**：若 mouth 保留 XL330，需单独一条总线
    + 单独代码路径，不在本方案内。
 
@@ -66,9 +66,9 @@
 > （obs / safety / fall / odometry / 状态流）**不变**；`imu.rs` 的 `SflpDecoder`
 > **零行改动**（12 字节块契约不变）。
 
-### 2.1 `duck-control/src/ftbus.rs`（新）—— HLS2909 总线驱动
+### 2.1 `duck-control/src/ftbus.rs`（新）—— HD1910 总线驱动
 
-FT-SCS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
+FT-HLS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
 
 - **帧/校验和**：按 `ftscs_protocol.md`；指令：PING 0x01、READ 0x02、WRITE 0x03、
   SYNC_READ 0x82、SYNC_WRITE 0x83、位置校准 0x0B（无参数=校到中位；HLS ≥3.43 支持，
@@ -78,8 +78,8 @@ FT-SCS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
   在 34/35/36 处不同，地址一律自定常量），调用宏生成的
   `sync_read_raw_data(&ids, addr, len)` / `sync_write_raw_data(&ids, addr, &data)`。
   核实结论：rustypot proto1 的 `sync_read` 就是"发 0x82 包 → 按 ID 顺序逐个读取应答帧"，
-  `StatusPacketV1` 的校验和算法与 FT-SCS 一致（`~(ID+LEN+ERR+DATA) == CHK`），
-  params 提取（`data[5..3+LEN]`）与 FT-SCS 应答帧对齐，且**非零状态字不视为错误**
+  `StatusPacketV1` 的校验和算法与 FT-HLS 一致（`~(ID+LEN+ERR+DATA) == CHK`），
+  params 提取（`data[5..3+LEN]`）与 FT-HLS 应答帧对齐，且**非零状态字不视为错误**
   （以 `errors()` 暴露，帧仍解析成功）——完全兼容；`sync_write`（0x83，广播，
   读回无应答）同样兼容。30 ms 超时照抄 `bus.rs`。若上板发现兼容性问题，回退自实现
   （参照 `microduck_rl/scripts/read_hls_registers.py`）。
@@ -179,7 +179,7 @@ FT-SCS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
 ### 2.5 `robotd-params` + `robotd` 集成
 
 - `robotd-params/src/lib.rs`：
-  - `Bus { port, driver }`，`driver: "hls2909" | "xl330"`（默认 `"hls2909"`；
+  - `Bus { port, driver }`，`driver: "hd1910" | "xl330"`（默认 `"hd1910"`；
     默认值即迁移目标，旧机器人用 `driver="xl330"` 回退）；
   - 新增 `Imu { bus: PathBuf("/dev/i2c-imu" 默认), address: u8(0x6A) }` 段；
   - `registry.rs` 同步新增 key（说明/默认值/枚举），并满足其一致性测试。
@@ -267,7 +267,7 @@ FT-SCS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
 - O1 电池测量来源（12V 供电方案）；O2 mouth 是否换装；O3 Kp/Kd 默认值；
   O4 电流偏置扣除；O5 min/max 电压寄存器值。
 - 风险 R1：无实机，寄存器/时序只能按文档 + 单测保证，上板调试是下一阶段；
-  R2（已消除）：rustypot proto1 帧/校验和/应答解析与 FT-SCS 协议源码级核对一致
+  R2（已消除）：rustypot proto1 帧/校验和/应答解析与 FT-HLS 协议源码级核对一致
   （见 §2.1 传输层），无需自实现帧层；
   R3：`Sensors.imu` 由调用方填充后，任何新消费者可能忘记填充 —— 用
   `FakeIo`/文档醒目注释 + robotd 合成点唯一化缓解；

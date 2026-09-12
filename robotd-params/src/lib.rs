@@ -791,8 +791,8 @@ impl Default for SafetyParams {
 pub struct Bus {
     /// Serial port the servos share. The Radxa Zero 3W wires them to `/dev/ttyS2`.
     pub port: String,
-    /// Which servo driver the serial bus speaks. [`Driver::Hls2909`] (the Feetech
-    /// HL-2909-C001) is the default and the migration target; [`Driver::Xl330`] (the
+    /// Which servo driver the serial bus speaks. [`Driver::Hd1910`] (the Feetech
+    /// HD1910-C001) is the default and the migration target; [`Driver::Xl330`] (the
     /// Dynamixel XL330) is the fallback for a robot whose servos were not migrated.
     pub driver: Driver,
 }
@@ -800,15 +800,15 @@ pub struct Bus {
 /// The servo bus driver — which protocol the serial port speaks.
 ///
 /// A bus can only carry one protocol, so this is a choice rather than free text. The default
-/// is [`Driver::Hls2909`], the migration target; an old robot that is still on XL330 servos
-/// sets `driver = "xl330"` (the migration doc `docs/design/hls2909-i2c-imu-migration.md` §1
+/// is [`Driver::Hd1910`], the migration target; an old robot that is still on XL330 servos
+/// sets `driver = "xl330"` (the migration doc `docs/design/hd1910-i2c-imu-migration.md` §1
 /// keeps it as the fallback).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Driver {
-    /// Feetech HL-2909-C001 (FT-SCS framing).
+    /// Feetech HD1910-C001 (FT-HLS framing).
     #[default]
-    Hls2909,
+    Hd1910,
     /// Dynamixel XL330 (Dynamixel 2.0 framing).
     Xl330,
 }
@@ -817,7 +817,7 @@ impl Driver {
     /// The name this driver has in the file.
     pub fn as_str(self) -> &'static str {
         match self {
-            Driver::Hls2909 => "hls2909",
+            Driver::Hd1910 => "hd1910",
             Driver::Xl330 => "xl330",
         }
     }
