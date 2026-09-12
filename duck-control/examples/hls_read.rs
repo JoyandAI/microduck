@@ -291,20 +291,8 @@ fn render(
     );
 
     [
-        names,
-        ids,
-        pos_deg,
-        pos_rad,
-        rpm,
-        load,
-        volt,
-        curr,
-        temp,
-        moving,
-        goal,
-        status,
-        async_flag,
-        footer,
+        names, ids, pos_deg, pos_rad, rpm, load, volt, curr, temp, moving, goal, status,
+        async_flag, footer,
     ]
 }
 
