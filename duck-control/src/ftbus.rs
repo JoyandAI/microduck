@@ -1,4 +1,4 @@
-//! The Feetech HD1910-C001 bus driver (FT-HLS protocol).
+//! The Feetech bus driver (FT-HLS protocol): HD1910 servos today, a bus IMU later.
 //!
 //! The `HD1910` speaks the vendor's `FT-HLS` framing, a Dynamixel-v1-style layout:
 //! `FF FF ID LEN INST PARAMS CHK` with `CHK = ~(ID + LEN + INST + PARAMS) & 0xFF` and
@@ -17,15 +17,19 @@
 //! (`feetech_hls2915_servo_swap.md`). Values flagged as "pending calibration" (O3/O5) are
 //! documented in place and must be backfilled on hardware before shipping.
 //!
-//! The IMU no longer rides this bus — it moves to its own I²C link ([`crate::imu`] +
-//! `ImuIo`) — so [`RobotIo::read`] here leaves `Sensors::imu` at its default and the caller
-//! fuses the IMU sample from the separate `ImuIo` on the same tick.
+//! **This type is Feetech-only.** [`crate::bus::DynamixelIo`] is the XL330 path and is not
+//! extended here. Today [`FeetechIo`] talks to the fifteen joints; [`crate::model::IMU_DXL_ID`]
+//! (200) is reserved for a later Feetech IMU node on this same bus — the same shape the
+//! original MicroDuck used on Dynamixel. Until that node exists, [`RobotIo::read`] leaves
+//! `Sensors::imu` at its default and the caller fills it from I²C [`crate::io::ImuIo`] on
+//! the same tick.
 
 use std::f64::consts::PI;
 use std::time::Duration;
 
 use rustypot::servo::feetech::sts3215::Sts3215Controller;
 
+use crate::hardware::HD1910_FIRMWARE;
 use crate::imu::ImuData;
 use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{BAUD_RATE, JOINT_IDS, NUM_JOINTS};
@@ -78,6 +82,22 @@ const TICK_READ_LEN: u8 = 15;
 /// bounded hiccup rather than stalling the loop on the serial driver's default.
 const READ_TIMEOUT: Duration = Duration::from_millis(30);
 
+/// HLSCL mode 4: pure position PD (HD1910 factory / Sim2Real). Register 33 sits in the
+/// EEPROM window (5..=39); a locked EPROM silently drops the write — `hls_control` had to
+/// unlock around this. Mode 0 is the HLS "angle servo with force limit"; BAM identified
+/// the HD1910 in mode 4, so that is what we write.
+const MODE_SERVO: u8 = HD1910_FIRMWARE.mode;
+
+/// Production [`encode_write_pos_ex`] fields, from the HD1910 bring-up in `hls_control`.
+///
+/// Accel 0 = maximum. Goal speed 0 = maximum **steps/s** (not the 0.732 RPM present-speed
+/// LSB). Torque is 0.1% LSB; 980 is the same cap as `max_torque` / `TORQUE_LIMIT`.
+const WRITE_POS_EX_ACCEL: u8 = 0;
+const WRITE_POS_EX_SPEED: u16 = 0;
+const WRITE_POS_EX_TORQUE: u16 = 980;
+const TORQUE_LIMIT_LSB: u16 = 980;
+const PROTECTION_CURRENT_BYTES: [u8; 2] = HD1910_FIRMWARE.protection_current_lsb.to_le_bytes();
+
 /// Position counts per revolution (4096), single-turn.
 const POSITION_COUNTS_PER_REV: f64 = 4096.0;
 const RAD_PER_POSITION_COUNT: f64 = 2.0 * PI / POSITION_COUNTS_PER_REV;
@@ -122,6 +142,19 @@ pub fn position_to_rad(count: u16) -> Option<f64> {
 pub fn rad_to_position_count(rad: f64) -> u16 {
     let count = (rad + PI) / RAD_PER_POSITION_COUNT;
     count.clamp(0.0, MAX_POSITION_COUNT as f64).round() as u16
+}
+
+/// HLSCL `WritePosEx`: one 7-byte block at ACCEL (41) =
+/// `acc | pos_l pos_h | torque_l torque_h | speed_l speed_h`.
+///
+/// Split writes that only poke [`reg::GOAL_POSITION`] leave goal-torque (44) at 0 and do
+/// not arm a move the way the HD1910 firmware expects — that is what `hls_control` found
+/// on the robot, and it is why [`FeetechIo::write`] sends this block rather than 2 bytes.
+pub fn encode_write_pos_ex(pos: u16, speed: u16, acc: u8, torque: u16) -> [u8; 7] {
+    let p = pos.to_le_bytes();
+    let t = torque.to_le_bytes();
+    let s = speed.to_le_bytes();
+    [acc, p[0], p[1], t[0], t[1], s[0], s[1]]
 }
 
 /// Present-speed counts → rad/s.
@@ -225,15 +258,15 @@ pub struct RegisterExpectation {
     pub want: &'static [u8],
 }
 
-/// EEPROM registers asserted (and corrected) by [`HlsBusIo::check_registers`].
+/// EEPROM registers asserted (and corrected) by [`FeetechIo::check_registers`].
 ///
 /// These live in the EEPROM range; correcting them requires opening the write lock
 /// (`reg::LOCK` = 0) and re-locking afterward. The SRAM registers that must be re-applied on
-/// every boot (mode/accel/goal_speed/torque_limit) are written by [`HlsBusIo::apply_startup`]
+/// every boot (mode/accel/goal_speed/torque_limit) are written by [`FeetechIo::apply_startup`]
 /// and are not listed here.
 ///
-/// **O5** — `max_voltage`/`min_voltage` use the 12 V system placeholders (14.0 V / 10.0 V).
-/// They are listed but not depended on until hardware calibration confirms the values.
+/// **Voltage window is the HD1910 spec (4.0–8.4 V), not the 12 V HLS placeholders.**
+/// A 2S pack at 7.4 V would trip a 10 V minimum.
 pub const HLS_EEPROM_EXPECTED: &[RegisterExpectation] = &[
     RegisterExpectation {
         name: "baud",
@@ -269,25 +302,37 @@ pub const HLS_EEPROM_EXPECTED: &[RegisterExpectation] = &[
         name: "max_voltage",
         addr: reg::MAX_VOLTAGE,
         len: 1,
-        want: &[140],
-    }, // 14.0 V, O5
+        want: &[HD1910_FIRMWARE.max_voltage_lsb],
+    }, // 8.4 V
     RegisterExpectation {
         name: "min_voltage",
         addr: reg::MIN_VOLTAGE,
         len: 1,
-        want: &[100],
-    }, // 10.0 V, O5
+        want: &[HD1910_FIRMWARE.min_voltage_lsb],
+    }, // 4.0 V
+    RegisterExpectation {
+        name: "protection_current",
+        addr: reg::PROTECTION_CURRENT,
+        len: 2,
+        want: &PROTECTION_CURRENT_BYTES,
+    }, // 500 LSB = 3.25 A
     RegisterExpectation {
         name: "max_torque",
         addr: reg::MAX_TORQUE,
         len: 2,
         want: &[0xD4, 0x03],
     }, // 980 (0.1%)
+    RegisterExpectation {
+        name: "mode",
+        addr: reg::MODE,
+        len: 1,
+        want: &[MODE_SERVO],
+    },
 ];
 
 // ── the bus ──────────────────────────────────────────────────────────────────
 
-pub struct HlsBusIo {
+pub struct FeetechIo {
     controller: Sts3215Controller,
     /// Servo ids in [`crate::model::JOINT_IDS`] order — the order blocks come back in.
     ids: Vec<u8>,
@@ -297,7 +342,7 @@ pub struct HlsBusIo {
     last_temps_c: [f64; NUM_JOINTS],
 }
 
-impl HlsBusIo {
+impl FeetechIo {
     /// Open the bus and apply the per-boot startup register writes.
     ///
     /// Verifies every servo answers, then writes the SRAM/operational registers and leaves
@@ -328,6 +373,9 @@ impl HlsBusIo {
 
     /// Confirm every servo is present. One missing servo means a `sync_read` below would fail
     /// the whole transaction anyway, so it is better to say so at open.
+    ///
+    /// Only [`JOINT_IDS`]. [`crate::model::IMU_DXL_ID`] (200) is reserved for a later
+    /// Feetech IMU node and is not pinged yet.
     fn ping_all(&mut self) -> Result<()> {
         for &id in &JOINT_IDS {
             let alive = self
@@ -341,25 +389,19 @@ impl HlsBusIo {
         Ok(())
     }
 
-    /// Write the SRAM/operational registers that must be in place for this session. These are
-    /// SRAM (mode/accel/speed/torque_limit) for the most part and lose their value on reboot,
-    /// so they are re-applied at every open. EEPROM persistence is handled by
-    /// [`HlsBusIo::check_registers`].
+    /// Write the operational registers this session needs. EEPROM persistence (angle limits,
+    /// voltages, baud, **mode**) is [`FeetechIo::check_registers`]; mode is also forced here
+    /// because a servo left in electric mode by `hls_control` must be a position servo
+    /// before the first tick, and register 33 is in the EEPROM window — writing it while
+    /// locked is a silent no-op.
     fn apply_startup(&mut self) -> Result<()> {
         for &id in &JOINT_IDS {
-            self.write_register(id, reg::MODE, &[0])?; // 位置伺服模式
-            self.write_register(id, reg::ACCEL, &[0])?; // 0 = 最大加速度
-            self.write_register(id, reg::GOAL_SPEED, &32767u16.to_le_bytes())?; // 最大 (受出厂参数 84 限制)
-            self.write_register(id, reg::TORQUE_LIMIT, &980u16.to_le_bytes())?; // 98%
-            self.write_register(id, reg::ANGLE_LIMIT_MIN, &0u16.to_le_bytes())?;
-            self.write_register(id, reg::ANGLE_LIMIT_MAX, &4095u16.to_le_bytes())?;
-            self.write_register(id, reg::MAX_TEMPERATURE, &[70])?;
-            self.write_register(id, reg::RESPONSE_LEVEL, &[1])?;
-            // O5: 12 V system placeholders, pending hardware calibration.
-            self.write_register(id, reg::MAX_VOLTAGE, &[140])?; // 14.0 V
-            self.write_register(id, reg::MIN_VOLTAGE, &[100])?; // 10.0 V
-            // Torque defaults off — matching RobotIo::set_torque's "nothing at startup".
+            // Torque off before touching mode, matching `hls_control::set_mode`.
             self.write_register(id, reg::TORQUE_ENABLE, &[0])?;
+            self.write_register(id, reg::LOCK, &[0])?;
+            self.write_register(id, reg::MODE, &[MODE_SERVO])?;
+            self.write_register(id, reg::LOCK, &[1])?;
+            self.write_register(id, reg::TORQUE_LIMIT, &TORQUE_LIMIT_LSB.to_le_bytes())?;
         }
         Ok(())
     }
@@ -468,7 +510,7 @@ impl HlsBusIo {
     }
 }
 
-impl RobotIo for HlsBusIo {
+impl RobotIo for FeetechIo {
     fn read(&mut self) -> Result<Sensors> {
         let blocks = self
             .controller
@@ -506,28 +548,41 @@ impl RobotIo for HlsBusIo {
     }
 
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
+        // One `WritePosEx` block per joint (accel + pos + torque + speed at ACCEL), not a
+        // 2-byte GOAL_POSITION poke — that leaves goal-torque at 0 and the HD1910 does not
+        // take the step. See [`encode_write_pos_ex`].
         let data: Vec<Vec<u8>> = targets
             .positions
             .iter()
-            .map(|&rad| rad_to_position_count(rad).to_le_bytes().to_vec())
+            .map(|&rad| {
+                encode_write_pos_ex(
+                    rad_to_position_count(rad),
+                    WRITE_POS_EX_SPEED,
+                    WRITE_POS_EX_ACCEL,
+                    WRITE_POS_EX_TORQUE,
+                )
+                .to_vec()
+            })
             .collect();
         self.controller
-            .sync_write_raw_data(&self.ids, reg::GOAL_POSITION, &data)
-            .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
+            .sync_write_raw_data(&self.ids, reg::ACCEL, &data)
+            .map_err(|e| IoError::Bus(format!("sync_write WritePosEx: {e}")))
     }
 
     fn set_torque(&mut self, on: bool) -> Result<()> {
         // The inherent method, which is what `robotd init` uses on the way down.
-        HlsBusIo::set_torque(self, on)
+        FeetechIo::set_torque(self, on)
     }
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {
-        // `kp` is the raw register value for reg 50 (0..254). Kd/Ki are forced to 0: the
-        // position-mode Ki is ineffective, and the Kd/Kp defaults are pending calibration
-        // (O3) — see feetech_hls2915_servo_swap.md §3.5.
-        const KD: u8 = 0;
-        const KI: u8 = 0;
-        let kp_byte = kp as u8;
+        // `kp` is the raw register value for reg 50 (0..254). Kd/Ki are the BAM-identified
+        // firmware values (40/0): position-mode Ki is inert, and the HD1910 factory D is 40
+        // not 32. See `crate::hardware::HD1910_FIRMWARE`.
+        const KD: u8 = HD1910_FIRMWARE.kd;
+        const KI: u8 = HD1910_FIRMWARE.ki;
+        // Register 50 is 0..=254. BAM identified Kp=32; clamp so a leftover 1023 from an
+        // XL330 config cannot wrap.
+        let kp_byte = kp.min(254) as u8;
         for &id in &JOINT_IDS {
             self.write_register(id, reg::KP, &[kp_byte])?;
             self.write_register(id, reg::KD, &[KD])?;
@@ -736,8 +791,37 @@ mod tests {
         assert!(expect(reg::ANGLE_LIMIT_MIN, &[0, 0]));
         assert!(expect(reg::ANGLE_LIMIT_MAX, &[0xFF, 0x0F])); // 4095
         assert!(expect(reg::MAX_TEMPERATURE, &[70]));
-        assert!(expect(reg::MAX_VOLTAGE, &[140])); // 14.0 V, O5
-        assert!(expect(reg::MIN_VOLTAGE, &[100])); // 10.0 V, O5
+        assert!(expect(reg::MAX_VOLTAGE, &[HD1910_FIRMWARE.max_voltage_lsb]));
+        assert!(expect(reg::MIN_VOLTAGE, &[HD1910_FIRMWARE.min_voltage_lsb]));
+        assert!(expect(
+            reg::PROTECTION_CURRENT,
+            &HD1910_FIRMWARE.protection_current_lsb.to_le_bytes()
+        ));
         assert!(expect(reg::MAX_TORQUE, &[0xD4, 0x03])); // 980 (0.1%)
+        assert!(expect(reg::MODE, &[MODE_SERVO]));
+        assert_eq!(MODE_SERVO, 4);
+    }
+
+    /// Pin the `WritePosEx` layout `hls_control` uses: 7 bytes at ACCEL, little-endian.
+    #[test]
+    fn write_pos_ex_is_acc_pos_torque_speed() {
+        let block = encode_write_pos_ex(2048, 800, 20, 100);
+        assert_eq!(block.len(), 7);
+        assert_eq!(block[0], 20); // acc
+        assert_eq!(&block[1..3], &2048u16.to_le_bytes()); // pos
+        assert_eq!(&block[3..5], &100u16.to_le_bytes()); // torque
+        assert_eq!(&block[5..7], &800u16.to_le_bytes()); // speed
+        // Mid-count 2048 is 0 rad, which is what the bring-up parks at.
+        assert_eq!(rad_to_position_count(0.0), 2048);
+        let production = encode_write_pos_ex(
+            rad_to_position_count(0.0),
+            WRITE_POS_EX_SPEED,
+            WRITE_POS_EX_ACCEL,
+            WRITE_POS_EX_TORQUE,
+        );
+        assert_eq!(production[0], 0);
+        assert_eq!(&production[1..3], &2048u16.to_le_bytes());
+        assert_eq!(&production[3..5], &980u16.to_le_bytes());
+        assert_eq!(&production[5..7], &0u16.to_le_bytes());
     }
 }

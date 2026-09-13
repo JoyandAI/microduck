@@ -504,7 +504,18 @@ i2c4, aliased `/dev/i2c-imu` (`setup-board.sh` installs the `i2c4-imu` overlay a
 ```
 sudo i2cdetect -y 4        # expect 0x6A (LSM6DSV16X)
 ls -l /dev/i2c-imu
+imu_probe --hz 50          # or imu_probe /dev/i2c-5 0x6A if the alias is empty
 ```
+
+Cross-compile and copy from a Windows/WSL machine:
+[`bringup-examples.md`](bringup-examples.md). HD1910 bus tools are `hls_read` (status)
+and `hls_control` (sweep/write) on `/dev/ttyS2`; stop `robotd` first.
+
+With the duck **standing upright**, `imu_probe`'s `gravity` should be about `[0, 0, -1]`.
+That is the trunk-frame projected gravity (`ImuData.gravity`), the same vector `fallen`
+is decided from. Chip-up on a desk reads about `[-1, 0, 0]` because of `DEFAULT_MOUNT`
+(+90° about Y). `ready=false` with gravity stuck at `[0, 0, -1]` is the decoder default,
+not a live upright sample.
 
 An IMU that stops fusing shows up as `orientation frozen — N stale reads` in `robotctl health`
 and `monitor`, not as a servo-bus error.

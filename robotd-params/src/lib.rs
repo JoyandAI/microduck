@@ -32,6 +32,7 @@ pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Params {
+    pub platform: Platform,
     pub bus: Bus,
     pub imu: Imu,
     pub control: Control,
@@ -532,8 +533,9 @@ pub struct PolicyParams {
     pub standing_action_scale: f64,
     /// Standing runs softer, at this fraction of `gain`.
     pub standing_gain_ratio: f64,
-    /// Position P gain while running.
-    pub gain: u16,
+    /// Position P gain while running. Unset resolves per [`Variant`]: 32 OpenMicroDuck
+    /// (HD1910 BAM Kp), 200 MicroDuck (XL330 prototype).
+    pub gain: Option<u16>,
     /// First-order low-pass on the head joint targets, `1.0` = pass-through. Default 0.5
     /// in both modes — the value the alpha policies are *trained* with, so it must match
     /// or transfer degrades. (The roller preset used to ship it off; the prototype rebased
@@ -561,8 +563,10 @@ pub struct PolicyParams {
     /// servos' effective kP tracks their supply, so this holds the robot's response steady
     /// as the pack sags. Off by default, as in the prototype.
     pub voltage_adapt: bool,
-    /// Reference voltage for `voltage_adapt` — the supply the gains were identified at.
-    pub nominal_voltage: f64,
+    /// Reference voltage for `voltage_adapt` — the 2S pack both variants run from.
+    /// Unset is 7.4 V (OpenMicroDuck HD1910 and MicroDuck XL330). BAM identified the
+    /// HD1910 at `vin=6.0`; that is a model condition, not this default.
+    pub nominal_voltage: Option<f64>,
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
@@ -603,7 +607,13 @@ pub struct ResolvedPolicy {
 }
 
 impl PolicyParams {
+    /// Resolve against the default variant ([`Variant::OpenMicroDuck`]). Prefer
+    /// [`Self::resolved_for`] when the board's variant is known.
     pub fn resolved(&self) -> ResolvedPolicy {
+        self.resolved_for(Variant::default())
+    }
+
+    pub fn resolved_for(&self, variant: Variant) -> ResolvedPolicy {
         let release = |name: &str| PathBuf::from(RELEASE_DIR).join("policies").join(name);
         let path = |field: &Option<PathBuf>, default: Option<&str>| -> Option<PathBuf> {
             match field {
@@ -652,7 +662,7 @@ impl PolicyParams {
             }),
             standing_action_scale: self.standing_action_scale,
             standing_gain_ratio: self.standing_gain_ratio,
-            gain: self.gain,
+            gain: self.gain.unwrap_or(variant.running_gain()),
             head_lowpass: Some(self.head_lowpass.unwrap_or(0.5)).filter(|a| *a < 1.0),
             legs_lowpass: Some(self.legs_lowpass.unwrap_or(0.7)).filter(|a| *a < 1.0),
             ground_pick_period: self.ground_pick_period.unwrap_or(match self.mode {
@@ -669,7 +679,7 @@ impl PolicyParams {
             roulade_action_scale: self.roulade_action_scale,
             roulade_gain_ratio: self.roulade_gain_ratio,
             voltage_adapt: self.voltage_adapt,
-            nominal_voltage: self.nominal_voltage,
+            nominal_voltage: self.nominal_voltage.unwrap_or(variant.nominal_voltage()),
         }
     }
 }
@@ -685,7 +695,8 @@ pub struct SafetyParams {
     /// Intent age past which the velocity is zeroed. Stop, not limp.
     pub deadman_ms: u64,
     /// The gain limp-fall yields at — low enough to give way rather than fight the floor.
-    pub gain_limp: u16,
+    /// Unset resolves per [`Variant`]: 8 OpenMicroDuck, 50 MicroDuck.
+    pub gain_limp: Option<u16>,
     /// Sit down and power the machine off when the battery EMA reaches the empty floor
     /// (6.6 V — `duck_control::model::BATTERY_EMPTY_V`). The EMA moves over ~10 s, so a
     /// load sag cannot trip it.
@@ -748,7 +759,7 @@ impl Default for PolicyParams {
             standing_action_scale: 1.0,
             // The prototype's `--standing-kp-ratio`.
             standing_gain_ratio: 0.8,
-            gain: 200,
+            gain: None,
             head_lowpass: None,
             legs_lowpass: None,
             ground_pick_period: None,
@@ -759,7 +770,7 @@ impl Default for PolicyParams {
             roulade_action_scale: 1.0,
             roulade_gain_ratio: 1.0,
             voltage_adapt: false,
-            nominal_voltage: 7.4,
+            nominal_voltage: None,
         }
     }
 }
@@ -770,7 +781,7 @@ impl Default for SafetyParams {
             fall_gravity_z: -0.5,
             fall_debounce_ms: 200,
             deadman_ms: 500,
-            gain_limp: 50,
+            gain_limp: None,
             battery_empty_shutdown: true,
             limp_fall: true,
             limp_fall_tilt_z: -0.90,
@@ -782,6 +793,90 @@ impl Default for SafetyParams {
             limp_fall_max_ms: 1500,
             limp_fall_pose_ms: 600,
             limp_fall_pose_gain: 160,
+        }
+    }
+}
+
+/// Which physical robot this board is. One switch: servo protocol, IMU source, and the
+/// actuator numbers (gain, limp gain) all resolve from here. Both variants use a 2S
+/// pack, so unset `policy.nominal_voltage` is 7.4 V either way.
+///
+/// Analogous to [`Mode`]: one line, not three that an operator has to keep consistent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Variant {
+    /// OpenMicroDuck: Feetech HD1910 + I²C IMU. The default — this is the robot being
+    /// developed. BAM M1 snapshot is `duck_control::HD1910_BAM_M1`.
+    #[default]
+    #[serde(rename = "open_microduck")]
+    OpenMicroDuck,
+    /// Original MicroDuck (`2c61dcc` and earlier): Dynamixel XL330 + IMU on the servo bus
+    /// (ID 200).
+    #[serde(rename = "microduck")]
+    MicroDuck,
+}
+
+/// Every variant name the file uses, in editor order.
+pub const VARIANT_LABELS: &[&str] = &["open_microduck", "microduck"];
+
+impl Variant {
+    pub const ALL: [Variant; 2] = [Variant::OpenMicroDuck, Variant::MicroDuck];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Variant::OpenMicroDuck => "open_microduck",
+            Variant::MicroDuck => "microduck",
+        }
+    }
+
+    /// Servo protocol this variant speaks. `bus.driver` should match; [`Params::driver`]
+    /// is the one `robotd` actually opens.
+    pub fn driver(self) -> Driver {
+        match self {
+            Variant::OpenMicroDuck => Driver::Hd1910,
+            Variant::MicroDuck => Driver::Xl330,
+        }
+    }
+
+    /// True when the IMU rides the servo bus (original MicroDuck). False: I²C.
+    pub fn imu_on_bus(self) -> bool {
+        matches!(self, Variant::MicroDuck)
+    }
+
+    /// Default position P gain written to the servos. HD1910 BAM identified Kp=32;
+    /// XL330 prototype used 200.
+    pub fn running_gain(self) -> u16 {
+        match self {
+            Variant::OpenMicroDuck => 32,
+            Variant::MicroDuck => 200,
+        }
+    }
+
+    /// Limp-fall P gain. Same 1/4 ratio as the XL330 50/200 pair.
+    pub fn gain_limp(self) -> u16 {
+        match self {
+            Variant::OpenMicroDuck => 8,
+            Variant::MicroDuck => 50,
+        }
+    }
+
+    /// 2S pack both robots run from (7.4 V).
+    pub fn nominal_voltage(self) -> f64 {
+        match self {
+            Variant::OpenMicroDuck | Variant::MicroDuck => 7.4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Platform {
+    pub variant: Variant,
+}
+
+impl Default for Platform {
+    fn default() -> Self {
+        Self {
+            variant: Variant::default(),
         }
     }
 }
@@ -825,10 +920,9 @@ impl Driver {
 
 /// The IMU, on its own I²C bus rather than the servo bus.
 ///
-/// The LSM6DSV16X rides i2c4 (pins 27/28, on-board pull-ups), aliased `/dev/i2c-imu` by a
-/// udev rule (`deploy/overlays/i2c4-imu.dts`), at 0x6A by default. It is independent of the
-/// servo bus: the two are fused on the same tick in `robotd`'s control loop
-/// ([`crate::Imu`]'s sibling `[bus] driver` picks the servo side).
+/// The LSM6DSV16X is reached at 0x6A by default. Production names the bus `/dev/i2c-imu`
+/// (a udev alias for i2c4). If that path cannot be opened, `robotd` scans `/dev/i2c-*` for
+/// WHO_AM_I = 0x70 the same way `imu_probe` does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Imu {
@@ -1047,6 +1141,27 @@ impl Params {
         Ok(())
     }
 
+    /// Servo driver this board actually opens. [`Platform::variant`] is the switch;
+    /// `bus.driver` is kept in the file so an old board still parses, but this is what
+    /// `robotd` opens.
+    pub fn driver(&self) -> Driver {
+        self.platform.variant.driver()
+    }
+
+    pub fn resolved_policy(&self) -> ResolvedPolicy {
+        self.policy.resolved_for(self.platform.variant)
+    }
+
+    pub fn gain(&self) -> u16 {
+        self.resolved_policy().gain
+    }
+
+    pub fn gain_limp(&self) -> u16 {
+        self.safety
+            .gain_limp
+            .unwrap_or(self.platform.variant.gain_limp())
+    }
+
     pub fn period(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(1.0 / self.control.hz as f64)
     }
@@ -1258,6 +1373,7 @@ mod tests {
         let from_file: Params = toml::from_str(shipped).expect("deploy/robotd.toml must parse");
         let built_in = Params::default();
 
+        assert_eq!(from_file.platform.variant, built_in.platform.variant);
         assert_eq!(from_file.bus.port, built_in.bus.port);
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
@@ -1303,7 +1419,7 @@ mod tests {
         assert_eq!(p.action_scale, 0.9);
         assert_eq!(p.standing_action_scale, 1.0);
         assert_eq!(p.standing_gain_ratio, 0.8, "--standing-kp-ratio");
-        assert_eq!(p.gain, 200);
+        assert_eq!(p.gain, 32, "HD1910 BAM Kp");
         assert_eq!(
             p.head_lowpass,
             Some(0.5),
@@ -1322,7 +1438,7 @@ mod tests {
         assert_eq!(p.roulade_action_scale, 1.0);
         assert_eq!(p.roulade_gain_ratio, 1.0);
         assert!(!p.voltage_adapt, "off by default in the prototype");
-        assert_eq!(p.nominal_voltage, 7.4);
+        assert_eq!(p.nominal_voltage, 7.4, "2S pack");
 
         let name = |p: &Option<std::path::PathBuf>| {
             p.as_ref()
@@ -1402,7 +1518,33 @@ mod tests {
             "the rebased roller line keeps the trained filters"
         );
         assert_eq!(p.legs_lowpass, Some(0.7));
-        assert_eq!(p.gain, 200);
+        assert_eq!(p.gain, 32, "variant default, not the drive mode");
+    }
+
+    #[test]
+    fn microduck_resolves_xl330_actuator_numbers() {
+        let mut p = Params::default();
+        p.platform.variant = Variant::MicroDuck;
+        assert_eq!(p.driver(), Driver::Xl330);
+        assert!(p.platform.variant.imu_on_bus());
+        let r = p.resolved_policy();
+        assert_eq!(r.gain, 200);
+        assert_eq!(r.nominal_voltage, 7.4);
+        assert_eq!(p.gain_limp(), 50);
+    }
+
+    #[test]
+    fn every_variant_label_round_trips() {
+        assert_eq!(VARIANT_LABELS.len(), Variant::ALL.len());
+        for (label, variant) in VARIANT_LABELS.iter().zip(Variant::ALL) {
+            assert_eq!(*label, variant.as_str());
+            let parsed: Params =
+                toml::from_str(&format!("[platform]\nvariant = \"{label}\"\n")).expect("parses");
+            assert_eq!(parsed.platform.variant, variant);
+        }
+        assert_eq!(Params::default().platform.variant, Variant::OpenMicroDuck);
+        assert_eq!(Params::default().gain(), 32);
+        assert_eq!(Params::default().gain_limp(), 8);
     }
 
     /// `"none"` disables an optional slot outright — the prototype's `--sitstand-policy None`

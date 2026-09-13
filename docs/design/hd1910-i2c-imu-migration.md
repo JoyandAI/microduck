@@ -1,12 +1,14 @@
 # HD1910-C001 舵机 + I²C IMU 迁移方案（microduck 运行时）
 
-> Status: **已实施（2026-09-07 晨完成并验证）** · 原计划多 agent 分阶段落地，≥18:00 开工。
-> 本文件是修改的唯一依据（契约冻结）。
+> Status: **已实施，并在 2026-09-13 按实机/BAM 回填修订**。
+> 2026-09-04/07 的 §2 是当时的契约；**当前 HD1910 通讯以 §6 为准**（mode 4、WritePosEx、
+> BAM 固件表、`FeetechIo` 命名、`[platform].variant`）。§2 未改写，以免把历史实施记录
+> 伪装成一直如此。
 >
 > **实施注记（Phase B · 集成，已落地）**：§2.5（`robotd-params` 的 `Bus.driver` + 新 `[imu]`
 > 段 + registry、`robotd/src/main.rs` 的按 driver 选总线 + `ImuIo` 构造 + `Safety` 双泛型 +
-> IMU 合成/降级、`deploy/robotd.toml`）已实现。`duck-control/src/imu.rs` 零改动；§2.5 之前
-> 的 Phase A 与 §2.6 部署物/§2.7 文档由各自 agent 落地。
+> IMU 合成/降级、`deploy/robotd.toml`）已实现。`duck-control/src/imu.rs` 的解码契约未改；
+> §2.5 之前的 Phase A 与 §2.6 部署物/§2.7 文档由各自 agent 落地。
 >
 > **验收记录（2026-09-07，Phase C 由主持 agent 执行）**：
 > `duck-control` 73 tests、`robotd-params` 25 tests、`robotd` 97+7 tests 全绿；
@@ -16,7 +18,15 @@
 > 部署物（`i2c4-imu.dts`/`99-robot-i2c-imu` udev/`provision-hls.py`）存在且语法检查通过；
 > 唯一新依赖处理：`bisync`（lsm6dsv16x-rs 传递依赖）在 crates.io 全版本 yanked，
 > 采用 `vendor/bisync` + `[patch.crates-io]`（注释已说明）。
-> 未决 O1–O5（§5）待硬件/标定回填；`mediad` 因宿主无 gstreamer 未本地验证（CI 覆盖）。
+>
+> **修订记录（2026-09-13）**：OpenMicroDuck 与原版 MicroDuck 并存。HD1910 固件写入对齐
+> BAM `hd1910/m1.json`（commit `b8b7721`）与真机回读（固件 3.46）：mode=4、Kp/Kd/Ki=32/40/0、
+> 保护电流 500 LSB（3.25 A）、电压窗 4.0–8.4 V（**2S 包 7.4 V**；BAM 辨识时 `vin=6.0`）。每拍写改为 HLSCL
+> `WritePosEx`（从 ACCEL 起 7 字节），不再只 poke 目标位置 2 字节。类型名 `HlsBusIo` →
+> `FeetechIo`。硬件开关是 `[platform].variant`，不是单独改 `bus.driver`。原版 MicroDuck
+> （XL330 + 总线 ID 200）相对 `2c61dcc` **不改设计**，`DynamixelIo` 已按当时路径接回。
+> O3（Kp/Kd）、O5（电压窗）关闭；O1/O2/O4 仍开。控制环形状与部署改 toml 的步骤见
+> [`robotd-design.md`](robotd-design.md) §1.1 / §2.1 / §4.2。
 
 ## 0. 背景与资料（已验证）
 
@@ -45,9 +55,10 @@
   `imu.rs` 的 `half()` 解码一致。器件路线二选一（接口同一）：
   a) 现有 `imu_to_dxl` 板改固件为 I²C 从机（服务同样的 12 字节块）；
   b) SparkFun SEN-21325（LSM6DSV16X Qwiic，0x6A/0x6B）直驱裸芯片。
-- 现状（本仓库）：15×XL330 + IMU（ID 200）共享 `/dev/ttyS2`（1 Mbps，Dynamixel v2）；
-  每拍一次 `sync_read`（124,12）+ 一次 `sync_write`；IMU 解码在
-  `duck-control/src/imu.rs`（`SflpDecoder`，12 字节块 → `ImuData`）。
+- 现状（本仓库，2026-09-13）：**两个变体**。OpenMicroDuck（默认）= 15×HD1910（`FeetechIo`）+
+  I²C IMU；原版 MicroDuck = 15×XL330 + IMU ID 200 同总线（`DynamixelIo`，对齐 `2c61dcc`）。
+  解码仍在 `duck-control/src/imu.rs`（`SflpDecoder`，12 字节块 → `ImuData`）。
+  2026-09-04 动手前的基线是单一 XL330+ID200 路径。
 
 ## 1. 硬件前提（不在本仓库改，但决定代码的占位默认）
 
@@ -67,6 +78,10 @@
 > **零行改动**（12 字节块契约不变）。
 
 ### 2.1 `duck-control/src/ftbus.rs`（新）—— HD1910 总线驱动
+
+> **§6 已取代本节里的写入值与每拍写格式。** 下面保留 2026-09-04 的契约原文（`HlsBusIo`、
+> mode=0、写 `0x2A`×2、Kp/Kd=32/32、12 V 电压窗），便于对照当时为什么那样写。落地代码是
+> `FeetechIo`，见 §6。
 
 FT-HLS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
 
@@ -168,13 +183,11 @@ FT-HLS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
 
 ### 2.4 `duck-control/src/model.rs` + `bus.rs`
 
-- `model.rs`：删除 `IMU_DXL_ID`（总线不再有 IMU；IMU 地址/路径在 params）；
-  `BAUD_RATE` / `JOINT_IDS` / `DEFAULT_POSITION` 等不动；`EXPECTED_REGISTERS`
-  改为 HLS 表（或移至 `ftbus.rs`——**倾向：HLS 表放 `ftbus.rs`，`EXPECTED_REGISTERS`
-  改名/移除，避免两张表**）。
-- `bus.rs`（DynamixelIo，保留作为 XL330 后备与测试参照）：去掉 IMU 相关
-  （ids 去掉 200、`SflpDecoder`/`StaleImuTracker`/`imu_stale`/`imu_ready` 迁走）。
-  若时间不够可先只加不动（见 §5 风险），**默认执行移除**。
+- `model.rs`：2026-09-04 方案要求删除 `IMU_DXL_ID`。**未删** — MicroDuck 仍用 200，
+  OpenMicroDuck 预留给以后的飞特 IMU 节点。`JOINT_IDS` / `DEFAULT_POSITION` 不动。
+  HLS EEPROM 表在 `ftbus.rs`（`HLS_EEPROM_EXPECTED`），不与 XL330 `EXPECTED_REGISTERS` 混表。
+- `bus.rs`（`DynamixelIo`）：2026-09-04 方案要求去掉 ID 200。**2026-09-13 已撤回该条**：
+  MicroDuck 必须保持 `2c61dcc` 的 combined `sync_read`。OpenMicroDuck 不使用本类型。
 
 ### 2.5 `robotd-params` + `robotd` 集成
 
@@ -215,12 +228,13 @@ FT-HLS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
 
 ### 2.7 文档
 
-- `docs/design/robotd-design.md`：§1.1 总线图（IMU 移出；"no second bus" 改述）、
-  §2.1 事务表、§3 健康（imu 来源）、结尾寄存器清单；
+- `docs/design/robotd-design.md`：§1.1 双变体总线图、§2.1 HD1910/XL330 事务、§4.2
+  `[platform].variant` 与部署时改 `robotd.toml` 的步骤；
+- 本文件 §6：当前 HD1910 通讯（取代 §2.1 中已过时的写入值）；
 - `docs/design/architecture.md` 相应图示/文字；`docs/robot/cheatsheet.md`、
   `docs/robot/install-by-hand.md`；`docs/microduck-fact-check.md`；
 - `source-lessons/lessons/03-bus-imu.md`（明确标注为本评估依据，需修订）；
-- `deploy/robotd.toml` 注释（§2.5）。
+- `deploy/robotd.toml` 注释（§2.5 / `robotd-design.md` §4.2）。
 
 ### 2.8 测试（每文件随附带，全部跑 `cargo test -p duck-control` 与 workspace）
 
@@ -264,13 +278,145 @@ FT-HLS 帧原语 + `HlsBusIo`（实现现有 `RobotIo` trait）。
 
 ## 5. 未决项（O）与风险
 
-- O1 电池测量来源（12V 供电方案）；O2 mouth 是否换装；O3 Kp/Kd 默认值；
-  O4 电流偏置扣除；O5 min/max 电压寄存器值。
-- 风险 R1：无实机，寄存器/时序只能按文档 + 单测保证，上板调试是下一阶段；
+- O1 电池测量来源（HD1910 真机电压窗是 4.0–8.4 V / **2S 包 7.4 V**，
+  `battery_percent` 的 8.2/6.6 V 映射是否仍表示「包电压」待电气定案。若替换为HL3915/HL2915/HL2909这种，电压为9~12V）。
+- O2 mouth 是否换装 HD1910（同一 UART 不能混 XL330）。
+- ~~O3 Kp/Kd 默认值~~ **已关闭（2026-09-13）**：BAM / 真机回读 Kp=32、Kd=40、Ki=0。
+- O4 电流偏置（reg 73）仍未从 `present_current` 扣除。
+- ~~O5 min/max 电压寄存器~~ **已关闭（2026-09-13）**：EEPROM 写 40/84（4.0 V / 8.4 V）。
+- 风险 R1：无实机时寄存器/时序只能按文档 + 单测保证；上板后 `hls_control` 已证明
+  WritePosEx 与 mode 4 是 HD1910 能走步的组合。
   R2（已消除）：rustypot proto1 帧/校验和/应答解析与 FT-HLS 协议源码级核对一致
   （见 §2.1 传输层），无需自实现帧层；
   R3：`Sensors.imu` 由调用方填充后，任何新消费者可能忘记填充 —— 用
-  `FakeIo`/文档醒目注释 + robotd 合成点唯一化缓解；
-  R4：与 microduck_rl 的 sim 参数（ACC=0、SPEED=32767、Kp/Kd 值、12 V、
-  延迟 3–6 步）必须一致，否则 sim2real 错位 —— 本方案只保证运行时侧写齐，
-  标定回填由 RL 侧流程负责。
+  `FakeIo`/文档醒目注释 + robotd 合成点唯一化缓解；MicroDuck 的 `DynamixelIo` 在
+  `RobotIo::read` 里已经填好 imu，合成点仍调用 `ImuIo::read` 以免两套循环。
+  R4：与 BAM / microduck_rl 的 sim 参数必须一致，否则 sim2real 错位 —— 运行时写入值
+  现以 `HD1910_FIRMWARE` 为单一来源；六项 M1 识别参数不写舵机。
+
+## 6. 落地后的 HD1910 通讯设计（2026-09-13，权威）
+
+OpenMicroDuck 的舵机路径。实现：`duck-control/src/ftbus.rs`（`FeetechIo`）+
+`duck-control/src/hardware.rs`（`HD1910_FIRMWARE` / `HD1910_BAM_M1`）。
+原版 MicroDuck 不走本节，见 [`robotd-design.md`](robotd-design.md) §2.1「MicroDuck」。
+
+### 6.1 帧与传输
+
+与 §2.1 传输层定案相同，未改：
+
+- 帧：`FF FF ID LEN INST PARAMS CHK`，`CHK = ~(ID+LEN+INST+PARAMS) & 0xFF`，多字节小端。
+- 指令：PING 0x01、READ 0x02、WRITE 0x03、SYNC_READ 0x82、SYNC_WRITE 0x83、
+  位置校准 0x0B；广播 0xFE。
+- 传输：`rustypot` `Sts3215Controller` + `with_protocol_v1()` **只当纯传输**。命名寄存器表
+  在 34/35/36 与 HLS 不同，**地址一律用 `ftbus::reg`**，只调用
+  `sync_read_raw_data` / `sync_write_raw_data` / `read_raw_data` / `write_raw_data` / `ping`。
+- 超时 30 ms。1 Mbps（baud 寄存器 = 0）。ID 表仍是 `JOINT_IDS`（20–24 / 30–34 / 10–14）。
+  `IMU_DXL_ID`（200）留给以后的飞特 IMU 节点，**现在不 ping**。
+
+### 6.2 每拍读
+
+`SYNC READ` 起始地址 **56（0x38）**、长度 **15**：
+
+`pos(2) speed(2) load(2) voltage(1) temp(1) async(1) status(1) moving(1) target(1) current(2)`
+
+即 56..70。一次事务覆盖关节反馈和 volts/temps；`slow_sensors()` 返回本拍缓存，不再另发。
+
+换算（冻结）：
+
+| 量 | 公式 |
+|---|---|
+| 位置 | `rad = (2π · p / 4096) − π`，`p` 为 u16、单圈 0..4095；BIT15 置位视为多圈，拒绝 |
+| 速度 | `rad/s = ±(raw & 0x7FFF) × 0.732 × 2π / 60`，BIT15 为方向 |
+| 电流 | `mA = (raw & 0x7FFF) × 6.5`（丢掉方向；bias 73 仍不扣，O4） |
+| 电压 | `V = u8 × 0.1` |
+| 温度 | `°C = u8` |
+| 负载 | `% = (raw & 0x3FF) × 0.1`（BIT10 方向，仅监控） |
+
+### 6.3 每拍写：WritePosEx，不是 2 字节 goal position
+
+只写寄存器 42（goal position）会把 goal-torque（44）留在 0，HD1910 **不会按预期迈步**
+（`hls_control` 真机结论）。因此 `FeetechIo::write` 对每个关节发一块 HLSCL **WritePosEx**：
+
+```text
+SYNC WRITE 起始地址 = ACCEL (41)，每关节 7 字节：
+  [ acc | pos_l pos_h | torque_l torque_h | speed_l speed_h ]
+```
+
+生产字段：
+
+| 字段 | 值 | 含义 |
+|---|---|---|
+| acc | 0 | 最大加速度 |
+| pos | `(rad+π)·4096/2π`，钳位到 0..4095 | 与位置读互逆 |
+| torque | 980 | 0.1% LSB，与 `max_torque` / `torque_limit` 同一上限 |
+| speed | **0** | 最大 **steps/s**（不是 present-speed 的 0.732 RPM/LSB，也不是旧稿的 32767） |
+
+编码函数：`ftbus::encode_write_pos_ex`。
+
+### 6.4 固件写入值（BAM / 真机回读）
+
+单一来源：`duck_control::HD1910_FIRMWARE`。来自 `bam/params/hd1910/m1.json`
+（commit `b8b7721`）配套的执行器设定，以及 FT-SCS 固件 3.46 真机回读。
+**不是** 2026-09-04 草稿里的 STS3215/12 V 占位。
+
+| 寄存器 | 值 | 何时写 |
+|---|---|---|
+| 33 mode | **4**（纯位置 PD；不限目标斜率） | `open()` 解 lock 后写，EEPROM；`check_registers` 再断言 |
+| 50 Kp | 32（可由 `set_gain` 覆盖，钳位 0..254） | RAM，控制环按 variant 默认 32 |
+| 51 Kd | **40**（厂默 D，不是 32） | 随 `set_gain` 每次写 |
+| 52 Ki | 0（位置模式无效） | 随 `set_gain` |
+| 28 保护电流 | 500 LSB = **3.25 A**（6.5 mA/LSB） | EEPROM，`check_registers` |
+| 14 / 15 电压窗 | 84 / 40 → **8.4 V / 4.0 V** | EEPROM |
+| 16 / 48 扭矩上限 | 980 | EEPROM / `open()` 写 48 |
+| 6 baud | 0（1 Mbps） | EEPROM |
+| 8 应答级别 | 1 | EEPROM |
+| 9 / 11 角度限制 | 0 / 4095 | EEPROM |
+| 13 最高温度 | 70 | EEPROM |
+
+Mode 4 与 mode 0（HLS「带力限的角度伺服」）不是一回事。BAM 在 mode 4、
+`use_rate_limiting = false` 下辨识，所以运行时必须写 4。寄存器 33 在 EEPROM 窗
+（5..=39）：锁定时写是静默丢弃，`open()` / `hls_control` 都必须先 `LOCK=0`。
+
+六项 BAM M1 识别参数（`HD1910_BAM_M1`）**不写舵机**：
+
+`kt=0.736` N·m/A，`R=3.75` Ω，`armature=0.0008` kg·m²，`q_offset=0`，
+`friction_base=0.05` N·m，`friction_viscous=0.008` N·m/(rad/s)。
+
+典型供电 **7.4 V**（2S 包，`HD1910_VIN`），对应 `policy.nominal_voltage` 两变体的未设置默认。
+BAM 辨识用过 `vin=6.0`，那是模型条件，不是这块电池。
+
+### 6.5 启动顺序
+
+1. 打开 `/dev/ttyS2`，30 ms 超时。
+2. 对 `JOINT_IDS` 逐个 PING；有一个不应答则 `open` 失败（上层等待上电）。
+3. `apply_startup`：扭矩关 → 解 lock → **mode 4** → 上 lock → `torque_limit=980`。
+   不因进程启动而开扭矩。
+4. `check_registers`：解 lock，按 `HLS_EEPROM_EXPECTED` 比对/校正，再上 lock。
+5. 控制环第一拍才 `set_gain(32)`（或 toml 覆盖）并按意图 `set_torque`。
+
+Limp-fall 仍是降 kP（默认 8），不是 torque-enable=2 阻尼模式。
+
+### 6.6 IMU（本变体）
+
+舵机 UART 上没有 IMU。LSM6DSV16X 走 I²C（`[imu].bus` 默认 `/dev/i2c-imu`，地址 0x6A；
+打不开则按 `imu_probe` 扫描 `/dev/i2c-*` 的 WHO_AM_I=0x70）。FIFO → 12 字节块 →
+`SflpDecoder`（与 v2 `imu_to_dxl` 块布局相同）。I²C 读失败只降级本拍姿态，不让整拍失败。
+
+安装朝向必须对齐 `SflpDecoder::DEFAULT_MOUNT`（绕 Y +90°：`trunk = [+raw_z, +raw_y, −raw_x]`）：
+芯片 **+X 朝下、+Y 朝左、+Z 朝前**。装好后把鸭子**直立站稳**，`imu_probe` 的 `gravity`
+应接近 **`[0, 0, -1]`**（Z ≈ −1，XY 接近 0）。这是策略观测和摔倒检测吃的量，不是加速度计原始轴。
+芯片封装朝上平放在桌上时，同一套旋转会报约 `[-1, 0, 0]`——那是未按设计安装时的姿态，不是坏芯片。
+`ready=false` 且 gravity 停在 `[0, 0, -1]` 才是 decoder 默认值（FIFO 还没组出 SFLP 块）。
+
+以后若飞特 IMU 节点上总线，复用 ID 200，形状对齐原版 MicroDuck；那是后续工作，不是现在。
+
+### 6.7 与原版 MicroDuck 的边界
+
+| | OpenMicroDuck（本节） | MicroDuck |
+|---|---|---|
+| 代码 | `FeetechIo` | `DynamixelIo`（`2c61dcc` 路径，不要改） |
+| 协议 | FT-HLS v1 风格 | Dynamixel v2 |
+| 每拍读 | 15× HD1910，0x38×15 | **16 设备**：ID 200 + 15× XL330，124×12 |
+| 每拍写 | WritePosEx 7 B | XL330 goal position |
+| IMU | I²C `ImuIo` | 同一次 `sync_read` 的 slot 0 |
+| toml | `variant = "open_microduck"` | `variant = "microduck"`（§4.2） |

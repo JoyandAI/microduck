@@ -1,40 +1,56 @@
 # `robotd` — the control loop
 
-Status: draft · Date: 2026-08-20 · Owner: pierre
+Status: draft · Date: 2026-08-20 · Revised: 2026-09-13 · Owner: pierre
 
 Implements the `robotd` row of [`architecture.md`](architecture.md) §1 and covers
 [`roadmap.md`](../project/roadmap.md) M3. The prototype being absorbed is
 [`apirrone/microduck_runtime`](https://github.com/apirrone/microduck_runtime), referred to
 throughout as *the runtime*.
 
-**Only the alpha variant, only the Radxa, only the v2 `imu_to_dxl` board.** v1/v1.5/v1.6, the
-four other IMUs, the three cameras and the Pi are dropped, and every shipped policy is
-`alpha_*`. The wheeled configuration survives as one params switch — `policy.mode = "roller"`
-(§4.2) — because what it selects is a policy set and a tuning preset, not a hardware variant.
+**Only the alpha *policy* family, only the Radxa.** v1/v1.5/v1.6, the four other IMUs, the
+three cameras and the Pi are dropped, and every shipped policy is `alpha_*`. Hardware is a
+second, orthogonal switch — `[platform].variant` (§1.1, §4.2) — because XL330 and HD1910
+do not share a protocol and cannot share a bus:
 
-> **Migration note (2026-09-04, `hd1910-i2c-imu-migration.md`).** The servos are now
-> Feetech **HD1910-C001** on the FT-HLS bus (Dynamixel v2 → FT-HLS v1-style frames), and the
-> **IMU is off the servo bus** — it rides **i2c4** as `/dev/i2c-imu` (LSM6DSV16X at 0x6A), read
-> through a separate `ImuIo` trait rather than inside the motors' `sync_read`. `Sensors` and
-> every consumer (obs / safety / fall / odometry / state stream) are unchanged; `SflpDecoder`
-> is untouched. Sections below are updated to that shape; verifiable lines that still hold are
-> kept, and new/edited claims carry today's date.
+| `platform.variant` | robot | servos | IMU |
+|---|---|---|---|
+| `open_microduck` (default, this tree) | OpenMicroDuck | Feetech HD1910-C001, FT-HLS | I²C (`/dev/i2c-imu`) |
+| `microduck` | original MicroDuck | Dynamixel XL330 | servo bus, `imu_to_dxl` **ID 200** |
+
+The wheeled configuration is a third switch — `policy.mode = "roller"` (§4.2) — because what
+it selects is a policy set and a tuning preset, not a hardware variant.
+
+> **Migration note (2026-09-04, `hd1910-i2c-imu-migration.md`; revised 2026-09-13).**
+> OpenMicroDuck moved servos onto Feetech **HD1910-C001** (FT-HLS, Dynamixel v1-style frames)
+> and the IMU onto **i2c4** as `/dev/i2c-imu` (LSM6DSV16X at 0x6A), read through a separate
+> `ImuIo` rather than inside the motors' `sync_read`. Original MicroDuck was **not** rewritten:
+> `DynamixelIo` still matches `2c61dcc` (one combined `sync_read` of ID 200 then the 15
+> XL330s). `Sensors` and every consumer (obs / safety / fall / odometry / state stream) are
+> unchanged; `SflpDecoder` is untouched. HD1910 firmware writes are pinned to the BAM
+> identification (`duck-control/src/hardware.rs`). Sections below describe both variants;
+> verifiable lines that still hold are kept, and new/edited claims carry today's date.
 
 ## 1. The shape of it
 
-One process, one serial bus, one 50 Hz loop. The loop reads all sixteen devices on the bus in
-a single transaction, decides fifteen joint targets, and writes them back. Everything else —
+One process, one servo UART, one 50 Hz loop. The loop reads the joints, decides fifteen
+targets, and writes them back. Where the IMU is read is a property of `[platform].variant`,
+not a second opinion the operator has to keep in step with `bus.driver`. Everything else —
 clients, health, telemetry — hangs off that loop without ever being able to block it.
 
-### 1.1 The bus, and who owns the port
+### 1.1 Two robots, one daemon: `[platform].variant`
 
-The servo bus and the IMU are **two separate buses now** (2026-09-04). Fifteen HLS servos
-share the servo UART; the IMU is on I²C4, never on that UART:
+`robotd` opens whichever bus the variant names. `bus.driver` stays in the file so an old
+board still parses; **`Params::driver()` (from the variant) is what the process actually
+opens**, and a mismatch is a warning, not a second switch.
+
+**OpenMicroDuck** (`variant = "open_microduck"`, default). Fifteen HD1910s on FT-HLS; the
+IMU is on its own I²C bus. ID 200 is reserved for a later Feetech IMU node on this same
+UART and is not pinged today:
 
 ```text
    servo bus         robotd — control thread
                            │
-                           │  duck_control::ftbus::HlsBusIo
+                           │  duck_control::ftbus::FeetechIo
                            │  serialport · TIOCEXCL
                            ▼
       /dev/ttyS2 · 1 Mbps · FT-HLS protocol (Dynamixel v1-style frames)
@@ -45,17 +61,40 @@ share the servo UART; the IMU is on I²C4, never on that UART:
   left leg   neck·head·mouth    right leg
    5 servos      5 servos         5 servos
 
-   IMU bus         ImuIo trait ──► imui2c::I2cDev (LSM6DSV16X)
+   IMU bus         ImuIo trait ──► imui2c::ImuBus (LSM6DSV16X)
                            │        /dev/i2c-imu · i2c4 @ 400 kHz · addr 0x6A
                            ▼
                     Sensors.imu  (filled by the caller, same tick as servo read)
 ```
 
-The servo loop is **`robotd`'s only serial bus again** — the old "no second bus" claim was
-about the motor port only, and still holds for I/O ownership, but the IMU now has its own I²C
-bus (i2c4, aliased `/dev/i2c-imu`) and its own code path (`ImuIo`). There is **no IMU on the
-Dynamixel/FT-HLS bus**: the hardware no longer embeds a Dynamixel-servicing IMU board, so the
-v2 `imu_to_dxl` board is gone and `id 200` is gone from the servo id vector.
+A failed I²C read **degrades the tick** (keep last orientation) rather than failing it —
+that is the point of the split, and only this variant gets it.
+
+**MicroDuck** (`variant = "microduck"`). Original robot, **unmodified relative to
+`2c61dcc`**: fifteen XL330s and `imu_to_dxl` at **ID 200**, one combined Dynamixel-v2
+`sync_read` (IMU first, then the joints). `DynamixelIo` implements both `RobotIo` and
+`ImuIo`; the control loop's composition point still calls `imu.read()`, which returns the
+sample already fetched — no second bus transaction. A missing ID 200 fails the whole tick,
+as it did then.
+
+```text
+   servo bus         robotd — control thread
+                           │
+                           │  duck_control::bus::DynamixelIo
+                           │  serialport · TIOCEXCL
+                           ▼
+      /dev/ttyS2 · 1 Mbps · Dynamixel protocol v2
+                           │
+     ┌──────────┬────────────┬────────┴───────┬──────────────────┐
+     │          │            │                │                  │
+    200       20–24        30–34            10–14              (mouth)
+  imu_to_dxl left leg   neck·head·mouth    right leg
+  (slot 0)    5 servos      5 servos         5 servos
+```
+
+The servo UART is still **`robotd`'s only serial port** — one owner, `TIOCEXCL`. OpenMicroDuck
+adds an I²C device the loop also reads; MicroDuck does not. ID 200 is a joint on neither
+robot (`JOINT_IDS` never contains it).
 
 **One owner at a time, and nothing hard-enforces it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
@@ -111,7 +150,8 @@ questions: nothing in the update path can command a motor.
 
 ```text
 duck-ipc-proto/  wire contract — serde only; no tokio, no http, no crypto
-duck-control/    robot model · bus · IMU · RobotIo · obs · policy · safety
+duck-control/    robot model · hardware tables · bus (XL330) · ftbus (HD1910)
+                 IMU (SflpDecoder + I²C) · RobotIo · obs · policy · safety
                  everything between reading the bus and writing it
                  no tokio, no sockets, no systemd
 robotd/          the process: socket, JSON-RPC, systemd, health reporting
@@ -141,29 +181,34 @@ targets and none of them can send one. That is the borrow checker, not a convent
 
 ### 1.4 The tick
 
-50 Hz, one `tokio` task on its own runtime so IPC work cannot sit in front of it. Two servo-bus
-transactions per tick, plus a third once a second, and **one IMU read on its own bus**:
+50 Hz, one `tokio` task on its own runtime so IPC work cannot sit in front of it. The servo
+half is always one `sync_read` and one `sync_write` per tick; the IMU half depends on the
+variant:
 
 ```text
-read()          one sync_read  · 15 servos · HLS regs 0x38–0x46 (15 B)   (§2.1)
-imu.read()      ImuIo → I²C  · LSM6DSV16X FIFO → 12-byte SFLP block      (§3)
-decide          observation → policy → targets → clamp                 (§2.2–§2.4)
-write()         one sync_write · goal positions (0x2A)
+read()          OpenMicroDuck: sync_read · 15 HD1910 · HLS 0x38 × 15 B     (§2.1)
+                MicroDuck:     sync_read · ID 200 + 15 XL330 · 124 × 12 B   (§2.1)
+imu.read()      OpenMicroDuck: ImuIo → I²C FIFO → 12-byte SFLP block        (§3)
+                MicroDuck:     returns the ID-200 sample already in read()
+decide          observation → policy → targets → clamp                      (§2.2–§2.4)
+write()         OpenMicroDuck: one sync_write WritePosEx (0x29 × 7 B)
+                MicroDuck:     one sync_write goal positions (XL330)
 publish         atomics always; a state frame only if someone subscribed     (§4.1)
 
-every 1 s       slow_sensors() · per-servo volts/temps from the tick cache  (§2.1)
+every 1 s       slow_sensors() · volts/temps (HD1910: tick cache; XL330: extra read)
 ```
 
 Where the data goes, once per period:
 
 ```text
-  servo bus (FT-HLS)
-       │  one sync_read: 15 servos, one transaction
+  servo bus (FT-HLS or Dynamixel v2)
+       │  one sync_read
        ▼
    Sensors ──────────┬──────────────────────► safety.observe ──► fallen? (debounced)
-    joints (by caller)│
+    joints            │
                       │   imu.read(): 12-byte SFLP block → SflpDecoder (unchanged)
-                      │   └─► s.imu = d  (IMU read failure degrades, never fails the tick)
+                      │   OpenMicroDuck: I²C failure degrades, never fails the tick
+                      │   MicroDuck:     already filled by DynamixelIo::read
                       ▼
               Observation::build  ◄──── Command ◄── gate(deadman) ◄── intent snapshot
                      │              (twist, head, body = nominal)
@@ -183,7 +228,7 @@ Where the data goes, once per period:
         ║  · clamp to actuator range                   ║
         ║  · no fall gate — the verdict only reports   ║
         ╚═════════════════════════════════════════════╝
-                     │  sync_write goal positions (0x2A)
+                     │  sync_write (WritePosEx or XL330 goal position)
                      ▼
               servo bus
 ```
@@ -260,38 +305,94 @@ intended:
 
 ### 2.1 The bus layer and `RobotIo`
 
-A thin layer over `rustypot`, used **as a pure FT-HLS transport**: open, one combined
-`sync_read`, `sync_write` goal positions, torque enable, gains, and the startup register check.
-The transport's own naming register table differs from the HLS in its 34/35/36 rows, so every
-register address is a constant defined in `duck-control/src/ftbus.rs`, never rustypot's names.
-Written fresh rather than lifted, but **the numbers are borrowed from the RL-side analysis**
-(`microduck_rl/docs/feetech_hls2915_servo_swap.md` §"运行时寄存器写入值"), each with a comment
-saying so (2026-09-04):
+Two concrete servo buses, one trait. `[platform].variant` picks which process opens
+(`FeetechIo` or `DynamixelIo`); the control loop's generic `RobotIo` never sees the
+difference. `FakeIo` is a third implementation for tests and `robotd --fake`.
+
+#### OpenMicroDuck — `FeetechIo` (FT-HLS)
+
+A thin layer over `rustypot`'s `Sts3215Controller` + `with_protocol_v1()`, used **as a
+pure FT-HLS transport**. The transport's own naming register table differs from the HLS
+in its 34/35/36 rows, so every address is a constant in `duck-control/src/ftbus.rs`,
+never rustypot's names. Full wire contract: [`hd1910-i2c-imu-migration.md`](hd1910-i2c-imu-migration.md)
+§6.
 
 - FT-HLS frame/checksum per `docs/ftscs_protocol.md`: `FF FF ID LEN INST PARAM CHECK`,
   `CHECK = ~(ID+LEN+INST+PARAM) & 0xFF`, little-endian multi-byte. Instructions are
   PING 0x01, READ 0x02, WRITE 0x03, SYNC_READ 0x82, SYNC_WRITE 0x83, position-calibrate 0x0B;
   broadcast 0xFE.
-- Register constants (DEC, from `docs/feetech_hls_memtable.md`): mode 33, torque_enable 40,
-  accel 41, goal_position 42(2B), goal_current 44(2B), goal_speed 46(2B), torque_limit 48(2B),
-  Kp 50 / Kd 51 / Ki 52, lock 55, present_position 56(2B), present_speed 58(2B),
-  present_load 60(2B), present_voltage 62(1B), present_temperature 63(1B), moving 66,
-  present_current 69(2B), current_bias 73(2B), offset 31(2B), angle limits 9/11,
-  max_temperature 13, min/max voltage 15/14, max_torque 16.
-- Unit conversions (frozen, matching the RL side): position `rad = (2π·p/4096) − π` (i16,
-  single-turn 0..4095, BIT15 direction); speed `rad/s = v × 0.732 × 2π/60`; current
-  `mA = |raw| × 6.5`; voltage `V = u8 × 0.1`; temperature `°C = u8`; load `% = u16 × 0.1`.
-- The startup register check (`check_registers`, mirroring the old `EXPECTED_REGISTERS`):
-  baud 6=0(1M), angle limits 9/11=0/4095, max_temp 13=70, max_torque 16=980, mode 33=0,
-  accel 41=0, goal_speed 46=32767, torque_limit 48=980, lock 55=1. EEPROM writes unlock
-  (55=0) first and re-lock (55=1) after — only here and in the ID config flow.
+- **Tick read:** `sync_read` at `0x38` × 15 bytes (present_position 56 … present_current 69).
+  Voltage, temperature and load come back *inside that block*, so `slow_sensors` returns
+  the cached sample rather than issuing a second transaction.
+- **Tick write:** one `WritePosEx` block per joint at **ACCEL (41)**, 7 bytes:
+  `acc | pos_l pos_h | torque_l torque_h | speed_l speed_h`. A 2-byte poke of goal
+  position (42) leaves goal-torque at 0 and the HD1910 does not take the step — that is
+  what `hls_control` found on the robot. Production fields: accel 0 (max), speed 0 (max
+  steps/s, *not* the 0.732 RPM present-speed LSB), torque 980 (0.1% LSB, same cap as
+  `max_torque`).
+- Unit conversions (frozen): position `rad = (2π·p/4096) − π` (u16, single-turn 0..4095);
+  speed `rad/s = ±(raw & 0x7FFF) × 0.732 × 2π/60`; current `mA = (raw & 0x7FFF) × 6.5`
+  (sign dropped); voltage `V = u8 × 0.1`; temperature `°C = u8`.
+- **Firmware writes** are pinned to `duck-control::HD1910_FIRMWARE` (true-hardware
+  readback, firmware 3.46 / BAM identification — not the 12 V STS3215 placeholders the
+  2026-09-04 draft used):
 
-**Two servo-bus transactions per tick, and a third once a second.** The tick reads a contiguous
-block at `0x38` for 15 bytes (present_position 56 … present_current 69: pos/speed/load/voltage/
-temp/async/status/moving/target/current). Voltage, temperature and load come back *inside that
-same block*, so `slow_sensors` no longer runs its own transaction — it returns the cached block
-from this tick (2026-09-04), keeping the "one read per tick" budget while the per-servo volts
-and temps are still carried at 1 Hz by the caller.
+  | register | value | meaning |
+  |---|---|---|
+  | 33 mode | **4** | pure position PD; does not rate-limit the target |
+  | 50/51/52 Kp/Kd/Ki | 32 / **40** / 0 | factory D is 40, not 32; Ki inert in position mode |
+  | 28/44 protection current | 500 LSB | 3.25 A at 6.5 mA/LSB |
+  | 14/15 max/min voltage | 84 / 40 | 8.4 V / 4.0 V (pack **7.4 V** 2S; BAM identified at 6.0 V) |
+  | 16 / 48 max/torque limit | 980 | 98% |
+
+  Mode 33 sits in the EEPROM window: `open()` unlocks, writes mode 4, re-locks, and
+  `check_registers` asserts the same table. The six BAM M1 identification numbers
+  (`HD1910_BAM_M1`: kt, R, armature, q_offset, friction_base, friction_viscous) are
+  **not** sent to the servo — they belong to training.
+
+#### MicroDuck — `DynamixelIo` (XL330 + ID 200)
+
+Unmodified relative to `2c61dcc`. One combined `sync_read` at register 124 × 12 bytes
+covering ID 200 then `JOINT_IDS`; one `sync_write` of XL330 goal positions. Slot 0 is
+the `imu_to_dxl` block (`SflpDecoder` + `StaleImuTracker`); slots 1..15 are the joints.
+Position `rad = (2π·count/4096) − π`, velocity `0.229 rev/min` per count. `slow_sensors`
+is a second `sync_read` at 144 × 3 (voltage + temperature). `set_gain` writes XL330
+position P and zeros I/D. Do not "improve" this path when changing HD1910.
+
+#### The seam
+
+```rust
+trait RobotIo {
+    fn read(&mut self) -> Result<Sensors>;                 // servos; MicroDuck also fills imu
+    fn write(&mut self, targets: &JointTargets) -> Result<()>;
+    fn set_gain(&mut self, kp: u16) -> Result<()>;         // one write per joint, not per tick
+    fn set_torque(&mut self, on: bool) -> Result<()>;      // idem
+    fn slow_sensors(&mut self) -> Result<SlowSensors>;
+}
+
+trait ImuIo {
+    fn read(&mut self) -> Result<ImuData>;                 // 50 Hz, same tick as servo read
+    fn ready(&self) -> bool;                               // converged; gates fall/odometry seed
+    fn stale(&self) -> ImuStale;                           // byte-repetition count for health
+}
+```
+
+`set_gain` and `set_torque` are one transaction *per joint*, which is why neither is a
+per-tick call and why bring-up is a state machine rather than a flag the loop keeps applying
+(§3.3). Two inherent methods sit outside `RobotIo` because only `init` uses them:
+`present_positions` (a lighter read, used once at startup to adopt the pose the robot is
+already in) and `interpolate_to` (a blocking linear ramp — deliberately blocking, since
+nothing else should be talking to the bus while it runs).
+
+**IMU staleness** is tracked on whichever `ImuIo` the variant opened. OpenMicroDuck's
+`ImuBus` counts identical 12-byte blocks assembled from the FIFO. MicroDuck's
+`DynamixelIo` counts identical ID-200 blocks in the combined `sync_read` — same
+`STALE_RUN_WARN = 25` (half a second at 50 Hz). Warning on the first repeated block is
+what teaches everyone to ignore the message; past the threshold it is rate-limited.
+
+**Neither bus is `cfg`-gated off macOS.** Only the entry points that open a real port are
+gated. `robotd --fake` is the laptop path, and it must be asked for explicitly rather than
+fallen back to.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than
@@ -313,73 +414,27 @@ servos are the same symptom until you can see both numbers. The maximum across z
 than one zone by name, so a board that wires its sensors differently cannot silently omit the
 one that was climbing.
 
-**IMU staleness is tracked, permanently — but not by the servo bus.** "The read succeeded but
-the IMU handed back the same sample" feeds dead orientation to the policy, is invisible unless
-someone counts it, and is known to happen. Now that the IMU is off the servo bus this lives in
-`ImuIo` (2026-09-04), not `RobotIo`: the `ImuIo` implementation holds a `StaleImuTracker` over
-the composed 12-byte blocks, counts identical successors, and says so in the journal once a run
-is long enough to mean something — half a second, the same span the SFLP decoder waits before it
-will call the chip's output a measurement. Warning on the first repeated block is what teaches
-everyone to ignore the message; past the threshold it is rate-limited, because a chip that has
-stopped refreshing produces one per tick and 50 Hz of identical warnings evicts the journal.
-
-The seam — `RobotIo` no longer carries the IMU (two sources of truth is what the split is
-removing), and a separate `ImuIo` owns it:
-
-```rust
-trait RobotIo {
-    fn read(&mut self) -> Result<Sensors>;                 // servo feedback; imu filled by caller
-    fn write(&mut self, targets: &JointTargets) -> Result<()>;
-    fn set_gain(&mut self, kp: u16) -> Result<()>;         // one write per joint, not per tick
-    fn set_torque(&mut self, on: bool) -> Result<()>;      // idem
-    fn slow_sensors(&mut self) -> Result<SlowSensors>;     // voltage + per-joint temp, from tick cache
-}
-
-trait ImuIo {
-    fn read(&mut self) -> Result<ImuData>;                 // 50 Hz, same tick as servo read
-    fn ready(&self) -> bool;                               // converged; gates fall/odometry seed
-    fn stale(&self) -> ImuStale;                           // byte-repetition count for health
-}
-```
-
-`set_gain` and `set_torque` are one transaction *per joint*, which is why neither is a
-per-tick call and why bring-up is a state machine rather than a flag the loop keeps applying
-(§3.3). Two inherent methods sit outside `RobotIo` because only `init` uses them:
-`present_positions` (a lighter read, used once at startup to adopt the pose the robot is
-already in) and `interpolate_to` (a blocking linear ramp — deliberately blocking, since
-nothing else should be talking to the bus while it runs).
-
-Two implementations: `HlsBusIo` (the migration target, `driver="hd1910"`), and `DynamixelIo`
-(the XL330 fallback, `driver="xl330"`, kept as reference and for legacy robots); plus `FakeIo`
-(scripted samples, optionally frozen or failing on demand). A `FakeImu` complements it for
-`robotd --fake` and the tests. `FakeIo` is what the test suite runs against, and it is why
-`cargo test` needs no hardware, no network and no Docker.
-
-**Neither is `cfg`-gated off macOS.** The gate was meant to keep `serialport` out of a
-laptop's dependency tree, but `rustypot` and `serialport` both build cleanly there, so it
-bought nothing and cost the ability to type-check the bus layer without a board — which is
-exactly the code most likely to be edited by someone who does not have one. Only the entry
-points that open a real port are gated, so a Mac build still refuses to pretend it has a
-robot: `robotd --fake` is the laptop path, and it must be asked for explicitly rather than
-fallen back to.
-
 **HLS register map (DEC, from `docs/feetech_hls_memtable.md`).** The tick reads `0x38` × 15
-bytes; the write targets `0x2A` × 2 bytes. Registers below are the ones `HlsBusIo` drives.
+bytes; the write is `WritePosEx` at `0x29` × 7 bytes. Registers below are the ones
+`FeetechIo` drives.
 
 | addr | name | bytes | unit | note |
 |---|---|---|---|---|
 | 5 / 6 | ID / baud | 1 | — / — | ID 0-253, baud 0=1M |
 | 9 / 11 | angle limits min/max | 2 | 0.087° | 0/4095 |
-| 16 | max torque | 2 | 0.1% | default 980 (98%) |
+| 13 | max temperature | 1 | °C | 70 |
+| 14 / 15 | max / min voltage | 1 | 0.1 V | **84 / 40** (8.4 V / 4.0 V), not 12 V |
+| 16 | max torque | 2 | 0.1% | 980 (98%) |
+| 28 | protection current | 2 | 6.5 mA | **500** → 3.25 A |
 | 31 | position offset | 2 | 0.087° | BIT15 sign |
-| 33 | mode | 1 | — | 0 = position servo |
-| 40 | torque enable | 1 | — | 0/1/2 (2=damper for limp) |
-| 41 | accel | 1 | 8.7°/s²/LSB | 0 = max |
-| 42 | goal position | 2 | 0.087° | BIT15 direction; every tick |
-| 44 | goal current | 2 | 6.5 mA | current limit in position mode |
-| 46 | goal speed | 2 | 0.732 RPM | 32767 = max |
-| 48 | torque limit | 2 | 0.1% | default 980 |
-| 50/51/52 | Kp / Kd / Ki | 1 | — | Kp 1/8, Kd 1/4 scale; Ki inert in position mode |
+| 33 | mode | 1 | — | **4** = pure position PD (BAM); 0 is the other HLS angle mode |
+| 40 | torque enable | 1 | — | 0/1 (limp is gain, not damper mode 2) |
+| 41 | accel | 1 | 8.7°/s²/LSB | 0 = max; first byte of WritePosEx |
+| 42 | goal position | 2 | 0.087° | inside the WritePosEx block |
+| 44 | goal current / torque | 2 | 6.5 mA / 0.1% | WritePosEx torque field; 980 |
+| 46 | goal speed | 2 | steps/s on write | WritePosEx: **0 = max**; present-speed LSB is 0.732 RPM |
+| 48 | torque limit | 2 | 0.1% | 980 |
+| 50/51/52 | Kp / Kd / Ki | 1 | — | BAM **32 / 40 / 0**; Ki inert in position mode |
 | 55 | lock | 1 | — | 1 = locked; EEPROM writes unlock first |
 | 56 | present position | 2 | 0.087° | read block |
 | 58 | present speed | 2 | 0.732 RPM | read block |
@@ -560,9 +615,11 @@ cannot trip it — reaching 6.6 V requires a genuinely empty pack.
 
 ### 2.5 The robot model
 
-Rust consts for alpha only: 15 joints, Dynamixel IDs `20–24 / 30–34 / 10–14`, names,
-`DEFAULT_POSITION`, and the actuator range. Same tables as the runtime's `motor.rs`, minus the
-three dead variants. There is exactly one robot; a second revision can be a second table.
+Rust consts for alpha only: 15 joints, Dynamixel/HLS IDs `20–24 / 30–34 / 10–14`, names,
+`DEFAULT_POSITION`, actuator range, and `IMU_DXL_ID = 200` (never a joint). Same tables as
+the runtime's `motor.rs`, minus the three dead *policy* variants. There is one observation
+layout; two hardware variants share it. HD1910 firmware / BAM M1 numbers live in
+`duck-control/src/hardware.rs`, not here — they are not joint geometry.
 
 Two of those tables are load-bearing beyond their own crate. `JOINT_NAMES` comes *from*
 `duck-ipc-proto`, because the wire indexes `joints` and `targets` positionally and the two
@@ -806,7 +863,7 @@ single last-writer slot would lose.
 
 A TOML file read at startup, **not watched** — live reload comes later. It lives outside
 `releases/<ver>/` so it survives update *and* rollback, next to the updater's own config at
-`/etc/robot/robotd.toml`.
+`/etc/robot/robotd.toml`. The shipped template is `deploy/robotd.toml`.
 
 Belonging to the board rather than the release is what makes a hand-edited policy path stick: the
 defaults point inside `releases/<ver>/`, so an ordinary update keeps a policy alongside the
@@ -816,14 +873,58 @@ which is far easier to diagnose remotely than a daemon that will not run. The co
 the hard way: an *uncommented* value is frozen on that board forever while releases move on, which
 is how a fleet ended up standing at kP 120 while the release default said 160.
 
-Roughly ten values, not 142: control rate, gains, action scale, low-pass alphas, max velocities,
-deadman timeout, policy paths and the update-gate thresholds. The flag explosion in the runtime was
-mostly variants, dead skills and dead sensors, all of which are gone.
+**`install.sh` copies this file to `/etc/robot/robotd.toml` once and never overwrites it.**
+Changing the robot after first boot is an edit of that file plus `systemctl restart robotd`,
+not a new release.
 
-One switch is coarser than the rest. `policy.mode` — `walk` or `roller` — selects which policies
-load *and* the tuning defaults, so every unset field resolves per mode and moving a robot onto
-wheels is one line plus a restart. It is a preset, not a variant: the roller line is the
-prototype's, rebased on the alpha defaults.
+#### `[platform].variant` — which robot this board is
+
+One line selects the servo protocol, where the IMU is read, and the BAM-aligned runtime
+numbers (P gain, limp gain, nominal voltage). `bus.driver` should match but is **not** what
+`robotd` opens — the variant is. Unset `policy.gain` / `policy.nominal_voltage` /
+`safety.gain_limp` resolve from the variant; **leave them commented** unless this board
+genuinely needs a different number, or a MicroDuck will stand up at HD1910 kP 32.
+
+| toml | meaning | `bus.driver` | IMU | running kP | limp kP | `vin` |
+|---|---|---|---|---|---|---|
+| `variant = "open_microduck"` | this development tree (default) | `hd1910` | `[imu]` I²C | 32 | 8 | 7.4 V |
+| `variant = "microduck"` | original, matching `2c61dcc` | `xl330` | bus ID 200; `[imu]` ignored | 200 | 50 | 7.4 V |
+
+**Deploy: leave the board as OpenMicroDuck** (the template's default). No edit.
+
+**Deploy: restore original MicroDuck (XL330 + `imu_to_dxl` ID 200).** On the robot:
+
+```bash
+sudo nano /etc/robot/robotd.toml    # or whatever editor
+```
+
+Set, and only these lines need to change:
+
+```toml
+[platform]
+variant = "microduck"
+
+[bus]
+port = "/dev/ttyS2"
+driver = "xl330"          # keep in step; robotd still opens the variant if they disagree
+```
+
+Leave `[imu]`, `[policy].gain`, `[policy].nominal_voltage` and `[safety].gain_limp`
+commented. Then:
+
+```bash
+sudo systemctl restart robotd
+```
+
+Confirm in the journal: `IMU on Dynamixel bus (original MicroDuck)` and `bus.driver
+overridden by platform.variant` only if `driver` was left at `hd1910`. A first install
+from a tree whose `deploy/robotd.toml` already says `microduck` bakes that in; changing
+the template later does **not** rewrite `/etc/robot/robotd.toml`.
+
+`policy.mode` — `walk` or `roller` — is a separate switch: it selects which policies
+load *and* the tuning defaults that are not variant-owned (action scale, low-pass). It is
+a preset, not a hardware variant: the roller line is the prototype's, rebased on the alpha
+defaults.
 
 ### 4.3 The gamepad is a client
 
@@ -844,9 +945,9 @@ the app will use.
 ### 4.4 Odometry, on the sample the loop already took
 
 `odometry::Odometry::alpha()` is stepped once per tick from the joint positions and the IMU
-quaternion read from `ImuIo` (the sample the loop took this tick, on its own I²C bus), and its
-estimate goes out on the state stream as `odom: { position, yaw }`. `robotctl monitor` draws it
-as a path map under the 3D view.
+quaternion read from `ImuIo` (the sample the loop took this tick — I²C on OpenMicroDuck,
+ID 200 on MicroDuck), and its estimate goes out on the state stream as
+`odom: { position, yaw }`. `robotctl monitor` draws it as a path map under the 3D view.
 
 **Contact-based**, ported from the prototype runtime: one sole corner is the ground anchor, the
 trunk's world pose follows from it by forward kinematics through the `kinematics` crate's model,
@@ -974,8 +1075,11 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 |---|---|
 | `duck-control` as a workspace crate | boundary enforced by the compiler, no second repo |
 | bus layer written fresh, constants borrowed | thin code, but the tuned numbers are not re-derived |
-| ~~the IMU in the motors' `sync_read`~~ reversed (2026-09-04) | IMU moved to its own I²C bus (`/dev/i2c-imu`, i2c4) and a separate `ImuIo` trait; `RobotIo` no longer carries the IMU |
-| Rust consts for the model | one robot exists |
+| `[platform].variant` is the hardware switch (2026-09-13) | OpenMicroDuck = HD1910 + I²C; MicroDuck = XL330 + ID 200 as at `2c61dcc`; `bus.driver` is not what `robotd` opens |
+| HD1910 firmware pinned to BAM / bench readback | mode 4, Kp/Kd/Ki 32/40/0, protection current 500, voltage 4.0–8.4 V; WritePosEx not a 2-byte goal poke |
+| ~~the IMU in the motors' `sync_read`~~ reversed for OpenMicroDuck (2026-09-04) | I²C `ImuIo`; a failed IMU read degrades the tick |
+| MicroDuck keeps the combined `sync_read` | `DynamixelIo` is the original path; do not "migrate" it |
+| Rust consts for the model | one *policy* family exists; two hardware variants share it |
 | params file, not watched | establishes the file and its location; the watcher is later |
 | policy path in params, default = release dir | updates carry the policy; devs override it |
 | adopt current pose on start | an update must not move a standing robot |

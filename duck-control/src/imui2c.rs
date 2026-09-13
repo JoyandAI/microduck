@@ -29,7 +29,7 @@
 //! into a block, and hands it to `SflpDecoder`. A failed [`ImuIo::read`] must degrade the
 //! tick, not fail it — that is a property of the caller, not of this type.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::imu::ImuData;
 #[cfg(target_os = "linux")]
@@ -77,6 +77,43 @@ mod bus {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(Self { fd })
+        }
+
+        fn transaction_once(
+            &mut self,
+            address: u8,
+            operations: &mut [Operation<'_>],
+        ) -> std::result::Result<(), I2cError> {
+            let mut msgs: Vec<I2cMsg> = Vec::with_capacity(operations.len());
+            for op in operations {
+                match op {
+                    Operation::Read(buf) => msgs.push(I2cMsg {
+                        addr: address as u16,
+                        flags: I2C_M_RD,
+                        len: buf.len() as u16,
+                        buf: buf.as_mut_ptr(),
+                    }),
+                    Operation::Write(buf) => msgs.push(I2cMsg {
+                        addr: address as u16,
+                        flags: 0,
+                        len: buf.len() as u16,
+                        buf: buf.as_ptr() as *mut u8,
+                    }),
+                }
+            }
+            let mut data = I2cRdwrData {
+                msgs: msgs.as_mut_ptr(),
+                nmsgs: msgs.len() as u32,
+            };
+            // SAFETY: `data` points to a live, correctly-laid-out `i2c_rdwr_ioctl_data`
+            // whose `msgs` array outlives the call; the kernel only reads from write
+            // buffers and writes into the read buffers the caller owns for the call.
+            let rc = unsafe { libc::ioctl(self.fd, I2C_RDWR, &mut data as *mut I2cRdwrData) };
+            if rc < 0 {
+                Err(I2cError(std::io::Error::last_os_error()))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -127,41 +164,36 @@ mod bus {
         nmsgs: u32,
     }
 
+    fn is_transient_i2c(err: &I2cError) -> bool {
+        matches!(
+            err.0.raw_os_error(),
+            Some(libc::EIO | libc::EREMOTEIO | libc::EAGAIN | libc::ETIMEDOUT)
+        )
+    }
+
     impl embedded_hal::i2c::I2c for I2cDev {
         fn transaction(
             &mut self,
             address: u8,
             operations: &mut [Operation<'_>],
         ) -> std::result::Result<(), Self::Error> {
-            let mut msgs: Vec<I2cMsg> = Vec::with_capacity(operations.len());
-            for op in operations {
-                match op {
-                    Operation::Read(buf) => msgs.push(I2cMsg {
-                        addr: address as u16,
-                        flags: I2C_M_RD,
-                        len: buf.len() as u16,
-                        buf: buf.as_mut_ptr(),
-                    }),
-                    Operation::Write(buf) => msgs.push(I2cMsg {
-                        addr: address as u16,
-                        flags: 0,
-                        len: buf.len() as u16,
-                        buf: buf.as_ptr() as *mut u8,
-                    }),
+            // Instant NACKs are ordinary on this bus (~4–15% on the Pi bench; rarer
+            // here). Three tries, matching `docs/design/imu-env-setup.md`. ENXIO is
+            // "nobody home" and is not retried — `scan_lsm6dsv16x` walks empty
+            // addresses on purpose.
+            const ATTEMPTS: u32 = 3;
+            let mut attempt = 0u32;
+            loop {
+                match self.transaction_once(address, operations) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt >= ATTEMPTS || !is_transient_i2c(&e) {
+                            return Err(e);
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
                 }
-            }
-            let mut data = I2cRdwrData {
-                msgs: msgs.as_mut_ptr(),
-                nmsgs: msgs.len() as u32,
-            };
-            // SAFETY: `data` points to a live, correctly-laid-out `i2c_rdwr_ioctl_data`
-            // whose `msgs` array outlives the call; the kernel only reads from write
-            // buffers and writes into the read buffers the caller owns for the call.
-            let rc = unsafe { libc::ioctl(self.fd, I2C_RDWR, &mut data as *mut I2cRdwrData) };
-            if rc < 0 {
-                Err(I2cError(std::io::Error::last_os_error()))
-            } else {
-                Ok(())
             }
         }
     }
@@ -443,6 +475,123 @@ impl ImuIo for ImuBus {
     }
 }
 
+/// WHO_AM_I of an LSM6DSV16X.
+pub const LSM6DSV16X_ID: u8 = 0x70;
+
+/// Addresses the chip straps (SA0 low / high).
+pub const LSM6DSV16X_ADDRS: [u8; 2] = [0x6A, 0x6B];
+
+/// A bus + 7-bit address that answered [`LSM6DSV16X_ID`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImuLocation {
+    pub bus: PathBuf,
+    pub address: u8,
+}
+
+/// One WHO_AM_I read at a strapped LSM6 address, without resetting the chip.
+///
+/// Empty pads (NACK / ENXIO) are omitted from [`probe_who_am_i`]. `who` is `Ok(id)` when a
+/// device ACKed — including chips that are not an LSM6DSV16X — and `Err` for unexpected I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImuWho {
+    pub bus: PathBuf,
+    pub address: u8,
+    pub who: std::result::Result<u8, String>,
+}
+
+/// Probe 0x6A/0x6B on every `/dev/i2c-*`. This is the verbose scan `imu_probe --scan` prints.
+///
+/// [`scan_lsm6dsv16x`] keeps only [`LSM6DSV16X_ID`]. Call this when you also need to see the
+/// other occupant at 0x6A (this board's i2c6 answers `0x4E` — do not [`ImuBus::open`] it).
+pub fn probe_who_am_i() -> Vec<ImuWho> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        probe_who_am_i_linux()
+    }
+}
+
+/// Scan `/dev/i2c-*` for an LSM6DSV16X, the same search `imu_probe` uses when no bus is given.
+///
+/// Production wants the udev alias `/dev/i2c-imu` (i2c4). Some boards put the chip on another
+/// controller — this one answers on `/dev/i2c-5` (`fe5e0000.i2c`) — so [`crate`]-level callers
+/// fall back to this when the configured path cannot be opened or is the wrong chip.
+pub fn scan_lsm6dsv16x() -> Vec<ImuLocation> {
+    probe_who_am_i()
+        .into_iter()
+        .filter_map(|hit| match hit.who {
+            Ok(id) if id == LSM6DSV16X_ID => Some(ImuLocation {
+                bus: hit.bus,
+                address: hit.address,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The unique chip on the machine, if there is exactly one. `None` if none or several.
+pub fn pick_lsm6dsv16x() -> Option<ImuLocation> {
+    let mut hits = scan_lsm6dsv16x();
+    (hits.len() == 1).then(|| hits.remove(0))
+}
+
+#[cfg(target_os = "linux")]
+fn probe_who_am_i_linux() -> Vec<ImuWho> {
+    let mut buses: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = std::fs::read_dir("/dev") {
+        for ent in dir.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if let Some(rest) = name.strip_prefix("i2c-")
+                && rest.chars().all(|c| c.is_ascii_digit())
+            {
+                buses.push(ent.path());
+            }
+        }
+    }
+    buses.sort_by(|a, b| bus_num(a).cmp(&bus_num(b)));
+
+    let mut hits = Vec::new();
+    for bus in buses {
+        for address in LSM6DSV16X_ADDRS {
+            match ImuBus::who_am_i(&bus, address) {
+                Ok(id) => hits.push(ImuWho {
+                    bus: bus.clone(),
+                    address,
+                    who: Ok(id),
+                }),
+                Err(e) if nobody_home(&e.to_string()) => {}
+                Err(e) => hits.push(ImuWho {
+                    bus: bus.clone(),
+                    address,
+                    who: Err(e.to_string()),
+                }),
+            }
+        }
+    }
+    hits
+}
+
+#[cfg(target_os = "linux")]
+fn bus_num(path: &Path) -> u32 {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("i2c-"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(u32::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn nobody_home(msg: &str) -> bool {
+    msg.contains("ENXIO")
+        || msg.contains("No such device")
+        || msg.contains("Remote I/O")
+        || msg.contains("Input/output error")
+}
+
 /// The same type on a platform with no i2c-dev, so the crate still builds there.
 ///
 /// This is not a fake IMU and must never become one — `FakeImu` already exists for that and
@@ -599,5 +748,20 @@ mod tests {
     fn open_rejects_a_non_dsv16x_address() {
         // Use a path that would open fine if we got there; the address check happens first.
         assert!(ImuBus::open(Path::new("/dev/null"), 0x29).is_err());
+    }
+
+    #[test]
+    fn nobody_home_matches_the_probe_skip_strings() {
+        assert!(nobody_home("ENXIO"));
+        assert!(nobody_home("Remote I/O error"));
+        assert!(nobody_home("Input/output error"));
+        assert!(!nobody_home("permission denied"));
+    }
+
+    #[test]
+    fn scan_does_not_panic() {
+        let _ = probe_who_am_i();
+        let _ = scan_lsm6dsv16x();
+        let _ = pick_lsm6dsv16x();
     }
 }

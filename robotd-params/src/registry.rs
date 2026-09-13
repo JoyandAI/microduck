@@ -76,6 +76,12 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 
 /// Every key, grouped by section, sections in the shipped file's order.
 pub const REGISTRY: &[Entry] = &[
+    // ── [platform] ───────────────────────────────────────────────────────────
+    feature(
+        "platform.variant",
+        Kind::Choice(&["open_microduck", "microduck"]),
+        "Which robot: open_microduck (HD1910 + I²C IMU, default) or microduck (XL330 + bus IMU)",
+    ),
     // ── [bus] ────────────────────────────────────────────────────────────────
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
     entry(
@@ -170,8 +176,8 @@ pub const REGISTRY: &[Entry] = &[
     ),
     entry(
         "policy.gain",
-        Kind::Integer,
-        "Servo position P gain while running",
+        Kind::OptionalInteger,
+        "Servo position P gain while running; unset = 32 OpenMicroDuck / 200 MicroDuck",
     ),
     entry(
         "policy.head_lowpass",
@@ -221,8 +227,8 @@ pub const REGISTRY: &[Entry] = &[
     ),
     entry(
         "policy.nominal_voltage",
-        Kind::Float,
-        "Reference voltage the gains were identified at",
+        Kind::OptionalFloat,
+        "Reference voltage for voltage_adapt; unset = 7.4 V (2S pack, both variants)",
     ),
     // ── [safety] ─────────────────────────────────────────────────────────────
     entry(
@@ -242,8 +248,8 @@ pub const REGISTRY: &[Entry] = &[
     ),
     entry(
         "safety.gain_limp",
-        Kind::Integer,
-        "The gain limp-fall yields at",
+        Kind::OptionalInteger,
+        "The gain limp-fall yields at; unset = 8 OpenMicroDuck / 50 MicroDuck",
     ),
     feature(
         "safety.battery_empty_shutdown",
@@ -482,6 +488,7 @@ mod tests {
         // A sanity anchor so a serde message change cannot pass vacuously: the sections this
         // build certainly has must all be found.
         for known in [
+            "platform",
             "bus",
             "imu",
             "control",
@@ -581,6 +588,7 @@ mod tests {
         assert_eq!(
             features,
             vec![
+                "platform.variant",
                 "policy.enabled",
                 "policy.mode",
                 "policy.voltage_adapt",

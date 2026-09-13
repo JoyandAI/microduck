@@ -225,6 +225,9 @@ export DUCK_ROBOT=duck-c51b && scripts/dev-push.sh   # 也可用环境变量
 sudo robotctl update rollback daemon
 ```
 
+只编 `imu_probe` / `hls_read` / `hls_control`（不走整包更新）：Windows 上用 WSL +
+`aarch64-linux-gnu-gcc`，步骤见 [`docs/robot/bringup-examples.md`](robot/bringup-examples.md)。
+
 版本号是 `0.5.1-dev.local.<时间戳>.<rev>` 形式，**两次构建永不混淆**，工作区脏也没关系。
 
 装 CI 的分支构建（不 push、不本机编译）：

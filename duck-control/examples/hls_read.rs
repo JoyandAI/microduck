@@ -7,9 +7,11 @@
 //! cargo run -p duck-control --example hls_read -- /dev/ttyACM0
 //! ```
 //!
+//! For the Radxa (aarch64), see `docs/robot/bringup-examples.md`.
+//!
 //! The UART is exclusive (`TIOCEXCL` on Linux): if this talks to the robot's
 //! onboard bus, stop `robotd` first. ID 200 is the old IMU-on-bus address and
-//! is not pinged. Opening here is read-only: unlike [`duck_control::ftbus::HlsBusIo::open`],
+//! is not pinged. Opening here is read-only: unlike [`duck_control::ftbus::FeetechIo::open`],
 //! this does not rewrite SRAM registers or drop torque.
 //!
 //! A TTY gets a 14-row × 15-column frame that repaints in place. Anything else

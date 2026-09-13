@@ -32,6 +32,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+use std::rc::Rc;
+
 use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::{Parser, Subcommand};
 use duck_control::fall::{FallPredictor, FallPredictorConfig};
@@ -460,7 +465,7 @@ impl RobotState {
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
-            policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
+            policies: ArcSwap::from_pointee(PolicyNames::of(&params.resolved_policy())),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             theremin_ready: AtomicBool::new(false),
             chorale_accepted: params.chorale.accept,
@@ -740,7 +745,7 @@ async fn main() -> ExitCode {
 /// Enable torque and ramp to the home pose.
 #[cfg(target_os = "linux")]
 fn run_init(params: &Params, duration: Duration) -> ExitCode {
-    let mut io = match BusIo::open(&params.bus.port, params.bus.driver) {
+    let mut io = match BusIo::open(&params.bus.port, params.driver()) {
         Ok(io) => io,
         Err(e) => {
             tracing::error!(error = %e, port = %params.bus.port, "cannot open the bus");
@@ -764,8 +769,8 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
     // `robotd`'s control loop sets its own gain on the first tick, so this only governs the
     // ramp and the window before the daemon starts — which is exactly the window where the
     // robot is standing up unsupported.
-    if let Err(e) = io.set_gain(params.policy.gain) {
-        tracing::error!(error = %e, gain = params.policy.gain, "cannot set the position gain");
+    if let Err(e) = io.set_gain(params.gain()) {
+        tracing::error!(error = %e, gain = params.gain(), "cannot set the position gain");
         return ExitCode::FAILURE;
     }
     if let Err(e) = io.interpolate_to(&DEFAULT_POSITION, duration, Duration::from_millis(20)) {
@@ -835,55 +840,123 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
-                let imu_cfg = params.imu.clone();
-                if let Some(io) = open_bus_waiting(&port, params.bus.driver, &state).await {
-                    let imu = open_imu(&imu_cfg);
+                if let Some(io) = open_bus_waiting(&port, params.driver(), &state).await {
+                    if params.bus.driver != params.driver() {
+                        tracing::warn!(
+                            configured = params.bus.driver.as_str(),
+                            using = params.driver().as_str(),
+                            variant = params.platform.variant.as_str(),
+                            "bus.driver overridden by platform.variant"
+                        );
+                    }
+                    let imu = imu_for_bus(&io, &params);
                     control_loop(io, imu, state, intents, params, period, poweroff).await;
                 }
             });
         })
 }
 
-/// The servo bus. The migration moves the robot onto the Feetech HD1910-C001 (`driver =
-/// "hd1910"`), but a robot that is still on XL330 servos falls back to `driver = "xl330"`;
-/// the two speak different protocols and cannot share a bus, so the driver picks which one
-/// this process opens. Wrapped in an enum so the control loop's generic [`RobotIo`] has a
-/// single concrete type on the real path.
+/// The servo bus. `platform.variant` picks which one this process opens: OpenMicroDuck
+/// is Feetech HD1910, MicroDuck is the original XL330 + IMU id 200 path. The two speak
+/// different protocols and cannot share a bus. Wrapped in an enum so the control loop's
+/// generic [`RobotIo`] has a single concrete type on the real path.
+///
+/// MicroDuck's `DynamixelIo` is also the IMU: one combined `sync_read`. `Rc<RefCell<_>>`
+/// lets [`Safety`] hold that same object as both `RobotIo` and `ImuIo` without a second
+/// bus transaction.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct SharedDxl(Rc<RefCell<duck_control::bus::DynamixelIo>>);
+
+#[cfg(target_os = "linux")]
+impl SharedDxl {
+    fn open(port: &str) -> duck_control::io::Result<Self> {
+        Ok(Self(Rc::new(RefCell::new(
+            duck_control::bus::DynamixelIo::open(port)?,
+        ))))
+    }
+
+    fn check_registers(&mut self) -> duck_control::io::Result<usize> {
+        self.0.borrow_mut().check_registers()
+    }
+
+    fn interpolate_to(
+        &mut self,
+        target: &[f64; NUM_JOINTS],
+        duration: Duration,
+        step: Duration,
+    ) -> duck_control::io::Result<()> {
+        self.0.borrow_mut().interpolate_to(target, duration, step)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RobotIo for SharedDxl {
+    fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
+        RobotIo::read(&mut *self.0.borrow_mut())
+    }
+    fn write(&mut self, targets: &duck_control::JointTargets) -> duck_control::io::Result<()> {
+        RobotIo::write(&mut *self.0.borrow_mut(), targets)
+    }
+    fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
+        RobotIo::set_gain(&mut *self.0.borrow_mut(), kp)
+    }
+    fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
+        RobotIo::set_torque(&mut *self.0.borrow_mut(), on)
+    }
+    fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
+        RobotIo::slow_sensors(&mut *self.0.borrow_mut())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ImuIo for SharedDxl {
+    fn read(&mut self) -> duck_control::io::Result<ImuData> {
+        ImuIo::read(&mut *self.0.borrow_mut())
+    }
+    fn ready(&self) -> bool {
+        ImuIo::ready(&*self.0.borrow())
+    }
+    fn stale(&self) -> duck_control::io::ImuStale {
+        ImuIo::stale(&*self.0.borrow())
+    }
+}
+
 #[cfg(target_os = "linux")]
 enum BusIo {
-    Hls(Box<duck_control::ftbus::HlsBusIo>),
-    Dxl(Box<duck_control::bus::DynamixelIo>),
+    Ft(Box<duck_control::ftbus::FeetechIo>),
+    Dxl(SharedDxl),
 }
 
 #[cfg(target_os = "linux")]
 impl RobotIo for BusIo {
     fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
         match self {
-            BusIo::Hls(b) => b.read(),
-            BusIo::Dxl(b) => b.read(),
+            BusIo::Ft(b) => b.read(),
+            BusIo::Dxl(b) => RobotIo::read(b),
         }
     }
     fn write(&mut self, targets: &duck_control::JointTargets) -> duck_control::io::Result<()> {
         match self {
-            BusIo::Hls(b) => b.write(targets),
+            BusIo::Ft(b) => b.write(targets),
             BusIo::Dxl(b) => b.write(targets),
         }
     }
     fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
         match self {
-            BusIo::Hls(b) => b.set_gain(kp),
+            BusIo::Ft(b) => b.set_gain(kp),
             BusIo::Dxl(b) => b.set_gain(kp),
         }
     }
     fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
         match self {
-            BusIo::Hls(b) => b.set_torque(on),
+            BusIo::Ft(b) => b.set_torque(on),
             BusIo::Dxl(b) => b.set_torque(on),
         }
     }
     fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
         match self {
-            BusIo::Hls(b) => b.slow_sensors(),
+            BusIo::Ft(b) => b.slow_sensors(),
             BusIo::Dxl(b) => b.slow_sensors(),
         }
     }
@@ -893,18 +966,16 @@ impl RobotIo for BusIo {
 impl BusIo {
     fn open(port: &str, driver: Driver) -> duck_control::io::Result<Self> {
         match driver {
-            Driver::Hd1910 => Ok(BusIo::Hls(Box::new(duck_control::ftbus::HlsBusIo::open(
+            Driver::Hd1910 => Ok(BusIo::Ft(Box::new(duck_control::ftbus::FeetechIo::open(
                 port,
             )?))),
-            Driver::Xl330 => Ok(BusIo::Dxl(Box::new(duck_control::bus::DynamixelIo::open(
-                port,
-            )?))),
+            Driver::Xl330 => Ok(BusIo::Dxl(SharedDxl::open(port)?)),
         }
     }
 
     fn check_registers(&mut self) -> duck_control::io::Result<usize> {
         match self {
-            BusIo::Hls(b) => b.check_registers(),
+            BusIo::Ft(b) => b.check_registers(),
             BusIo::Dxl(b) => b.check_registers(),
         }
     }
@@ -916,7 +987,7 @@ impl BusIo {
         step: Duration,
     ) -> duck_control::io::Result<()> {
         match self {
-            BusIo::Hls(b) => b.interpolate_to(target, duration, step),
+            BusIo::Ft(b) => b.interpolate_to(target, duration, step),
             BusIo::Dxl(b) => b.interpolate_to(target, duration, step),
         }
     }
@@ -952,29 +1023,116 @@ fn not_ready_imu() -> FakeImu {
     imu
 }
 
-/// Open the IMU for the real control loop, falling back to a not-ready fake on failure.
+/// Pick the IMU source for this board: MicroDuck reads ID 200 on the Dynamixel bus
+/// (same object as the servos); OpenMicroDuck opens I²C.
+fn imu_for_bus(io: &BusIo, params: &Params) -> ImuIoBox {
+    #[cfg(target_os = "linux")]
+    {
+        match io {
+            BusIo::Dxl(dxl) => {
+                tracing::info!(
+                    id = duck_control::IMU_DXL_ID,
+                    variant = params.platform.variant.as_str(),
+                    "IMU on Dynamixel bus (original MicroDuck)"
+                );
+                ImuIoBox(Box::new(dxl.clone()))
+            }
+            BusIo::Ft(_) => open_imu(&params.imu),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = io;
+        open_imu(&params.imu)
+    }
+}
+
+/// Open the I²C IMU for OpenMicroDuck, falling back to a not-ready fake on failure.
 ///
 /// A failed IMU open must not stop the robot: the whole point of the split is that the IMU is
 /// optional equipment — a robot without one walks identically, but with fall detection and
 /// odometry-seeding gated off.
+///
+/// Tries `[imu].bus` first (the `/dev/i2c-imu` alias). If that cannot be opened, scans
+/// `/dev/i2c-*` for WHO_AM_I=`0x70` the same way `imu_probe` does — this board's chip sits
+/// on `/dev/i2c-5`, not i2c4.
 fn open_imu(cfg: &params::Imu) -> ImuIoBox {
     #[cfg(target_os = "linux")]
-    match duck_control::imui2c::ImuBus::open(&cfg.bus, cfg.address) {
-        Ok(bus) => ImuIoBox(Box::new(bus)),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                bus = %cfg.bus.display(),
-                "cannot open the IMU; running degraded"
-            );
-            ImuIoBox(Box::new(not_ready_imu()))
+    {
+        if let Some(imu) = try_open_imu(&cfg.bus, cfg.address) {
+            return imu;
         }
+        match duck_control::imui2c::pick_lsm6dsv16x() {
+            Some(hit) if hit.bus == cfg.bus && hit.address == cfg.address => {
+                // Already tried the configured path.
+            }
+            Some(hit) => {
+                tracing::warn!(
+                    bus = %hit.bus.display(),
+                    address = hit.address,
+                    configured = %cfg.bus.display(),
+                    "IMU is not on [imu].bus; using the chip imu_probe would pick"
+                );
+                if let Some(imu) = try_open_imu(&hit.bus, hit.address) {
+                    return imu;
+                }
+            }
+            None => {
+                tracing::warn!("no LSM6DSV16X (WHO_AM_I=0x70) at 0x6A/0x6B on /dev/i2c-*");
+            }
+        }
+        tracing::warn!(
+            bus = %cfg.bus.display(),
+            "cannot open the IMU; running degraded"
+        );
+        ImuIoBox(Box::new(not_ready_imu()))
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = cfg;
         tracing::warn!("no i2c-dev on this platform; running without an IMU");
         ImuIoBox(Box::new(not_ready_imu()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_open_imu(bus: &std::path::Path, address: u8) -> Option<ImuIoBox> {
+    // WHO_AM_I only — `ImuBus::open` would reset whatever lives at this address.
+    match duck_control::imui2c::ImuBus::who_am_i(bus, address) {
+        Ok(id) if id == duck_control::imui2c::LSM6DSV16X_ID => {}
+        Ok(id) => {
+            tracing::warn!(
+                bus = %bus.display(),
+                address,
+                who_am_i = format_args!("{id:#04x}"),
+                "not an LSM6DSV16X; leaving this bus alone"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                bus = %bus.display(),
+                address,
+                "cannot probe the IMU at this address"
+            );
+            return None;
+        }
+    }
+    match duck_control::imui2c::ImuBus::open(bus, address) {
+        Ok(imu) => {
+            tracing::info!(bus = %bus.display(), address, "IMU opened");
+            Some(ImuIoBox(Box::new(imu)))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                bus = %bus.display(),
+                address,
+                "cannot open the IMU at this address"
+            );
+            None
+        }
     }
 }
 
@@ -1265,7 +1423,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
 ) {
     // `mut` because a mode switch replaces it: the resolved policy *is* the mode, once the
     // per-mode defaults have been applied.
-    let mut policy_cfg = params.policy.resolved();
+    let mut policy_cfg = params.resolved_policy();
     let mut safety = Safety::new(
         io,
         imu,
@@ -1274,7 +1432,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
             fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
             deadman: Duration::from_millis(params.safety.deadman_ms),
             gain_running: policy_cfg.gain,
-            gain_limp: params.safety.gain_limp,
+            gain_limp: params.gain_limp(),
         },
     );
 
@@ -1840,7 +1998,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                                     gravity_z = format!("{:.2}", fresh.imu.gravity[2]),
                                     rate =
                                         format!("{:.2}", FallPredictor::gravity_z_rate(&fresh.imu)),
-                                    gain = params.safety.gain_limp,
+                                    gain = params.gain_limp(),
                                     "falling — going limp to land soft"
                                 );
                                 limp_fall = LimpFall::Limp {
@@ -2003,7 +2161,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
             // pose rather than mid-stride. Missed ticks in that window are expected.
             if let Some(target) = mode_change.take() {
                 policy_params.mode = target;
-                let cfg = policy_params.resolved();
+                let cfg = policy_params.resolved_for(params.platform.variant);
                 state.policy_error.store(None);
                 controller = build_controller(&cfg, params.safety.limp_fall, &state);
                 // Published together with the mode, and only after the load: a client that reads
@@ -2113,7 +2271,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                 // gain is a motor pushing back against the floor.
                 LimpFall::Limp { .. } => (
                     coast.known_positions(hold),
-                    params.safety.gain_limp,
+                    params.gain_limp(),
                     true,
                     "limp_fall",
                 ),

@@ -10,6 +10,7 @@
 pub mod bus;
 pub mod fall;
 pub mod ftbus;
+pub mod hardware;
 pub mod imu;
 pub mod imui2c;
 pub mod io;
@@ -22,8 +23,9 @@ pub use imu::ImuData;
 pub use io::{
     FakeImu, FakeIo, ImuIo, ImuStale, IoError, JointTargets, RobotIo, Sensors, SlowSensors,
 };
+pub use hardware::{HD1910_BAM_M1, HD1910_FIRMWARE, Hd1910BamM1, Hd1910Firmware};
 pub use model::{
-    BATTERY_EMPTY_V, BATTERY_FULL_V, DEFAULT_POSITION, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
-    battery_percent,
+    BATTERY_EMPTY_V, BATTERY_FULL_V, DEFAULT_POSITION, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES,
+    NUM_JOINTS, battery_percent,
 };
 pub use obs::{ACTION_LEN, Command, OBS_LEN, Observation};

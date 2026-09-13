@@ -11,12 +11,20 @@
 /// Left leg (5) · neck/head/mouth (5) · right leg (5).
 pub const NUM_JOINTS: usize = 15;
 
-/// Dynamixel IDs, indexed as [`JOINT_NAMES`].
+/// Servo IDs, indexed as [`JOINT_NAMES`]. Fifteen joints only.
+///
+/// ID 200 is reserved for an IMU node on the servo bus. It is never a joint.
 pub const JOINT_IDS: [u8; NUM_JOINTS] = [
     20, 21, 22, 23, 24, // left leg
     30, 31, 32, 33, 34, // neck, head, mouth
     10, 11, 12, 13, 14, // right leg
 ];
+
+/// Servo-bus IMU id (200). Original MicroDuck (`DynamixelIo`) still reads `imu_to_dxl`
+/// at this id in the same `sync_read` as the XL330s, matching `2c61dcc`.
+/// OpenMicroDuck currently reads the chip over I²C; a later Feetech IMU node on
+/// [`crate::ftbus::FeetechIo`] will reuse this id.
+pub const IMU_DXL_ID: u8 = 200;
 
 /// Joint names, from the protocol crate — the wire indexes `joints` and `targets`
 /// positionally, so that order and this one cannot be allowed to drift apart. The
@@ -24,6 +32,14 @@ pub const JOINT_IDS: [u8; NUM_JOINTS] = [
 pub use duck_ipc_proto::JOINT_NAMES;
 
 const _: () = assert!(JOINT_NAMES.len() == NUM_JOINTS);
+
+const _: () = {
+    let mut i = 0;
+    while i < NUM_JOINTS {
+        assert!(JOINT_IDS[i] != IMU_DXL_ID, "ID 200 is the IMU, not a joint");
+        i += 1;
+    }
+};
 
 /// The mouth is absent from every alpha policy — they are all 61-D observation, 14-action,
 /// and the action vector skips this index. Named so that omission is deliberate rather
@@ -149,6 +165,16 @@ mod tests {
         seen.sort_unstable();
         seen.windows(2)
             .for_each(|w| assert_ne!(w[0], w[1], "duplicate Dynamixel ID {}", w[0]));
+    }
+
+    /// ID 200 is reserved for a servo-bus IMU node. It must not appear in [`JOINT_IDS`].
+    #[test]
+    fn imu_bus_id_is_not_a_joint() {
+        assert_eq!(IMU_DXL_ID, 200);
+        assert!(
+            !JOINT_IDS.contains(&IMU_DXL_ID),
+            "ID 200 is reserved for the bus IMU; do not ping/read/write it as a joint"
+        );
     }
 
     /// `MOUTH_INDEX` is used to skip a slot when mapping 14 policy actions onto 15 joints.

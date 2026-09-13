@@ -146,6 +146,11 @@ on the board:
 sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
 ```
 
+## Bench examples (IMU / HD1910 UART)
+
+`imu_probe`, `hls_read` and `hls_control` are not a daemon update. Cross-compile in WSL
+and `scp` onto the board: [`bringup-examples.md`](bringup-examples.md).
+
 ## From a laptop — `duckctl`
 
 Reaching the robot over Bluetooth LE, with no network and no ssh:

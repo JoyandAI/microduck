@@ -11,7 +11,8 @@
 //! cargo run -p duck-control --example imu_probe -- --scan
 //! ```
 //!
-//! Cross-compile for the board:
+//! Cross-compile for the board (Windows host: WSL + `aarch64-linux-gnu-gcc`):
+//! `docs/robot/bringup-examples.md`.
 //!
 //! ```text
 //! cargo zigbuild --target aarch64-unknown-linux-gnu.2.31 -p duck-control --example imu_probe
@@ -21,13 +22,15 @@
 //! prints one snapshot and exits.
 
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use duck_control::ImuData;
-use duck_control::imui2c::ImuBus;
+use duck_control::imui2c::{
+    ImuBus, ImuWho, LSM6DSV16X_ID, pick_lsm6dsv16x, probe_who_am_i, scan_lsm6dsv16x,
+};
 use duck_control::io::ImuIo;
 
 /// Display / sample rate if `--hz` is omitted. Comfortable on a TTY; the control
@@ -40,8 +43,6 @@ const ROWS: usize = 10;
 /// Production default: i2c4 alias, SA0 pulled to the 0x6A pad.
 const DEFAULT_BUS: &str = "/dev/i2c-imu";
 const DEFAULT_ADDR: u8 = 0x6A;
-const WHO_AM_I: u8 = 0x70;
-const CANDIDATE_ADDRS: [u8; 2] = [0x6A, 0x6B];
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -67,14 +68,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (bus, address) = match positional.as_slice() {
         [] if scan_only => {
-            let hits = scan_buses()?;
+            let hits = probe_who_am_i();
             print_scan(&hits);
-            if hits.iter().filter(|h| h.who == Some(WHO_AM_I)).count() != 1 {
-                std::process::exit(if hits.iter().any(|h| h.who == Some(WHO_AM_I)) {
-                    2
-                } else {
-                    1
-                });
+            let n = hits
+                .iter()
+                .filter(|h| matches!(h.who, Ok(id) if id == LSM6DSV16X_ID))
+                .count();
+            if n != 1 {
+                std::process::exit(if n == 0 { 1 } else { 2 });
             }
             return Ok(());
         }
@@ -94,8 +95,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if scan_only {
-        let hits = scan_buses()?;
-        print_scan(&hits);
+        print_scan(&probe_who_am_i());
         return Ok(());
     }
 
@@ -103,10 +103,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let who = ImuBus::who_am_i(Path::new(&bus), address);
     match &who {
-        Ok(id) if *id == WHO_AM_I => {}
+        Ok(id) if *id == LSM6DSV16X_ID => {}
         Ok(id) => {
             return Err(format!(
-                "{bus} addr {address:#04x}: WHO_AM_I={id:#04x}, expected {WHO_AM_I:#04x} — not an LSM6DSV16X"
+                "{bus} addr {address:#04x}: WHO_AM_I={id:#04x}, expected {LSM6DSV16X_ID:#04x} — not an LSM6DSV16X"
             )
             .into());
         }
@@ -190,116 +190,46 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct ScanHit {
-    bus: PathBuf,
-    addr: u8,
-    who: Option<u8>,
-    err: Option<String>,
-}
-
-fn scan_buses() -> Result<Vec<ScanHit>, Box<dyn std::error::Error>> {
-    let mut buses: Vec<PathBuf> = Vec::new();
-    if let Ok(dir) = std::fs::read_dir("/dev") {
-        for ent in dir.flatten() {
-            let name = ent.file_name();
-            let name = name.to_string_lossy();
-            if let Some(rest) = name.strip_prefix("i2c-")
-                && rest.chars().all(|c| c.is_ascii_digit())
-            {
-                buses.push(ent.path());
-            }
-        }
-    }
-    buses.sort_by(|a, b| bus_num(a).cmp(&bus_num(b)));
-
-    let mut hits = Vec::new();
-    for bus in buses {
-        for addr in CANDIDATE_ADDRS {
-            match ImuBus::who_am_i(&bus, addr) {
-                Ok(who) => hits.push(ScanHit {
-                    bus: bus.clone(),
-                    addr,
-                    who: Some(who),
-                    err: None,
-                }),
-                Err(e) => {
-                    let msg = e.to_string();
-                    // Skip buses that simply have no device at this address.
-                    if msg.contains("ENXIO")
-                        || msg.contains("No such device")
-                        || msg.contains("Remote I/O")
-                        || msg.contains("Input/output error")
-                    {
-                        continue;
-                    }
-                    hits.push(ScanHit {
-                        bus: bus.clone(),
-                        addr,
-                        who: None,
-                        err: Some(msg),
-                    });
-                }
-            }
-        }
-    }
-    Ok(hits)
-}
-
-fn bus_num(path: &Path) -> u32 {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix("i2c-"))
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(u32::MAX)
-}
-
-fn print_scan(hits: &[ScanHit]) {
+fn print_scan(hits: &[ImuWho]) {
     if hits.is_empty() {
         eprintln!("no 0x6A/0x6B answers on /dev/i2c-*");
         return;
     }
     println!("bus            addr   WHO_AM_I");
     for h in hits {
-        let who = h
-            .who
-            .map(|id| {
-                if id == WHO_AM_I {
-                    format!("{id:#04x}  LSM6DSV16X")
-                } else {
-                    format!("{id:#04x}")
-                }
-            })
-            .unwrap_or_else(|| h.err.clone().unwrap_or_else(|| "err".into()));
-        println!("{:<14} {addr:#04x}  {who}", h.bus.display(), addr = h.addr);
+        let who = match &h.who {
+            Ok(id) if *id == LSM6DSV16X_ID => format!("{id:#04x}  LSM6DSV16X"),
+            Ok(id) => format!("{id:#04x}"),
+            Err(e) => e.clone(),
+        };
+        println!(
+            "{:<14} {addr:#04x}  {who}",
+            h.bus.display(),
+            addr = h.address
+        );
     }
 }
 
 fn pick_bus() -> Result<Option<(String, u8)>, Box<dyn std::error::Error>> {
-    let hits = scan_buses()?;
-    let found: Vec<&ScanHit> = hits.iter().filter(|h| h.who == Some(WHO_AM_I)).collect();
-    match found.as_slice() {
-        [one] => {
+    match pick_lsm6dsv16x() {
+        Some(hit) => {
             eprintln!(
-                "using {} addr {:#04x} (WHO_AM_I={WHO_AM_I:#04x})",
-                one.bus.display(),
-                one.addr
+                "using {} addr {:#04x} (WHO_AM_I={LSM6DSV16X_ID:#04x})",
+                hit.bus.display(),
+                hit.address
             );
-            Ok(Some((one.bus.display().to_string(), one.addr)))
+            Ok(Some((hit.bus.display().to_string(), hit.address)))
         }
-        [] => {
-            print_scan(&hits);
-            eprintln!(
-                "no LSM6DSV16X (WHO_AM_I={WHO_AM_I:#04x}) at 0x6A/0x6B on /dev/i2c-*\n\
-                 pass a bus explicitly, e.g. {DEFAULT_BUS} or /dev/i2c-5"
-            );
-            Ok(None)
-        }
-        many => {
-            print_scan(&hits);
-            eprintln!(
-                "found {} LSM6DSV16X chips; pass one bus explicitly",
-                many.len()
-            );
+        None => {
+            print_scan(&probe_who_am_i());
+            if scan_lsm6dsv16x().len() > 1 {
+                eprintln!("found several LSM6DSV16X chips; pass one bus explicitly");
+            } else {
+                eprintln!(
+                    "no LSM6DSV16X (WHO_AM_I={LSM6DSV16X_ID:#04x}) at 0x6A/0x6B on /dev/i2c-*\n\
+                     pass a bus explicitly, e.g. {DEFAULT_BUS} or /dev/i2c-5"
+                );
+            }
             Ok(None)
         }
     }
@@ -392,7 +322,7 @@ fn render(
         "default (FIFO has not packed gyro+quat yet)"
     };
     [
-        format!("imu_probe  {bus}  addr {address:#04x}  WHO_AM_I={WHO_AM_I:#04x}"),
+        format!("imu_probe  {bus}  addr {address:#04x}  WHO_AM_I={LSM6DSV16X_ID:#04x}"),
         format!("ready      {ready}  {sample_kind}"),
         format!("gyro rad/s {:>8.4} {:>8.4} {:>8.4}", gx, gy, gz),
         format!(

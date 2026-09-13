@@ -181,7 +181,7 @@ impl Model {
     /// pending state, so flipping `mode` updates every hint that depends on it.
     fn resolved_hint(&self, key: &str) -> Option<String> {
         let params: Params = toml::from_str(&self.rendered()).ok()?;
-        let policy = params.policy.resolved();
+        let policy = params.resolved_policy();
         let path = |p: Option<std::path::PathBuf>| {
             Some(match p {
                 Some(p) => p.display().to_string(),
@@ -198,6 +198,9 @@ impl Model {
             "policy.kick_right" => path(policy.kick_right),
             "policy.roulade" => path(policy.roulade),
             "policy.action_scale" => float(policy.action_scale),
+            "policy.gain" => Some(policy.gain.to_string()),
+            "policy.nominal_voltage" => float(policy.nominal_voltage),
+            "safety.gain_limp" => Some(params.gain_limp().to_string()),
             "policy.head_lowpass" => policy.head_lowpass.and_then(float),
             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
             "policy.ground_pick_period" => float(policy.ground_pick_period),

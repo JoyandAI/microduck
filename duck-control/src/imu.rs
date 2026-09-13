@@ -1,9 +1,9 @@
 //! The `imu_to_dxl` v2 board (LSM6DSV16X), decoded.
 //!
-//! One IMU, one code path. The board rides the Dynamixel bus and its 12-byte block is
-//! fetched in the same `sync_read` as the servos, so there is no separate sensor to poll
-//! and no fusion to run on the host — the chip's SFLP block ships a game-rotation
-//! quaternion and estimates its own gyro bias.
+//! One IMU, one decoder. Original MicroDuck fetches the 12-byte block in the same
+//! Dynamixel `sync_read` as the XL330s (ID 200). OpenMicroDuck assembles the same
+//! block from the chip over I²C. There is no fusion on the host — the chip's SFLP
+//! block ships a game-rotation quaternion and estimates its own gyro bias.
 //!
 //! Block layout at address 124:
 //!

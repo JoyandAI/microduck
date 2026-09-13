@@ -12,23 +12,32 @@
 # unprovisioned board comes up on these same numbers rather than refusing to start, which
 # is far easier to diagnose remotely than a daemon that will not run.
 
+[platform]
+# Which robot this board is. One line selects the servo protocol, where the IMU is read,
+# and the BAM-aligned runtime numbers (P gain, limp gain, nominal voltage).
+#   open_microduck  — Feetech HD1910 + I²C IMU (this development tree; default)
+#   microduck       — original: Dynamixel XL330 + IMU on the servo bus (ID 200),
+#                     matching 2c61dcc and earlier
+# Changing this needs `systemctl restart robotd`.
+variant = "open_microduck"
+
 [bus]
 # Serial port the servos share. /dev/ttyS2 is the Radxa Zero 3W's wiring; a board wired
 # differently can also be overridden per-invocation with `robotd --port`, which is the dev
 # escape hatch rather than the thing to edit here.
 port = "/dev/ttyS2"
-# Which driver the serial port speaks, i.e. which servo protocol it carries. `hd1910`
-# (the Feetech HD1910-C001, FT-HLS framing) is the migration target and the default;
-# `xl330` (the Dynamixel XL330, Dynamixel 2.0 framing) is the fallback for a robot whose
-# servos were not migrated. A bus can only carry one protocol, so this is the whole
-# difference between them.
+# Which driver the serial port speaks. Keep this in step with [platform].variant
+# (hd1910 for open_microduck, xl330 for microduck). robotd opens the variant's driver.
 driver = "hd1910"
 
 [imu]
-# The IMU on its own I²C bus, not the servo bus. The LSM6DSV16X sits on i2c4 (pins 27/28,
-# on-board pull-ups), aliased /dev/i2c-imu by the udev rule, at 0x6A by default.
-# i2c4 is dedicated to the IMU: the ToF rides the HAT's i2c3, whose 550 KB firmware upload
-# occupies that bus at boot — which is why the IMU no longer shares the servo bus.
+# OpenMicroDuck only: the IMU on its own I²C bus. Production wiring is i2c4 (pins 27/28,
+# on-board pull-ups), aliased /dev/i2c-imu by the udev rule, at 0x6A.
+# If that path cannot be opened or WHO_AM_I is not 0x70, robotd scans /dev/i2c-* the same
+# way imu_probe does — some boards answer on /dev/i2c-5. Do not point this at i2c6: 0x6A
+# there is a different device.
+# MicroDuck (variant = "microduck") ignores this section: the IMU is imu_to_dxl at
+# Dynamixel ID 200, fetched in the same sync_read as the XL330s.
 bus = "/dev/i2c-imu"
 address = 0x6A
 
@@ -141,8 +150,9 @@ mode = "walk"
 # standing_action_scale = 1.0
 # Standing runs softer, at this fraction of `gain`. The prototype's --standing-kp-ratio.
 # standing_gain_ratio = 0.8
-# Position P gain while running.
-# gain = 200
+# Position P gain while running. Unset follows [platform].variant: 32 OpenMicroDuck
+# (HD1910 BAM Kp), 200 MicroDuck (XL330).
+# gain = 32
 
 # First-order low-pass on the head and leg joint targets, as a blend factor in (0, 1].
 # 1.0 is pass-through (off). Unset resolves per mode: 0.5 / 0.7 walking — the values the
@@ -173,6 +183,8 @@ mode = "walk"
 # EMA, clamped 6.0..9.5 V). The servos' effective kP tracks their supply, so this holds the
 # robot's response steady as the pack sags. Off by default, as in the prototype.
 # voltage_adapt = false
+# Unset is 7.4 V for both variants (2S pack). BAM identified the HD1910 at vin=6.0;
+# that is a model condition, not this default.
 # nominal_voltage = 7.4
 
 [safety]
@@ -195,7 +207,8 @@ mode = "walk"
 # deadman_ms = 500
 
 # The gain limp-fall yields at — low enough to give way rather than fight the floor.
-# gain_limp = 50
+# Unset follows [platform].variant: 8 OpenMicroDuck, 50 MicroDuck.
+# gain_limp = 8
 
 # Land soft, then stand up from a still robot instead of a thrashing one.
 #

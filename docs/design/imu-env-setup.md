@@ -1,6 +1,6 @@
 # IMU 环境安装(Pi 5 台架 + microduck,越简越好)
 
-IMU: **LSM6DSV16X** @ `0x6B`,总线 `i2c-1`,Pi 3V3 供电。
+IMU: **LSM6DSV16X** @ `0x6B`,总线 `i2c-5`,Pi 3V3 供电。
 
 ## 1. Pi 侧
 
@@ -12,11 +12,11 @@ dtparam=i2c_arm=on,i2c_arm_baudrate=50000
 sudo apt-get update && sudo apt-get install -y i2c-tools
 pip install smbus2        # 或 sudo apt-get install -y python3-smbus2
 
-# 3) IMU 总线别名 /dev/i2c-imu -> i2c-1
+# 3) IMU 总线别名 /dev/i2c-imu -> i2c-5
 sudo tee /etc/udev/rules.d/99-robot-i2c-imu.rules >/dev/null <<'EOF'
-KERNEL=="i2c-1", SUBSYSTEM=="i2c-dev", SYMLINK+="i2c-imu"
+KERNEL=="i2c-5", SUBSYSTEM=="i2c-dev", SYMLINK+="i2c-imu"
 EOF
-sudo udevadm control --reload-rules && sudo udevadm trigger --sysname-match=i2c-1
+sudo udevadm control --reload-rules && sudo udevadm trigger --sysname-match=i2c-5
 ```
 
 自检:
@@ -41,12 +41,13 @@ export PATH="$HOME/.cargo/bin:$HOME/.local/zig/zig-x86_64-linux-0.14.1:$PATH"
 cd <microduck 仓库>
 cargo zigbuild --target aarch64-unknown-linux-gnu.2.31 -p duck-control --example imu_probe
 scp target/aarch64-unknown-linux-gnu/debug/examples/imu_probe joyandai@<pi>:~/microduck/
-ssh joyandai@<pi> '~/microduck/imu_probe /dev/i2c-imu 0x6B'
+ssh radxa@<radxa> '~/microduck/imu_probe /dev/i2c-imu 0x6B'
 ```
 
 ## 4. 说明
 
-- 期望输出:`ready=true`、四元数实时、`0 errors`。
+- 期望输出:`ready=true`、四元数实时、`stale` 不爬。瞬时 NACK 会记进 `errors`，不必为个位数紧张。
+- **安装后直立核对：** 鸭子站稳时 `gravity` 应接近 `[0, 0, -1]`（Z ≈ −1，XY 接近 0）。这是躯干系投影重力，策略和摔倒检测吃它。芯片封装朝上平放在桌上会看到约 `[-1, 0, 0]`——安装旋转把芯片 +Z 朝天当成机头朝天，不是坏芯片。`ready=false` 且 gravity 钉在 `[0, 0, -1]` 才是 decoder 默认值。
 - `robotd.toml` 的 `[imu]`:`bus = "/dev/i2c-imu"`,`address = 0x6B`(本台架;量产板为 0x6A)。
 - `duck-control/src/imui2c.rs` 需包含两处修复:
   1. `init()` 里 `fifo_gy_batch_set(FifoBatch::_120hz)`(否则 FIFO 无陀螺仪,永远组不出数据块);

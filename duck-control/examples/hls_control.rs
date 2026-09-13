@@ -6,10 +6,13 @@
 //! Compile on a development machine (not on the board):
 //!
 //! ```text
-//! cargo run -p duck-control --example hls_control -- COM13 speed
-//! cargo run -p duck-control --example hls_control -- COM13 torque
-//! cargo run -p duck-control --example hls_control -- COM13 speed 10
+//! cargo run -p duck-control --example hls_control -- --port COM13 --mode speed
+//! cargo run -p duck-control --example hls_control -- --port COM13 --mode torque
+//! cargo run -p duck-control --example hls_control -- --port COM13 --mode speed --id 10
+//! cargo run -p duck-control --example hls_control -- --port COM13 --mode torque --id 31 --cycles 3
 //! ```
+//!
+//! For the Radxa (aarch64), see `docs/robot/bringup-examples.md`.
 //!
 //! The UART is exclusive: if this talks to the robot's onboard bus, stop `robotd`
 //! first. Joints that are not being swept hold **0°**, not the pose they were
@@ -54,21 +57,23 @@ const fn tune(limit_deg: f64, torque: u16) -> Tune {
 /// (id 12 kept the old 100 because that slot was `head_yaw`).
 const fn tune_for(id: u8) -> Tune {
     match id {
-        10 => tune(30.0, 100),  // right_hip_yaw
+        10 => tune(25.0, 100),  // right_hip_yaw
         11 => tune(24.0, 200),  // right_hip_roll
         12 => tune(30.0, 200),  // right_hip_pitch
         13 => tune(30.0, 100),  // right_knee
         14 => tune(30.0, 100),  // right_ankle
-        20 => tune(30.0, 100),  // left_hip_yaw
+        20 => tune(25.0, 100),  // left_hip_yaw
         21 => tune(24.0, 200),  // left_hip_roll
         22 => tune(30.0, 200),  // left_hip_pitch
         23 => tune(30.0, 100),  // left_knee
         24 => tune(30.0, 100),  // left_ankle
-        30 => tune(30.0, 1000), // neck_pitch
-        31 => tune(30.0, 200),  // head_pitch
+        // Neck carries the head. 1000 (100%) in mode 2 has no speed cap: one
+        // poll slammed past ±30° and the pull-in chatter shook the joint.
+        30 => tune(30.0, 300), // neck_pitch
+        31 => tune(30.0, 100), // head_pitch
         32 => tune(30.0, 100),  // head_yaw
-        33 => tune(30.0, 100),  // head_roll
-        34 => tune(35.0, 80),   // mouth
+        33 => tune(20.0, 100),  // head_roll
+        34 => tune(12.0, 80),   // mouth
         _ => tune(0.0, 0),
     }
 }
@@ -87,7 +92,7 @@ const ZERO_RAD: f64 = 0.0;
 /// present-speed LSB). 800 ≈ 70 °/s. The first draft used 25, which is ~2 °/s.
 const DEFAULT_SPEED_LSB: u16 = 800;
 
-/// Accel register. 0 = maximum (what `HlsBusIo::apply_startup` writes). Softer for a demo.
+/// Accel register. 0 = maximum (what `FeetechIo::apply_startup` writes). Softer for a demo.
 const ACCEL: u8 = 20;
 
 /// How close to the goal counts as arrived, in degrees.
@@ -106,11 +111,15 @@ const STALL_DEG: f64 = 0.6;
 /// Flip once to pull in; never keep driving into that stop.
 const OUTSIDE_STALL: Duration = Duration::from_millis(350);
 
+/// Do not reverse force again this soon. Inertia after a flip looks like the
+/// opposite polarity if we keep re-learning `plus_increases` from drift.
+const FLIP_HOLD: Duration = Duration::from_millis(200);
+
 /// Poll period while a joint is moving.
 const POLL: Duration = Duration::from_millis(40);
 
-/// Three triangles per joint: +limit → −limit → 0°, repeated.
-const CYCLES: u32 = 3;
+/// One triangle per joint: +limit → −limit → 0°. Override with `--cycles`.
+const DEFAULT_CYCLES: u32 = 1;
 
 /// Display / exercise order: IDs 10–14, 20–24, 30–34.
 const COL_ORDER: [usize; NUM_JOINTS] = [10, 11, 12, 13, 14, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -131,29 +140,17 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let port = match args.next() {
-        Some(p) if p != "-h" && p != "--help" => p,
-        _ => {
-            eprint!("{USAGE}");
-            std::process::exit(2);
-        }
-    };
-    let mode = match args.next().as_deref() {
-        Some("speed") | Some("pos") | Some("servo") => Mode::Speed,
-        Some("torque") | Some("ele") | Some("force") => Mode::Torque,
-        Some(other) => {
-            return Err(format!("unknown mode {other:?}; use speed or torque").into());
-        }
-        None => {
-            eprint!("{USAGE}");
-            std::process::exit(2);
-        }
-    };
-    let only_id: Option<u8> = match args.next() {
-        Some(s) => Some(s.parse()?),
-        None => None,
-    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
+        eprint!("{USAGE}");
+        std::process::exit(2);
+    }
+    let Cli {
+        port,
+        mode,
+        only_id,
+        cycles,
+    } = parse_cli(&args)?;
 
     install_sigint();
 
@@ -199,7 +196,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     park_at_zero(&mut controller, &alive, None)?;
 
     println!(
-        "{label}  {n_alive}/{n} alive  per-joint limits/torque via tune_for(id)  {port}",
+        "{label}  {n_alive}/{n} alive  cycles={cycles}  per-joint limits/torque via tune_for(id)  {port}",
         label = match mode {
             Mode::Speed => format!(
                 "speed mode  goal_speed={DEFAULT_SPEED_LSB} steps/s (~{:.0} deg/s)  accel={ACCEL}",
@@ -210,7 +207,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         n = NUM_JOINTS,
     );
 
-    let result = drive(&mut controller, &alive, mode, only_id);
+    let result = drive(&mut controller, &alive, mode, only_id, cycles);
     limp_all(&mut controller, &alive);
     println!("torque off on every live servo");
     result
@@ -221,6 +218,7 @@ fn drive(
     alive: &[bool; NUM_JOINTS],
     mode: Mode,
     only_id: Option<u8>,
+    cycles: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for &i in &COL_ORDER {
         if !RUNNING.load(Ordering::Relaxed) {
@@ -245,8 +243,8 @@ fn drive(
             pct = tune.torque as f64 / 10.0,
         );
         match mode {
-            Mode::Speed => sweep_speed(controller, id, tune)?,
-            Mode::Torque => sweep_torque(controller, id, tune)?,
+            Mode::Speed => sweep_speed(controller, id, tune, cycles)?,
+            Mode::Torque => sweep_torque(controller, id, tune, cycles)?,
         }
         if RUNNING.load(Ordering::Relaxed) {
             hold_pose(controller, id, ZERO_RAD, tune)?;
@@ -314,6 +312,7 @@ fn sweep_speed(
     controller: &mut Sts3215Controller,
     id: u8,
     tune: Tune,
+    cycles: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     set_mode(controller, id, MODE_SERVO)?;
     write_u16(controller, id, reg::TORQUE_LIMIT, tune.torque)?;
@@ -325,7 +324,7 @@ fn sweep_speed(
     let minus = -tune.limit_deg.to_radians();
     let plus_l = format!("+{:.0}", tune.limit_deg);
     let minus_l = format!("-{:.0}", tune.limit_deg);
-    for _ in 0..CYCLES {
+    for _ in 0..cycles {
         go_to(controller, id, plus, &plus_l, tune)?;
         go_to(controller, id, minus, &minus_l, tune)?;
         go_to(controller, id, ZERO_RAD, "0", tune)?;
@@ -337,6 +336,7 @@ fn sweep_torque(
     controller: &mut Sts3215Controller,
     id: u8,
     tune: Tune,
+    cycles: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     set_mode(controller, id, MODE_ELECTRIC)?;
     write_u16(controller, id, reg::TORQUE_LIMIT, tune.torque)?;
@@ -371,7 +371,7 @@ fn sweep_torque(
         );
     }
 
-    let reversals_needed = CYCLES.saturating_mul(2);
+    let reversals_needed = cycles.saturating_mul(2);
     let mut reversals = 0u32;
     let mut last_flip = Instant::now();
     let mut plus_increases: Option<bool> = None;
@@ -384,7 +384,10 @@ fn sweep_torque(
     while reversals < reversals_needed && RUNNING.load(Ordering::Relaxed) {
         now = read_pos_rad(controller, id)?;
         let drift = now - mark_pos;
-        if drift.abs() >= LEARN_DEG.to_radians() {
+        if plus_increases.is_none() && drift.abs() >= LEARN_DEG.to_radians() {
+            // Polarity is a property of the actuator. Re-learning it from
+            // coasting-after-flip drift inverted the map every poll and
+            // bang-banged ±force at the soft stop (the shake on 30/31).
             plus_increases = Some((dir > 0) == (drift > 0.0));
             mark_pos = now;
             mark_at = Instant::now();
@@ -409,7 +412,7 @@ fn sweep_torque(
             let mut announced = false;
             if let Some(pinc) = plus_increases {
                 let need = dir_toward(want_up, pinc);
-                if need != dir {
+                if need != dir && last_flip.elapsed() >= FLIP_HOLD {
                     dir = need;
                     write_force(controller, id, dir, force)?;
                     last_flip = Instant::now();
@@ -815,21 +818,118 @@ fn install_sigint() {
     }
 }
 
+struct Cli {
+    port: String,
+    mode: Mode,
+    only_id: Option<u8>,
+    cycles: u32,
+}
+
+fn parse_cli(args: &[String]) -> Result<Cli, Box<dyn std::error::Error>> {
+    let mut port = None;
+    let mut mode = None;
+    let mut only_id = None;
+    let mut cycles = DEFAULT_CYCLES;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if let Some(v) = take_opt(args, &mut i, a, &["--port", "-p"])? {
+            port = Some(v);
+        } else if let Some(v) = take_opt(args, &mut i, a, &["--mode", "-m"])? {
+            mode = Some(parse_mode(&v)?);
+        } else if let Some(v) = take_opt(args, &mut i, a, &["--id", "-i"])? {
+            only_id = Some(parse_joint_id(&v)?);
+        } else if let Some(v) = take_opt(args, &mut i, a, &["--cycles", "-c"])? {
+            cycles = parse_cycles(&v)?;
+        } else {
+            return Err(format!(
+                "unexpected {a:?}; use --port, --mode, --id, --cycles (see --help)"
+            )
+            .into());
+        }
+    }
+    Ok(Cli {
+        port: port.ok_or("--port is required")?,
+        mode: mode.ok_or("--mode is required (speed or torque)")?,
+        only_id,
+        cycles,
+    })
+}
+
+/// `--foo bar`, `--foo=bar`, and the short form. Advances `i` past the value.
+fn take_opt(
+    args: &[String],
+    i: &mut usize,
+    a: &str,
+    names: &[&str],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    for name in names {
+        if a == *name {
+            *i += 1;
+            let v = args
+                .get(*i)
+                .ok_or_else(|| format!("{name} needs a value"))?;
+            *i += 1;
+            return Ok(Some(v.clone()));
+        }
+        let prefix = format!("{name}=");
+        if let Some(v) = a.strip_prefix(&prefix) {
+            if v.is_empty() {
+                return Err(format!("{name} needs a value").into());
+            }
+            *i += 1;
+            return Ok(Some(v.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_mode(s: &str) -> Result<Mode, Box<dyn std::error::Error>> {
+    match s {
+        "speed" | "pos" | "servo" => Ok(Mode::Speed),
+        "torque" | "ele" | "force" => Ok(Mode::Torque),
+        other => Err(format!("unknown --mode {other:?}; use speed or torque").into()),
+    }
+}
+
+fn parse_joint_id(s: &str) -> Result<u8, Box<dyn std::error::Error>> {
+    let id: u8 = s.parse().map_err(|_| format!("not a servo id: {s}"))?;
+    if !JOINT_IDS.contains(&id) {
+        return Err(format!("servo {id} is not a duck joint id").into());
+    }
+    Ok(id)
+}
+
+fn parse_cycles(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let n: u32 = s.parse().map_err(|_| format!("not a cycle count: {s}"))?;
+    if n == 0 {
+        return Err("--cycles must be >= 1".into());
+    }
+    if n > 100 {
+        return Err(format!("--cycles {s} is too large (max 100)").into());
+    }
+    Ok(n)
+}
+
 const USAGE: &str = "\
 hls_control — sweep each HD1910 about 0°; limits and torque are per joint
 
 Usage:
-  cargo run -p duck-control --example hls_control -- <port> <speed|torque> [id]
+  cargo run -p duck-control --example hls_control -- --port <port> --mode <speed|torque> [--id <id>] [--cycles <n>]
+
+--cycles defaults to 1 (one +limit → −limit → 0° triangle). Omit --id to sweep
+every live servo.
 
 Edit tune_for() in this file by servo id (not array index): limit_deg is
 ± about 0°, torque is 0.1% LSB (100 = 10%). Same value for constant force,
 WritePosEx, and TORQUE_LIMIT.
 
 Windows:
-  cargo run -p duck-control --example hls_control -- COM13 speed
-  cargo run -p duck-control --example hls_control -- COM13 torque 14
+  cargo run -p duck-control --example hls_control -- --port COM13 --mode speed
+  cargo run -p duck-control --example hls_control -- --port COM13 --mode torque --id 14
+  cargo run -p duck-control --example hls_control -- --port COM13 --mode torque --id 31 --cycles 3
 
 Linux / the robot:
   sudo systemctl stop robotd
-  cargo run -p duck-control --example hls_control -- /dev/ttyACM0 speed
+  ./hls_control --port /dev/ttyS2 --mode speed
 ";

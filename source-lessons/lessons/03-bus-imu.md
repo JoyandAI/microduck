@@ -124,6 +124,11 @@ pub const DEFAULT_MOUNT: [f64; 4] = [FRAC_1_SQRT_2, 0.0, FRAC_1_SQRT_2, 0.0]; //
 注释：*board is mounted so that trunk = [+raw_z, +raw_y, −raw_x]*。**你直连 IMU 时，安装朝向
 必须和这张表一致，或换一张新的 `mount`**——装歪了 gravity 就错，策略与安全一起错。
 
+**上板核对（装好后直立）：** 鸭子站稳，跑 `imu_probe`（可加 `--hz 50`）。`ready=true` 且
+`gravity` 接近 **`[0, 0, -1]`** 才算安装对了。这是躯干系里的「世界向下」，不是芯片原始轴。
+封装朝上平放在桌上会看到约 `[-1, 0, 0]`（安装旋转把芯片 +Z 朝天当成了机头朝天），不要当成坏数。
+`ready=false` 且 gravity 钉在 `[0, 0, -1]` 才是 decoder 还没吃到 SFLP 块。
+
 `ready()`（`imu.rs:99`）：
 
 ```rust
@@ -180,6 +185,7 @@ cargo test -p duck-control the_first_block_is_never_stale
 - [ ] 旧 XL330 时代 IMU 板为什么能和舵机同包读？（答：Dynamixel `sync_read` 同地址同长度多 id；两者都服务 124 地址 12 字节。**迁移后已拆开**：IMU 走 `/dev/i2c-imu`，舵机走 FT-HLS。）
 - [ ] 一个全 0 的 quat 块意味着什么？解码器会怎么做？（答：SFLP 还没写表；保留上次好值，绝不回落 identity）
 - [ ] `gravity` 怎么来的？（答：把世界系 `[0,0,-1]` 用 `last_quat` 反旋回躯干系并单位化）
+- [ ] 安装后鸭子直立，`imu_probe` 的 gravity 应接近什么？（答：`[0, 0, -1]`；平放芯片朝天约 `[-1, 0, 0]`）
 - [ ] 迁移后 IMU 读失败会怎样？（答：只降级——保留上次 `ImuData`、错误计数、按 1/10 记日志，整拍不 fail；`imu.rs` 零改动）
 - [ ] 换了非 SFLP 的 IMU，第几、几步要在主机重做？（答：第 2/4 步——出 quat 与估 gyro bias 的融合）
 
