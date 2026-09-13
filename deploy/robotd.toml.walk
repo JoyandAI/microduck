@@ -108,6 +108,7 @@ hz = 50
 # reports unhealthy, so the updater rolls the release back. `robotd --no-policy` sets this
 # from the command line.
 enabled = true
+action-scale = 0.3
 
 # Drive mode: "walk" (legs, the default) or "roller". The mode changes which policies load
 # AND the tuning defaults below — every value left unset resolves per mode, so switching a
