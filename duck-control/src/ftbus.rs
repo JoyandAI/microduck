@@ -122,25 +122,36 @@ const BIT15: u16 = 0x8000;
 const LOAD_MAGNITUDE_MASK: u16 = 0x03FF;
 
 // ── conversions (frozen) ─────────────────────────────────────────────────────
+//
+// Feetech's horn: increasing count is clockwise (datasheet "Clockwise 0→4095").
+// XL330 Drive Mode 0 and the MJCF / MicroDuck_rl joint axes: positive radian is
+// CCW from the horn. We negate the count↔radian map so a +rad command on HD1910
+// is the same physical turn as on the original duck. Mid-count 2048 stays 0 rad.
+// Do not "correct" this back to the vendor formula — that would invert every
+// policy action.
 
-/// Present-position counts → radians in `[-π, π)`.
+/// Present-position counts → radians in `(-π, π]`.
 ///
 /// Single-turn only: the count must be 0..=4095, which is exactly the range a servo in
 /// single-turn mode reports (BIT15 clear). A value with BIT15 or higher bits set is a
 /// multi-turn reading and returns `None` — the caller must not feed it through this mapping.
+///
+/// Sign is flipped relative to the raw encoder: count 0 is `+π`, count 4095 is just
+/// above `−π`. Matches [`rad_to_position_count`].
 pub fn position_to_rad(count: u16) -> Option<f64> {
     if count > MAX_POSITION_COUNT {
         return None;
     }
-    Some(count as f64 * RAD_PER_POSITION_COUNT - PI)
+    Some(PI - count as f64 * RAD_PER_POSITION_COUNT)
 }
 
 /// Radians → goal-position counts, the inverse of [`position_to_rad`].
 ///
-/// Single-turn positions (`[-π, π)`) map to `0..=4095`. Out-of-range inputs are clamped so a
-/// command never wraps into a multi-turn value. Matches `(rad + π) · 4096 / 2π`.
+/// Single-turn positions (`(-π, π]`) map to `0..=4095`. Out-of-range inputs are clamped so a
+/// command never wraps into a multi-turn value. Matches `(π − rad) · 4096 / 2π`.
+/// Positive radian decreases the count (CCW on the Feetech horn).
 pub fn rad_to_position_count(rad: f64) -> u16 {
-    let count = (rad + PI) / RAD_PER_POSITION_COUNT;
+    let count = (PI - rad) / RAD_PER_POSITION_COUNT;
     count.clamp(0.0, MAX_POSITION_COUNT as f64).round() as u16
 }
 
@@ -160,10 +171,12 @@ pub fn encode_write_pos_ex(pos: u16, speed: u16, acc: u8, torque: u16) -> [u8; 7
 /// Present-speed counts → rad/s.
 ///
 /// Sign-magnitude: BIT15 is the direction bit and the low 15 bits are the magnitude, matching
-/// the register's `±32767` (0.732 RPM/LSB) range. Reverse direction comes back negative.
+/// the register's `±32767` (0.732 RPM/LSB) range. Feetech's "forward" bit (BIT15 clear) is
+/// clockwise, which is **negative** in the XL330 / MJCF convention used by
+/// [`position_to_rad`].
 pub fn speed_to_rad_s(raw: u16) -> f64 {
     let magnitude = (raw & !BIT15) as f64;
-    let sign = if raw & BIT15 != 0 { -1.0 } else { 1.0 };
+    let sign = if raw & BIT15 != 0 { 1.0 } else { -1.0 };
     sign * magnitude * RPM_PER_SPEED_COUNT * RAD_PER_SEC_PER_RPM
 }
 
@@ -670,15 +683,24 @@ mod tests {
 
     #[test]
     fn position_conversion_handles_bit15_and_sign() {
-        assert_eq!(position_to_rad(0), Some(-PI));
+        assert_eq!(position_to_rad(0), Some(PI));
         assert!((position_to_rad(2048).unwrap() - 0.0).abs() < 1e-12); // 中位
         let max = 4095u16;
-        let expected = max as f64 * RAD_PER_POSITION_COUNT - PI;
+        let expected = PI - max as f64 * RAD_PER_POSITION_COUNT;
         assert!((position_to_rad(max).unwrap() - expected).abs() < 1e-12);
         // BIT15 (direction) set, or any multi-turn count, is out of single-turn range.
         assert_eq!(position_to_rad(0x8000), None);
         assert_eq!(position_to_rad(4096), None);
         assert_eq!(position_to_rad(0xFFFF), None);
+    }
+
+    /// Positive radian must turn CCW on the horn (decreasing Feetech count), matching XL330.
+    #[test]
+    fn positive_radian_decreases_count() {
+        assert!(rad_to_position_count(0.2) < 2048);
+        assert!(rad_to_position_count(-0.2) > 2048);
+        assert!(position_to_rad(2048 - 100).unwrap() > 0.0);
+        assert!(position_to_rad(2048 + 100).unwrap() < 0.0);
     }
 
     #[test]
@@ -698,9 +720,9 @@ mod tests {
     #[test]
     fn speed_conversion_handles_bit15_and_sign() {
         let per_count = 0.732 * RAD_PER_SEC_PER_RPM;
-        assert!((speed_to_rad_s(1) - per_count).abs() < 1e-12);
-        // BIT15 direction negates the magnitude.
-        assert!((speed_to_rad_s(0x8001) + per_count).abs() < 1e-12);
+        // BIT15 clear = Feetech clockwise = negative in the XL330 / MJCF convention.
+        assert!((speed_to_rad_s(1) + per_count).abs() < 1e-12);
+        assert!((speed_to_rad_s(0x8001) - per_count).abs() < 1e-12);
         assert_eq!(speed_to_rad_s(0), 0.0);
     }
 
@@ -724,8 +746,8 @@ mod tests {
     #[test]
     fn tick_block_parses_joint_fields() {
         let mut block = [0u8; TICK_READ_LEN as usize];
-        block[0..2].copy_from_slice(&1024u16.to_le_bytes()); // pos → -π/2
-        block[2..4].copy_from_slice(&1000u16.to_le_bytes()); // speed
+        block[0..2].copy_from_slice(&1024u16.to_le_bytes()); // pos → +π/2 (count < mid)
+        block[2..4].copy_from_slice(&1000u16.to_le_bytes()); // speed, BIT15 clear = clockwise
         block[4..6].copy_from_slice(&500u16.to_le_bytes()); // load
         block[6] = 120; // 12.0 V
         block[7] = 45; // 45 °C
@@ -736,8 +758,8 @@ mod tests {
         block[13..15].copy_from_slice(&200u16.to_le_bytes()); // current
 
         let fb = decode_joint_block(&block).unwrap();
-        assert!((fb.position_rad - (-PI / 2.0)).abs() < 1e-9);
-        assert!((fb.velocity_rad_s - 1000.0 * 0.732 * RAD_PER_SEC_PER_RPM).abs() < 1e-9);
+        assert!((fb.position_rad - (PI / 2.0)).abs() < 1e-9);
+        assert!((fb.velocity_rad_s + 1000.0 * 0.732 * RAD_PER_SEC_PER_RPM).abs() < 1e-9);
         assert!((fb.current_ma - 200.0 * 6.5).abs() < 1e-9);
         assert!((fb.load_percent - 50.0).abs() < 1e-9); // 500 * 0.1
         assert!((fb.volts - 12.0).abs() < 1e-12);

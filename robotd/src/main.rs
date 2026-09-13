@@ -2499,9 +2499,15 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                 duck_control::model::mouth_target(snapshot.mouth);
         }
 
-        match safety.apply(targets, hold, gain) {
-            Ok(applied) => limits.extend(applied.limits),
-            Err(e) => tracing::warn!(error = %e, "bus write failed"),
+        // HD1910 WritePosEx arms the servo (goal torque 980). A limp robot — `--no-policy`,
+        // or anything that has not been `init`/enabled — must not get a position write
+        // every tick or every joint locks. XL330 hid this: a goal-position poke does not
+        // enable torque.
+        if bringup != Bringup::Limp {
+            match safety.apply(targets, hold, gain) {
+                Ok(applied) => limits.extend(applied.limits),
+                Err(e) => tracing::warn!(error = %e, "bus write failed"),
+            }
         }
 
         // Only assemble a frame when somebody is subscribed. On a robot nobody usually is,
@@ -2586,6 +2592,11 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                 last_summary = Instant::now();
             }
         }
+    }
+    if let Err(e) = safety.set_torque(false) {
+        tracing::warn!(error = %e, "cannot cut torque on shutdown");
+    } else {
+        tracing::warn!("torque off");
     }
     tracing::info!("control loop stopped");
 }
@@ -4894,7 +4905,11 @@ mod tests {
         s.shutdown.store(true, Ordering::Relaxed);
         handle.await.unwrap();
 
-        assert_eq!(rx.recv().unwrap(), None, "powered up with no policy to run");
+        assert_ne!(
+            rx.recv().unwrap(),
+            Some(true),
+            "powered up with no policy to run"
+        );
         assert!(!s.homed.load(Ordering::Relaxed));
     }
 
