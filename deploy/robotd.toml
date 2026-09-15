@@ -17,12 +17,12 @@
 # differently can also be overridden per-invocation with `robotd --port`, which is the dev
 # escape hatch rather than the thing to edit here.
 port = "/dev/ttyS2"
-# Which driver the serial port speaks, i.e. which servo protocol it carries. `hls2909`
-# (the Feetech HL-2909-C001, FT-SCS framing) is the migration target and the default;
+# Which driver the serial port speaks, i.e. which servo protocol it carries. `hd1910`
+# (the Feetech HD1910-C001, FT-HLS framing) is the migration target and the default;
 # `xl330` (the Dynamixel XL330, Dynamixel 2.0 framing) is the fallback for a robot whose
 # servos were not migrated. A bus can only carry one protocol, so this is the whole
 # difference between them.
-driver = "hls2909"
+driver = "hd1910"
 
 [imu]
 # The IMU on its own I²C bus, not the servo bus. The LSM6DSV16X sits on i2c4 (pins 27/28,

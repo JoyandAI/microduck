@@ -1,7 +1,7 @@
 //! LSM6DSV16X IMU on its own I²C bus, driven directly from Linux i2c-dev.
 //!
 //! This is the linux-only half of the IMU move described in
-//! `docs/design/hls2909-i2c-imu-migration.md` §2.3: instead of the IMU riding the Dynamixel
+//! `docs/design/hd1910-i2c-imu-migration.md` §2.3: instead of the IMU riding the Dynamixel
 //! bus as a 12-byte block read at address 124, the chip is now reached over `/dev/i2c-imu`
 //! (the i2c4 bus) at 0x6A, and the host drives it with ST's official `lsm6dsv16x-rs`
 //! driver. The chip's on-sensor SFLP fusion still ships a game-rotation quaternion and its
@@ -31,7 +31,9 @@
 
 use std::path::Path;
 
-use crate::imu::{IMU_BLOCK_LEN, ImuData, SflpDecoder};
+use crate::imu::ImuData;
+#[cfg(target_os = "linux")]
+use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuIo, ImuStale, IoError, Result};
 #[cfg(target_os = "linux")]
 use lsm6dsv16x_rs::blocking::prelude::Tag;
@@ -238,6 +240,12 @@ mod bus {
             ..Default::default()
         };
         sensor.fifo_sflp_batch_set(fifo_sflp).map_err(drv_err)?;
+        // SFLP tags alone are not a 12-byte block. Without a gyro batch rate the FIFO
+        // never carries `GyNcTag`, `ImuIo::read` never packs, and `ready()` stays false
+        // on a live chip — the decoder keeps returning the upright default.
+        sensor
+            .fifo_gy_batch_set(FifoBatch::_120hz)
+            .map_err(drv_err)?;
         sensor
             .fifo_mode_set(FifoMode::StreamMode)
             .map_err(drv_err)?;
@@ -367,6 +375,25 @@ impl ImuBus {
             last_imu: ImuData::default(),
         })
     }
+
+    /// Read WHO_AM_I (0x0F) without resetting or configuring the chip.
+    ///
+    /// LSM6DSV16X is `0x70`. Use this to pick a bus: opening [`ImuBus::open`] on a
+    /// different device at 0x6A would go on to reset it.
+    pub fn who_am_i(bus_path: &Path, address: u8) -> Result<u8> {
+        let dev = bus::I2cDev::open(bus_path).map_err(|source| IoError::Port {
+            path: bus_path.display().to_string(),
+            source,
+        })?;
+        let addr = bus::i2c_address(address).ok_or_else(|| {
+            IoError::Bus(format!(
+                "bad IMU address {address:#04x}, expected 0x6A/0x6B"
+            ))
+        })?;
+        let mut sensor = lsm6dsv16x_rs::blocking::Lsm6dsv16x::new_i2c(dev, addr, bus::StdDelay);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        sensor.device_id_get().map_err(bus::drv_err)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -431,6 +458,28 @@ impl ImuBus {
             "no i2c-dev on this platform, so {} cannot be opened — run with a fake IMU",
             bus_path.display()
         )))
+    }
+
+    pub fn who_am_i(bus_path: &Path, _address: u8) -> Result<u8> {
+        Err(IoError::Bus(format!(
+            "no i2c-dev on this platform, so {} cannot be probed",
+            bus_path.display()
+        )))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ImuIo for ImuBus {
+    fn read(&mut self) -> Result<ImuData> {
+        match self.0 {}
+    }
+
+    fn ready(&self) -> bool {
+        match self.0 {}
+    }
+
+    fn stale(&self) -> ImuStale {
+        match self.0 {}
     }
 }
 

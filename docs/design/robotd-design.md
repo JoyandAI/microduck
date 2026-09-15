@@ -12,8 +12,8 @@ four other IMUs, the three cameras and the Pi are dropped, and every shipped pol
 `alpha_*`. The wheeled configuration survives as one params switch — `policy.mode = "roller"`
 (§4.2) — because what it selects is a policy set and a tuning preset, not a hardware variant.
 
-> **Migration note (2026-09-04, `hls2909-i2c-imu-migration.md`).** The servos are now
-> Feetech **HL-2909-C001** on the FT-SCS bus (Dynamixel v2 → FT-SCS v1-style frames), and the
+> **Migration note (2026-09-04, `hd1910-i2c-imu-migration.md`).** The servos are now
+> Feetech **HD1910-C001** on the FT-HLS bus (Dynamixel v2 → FT-HLS v1-style frames), and the
 > **IMU is off the servo bus** — it rides **i2c4** as `/dev/i2c-imu` (LSM6DSV16X at 0x6A), read
 > through a separate `ImuIo` trait rather than inside the motors' `sync_read`. `Sensors` and
 > every consumer (obs / safety / fall / odometry / state stream) are unchanged; `SflpDecoder`
@@ -37,7 +37,7 @@ share the servo UART; the IMU is on I²C4, never on that UART:
                            │  duck_control::ftbus::HlsBusIo
                            │  serialport · TIOCEXCL
                            ▼
-      /dev/ttyS2 · 1 Mbps · FT-SCS protocol (Dynamixel v1-style frames)
+      /dev/ttyS2 · 1 Mbps · FT-HLS protocol (Dynamixel v1-style frames)
                            │
      ┌────────────┬────────┴───────┬──────────────────┐
      │            │                │                  │
@@ -54,7 +54,7 @@ share the servo UART; the IMU is on I²C4, never on that UART:
 The servo loop is **`robotd`'s only serial bus again** — the old "no second bus" claim was
 about the motor port only, and still holds for I/O ownership, but the IMU now has its own I²C
 bus (i2c4, aliased `/dev/i2c-imu`) and its own code path (`ImuIo`). There is **no IMU on the
-Dynamixel/FT-SCS bus**: the hardware no longer embeds a Dynamixel-servicing IMU board, so the
+Dynamixel/FT-HLS bus**: the hardware no longer embeds a Dynamixel-servicing IMU board, so the
 v2 `imu_to_dxl` board is gone and `id 200` is gone from the servo id vector.
 
 **One owner at a time, and nothing hard-enforces it.** `serialport` sets `TIOCEXCL`, which
@@ -157,7 +157,7 @@ every 1 s       slow_sensors() · per-servo volts/temps from the tick cache  (§
 Where the data goes, once per period:
 
 ```text
-  servo bus (FT-SCS)
+  servo bus (FT-HLS)
        │  one sync_read: 15 servos, one transaction
        ▼
    Sensors ──────────┬──────────────────────► safety.observe ──► fallen? (debounced)
@@ -260,7 +260,7 @@ intended:
 
 ### 2.1 The bus layer and `RobotIo`
 
-A thin layer over `rustypot`, used **as a pure FT-SCS transport**: open, one combined
+A thin layer over `rustypot`, used **as a pure FT-HLS transport**: open, one combined
 `sync_read`, `sync_write` goal positions, torque enable, gains, and the startup register check.
 The transport's own naming register table differs from the HLS in its 34/35/36 rows, so every
 register address is a constant defined in `duck-control/src/ftbus.rs`, never rustypot's names.
@@ -268,7 +268,7 @@ Written fresh rather than lifted, but **the numbers are borrowed from the RL-sid
 (`microduck_rl/docs/feetech_hls2915_servo_swap.md` §"运行时寄存器写入值"), each with a comment
 saying so (2026-09-04):
 
-- FT-SCS frame/checksum per `docs/ftscs_protocol.md`: `FF FF ID LEN INST PARAM CHECK`,
+- FT-HLS frame/checksum per `docs/ftscs_protocol.md`: `FF FF ID LEN INST PARAM CHECK`,
   `CHECK = ~(ID+LEN+INST+PARAM) & 0xFF`, little-endian multi-byte. Instructions are
   PING 0x01, READ 0x02, WRITE 0x03, SYNC_READ 0x82, SYNC_WRITE 0x83, position-calibrate 0x0B;
   broadcast 0xFE.
@@ -349,7 +349,7 @@ per-tick call and why bring-up is a state machine rather than a flag the loop ke
 already in) and `interpolate_to` (a blocking linear ramp — deliberately blocking, since
 nothing else should be talking to the bus while it runs).
 
-Two implementations: `HlsBusIo` (the migration target, `driver="hls2909"`), and `DynamixelIo`
+Two implementations: `HlsBusIo` (the migration target, `driver="hd1910"`), and `DynamixelIo`
 (the XL330 fallback, `driver="xl330"`, kept as reference and for legacy robots); plus `FakeIo`
 (scripted samples, optionally frozen or failing on demand). A `FakeImu` complements it for
 `robotd --fake` and the tests. `FakeIo` is what the test suite runs against, and it is why

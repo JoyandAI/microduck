@@ -11,7 +11,6 @@ pub mod bus;
 pub mod fall;
 pub mod ftbus;
 pub mod imu;
-#[cfg(target_os = "linux")]
 pub mod imui2c;
 pub mod io;
 pub mod model;
