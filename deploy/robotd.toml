@@ -135,7 +135,19 @@ mode = "walk"
 
 # Scales raw policy output into a joint offset. Unset resolves per mode: 0.9 walking (the
 # prototype's current alpha default), 0.8 roller.
-# action_scale = 0.9
+#
+# SET EXPLICITLY TO 1.0 (2026-09-17) so the deployed robot matches TRAINING.
+# microduck_rl trains with joint_pos_action.scale = 1.0
+# (src/mjlab_microduck/tasks/microduck_velocity_env_cfg.py:799-801), and the official
+# reference recipe uses 1.0 as well
+# (reference_official_velocity_env_cfg.py:296). The 0.9 walk default would have made the
+# robot execute 90 % of the joint offset the policy was trained to produce -- the exact
+# "trained-with / deployed-without" mismatch AGENTS.md warns about.
+#
+# This was inherited from the prototype's alpha tuning and is NOT a claim that the policy
+# was trained with it. If a future policy IS trained with a scale != 1.0, put that value
+# here AND record it in the training cfg -- the two must always agree.
+action_scale = 1.0
 
 # The standing policy is trained to be applied whole.
 # standing_action_scale = 1.0
