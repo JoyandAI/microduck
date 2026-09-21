@@ -82,6 +82,37 @@ const TICK_READ_LEN: u8 = 15;
 /// bounded hiccup rather than stalling the loop on the serial driver's default.
 const READ_TIMEOUT: Duration = Duration::from_millis(30);
 
+/// How many times one tick's `sync_read` is attempted before the tick is declared failed.
+///
+/// **Measured on the K1 bench, 2026-09-20.** A `sync_read` is one 0x82 broadcast and fifteen
+/// replies collected as a single byte stream; a byte lost to motor-current noise on the TTL
+/// link shifts every following reply, so one dropped byte failed the whole transaction. The
+/// control loop then had no retry, and `COAST_TICKS` (3) meant the robot was frozen for the
+/// fourth tick onwards — with bursts measured at 40–90 consecutive failures, the loop spent
+/// whole tenths of a second not driving at all: 50 Hz target, 22 Hz achieved, visible as a
+/// stuttering gait.
+///
+/// A retry costs one more `READ_TIMEOUT` at worst, and a fresh transaction is the only way
+/// back into frame alignment — the failed read leaves the port's receive buffer holding
+/// whatever arrived late, which is what made the failure self-sustaining.
+const READ_ATTEMPTS: usize = 2;
+
+/// The plausible supply range for the servo rail, in volts.
+///
+/// The pack is 2S: `BATTERY_FULL_V` is 8.2 and `BATTERY_EMPTY_V` is 6.6, so anything outside
+/// this band is not a battery, it is a misread. `present_voltage` is register 62 of a servo
+/// whose reply shares the byte stream with fourteen others, and a shifted stream decodes to
+/// plausible-looking nonsense — 4.0 V was observed on a pack sitting at 7.4 V. A reading this
+/// far out is dropped rather than averaged in, because the average is what the daemon
+/// compares against the empty threshold, and a wrong comparison there powers the board off.
+pub const PLAUSIBLE_VOLTAGE_V: std::ops::RangeInclusive<f64> = 5.0..=9.0;
+
+/// The fewest servo voltage readings that must be plausible for the average to be used.
+///
+/// Ten of fifteen: a majority with margin, so one or two dead or wedged servos cannot block
+/// the battery estimate, while a bus that is broadly misreading cannot produce one either.
+const MIN_PLAUSIBLE_VOLTAGE_READINGS: usize = 10;
+
 /// HLSCL mode 4: pure position PD (HD1910 factory / Sim2Real). Register 33 sits in the
 /// EEPROM window (5..=39); a locked EPROM silently drops the write — `hls_control` had to
 /// unlock around this. Mode 0 is the HLS "angle servo with force limit"; BAM identified
@@ -192,6 +223,34 @@ pub fn current_to_ma(raw: u16) -> f64 {
 /// Present-voltage byte → volts (0.1 V per count).
 pub fn voltage_to_volts(count: u8) -> f64 {
     count as f64 * VOLTS_PER_VOLTAGE_COUNT
+}
+
+/// The mean of the servo voltage readings that are physically possible, or `None`.
+///
+/// **This guard decides whether the robot has a battery estimate at all.** A servo's supply
+/// voltage rides in the same reply block as its position and temperature, so a misaligned byte
+/// stream turns it into nonsense that still looks like a number. Measured on the K1 bench with
+/// a pack sitting at 7.40 V: the reported value fell to 6.757 V, then 6.411 V, then 4.01 V as
+/// the bus failed — and 6.411 V is below `BATTERY_EMPTY_V` (6.6 V), so the daemon concluded the
+/// pack was flat and powered the board off mid-stride. Dropping implausible readings instead of
+/// averaging them keeps that comparison meaningful: a reported voltage is now either a real
+/// battery or nothing at all.
+///
+/// Returns `None` when fewer than [`MIN_PLAUSIBLE_VOLTAGE_READINGS`] readings are usable, so
+/// the caller reports "no estimate" rather than a number derived from wreckage.
+pub fn plausible_voltage_average(volts: &[f64; NUM_JOINTS]) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for &v in volts {
+        if PLAUSIBLE_VOLTAGE_V.contains(&v) {
+            sum += v;
+            count += 1;
+        }
+    }
+    if count < MIN_PLAUSIBLE_VOLTAGE_READINGS {
+        return None;
+    }
+    Some(sum / count as f64)
 }
 
 /// Present-temperature byte → °C (already whole degrees).
@@ -521,10 +580,12 @@ impl FeetechIo {
             .write_raw_data(id, addr, data.to_vec())
             .map_err(|e| IoError::Bus(format!("write reg {addr} on {id}: {e}")))
     }
-}
 
-impl RobotIo for FeetechIo {
-    fn read(&mut self) -> Result<Sensors> {
+    /// One `sync_read` attempt: broadcast, collect fifteen replies, decode them.
+    ///
+    /// Split out of [`RobotIo::read`] so the retry around it is visible as a retry, and so a
+    /// failed attempt cannot be mistaken for the whole tick's work.
+    fn read_once(&mut self) -> Result<Sensors> {
         let blocks = self
             .controller
             .sync_read_raw_data(&self.ids, TICK_READ_ADDR, TICK_READ_LEN)
@@ -558,6 +619,24 @@ impl RobotIo for FeetechIo {
         // The IMU no longer rides this bus; the caller fuses the separate ImuIo sample.
         sensors.imu = ImuData::default();
         Ok(sensors)
+    }
+}
+
+impl RobotIo for FeetechIo {
+    /// One bus read, retried once.
+    ///
+    /// See [`READ_ATTEMPTS`]: a single lost byte misaligns the whole reply stream, and the
+    /// retry is what turns "one noisy byte" back into a usable tick instead of four frozen
+    /// ones. The last attempt's error is the one reported.
+    fn read(&mut self) -> Result<Sensors> {
+        let mut last = None;
+        for _ in 0..READ_ATTEMPTS {
+            match self.read_once() {
+                Ok(sensors) => return Ok(sensors),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("READ_ATTEMPTS is non-zero"))
     }
 
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
@@ -606,27 +685,18 @@ impl RobotIo for FeetechIo {
 
     /// Supply voltage and case temperatures from the last tick's block — no extra transaction.
     ///
-    /// `volts` is averaged over the joints that reported a positive reading; `temps_c` is
-    /// per-joint. Before the first tick no cache exists, so this fails until the loop has read
-    /// once (mirroring how a bus with nothing on it reports no voltage).
+    /// `volts` is the mean of readings inside [`PLAUSIBLE_VOLTAGE_V`], and only when at least
+    /// [`MIN_PLAUSIBLE_VOLTAGE_READINGS`] servos reported one. A bus that is misreading therefore
+    /// produces no battery estimate — the caller keeps its last good sample, instead of treating
+    /// garbage as an empty pack and powering the board off. `temps_c` is per-joint.
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
-        let mut volts_sum = 0.0;
-        let mut count = 0usize;
-        for &v in &self.last_volts {
-            if v > 0.0 {
-                volts_sum += v;
-                count += 1;
-            }
-        }
-        if count == 0 {
-            return Err(IoError::ShortRead {
-                what: "input voltage",
-                expected: NUM_JOINTS,
-                got: 0,
-            });
-        }
+        let volts = plausible_voltage_average(&self.last_volts).ok_or(IoError::Bus(format!(
+            "input voltage: fewer than {MIN_PLAUSIBLE_VOLTAGE_READINGS} of {NUM_JOINTS} servo \
+             readings were in {PLAUSIBLE_VOLTAGE_V:?} V — the bus is misreading, so there is no \
+             battery estimate to report"
+        )))?;
         Ok(SlowSensors {
-            volts: volts_sum / count as f64,
+            volts,
             temps_c: self.last_temps_c,
         })
     }
@@ -845,5 +915,85 @@ mod tests {
         assert_eq!(&production[1..3], &2048u16.to_le_bytes());
         assert_eq!(&production[3..5], &980u16.to_le_bytes());
         assert_eq!(&production[5..7], &0u16.to_le_bytes());
+    }
+
+    // ── the battery guard ───────────────────────────────────────────────────
+    //
+    // These pin the behaviour that the K1 bench falsified: a bus that is misreading must not
+    // be able to produce a battery estimate, because that estimate is compared against
+    // `BATTERY_EMPTY_V` and a wrong comparison there powers the board off.
+
+    /// A healthy rail averages to the real voltage.
+    #[test]
+    fn a_healthy_rail_averages_to_its_voltage() {
+        let volts = [7.4f64; NUM_JOINTS];
+        let avg = plausible_voltage_average(&volts).expect("a healthy rail has an estimate");
+        assert!((avg - 7.4).abs() < 1e-9, "got {avg}");
+    }
+
+    /// One or two servos reading nonsense is tolerated — the average is still the pack.
+    #[test]
+    fn a_few_implausible_readings_do_not_spoil_the_estimate() {
+        let mut volts = [7.4f64; NUM_JOINTS];
+        volts[0] = 0.0; // a servo that did not answer
+        volts[1] = 213.0; // a decoded byte-shift
+        volts[2] = 4.01; // the observed mid-failure value, below the empty threshold
+        let avg = plausible_voltage_average(&volts).expect("12 good readings are enough");
+        assert!((avg - 7.4).abs() < 1e-9, "got {avg}");
+    }
+
+    /// **What this filter can and cannot do**, pinned so the limit is explicit rather than
+    /// assumed. A *uniform* misread — every servo reporting 6.411 V because the whole reply
+    /// stream shifted the same way — is inside the plausible band and looks exactly like a
+    /// deeply discharged pack. No value test can separate those two, which is why the real
+    /// defence is `Safety::slow_sensors` refusing to report a battery estimate for a tick
+    /// whose read was not clean. This filter only rejects readings that are impossible.
+    #[test]
+    fn a_uniform_misread_is_inside_the_band_and_is_the_read_gates_job() {
+        let volts = [6.411f64; NUM_JOINTS]; // below BATTERY_EMPTY_V, yet plausible-looking
+        assert!(
+            plausible_voltage_average(&volts).is_some(),
+            "6.411 V is a possible pack voltage, so the value filter cannot reject it"
+        );
+    }
+
+    /// Values that are physically impossible are rejected: a reading outside the band cannot
+    /// be a 2S pack, whatever the bus did.
+    #[test]
+    fn impossible_readings_are_rejected() {
+        for bad in [0.0, 4.9, 9.01, 213.0, -7.4] {
+            let mut volts = [7.4f64; NUM_JOINTS];
+            for v in volts
+                .iter_mut()
+                .take(NUM_JOINTS - MIN_PLAUSIBLE_VOLTAGE_READINGS + 1)
+            {
+                *v = bad;
+            }
+            assert_eq!(
+                plausible_voltage_average(&volts),
+                None,
+                "{bad} V was accepted as a battery reading"
+            );
+        }
+    }
+
+    /// Below the quorum there is no estimate, even if every reading is individually sane.
+    #[test]
+    fn too_few_readings_is_no_estimate() {
+        let mut volts = [0.0f64; NUM_JOINTS];
+        for v in volts.iter_mut().take(MIN_PLAUSIBLE_VOLTAGE_READINGS - 1) {
+            *v = 7.4;
+        }
+        assert_eq!(plausible_voltage_average(&volts), None);
+    }
+
+    /// The retry count is load-bearing: one attempt is the behaviour that left the robot
+    /// frozen for four ticks per dropped byte, and zero attempts would not compile a read.
+    #[test]
+    fn the_read_is_retried() {
+        assert!(
+            READ_ATTEMPTS >= 2,
+            "a single attempt is the bug this guards"
+        );
     }
 }

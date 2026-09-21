@@ -112,6 +112,16 @@ pub struct Safety<T: RobotIo, U: ImuIo> {
     /// Tracks the last gain written so an unchanged one is not rewritten every tick — that
     /// would be fifteen bus writes per tick for no reason.
     gain: Option<u16>,
+    /// Whether the most recent tick's bus read came back intact.
+    ///
+    /// **This is what makes the battery estimate trustworthy.** A servo's supply voltage is
+    /// decoded from the same reply bytes as its position, so a read that had to be retried, or
+    /// that failed outright, may still hand back a number for it — and on the K1 bench that
+    /// number read 6.411 V on a pack sitting at 7.40 V, under `BATTERY_EMPTY_V`, which powered
+    /// the board off mid-stride. The value cannot be told apart from a real sag by looking at
+    /// it, so the gate is the read itself: a battery estimate only exists for a tick whose
+    /// read was clean, and otherwise the last good estimate stands.
+    last_read_clean: bool,
 }
 
 impl<T: RobotIo, U: ImuIo> Safety<T, U> {
@@ -123,11 +133,19 @@ impl<T: RobotIo, U: ImuIo> Safety<T, U> {
             falling_for: Duration::ZERO,
             fallen: false,
             gain: None,
+            last_read_clean: false,
         }
     }
 
     pub fn read(&mut self) -> Result<Sensors, IoError> {
-        self.io.read()
+        let result = self.io.read();
+        self.last_read_clean = result.is_ok();
+        result
+    }
+
+    /// Whether the last tick's servo read came back intact (see [`Self::last_read_clean`]).
+    pub fn read_was_clean(&self) -> bool {
+        self.last_read_clean
     }
 
     /// Bus reads that are not part of the tick, passed through rather than exposing the IO.
@@ -136,7 +154,13 @@ impl<T: RobotIo, U: ImuIo> Safety<T, U> {
     /// except through here" a fact the borrow checker enforces rather than a convention. Slow
     /// sensors and IMU diagnostics read rather than write, so they are no threat to that, but
     /// handing out the handle to reach them would be.
+    ///
+    /// Refuses to answer after a tick whose read was not clean: the caller keeps its last
+    /// sample, which is the documented behaviour for a slow-sensor read that fails.
     pub fn slow_sensors(&mut self) -> Result<crate::io::SlowSensors, IoError> {
+        if !self.last_read_clean {
+            return Err(IoError::Simulated);
+        }
         self.io.slow_sensors()
     }
 
@@ -595,5 +619,42 @@ mod tests {
         assert_eq!(s.io().writes, 3);
         assert_eq!(s.io().last_gain, Some(SafetyConfig::default().gain_running));
         assert_eq!(s.gain, Some(SafetyConfig::default().gain_running));
+    }
+
+    /// **The battery gate.** A tick whose servo read failed must not produce a battery
+    /// estimate, because the supply voltage is decoded from those same reply bytes: on the K1
+    /// bench a failed read reported 6.411 V on a 7.40 V pack, which is under
+    /// `BATTERY_EMPTY_V` and powered the board off. With the gate, the caller keeps its last
+    /// good sample instead (which is what `publish_slow_sensors` documents for a failed read).
+    #[test]
+    fn a_failed_read_yields_no_battery_estimate() {
+        let mut s = populated_safety();
+
+        // A clean tick has an estimate.
+        s.read().expect("the fake answers");
+        assert!(s.read_was_clean());
+        assert!(
+            s.slow_sensors().is_ok(),
+            "a clean read must produce a battery estimate"
+        );
+
+        // The next tick's read fails: no estimate, even though the fake would happily report
+        // a plausible-looking voltage.
+        s.io.fail_next_read = true;
+        assert!(s.read().is_err(), "the injected failure must surface");
+        assert!(!s.read_was_clean());
+        assert!(
+            s.slow_sensors().is_err(),
+            "a failed read must not become a battery reading"
+        );
+
+        // And it recovers with the bus.
+        s.read().expect("the fake answers again");
+        assert!(s.read_was_clean());
+        assert!(s.slow_sensors().is_ok());
+    }
+
+    fn populated_safety() -> Safety<FakeIo, FakeImu> {
+        Safety::new(FakeIo::new(), FakeImu::new(), SafetyConfig::default())
     }
 }
