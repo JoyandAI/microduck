@@ -25,9 +25,13 @@
 //! the same tick.
 
 use std::f64::consts::PI;
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use rustypot::servo::feetech::sts3215::Sts3215Controller;
+use serialport::SerialPort;
 
 use crate::hardware::HD1910_FIRMWARE;
 use crate::imu::ImuData;
@@ -94,8 +98,19 @@ const READ_TIMEOUT: Duration = Duration::from_millis(30);
 ///
 /// A retry costs one more `READ_TIMEOUT` at worst, and a fresh transaction is the only way
 /// back into frame alignment — the failed read leaves the port's receive buffer holding
-/// whatever arrived late, which is what made the failure self-sustaining.
+/// whatever arrived late, which is what made the failure self-sustaining. The retry arms
+/// [`RxFlushPort`] so that leftover is discarded before the next instruction is sent.
 const READ_ATTEMPTS: usize = 2;
+
+/// How long a silent input means the late replies from a failed read have finished.
+///
+/// At 1 Mbps a byte is 10 µs, so 2 ms is two hundred byte-times of idle — longer than one
+/// status frame, short enough to add to a retry without spending the tick.
+const RX_DRAIN_QUIET: Duration = Duration::from_millis(2);
+
+/// Cap on draining a failed read's leftovers. A line that never goes quiet must not hold
+/// the control tick; past this the next instruction is sent anyway.
+const RX_DRAIN_CAP: Duration = Duration::from_millis(8);
 
 /// The plausible supply range for the servo rail, in volts.
 ///
@@ -404,8 +419,209 @@ pub const HLS_EEPROM_EXPECTED: &[RegisterExpectation] = &[
 
 // ── the bus ──────────────────────────────────────────────────────────────────
 
+/// What [`discard_stale_input`] needs from a port. Split out so the drain can be tested
+/// without a real tty: `clear` drops what the driver already buffered, then a short read
+/// waits out bytes still on the wire.
+trait InputDrain {
+    fn clear_input(&mut self);
+    fn io_timeout(&self) -> Duration;
+    fn set_io_timeout(&mut self, timeout: Duration) -> bool;
+    fn read_some(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+struct PortDrain<'a>(&'a mut dyn SerialPort);
+
+impl InputDrain for PortDrain<'_> {
+    fn clear_input(&mut self) {
+        let _ = self.0.clear(serialport::ClearBuffer::Input);
+    }
+
+    fn io_timeout(&self) -> Duration {
+        self.0.timeout()
+    }
+
+    fn set_io_timeout(&mut self, timeout: Duration) -> bool {
+        self.0.set_timeout(timeout).is_ok()
+    }
+
+    fn read_some(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+/// Drop bytes left in the receive buffer by a failed `sync_read`, then read until the line
+/// is quiet or [`RX_DRAIN_CAP`] elapses.
+///
+/// `clear` alone is not enough: replies already in flight arrive after it and become the
+/// first bytes of the next transaction. The port's real timeout is restored before return
+/// so the following status read still waits [`READ_TIMEOUT`], not the 2 ms quiet gap.
+fn discard_stale_input(port: &mut dyn InputDrain) {
+    let saved = port.io_timeout();
+    if !port.set_io_timeout(RX_DRAIN_QUIET) {
+        port.clear_input();
+        return;
+    }
+    port.clear_input();
+    let mut buf = [0u8; 128];
+    let start = Instant::now();
+    while start.elapsed() < RX_DRAIN_CAP {
+        match port.read_some(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+    let _ = port.set_io_timeout(saved);
+}
+
+/// Serial port wrapper that can discard a stale receive buffer on the next write.
+///
+/// rustypot owns the port inside `Sts3215Controller` and does not give it back, and a
+/// `sync_read` sends its instruction before it reads. Arming [`Self::discard_rx`] on a
+/// failed read therefore flushes at the one moment that is safe: before the retry's
+/// instruction, while the new replies are not yet on the wire. Flushing at the start of
+/// the following `read` would drop those new replies if they had already landed.
+struct RxFlushPort {
+    inner: Box<dyn SerialPort>,
+    discard_rx: Arc<AtomicBool>,
+}
+
+impl RxFlushPort {
+    fn discard_if_armed(&mut self) {
+        if self.discard_rx.swap(false, Ordering::AcqRel) {
+            discard_stale_input(&mut PortDrain(&mut *self.inner));
+        }
+    }
+}
+
+impl Read for RxFlushPort {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Write for RxFlushPort {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.discard_if_armed();
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl SerialPort for RxFlushPort {
+    fn name(&self) -> Option<String> {
+        self.inner.name()
+    }
+
+    fn baud_rate(&self) -> serialport::Result<u32> {
+        self.inner.baud_rate()
+    }
+
+    fn data_bits(&self) -> serialport::Result<serialport::DataBits> {
+        self.inner.data_bits()
+    }
+
+    fn flow_control(&self) -> serialport::Result<serialport::FlowControl> {
+        self.inner.flow_control()
+    }
+
+    fn parity(&self) -> serialport::Result<serialport::Parity> {
+        self.inner.parity()
+    }
+
+    fn stop_bits(&self) -> serialport::Result<serialport::StopBits> {
+        self.inner.stop_bits()
+    }
+
+    fn timeout(&self) -> Duration {
+        self.inner.timeout()
+    }
+
+    fn set_baud_rate(&mut self, baud_rate: u32) -> serialport::Result<()> {
+        self.inner.set_baud_rate(baud_rate)
+    }
+
+    fn set_data_bits(&mut self, data_bits: serialport::DataBits) -> serialport::Result<()> {
+        self.inner.set_data_bits(data_bits)
+    }
+
+    fn set_flow_control(
+        &mut self,
+        flow_control: serialport::FlowControl,
+    ) -> serialport::Result<()> {
+        self.inner.set_flow_control(flow_control)
+    }
+
+    fn set_parity(&mut self, parity: serialport::Parity) -> serialport::Result<()> {
+        self.inner.set_parity(parity)
+    }
+
+    fn set_stop_bits(&mut self, stop_bits: serialport::StopBits) -> serialport::Result<()> {
+        self.inner.set_stop_bits(stop_bits)
+    }
+
+    fn set_timeout(&mut self, timeout: Duration) -> serialport::Result<()> {
+        self.inner.set_timeout(timeout)
+    }
+
+    fn write_request_to_send(&mut self, level: bool) -> serialport::Result<()> {
+        self.inner.write_request_to_send(level)
+    }
+
+    fn write_data_terminal_ready(&mut self, level: bool) -> serialport::Result<()> {
+        self.inner.write_data_terminal_ready(level)
+    }
+
+    fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+        self.inner.read_clear_to_send()
+    }
+
+    fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+        self.inner.read_data_set_ready()
+    }
+
+    fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+        self.inner.read_ring_indicator()
+    }
+
+    fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+        self.inner.read_carrier_detect()
+    }
+
+    fn bytes_to_read(&self) -> serialport::Result<u32> {
+        self.inner.bytes_to_read()
+    }
+
+    fn bytes_to_write(&self) -> serialport::Result<u32> {
+        self.inner.bytes_to_write()
+    }
+
+    fn clear(&self, buffer_to_clear: serialport::ClearBuffer) -> serialport::Result<()> {
+        self.inner.clear(buffer_to_clear)
+    }
+
+    fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
+        Ok(Box::new(RxFlushPort {
+            inner: self.inner.try_clone()?,
+            discard_rx: Arc::clone(&self.discard_rx),
+        }))
+    }
+
+    fn set_break(&self) -> serialport::Result<()> {
+        self.inner.set_break()
+    }
+
+    fn clear_break(&self) -> serialport::Result<()> {
+        self.inner.clear_break()
+    }
+}
+
 pub struct FeetechIo {
     controller: Sts3215Controller,
+    /// Set after a failed read. [`RxFlushPort`] consumes it on the next write.
+    discard_rx: Arc<AtomicBool>,
     /// Servo ids in [`crate::model::JOINT_IDS`] order — the order blocks come back in.
     ids: Vec<u8>,
     /// Supply voltage per joint captured in the last tick's block. Zero until a read happens.
@@ -428,12 +644,18 @@ impl FeetechIo {
                 source: std::io::Error::other(e),
             })?;
 
+        let discard_rx = Arc::new(AtomicBool::new(false));
+        let serial = Box::new(RxFlushPort {
+            inner: serial,
+            discard_rx: Arc::clone(&discard_rx),
+        });
         let controller = Sts3215Controller::new()
             .with_protocol_v1()
             .with_serial_port(serial);
 
         let mut io = Self {
             controller,
+            discard_rx,
             ids: JOINT_IDS.to_vec(),
             last_volts: [0.0; NUM_JOINTS],
             last_temps_c: [0.0; NUM_JOINTS],
@@ -627,13 +849,18 @@ impl RobotIo for FeetechIo {
     ///
     /// See [`READ_ATTEMPTS`]: a single lost byte misaligns the whole reply stream, and the
     /// retry is what turns "one noisy byte" back into a usable tick instead of four frozen
-    /// ones. The last attempt's error is the one reported.
+    /// ones. Each failure arms a receive-buffer discard, consumed by the next write — the
+    /// retry's instruction when another attempt remains, otherwise the next tick's first
+    /// write. The last attempt's error is the one reported.
     fn read(&mut self) -> Result<Sensors> {
         let mut last = None;
         for _ in 0..READ_ATTEMPTS {
             match self.read_once() {
                 Ok(sensors) => return Ok(sensors),
-                Err(e) => last = Some(e),
+                Err(e) => {
+                    self.discard_rx.store(true, Ordering::Release);
+                    last = Some(e);
+                }
             }
         }
         Err(last.expect("READ_ATTEMPTS is non-zero"))
@@ -705,6 +932,7 @@ impl RobotIo for FeetechIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     // ── FT-HLS frame bits, checked against the protocol manual examples ─────
     //
@@ -995,5 +1223,314 @@ mod tests {
             READ_ATTEMPTS >= 2,
             "a single attempt is the bug this guards"
         );
+    }
+
+    /// Bytes already buffered are dropped, bytes still arriving are read off, then the
+    /// caller's timeout is put back. A retry that skipped this would checksum the leftover.
+    #[test]
+    fn a_failed_read_drains_buffered_and_inflight_bytes() {
+        let mut port = FakeDrain {
+            buffered: vec![0xFF, 0xFF, 12],
+            inflight: vec![17, 1, 255],
+            ..FakeDrain::default()
+        };
+        discard_stale_input(&mut port);
+        assert_eq!(port.cleared, vec![0xFF, 0xFF, 12]);
+        assert!(port.inflight.is_empty());
+        assert_eq!(port.timeout, Duration::from_millis(30));
+    }
+
+    /// A line that keeps delivering bytes has to give up, with the real timeout restored.
+    #[test]
+    fn drain_stops_at_the_cap_when_the_line_stays_noisy() {
+        let mut port = FakeDrain {
+            buffered: vec![1],
+            noisy: true,
+            ..FakeDrain::default()
+        };
+        let start = Instant::now();
+        discard_stale_input(&mut port);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(port.timeout, Duration::from_millis(30));
+        assert!(port.reads > 1);
+    }
+
+    /// The armed flush runs before the instruction bytes, and only on that one write.
+    #[test]
+    fn an_armed_flush_discards_input_before_the_next_write() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let state = Arc::new(std::sync::Mutex::new(FakePortState {
+            buffered: vec![0xFF, 0x0C],
+            inflight: vec![0x11],
+            timeout: READ_TIMEOUT,
+            ..FakePortState::default()
+        }));
+        let mut port = RxFlushPort {
+            inner: Box::new(FakePort {
+                state: Arc::clone(&state),
+            }),
+            discard_rx: Arc::clone(&flag),
+        };
+        port.write_all(&[0x82, 0x01]).unwrap();
+        {
+            let inner = state.lock().unwrap();
+            assert_eq!(inner.cleared, vec![0xFF, 0x0C]);
+            assert!(inner.inflight.is_empty());
+            assert_eq!(inner.written, vec![0x82, 0x01]);
+            assert_eq!(
+                inner.events,
+                vec![PortEvent::Clear, PortEvent::Write],
+                "stale bytes have to leave before the retry's instruction"
+            );
+            assert_eq!(inner.timeout, READ_TIMEOUT);
+        }
+        assert!(!flag.load(Ordering::Acquire));
+
+        port.write_all(&[0x03]).unwrap();
+        let inner = state.lock().unwrap();
+        assert_eq!(inner.cleared, vec![0xFF, 0x0C]);
+        assert_eq!(inner.written, vec![0x82, 0x01, 0x03]);
+        assert_eq!(
+            inner.events,
+            vec![PortEvent::Clear, PortEvent::Write, PortEvent::Write]
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PortEvent {
+        Clear,
+        Write,
+    }
+
+    struct FakePortState {
+        buffered: Vec<u8>,
+        inflight: Vec<u8>,
+        cleared: Vec<u8>,
+        written: Vec<u8>,
+        events: Vec<PortEvent>,
+        timeout: Duration,
+    }
+
+    impl Default for FakePortState {
+        fn default() -> Self {
+            Self {
+                buffered: Vec::new(),
+                inflight: Vec::new(),
+                cleared: Vec::new(),
+                written: Vec::new(),
+                events: Vec::new(),
+                timeout: READ_TIMEOUT,
+            }
+        }
+    }
+
+    struct FakePort {
+        state: Arc<std::sync::Mutex<FakePortState>>,
+    }
+
+    fn unused_port() -> serialport::Error {
+        serialport::Error::new(serialport::ErrorKind::Unknown, "unused in this test")
+    }
+
+    impl Read for FakePort {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut state = self.state.lock().unwrap();
+            if state.inflight.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "line quiet",
+                ));
+            }
+            let n = state.inflight.len().min(buf.len());
+            buf[..n].copy_from_slice(&state.inflight[..n]);
+            state.inflight.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl Write for FakePort {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push(PortEvent::Write);
+            state.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SerialPort for FakePort {
+        fn name(&self) -> Option<String> {
+            None
+        }
+
+        fn baud_rate(&self) -> serialport::Result<u32> {
+            Err(unused_port())
+        }
+
+        fn data_bits(&self) -> serialport::Result<serialport::DataBits> {
+            Err(unused_port())
+        }
+
+        fn flow_control(&self) -> serialport::Result<serialport::FlowControl> {
+            Err(unused_port())
+        }
+
+        fn parity(&self) -> serialport::Result<serialport::Parity> {
+            Err(unused_port())
+        }
+
+        fn stop_bits(&self) -> serialport::Result<serialport::StopBits> {
+            Err(unused_port())
+        }
+
+        fn timeout(&self) -> Duration {
+            self.state.lock().unwrap().timeout
+        }
+
+        fn set_baud_rate(&mut self, _baud_rate: u32) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+
+        fn set_data_bits(&mut self, _data_bits: serialport::DataBits) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+
+        fn set_flow_control(
+            &mut self,
+            _flow_control: serialport::FlowControl,
+        ) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+
+        fn set_parity(&mut self, _parity: serialport::Parity) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+
+        fn set_stop_bits(&mut self, _stop_bits: serialport::StopBits) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+
+        fn set_timeout(&mut self, timeout: Duration) -> serialport::Result<()> {
+            self.state.lock().unwrap().timeout = timeout;
+            Ok(())
+        }
+
+        fn write_request_to_send(&mut self, _level: bool) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+
+        fn write_data_terminal_ready(&mut self, _level: bool) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+
+        fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+            Err(unused_port())
+        }
+
+        fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+            Err(unused_port())
+        }
+
+        fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+            Err(unused_port())
+        }
+
+        fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+            Err(unused_port())
+        }
+
+        fn bytes_to_read(&self) -> serialport::Result<u32> {
+            Err(unused_port())
+        }
+
+        fn bytes_to_write(&self) -> serialport::Result<u32> {
+            Err(unused_port())
+        }
+
+        fn clear(&self, buffer_to_clear: serialport::ClearBuffer) -> serialport::Result<()> {
+            if buffer_to_clear == serialport::ClearBuffer::Input
+                || buffer_to_clear == serialport::ClearBuffer::All
+            {
+                let mut state = self.state.lock().unwrap();
+                state.events.push(PortEvent::Clear);
+                let buffered = std::mem::take(&mut state.buffered);
+                state.cleared.extend(buffered);
+            }
+            Ok(())
+        }
+
+        fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
+            Ok(Box::new(FakePort {
+                state: Arc::clone(&self.state),
+            }))
+        }
+
+        fn set_break(&self) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+
+        fn clear_break(&self) -> serialport::Result<()> {
+            Err(unused_port())
+        }
+    }
+
+    /// In-memory stand-in for [`InputDrain`]. `buffered` is what `clear` drops; `inflight`
+    /// is what a following read still pulls off the wire.
+    struct FakeDrain {
+        buffered: Vec<u8>,
+        inflight: Vec<u8>,
+        timeout: Duration,
+        cleared: Vec<u8>,
+        noisy: bool,
+        reads: u32,
+    }
+
+    impl Default for FakeDrain {
+        fn default() -> Self {
+            Self {
+                buffered: Vec::new(),
+                inflight: Vec::new(),
+                timeout: Duration::from_millis(30),
+                cleared: Vec::new(),
+                noisy: false,
+                reads: 0,
+            }
+        }
+    }
+
+    impl InputDrain for FakeDrain {
+        fn clear_input(&mut self) {
+            self.cleared.append(&mut self.buffered);
+        }
+
+        fn io_timeout(&self) -> Duration {
+            self.timeout
+        }
+
+        fn set_io_timeout(&mut self, timeout: Duration) -> bool {
+            self.timeout = timeout;
+            true
+        }
+
+        fn read_some(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.noisy {
+                buf[0] = 0xFF;
+                return Ok(1);
+            }
+            if self.inflight.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "line quiet",
+                ));
+            }
+            let n = self.inflight.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.inflight[..n]);
+            self.inflight.drain(..n);
+            Ok(n)
+        }
     }
 }
