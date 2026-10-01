@@ -26,8 +26,8 @@
 
 use std::f64::consts::PI;
 use std::io::{Read, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustypot::servo::feetech::sts3215::Sts3215Controller;
@@ -82,6 +82,14 @@ pub mod reg {
 const TICK_READ_ADDR: u8 = reg::PRESENT_POSITION; // 0x38
 const TICK_READ_LEN: u8 = 15;
 
+/// Status-packet `LEN` for a tick read: error byte + [`TICK_READ_LEN`] data + checksum.
+/// A resync candidate has to carry this and no other length. A ping is 2, and a shifted
+/// window often shows 32 or 255; accepting those would swallow the real frames that follow.
+const TICK_STATUS_LEN: u8 = TICK_READ_LEN + 2;
+
+/// `FF FF | ID | LEN | payload[LEN]`, with `payload` ending in the checksum.
+const TICK_STATUS_FRAME: usize = 4 + TICK_STATUS_LEN as usize;
+
 /// A healthy read completes well inside this. Capping it means a missing device costs a
 /// bounded hiccup rather than stalling the loop on the serial driver's default.
 const READ_TIMEOUT: Duration = Duration::from_millis(30);
@@ -96,10 +104,11 @@ const READ_TIMEOUT: Duration = Duration::from_millis(30);
 /// whole tenths of a second not driving at all: 50 Hz target, 22 Hz achieved, visible as a
 /// stuttering gait.
 ///
-/// A retry costs one more `READ_TIMEOUT` at worst, and a fresh transaction is the only way
-/// back into frame alignment — the failed read leaves the port's receive buffer holding
-/// whatever arrived late, which is what made the failure self-sustaining. The retry arms
-/// [`RxFlushPort`] so that leftover is discarded before the next instruction is sent.
+/// A retry costs one more `READ_TIMEOUT` at worst. Before spending it, the failed attempt's
+/// bytes are scanned for real frames ([`resync_tick_blocks`]): one lost byte makes rustypot
+/// give up, but the other fourteen replies are usually still intact, and recovering them
+/// keeps this tick. Only a scan that cannot assemble every joint arms [`RxFlushPort`] to
+/// discard what is left before the next instruction.
 const READ_ATTEMPTS: usize = 2;
 
 /// How long a silent input means the late replies from a failed read have finished.
@@ -449,6 +458,64 @@ impl InputDrain for PortDrain<'_> {
     }
 }
 
+/// `~(ID + LEN + ERR + DATA) & 0xFF`, the FT-HLS status checksum.
+fn hls_checksum(body: &[u8]) -> u8 {
+    !body.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte))
+}
+
+/// Pull tick-read replies back out of a stream rustypot has already given up on.
+///
+/// A candidate starts at `FF FF`, names one of [`JOINT_IDS`], and has [`TICK_STATUS_LEN`].
+/// The checksum is what makes that boundary real: a mismatch, or an id that is not a joint,
+/// advances one byte and the scan continues, so one lost byte does not discard the frames
+/// after it. Bytes before the first real header are skipped. Returns register blocks in
+/// [`JOINT_IDS`] order when each joint appears once; a duplicate id means two transactions
+/// got mixed, and that is not a tick we can trust.
+fn resync_tick_blocks(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut found = vec![None; NUM_JOINTS];
+    let mut i = 0;
+    while i + TICK_STATUS_FRAME <= buf.len() {
+        let head = &buf[i..];
+        let id_ok = JOINT_IDS.iter().position(|&id| id == head[2]);
+        if head[0] != 0xFF || head[1] != 0xFF || head[3] != TICK_STATUS_LEN || id_ok.is_none() {
+            i += 1;
+            continue;
+        }
+        let frame = &head[..TICK_STATUS_FRAME];
+        if hls_checksum(&frame[2..TICK_STATUS_FRAME - 1]) != frame[TICK_STATUS_FRAME - 1] {
+            i += 1;
+            continue;
+        }
+        let joint = id_ok.expect("id was just found in JOINT_IDS");
+        if found[joint].is_some() {
+            return None;
+        }
+        found[joint] = Some(frame[5..5 + TICK_READ_LEN as usize].to_vec());
+        i += TICK_STATUS_FRAME;
+    }
+    found.into_iter().collect()
+}
+
+/// Read whatever a failed `sync_read` has not consumed yet, until the line is quiet.
+///
+/// These bytes are the rest of the same reply burst. They have to be scanned, not
+/// `clear`ed: `clear` throws away frames that are only misaligned.
+fn append_until_quiet(port: &mut dyn SerialPort, buf: &mut Vec<u8>) {
+    let saved = port.timeout();
+    if port.set_timeout(RX_DRAIN_QUIET).is_err() {
+        return;
+    }
+    let mut tmp = [0u8; 128];
+    let start = Instant::now();
+    while start.elapsed() < RX_DRAIN_CAP {
+        match port.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    let _ = port.set_timeout(saved);
+}
+
 /// Drop bytes left in the receive buffer by a failed `sync_read`, then read until the line
 /// is quiet or [`RX_DRAIN_CAP`] elapses.
 ///
@@ -473,16 +540,54 @@ fn discard_stale_input(port: &mut dyn InputDrain) {
     let _ = port.set_io_timeout(saved);
 }
 
-/// Serial port wrapper that can discard a stale receive buffer on the next write.
+/// Serial port wrapper that records a `sync_read` and can discard a stale buffer on the next write.
 ///
-/// rustypot owns the port inside `Sts3215Controller` and does not give it back, and a
-/// `sync_read` sends its instruction before it reads. Arming [`Self::discard_rx`] on a
-/// failed read therefore flushes at the one moment that is safe: before the retry's
-/// instruction, while the new replies are not yet on the wire. Flushing at the start of
-/// the following `read` would drop those new replies if they had already landed.
+/// rustypot owns the port inside `Sts3215Controller` and does not give it back. [`RxCapture`]
+/// is the copy of every byte rustypot already pulled, so a checksum failure can be scanned
+/// for `FF FF` frames instead of thrown away. [`Self::discard_rx`] is the fallback: a scan
+/// that cannot assemble every joint still has to empty the line before the retry's
+/// instruction, and that write happens before the new replies are on the wire.
 struct RxFlushPort {
     inner: Box<dyn SerialPort>,
     discard_rx: Arc<AtomicBool>,
+    capture: Arc<RxCapture>,
+}
+
+/// Bytes rustypot has read since [`RxCapture::start`], shared with [`FeetechIo`].
+struct RxCapture {
+    on: AtomicBool,
+    bytes: Mutex<Vec<u8>>,
+}
+
+impl RxCapture {
+    fn new() -> Self {
+        Self {
+            on: AtomicBool::new(false),
+            bytes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn start(&self) {
+        self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.on.store(true, Ordering::Release);
+    }
+
+    fn stop(&self) {
+        self.on.store(false, Ordering::Release);
+    }
+
+    fn push(&self, data: &[u8]) {
+        if self.on.load(Ordering::Acquire) && !data.is_empty() {
+            self.bytes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(data);
+        }
+    }
+
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.bytes.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 impl RxFlushPort {
@@ -495,7 +600,9 @@ impl RxFlushPort {
 
 impl Read for RxFlushPort {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buf)
+        let n = self.inner.read(buf)?;
+        self.capture.push(&buf[..n]);
+        Ok(n)
     }
 }
 
@@ -606,6 +713,7 @@ impl SerialPort for RxFlushPort {
         Ok(Box::new(RxFlushPort {
             inner: self.inner.try_clone()?,
             discard_rx: Arc::clone(&self.discard_rx),
+            capture: Arc::clone(&self.capture),
         }))
     }
 
@@ -620,8 +728,14 @@ impl SerialPort for RxFlushPort {
 
 pub struct FeetechIo {
     controller: Sts3215Controller,
-    /// Set after a failed read. [`RxFlushPort`] consumes it on the next write.
+    /// Set after a failed read that resync could not save. [`RxFlushPort`] consumes it
+    /// on the next write.
     discard_rx: Arc<AtomicBool>,
+    /// Copy of the bytes rustypot already consumed. See [`RxCapture`].
+    capture: Arc<RxCapture>,
+    /// Second handle on the same tty, used only after rustypot has returned, to read
+    /// the reply bytes it left behind and rescan them.
+    tail: Box<dyn SerialPort>,
     /// Servo ids in [`crate::model::JOINT_IDS`] order — the order blocks come back in.
     ids: Vec<u8>,
     /// Supply voltage per joint captured in the last tick's block. Zero until a read happens.
@@ -645,9 +759,15 @@ impl FeetechIo {
             })?;
 
         let discard_rx = Arc::new(AtomicBool::new(false));
+        let capture = Arc::new(RxCapture::new());
+        let tail = serial.try_clone().map_err(|e| IoError::Port {
+            path: port.to_owned(),
+            source: std::io::Error::other(e),
+        })?;
         let serial = Box::new(RxFlushPort {
             inner: serial,
             discard_rx: Arc::clone(&discard_rx),
+            capture: Arc::clone(&capture),
         });
         let controller = Sts3215Controller::new()
             .with_protocol_v1()
@@ -656,6 +776,8 @@ impl FeetechIo {
         let mut io = Self {
             controller,
             discard_rx,
+            capture,
+            tail,
             ids: JOINT_IDS.to_vec(),
             last_volts: [0.0; NUM_JOINTS],
             last_temps_c: [0.0; NUM_JOINTS],
@@ -806,13 +928,34 @@ impl FeetechIo {
     /// One `sync_read` attempt: broadcast, collect fifteen replies, decode them.
     ///
     /// Split out of [`RobotIo::read`] so the retry around it is visible as a retry, and so a
-    /// failed attempt cannot be mistaken for the whole tick's work.
+    /// failed attempt cannot be mistaken for the whole tick's work. rustypot stops at the
+    /// first bad frame; the bytes it already read, plus whatever is still in the tty, are
+    /// scanned for `FF FF` / [`TICK_STATUS_LEN`] before this attempt is declared failed.
     fn read_once(&mut self) -> Result<Sensors> {
-        let blocks = self
+        self.capture.start();
+        let result = self
             .controller
-            .sync_read_raw_data(&self.ids, TICK_READ_ADDR, TICK_READ_LEN)
-            .map_err(|e| IoError::Bus(format!("hls servo sync_read: {e}")))?;
+            .sync_read_raw_data(&self.ids, TICK_READ_ADDR, TICK_READ_LEN);
+        self.capture.stop();
+        match result {
+            Ok(blocks) => self.decode_tick_blocks(&blocks),
+            Err(e) => match self.recover_tick() {
+                Ok(sensors) => Ok(sensors),
+                Err(_) => Err(IoError::Bus(format!("hls servo sync_read: {e}"))),
+            },
+        }
+    }
 
+    /// Rescan a failed `sync_read` and keep the tick when every joint's frame is in there.
+    fn recover_tick(&mut self) -> Result<Sensors> {
+        let mut buf = self.capture.take();
+        append_until_quiet(&mut *self.tail, &mut buf);
+        let blocks = resync_tick_blocks(&buf)
+            .ok_or_else(|| IoError::Bus("hls servo sync_read: resync found no full tick".into()))?;
+        self.decode_tick_blocks(&blocks)
+    }
+
+    fn decode_tick_blocks(&mut self, blocks: &[Vec<u8>]) -> Result<Sensors> {
         if blocks.len() != NUM_JOINTS {
             return Err(IoError::ShortRead {
                 what: "hls sync_read blocks",
@@ -847,11 +990,11 @@ impl FeetechIo {
 impl RobotIo for FeetechIo {
     /// One bus read, retried once.
     ///
-    /// See [`READ_ATTEMPTS`]: a single lost byte misaligns the whole reply stream, and the
-    /// retry is what turns "one noisy byte" back into a usable tick instead of four frozen
-    /// ones. Each failure arms a receive-buffer discard, consumed by the next write — the
-    /// retry's instruction when another attempt remains, otherwise the next tick's first
-    /// write. The last attempt's error is the one reported.
+    /// See [`READ_ATTEMPTS`]. A failed attempt first tries to rebuild the tick from the
+    /// bytes already on hand. Only when that scan is short a joint does it arm a
+    /// receive-buffer discard, consumed by the next write — the retry's instruction when
+    /// another attempt remains, otherwise the next tick's first write. The last attempt's
+    /// error is the one reported.
     fn read(&mut self) -> Result<Sensors> {
         let mut last = None;
         for _ in 0..READ_ATTEMPTS {
@@ -1225,6 +1368,76 @@ mod tests {
         );
     }
 
+    fn tick_frame(id: u8, mark: u8) -> Vec<u8> {
+        let mut data = [0u8; TICK_READ_LEN as usize];
+        data[0] = mark;
+        let mut frame = vec![0xFF, 0xFF, id, TICK_STATUS_LEN, 0];
+        frame.extend_from_slice(&data);
+        let chk = hls_checksum(&frame[2..]);
+        frame.push(chk);
+        frame
+    }
+
+    fn all_tick_frames() -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (i, &id) in JOINT_IDS.iter().enumerate() {
+            buf.extend(tick_frame(id, i as u8 + 1));
+        }
+        buf
+    }
+
+    /// A byte in front of an otherwise intact burst is not a lost tick: the scan locks
+    /// onto `FF FF` and still returns every joint, in [`JOINT_IDS`] order.
+    #[test]
+    fn resync_skips_leading_garbage_and_keeps_the_tick() {
+        let mut buf = vec![0x00, 0xFF, 0x13];
+        buf.extend(all_tick_frames());
+        let blocks = resync_tick_blocks(&buf).expect("fifteen frames are in this buffer");
+        assert_eq!(blocks.len(), NUM_JOINTS);
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(block.len(), TICK_READ_LEN as usize);
+            assert_eq!(block[0], i as u8 + 1);
+        }
+    }
+
+    /// A header whose length is not the tick reply must not swallow the real frames after it.
+    #[test]
+    fn resync_rejects_an_illegal_length() {
+        let mut buf = vec![0xFF, 0xFF, JOINT_IDS[0], 32, 0, 1, 2, 3];
+        buf.extend(all_tick_frames());
+        let blocks = resync_tick_blocks(&buf).expect("illegal LEN is not a frame");
+        assert_eq!(blocks[0][0], 1);
+    }
+
+    /// Frames may arrive in any order; the blocks come back in joint order.
+    #[test]
+    fn resync_orders_blocks_by_joint_id() {
+        let mut buf = Vec::new();
+        for (i, &id) in JOINT_IDS.iter().enumerate().rev() {
+            buf.extend(tick_frame(id, i as u8 + 1));
+        }
+        let blocks = resync_tick_blocks(&buf).unwrap();
+        assert_eq!(blocks[0][0], 1);
+        assert_eq!(blocks[NUM_JOINTS - 1][0], NUM_JOINTS as u8);
+    }
+
+    /// One damaged frame means this buffer is not a full tick. The caller retries
+    /// rather than inventing the missing joint.
+    #[test]
+    fn resync_needs_every_joint() {
+        let mut buf = all_tick_frames();
+        buf.drain(..TICK_STATUS_FRAME);
+        assert!(resync_tick_blocks(&buf).is_none());
+    }
+
+    /// Two checksum-valid frames for one id are two bursts mixed together.
+    #[test]
+    fn resync_rejects_a_duplicate_id() {
+        let mut buf = all_tick_frames();
+        buf.extend(tick_frame(JOINT_IDS[0], 0xAB));
+        assert!(resync_tick_blocks(&buf).is_none());
+    }
+
     /// Bytes already buffered are dropped, bytes still arriving are read off, then the
     /// caller's timeout is put back. A retry that skipped this would checksum the leftover.
     #[test]
@@ -1270,6 +1483,7 @@ mod tests {
                 state: Arc::clone(&state),
             }),
             discard_rx: Arc::clone(&flag),
+            capture: Arc::new(RxCapture::new()),
         };
         port.write_all(&[0x82, 0x01]).unwrap();
         {
