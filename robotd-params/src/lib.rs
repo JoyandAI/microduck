@@ -837,7 +837,9 @@ impl Variant {
         }
     }
 
-    /// True when the IMU rides the servo bus (original MicroDuck). False: I²C.
+    /// True for MicroDuck, whose IMU is always Dynamixel ID 200.
+    ///
+    /// OpenMicroDuck probes Feetech ID 200 at startup and otherwise uses [`Imu`].
     pub fn imu_on_bus(self) -> bool {
         matches!(self, Variant::MicroDuck)
     }
@@ -918,11 +920,12 @@ impl Driver {
     }
 }
 
-/// The IMU, on its own I²C bus rather than the servo bus.
+/// The I²C IMU, used when startup does not find `imu_to_servo` at Feetech ID 200.
 ///
-/// The LSM6DSV16X is reached at 0x6A by default. Production names the bus `/dev/i2c-imu`
-/// (a udev alias for i2c4). If that path cannot be opened, `robotd` scans `/dev/i2c-*` for
-/// WHO_AM_I = 0x70 the same way `imu_probe` does.
+/// MicroDuck ignores this: its IMU is on the Dynamixel bus. The LSM6DSV16X is reached at
+/// 0x6A by default. Production names the bus `/dev/i2c-imu` (a udev alias for i2c4). If
+/// that path cannot be opened, `robotd` scans `/dev/i2c-*` for WHO_AM_I = 0x70 the same
+/// way `imu_probe` does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Imu {

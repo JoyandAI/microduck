@@ -13,7 +13,7 @@ without hardware, get a dev board, push a branch, release — with pointers to t
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
-| [`bringup-examples.md`](robot/bringup-examples.md) | Cross-compile `imu_probe` / `hls_read` / `hls_control` and copy them onto the Radxa. |
+| [`bringup-examples.md`](robot/bringup-examples.md) | Cross-compile `imu_probe` / `hls_read` / `imu_servo_read` / `hls_control` and copy them onto the Radxa. |
 | [`dev-push.md`](robot/dev-push.md) | Build on your machine and install on the board over ssh, with no CI run. |
 | [`duckctl.md`](robot/duckctl.md) | Every `duckctl` command — the robot from a laptop, over Bluetooth. |
 | [`install-dev.md`](robot/install-dev.md) | Setting up a board for development, from nothing. |

@@ -1,14 +1,17 @@
-//! Live LSM6DSV16X sample from the duck's I²C IMU bus.
+//! Live LSM6DSV16X sample, from I²C or from `imu_to_servo` on the Feetech bus.
 //!
 //! The production alias is `/dev/i2c-imu` (i2c4 @ 0x6A). Some boards put the
 //! chip on another controller — this example scans `/dev/i2c-*` for WHO_AM_I
-//! `0x70` if you do not pass a bus.
+//! `0x70` if you do not pass a bus. A serial port instead reads ID 200 (five
+//! pings, model `0x4D44`) and decodes the same 12-byte block `robotd` uses.
 //!
 //! ```text
 //! cargo run -p duck-control --example imu_probe
 //! cargo run -p duck-control --example imu_probe -- /dev/i2c-5 0x6A
 //! cargo run -p duck-control --example imu_probe -- /dev/i2c-5 0x6A --hz 50
 //! cargo run -p duck-control --example imu_probe -- --scan
+//! cargo run -p duck-control --example imu_probe -- --port COM5
+//! cargo run -p duck-control --example imu_probe -- /dev/ttyACM0 --hz 50
 //! ```
 //!
 //! Cross-compile for the board (Windows host: WSL + `aarch64-linux-gnu-gcc`):
@@ -27,11 +30,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use duck_control::ImuData;
+use duck_control::IMU_DXL_ID;
+use duck_control::ftbus::{IMU_MODEL_ADDR, IMU_PROBE_ATTEMPTS, IMU_TO_SERVO_MODEL, reg};
+use duck_control::imu::{IMU_BLOCK_LEN, ImuData, SflpDecoder};
 use duck_control::imui2c::{
     ImuBus, ImuWho, LSM6DSV16X_ID, pick_lsm6dsv16x, probe_who_am_i, scan_lsm6dsv16x,
 };
 use duck_control::io::ImuIo;
+use duck_control::model::BAUD_RATE;
+use rustypot::servo::feetech::sts3215::Sts3215Controller;
 
 /// Display / sample rate if `--hz` is omitted. Comfortable on a TTY; the control
 /// loop's 50 Hz is opt-in (`--hz 50`).
@@ -64,6 +71,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let scan_only = flags.scan;
     let target_hz = flags.hz;
     let tick_period = Duration::from_secs_f64(1.0 / target_hz);
+    if let Some(port) = &flags.port {
+        if scan_only {
+            return Err("--scan reads I²C; it does not take a serial port".into());
+        }
+        return run_bus(port, target_hz, tick_period);
+    }
     let positional: Vec<&str> = flags.positional.iter().map(String::as_str).collect();
 
     let (bus, address) = match positional.as_slice() {
@@ -155,8 +168,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let stale = imu.stale();
         let lines = render(
-            &bus,
-            address,
+            &format!("imu_probe  {bus}  addr {address:#04x}  WHO_AM_I={LSM6DSV16X_ID:#04x}"),
             &sample,
             imu.ready(),
             stale.total,
@@ -188,6 +200,165 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         io::stdout().flush()?;
     }
     Ok(())
+}
+
+/// Stream ID 200. Five pings, then the model must be `0x4D44`. The sample is the
+/// trunk-frame [`SflpDecoder`] output, the same numbers the control loop stores.
+fn run_bus(
+    port: &str,
+    target_hz: f64,
+    tick_period: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    install_sigint();
+    let serial = serialport::new(port, BAUD_RATE)
+        .timeout(Duration::from_millis(30))
+        .open()
+        .map_err(|e| {
+            format!(
+                "open {port}: {e}\n\
+                 on the robot bus, stop robotd first (`sudo systemctl stop robotd`)"
+            )
+        })?;
+    let mut controller = Sts3215Controller::new()
+        .with_protocol_v1()
+        .with_serial_port(serial);
+    if !probe_bus_imu(&mut controller)? {
+        return Err(format!(
+            "no imu_to_servo at id {IMU_DXL_ID} on {port} after {IMU_PROBE_ATTEMPTS} pings"
+        )
+        .into());
+    }
+
+    let tty = io::stdout().is_terminal();
+    if tty {
+        print!("\x1b[?25l");
+        io::stdout().flush()?;
+    }
+
+    let mut decoder = SflpDecoder::default();
+    let mut last_raw: Option<[u8; IMU_BLOCK_LEN]> = None;
+    let mut stale_total = 0u64;
+    let mut stale_run = 0u64;
+    let mut first = true;
+    let mut errors: u64 = 0;
+    let mut reads: u64 = 0;
+    let mut hz = 0.0;
+    let mut last = Instant::now();
+    let mut sample = ImuData::default();
+    let header =
+        format!("imu_probe  {port}  feetech id {IMU_DXL_ID}  model {IMU_TO_SERVO_MODEL:#06x}");
+
+    while RUNNING.load(Ordering::Relaxed) {
+        let t0 = Instant::now();
+        let last_err = match read_bus_block(&mut controller) {
+            Ok(raw) => {
+                if last_raw.replace(raw) == Some(raw) {
+                    stale_total = stale_total.saturating_add(1);
+                    stale_run = stale_run.saturating_add(1);
+                } else {
+                    stale_run = 0;
+                }
+                sample = decoder.decode(&raw);
+                reads += 1;
+                let dt = last.elapsed().as_secs_f64();
+                if dt > 0.0 {
+                    hz = 1.0 / dt;
+                }
+                last = Instant::now();
+                None
+            }
+            Err(e) => {
+                errors += 1;
+                if !tty {
+                    return Err(e);
+                }
+                Some(e.to_string())
+            }
+        };
+
+        let lines = render(
+            &header,
+            &sample,
+            decoder.ready(),
+            stale_total,
+            stale_run,
+            reads,
+            errors,
+            hz,
+            target_hz,
+            last_err.as_deref(),
+        );
+        if tty {
+            paint(&lines, first)?;
+            first = false;
+        } else {
+            for line in &lines {
+                println!("{line}");
+            }
+            break;
+        }
+
+        let spent = t0.elapsed();
+        if let Some(rest) = tick_period.checked_sub(spent) {
+            thread::sleep(rest);
+        }
+    }
+
+    if tty {
+        print!("\x1b[?25h\n");
+        io::stdout().flush()?;
+    }
+    Ok(())
+}
+
+fn probe_bus_imu(controller: &mut Sts3215Controller) -> Result<bool, Box<dyn std::error::Error>> {
+    for attempt in 1..=IMU_PROBE_ATTEMPTS {
+        let answered = match controller.ping(IMU_DXL_ID) {
+            Ok(alive) => alive,
+            Err(e) => {
+                eprintln!("ping {IMU_DXL_ID} attempt {attempt}: {e}");
+                false
+            }
+        };
+        if !answered {
+            continue;
+        }
+        match controller.read_raw_data(IMU_DXL_ID, IMU_MODEL_ADDR, 2) {
+            Ok(bytes) if bytes.len() == 2 => {
+                let model = u16::from_le_bytes([bytes[0], bytes[1]]);
+                if model == IMU_TO_SERVO_MODEL {
+                    eprintln!(
+                        "imu_to_servo id {IMU_DXL_ID} model {model:#06x} (attempt {attempt})"
+                    );
+                    return Ok(true);
+                }
+                return Err(format!(
+                    "id {IMU_DXL_ID} answered model {model:#06x}, not an imu_to_servo ({IMU_TO_SERVO_MODEL:#06x})"
+                )
+                .into());
+            }
+            Ok(bytes) => eprintln!(
+                "id {IMU_DXL_ID} model read was {} bytes (attempt {attempt})",
+                bytes.len()
+            ),
+            Err(e) => eprintln!("id {IMU_DXL_ID} model read attempt {attempt}: {e}"),
+        }
+    }
+    Ok(false)
+}
+
+fn read_bus_block(
+    controller: &mut Sts3215Controller,
+) -> Result<[u8; IMU_BLOCK_LEN], Box<dyn std::error::Error>> {
+    let block = controller
+        .read_raw_data(IMU_DXL_ID, reg::PRESENT_POSITION, IMU_BLOCK_LEN as u8)
+        .map_err(|e| format!("read id {IMU_DXL_ID}: {e}"))?;
+    if block.len() < IMU_BLOCK_LEN {
+        return Err(format!("short imu block: {} bytes", block.len()).into());
+    }
+    let mut raw = [0u8; IMU_BLOCK_LEN];
+    raw.copy_from_slice(&block[..IMU_BLOCK_LEN]);
+    Ok(raw)
 }
 
 fn print_scan(hits: &[ImuWho]) {
@@ -238,10 +409,21 @@ fn pick_bus() -> Result<Option<(String, u8)>, Box<dyn std::error::Error>> {
 fn parse_flags(args: &[String]) -> Result<Flags, Box<dyn std::error::Error>> {
     let mut scan = false;
     let mut hz = DEFAULT_HZ;
+    let mut port = None;
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
+        if a == "--port" {
+            i += 1;
+            let path = args
+                .get(i)
+                .cloned()
+                .ok_or("--port needs a serial device, e.g. COM5 or /dev/ttyACM0")?;
+            port = Some(path);
+            i += 1;
+            continue;
+        }
         if a == "--scan" {
             scan = true;
             i += 1;
@@ -263,19 +445,37 @@ fn parse_flags(args: &[String]) -> Result<Flags, Box<dyn std::error::Error>> {
             i += 1;
             continue;
         }
+        if looks_like_uart(&args[i]) {
+            if port.is_some() {
+                return Err("pass the serial port once".into());
+            }
+            port = Some(args[i].clone());
+            i += 1;
+            continue;
+        }
         positional.push(args[i].clone());
         i += 1;
     }
     Ok(Flags {
         scan,
         hz,
+        port,
         positional,
     })
+}
+
+fn looks_like_uart(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let com = lower
+        .strip_prefix("com")
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
+    com || lower.contains("tty")
 }
 
 struct Flags {
     scan: bool,
     hz: f64,
+    port: Option<String>,
     positional: Vec<String>,
 }
 
@@ -300,8 +500,7 @@ fn parse_addr(s: &str) -> Result<u8, Box<dyn std::error::Error>> {
 }
 
 fn render(
-    bus: &str,
-    address: u8,
+    header: &str,
     imu: &ImuData,
     ready: bool,
     stale_total: u64,
@@ -322,7 +521,7 @@ fn render(
         "default (FIFO has not packed gyro+quat yet)"
     };
     [
-        format!("imu_probe  {bus}  addr {address:#04x}  WHO_AM_I={LSM6DSV16X_ID:#04x}"),
+        header.to_string(),
         format!("ready      {ready}  {sample_kind}"),
         format!("gyro rad/s {:>8.4} {:>8.4} {:>8.4}", gx, gy, gz),
         format!(
@@ -395,20 +594,24 @@ fn install_sigint() {
 fn install_sigint() {}
 
 const USAGE: &str = "\
-imu_probe — live LSM6DSV16X sample (SFLP FIFO, not raw OUT registers)
+imu_probe — live LSM6DSV16X sample (I²C chip, or imu_to_servo on the Feetech bus)
 
 Usage:
   imu_probe [--hz N]                 # scan /dev/i2c-* for WHO_AM_I=0x70, then stream
   imu_probe --scan                   # print WHO_AM_I on 0x6A/0x6B, do not stream
-  imu_probe [--hz N] <bus> [address] # open that bus (default address 0x6A)
+  imu_probe [--hz N] <bus> [address] # open that I²C bus (default address 0x6A)
+  imu_probe [--hz N] --port <uart>   # ping Feetech ID 200 five times, then stream
 
+A COM port or a path containing \"tty\" is the bus, not an I²C device.
 --hz defaults to 10. robotd samples the IMU at 50 Hz (--hz 50).
+Stop robotd before opening the servo UART.
 
 Examples:
   imu_probe /dev/i2c-5 0x6A
-  imu_probe /dev/i2c-5 0x6A --hz 50
-  imu_probe /dev/i2c-imu 0x6A
+  imu_probe /dev/i2c-imu 0x6A --hz 50
+  imu_probe --port COM5
+  imu_probe /dev/ttyACM0 --hz 50
 
 ready=false with gravity [0,0,-1] is the decoder default, not a dead chip:
-the control path waits for a FIFO block that has both gyro and SFLP quat.
+the control path waits until SFLP has produced a quaternion.
 ";

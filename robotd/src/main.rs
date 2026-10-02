@@ -863,7 +863,8 @@ fn spawn_control_thread(
 ///
 /// MicroDuck's `DynamixelIo` is also the IMU: one combined `sync_read`. `Rc<RefCell<_>>`
 /// lets [`Safety`] hold that same object as both `RobotIo` and `ImuIo` without a second
-/// bus transaction.
+/// bus transaction. OpenMicroDuck does the same when startup found `imu_to_servo` at
+/// Feetech ID 200; otherwise the IMU is I²C and the servo object is not shared.
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct SharedDxl(Rc<RefCell<duck_control::bus::DynamixelIo>>);
@@ -922,9 +923,75 @@ impl ImuIo for SharedDxl {
     }
 }
 
+/// OpenMicroDuck's servo bus, shared when `imu_to_servo` is the IMU.
+///
+/// The tick `sync_read` already fetched ID 200. [`ImuIo::read`] returns that sample,
+/// so both halves have to be this same object — a second owner of the tty cannot exist.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct SharedFt(Rc<RefCell<duck_control::ftbus::FeetechIo>>);
+
+#[cfg(target_os = "linux")]
+impl SharedFt {
+    fn open(port: &str) -> duck_control::io::Result<Self> {
+        Ok(Self(Rc::new(RefCell::new(
+            duck_control::ftbus::FeetechIo::open(port)?,
+        ))))
+    }
+
+    fn imu_on_bus(&self) -> bool {
+        self.0.borrow().imu_on_bus()
+    }
+
+    fn check_registers(&mut self) -> duck_control::io::Result<usize> {
+        self.0.borrow_mut().check_registers()
+    }
+
+    fn interpolate_to(
+        &mut self,
+        target: &[f64; NUM_JOINTS],
+        duration: Duration,
+        step: Duration,
+    ) -> duck_control::io::Result<()> {
+        self.0.borrow_mut().interpolate_to(target, duration, step)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RobotIo for SharedFt {
+    fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
+        RobotIo::read(&mut *self.0.borrow_mut())
+    }
+    fn write(&mut self, targets: &duck_control::JointTargets) -> duck_control::io::Result<()> {
+        RobotIo::write(&mut *self.0.borrow_mut(), targets)
+    }
+    fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
+        RobotIo::set_gain(&mut *self.0.borrow_mut(), kp)
+    }
+    fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
+        RobotIo::set_torque(&mut *self.0.borrow_mut(), on)
+    }
+    fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
+        RobotIo::slow_sensors(&mut *self.0.borrow_mut())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ImuIo for SharedFt {
+    fn read(&mut self) -> duck_control::io::Result<ImuData> {
+        ImuIo::read(&mut *self.0.borrow_mut())
+    }
+    fn ready(&self) -> bool {
+        ImuIo::ready(&*self.0.borrow())
+    }
+    fn stale(&self) -> duck_control::io::ImuStale {
+        ImuIo::stale(&*self.0.borrow())
+    }
+}
+
 #[cfg(target_os = "linux")]
 enum BusIo {
-    Ft(Box<duck_control::ftbus::FeetechIo>),
+    Ft(SharedFt),
     Dxl(SharedDxl),
 }
 
@@ -932,7 +999,7 @@ enum BusIo {
 impl RobotIo for BusIo {
     fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
         match self {
-            BusIo::Ft(b) => b.read(),
+            BusIo::Ft(b) => RobotIo::read(b),
             BusIo::Dxl(b) => RobotIo::read(b),
         }
     }
@@ -966,9 +1033,7 @@ impl RobotIo for BusIo {
 impl BusIo {
     fn open(port: &str, driver: Driver) -> duck_control::io::Result<Self> {
         match driver {
-            Driver::Hd1910 => Ok(BusIo::Ft(Box::new(duck_control::ftbus::FeetechIo::open(
-                port,
-            )?))),
+            Driver::Hd1910 => Ok(BusIo::Ft(SharedFt::open(port)?)),
             Driver::Xl330 => Ok(BusIo::Dxl(SharedDxl::open(port)?)),
         }
     }
@@ -999,9 +1064,10 @@ type BusIo = FakeIo;
 
 /// A type-erased IMU so the control loop takes one concrete `U: ImuIo`.
 ///
-/// The real IMU is [`duck_control::imui2c::ImuBus`]; when it cannot open (a board with no IMU,
-/// or a build off Linux) the loop falls back to a [`FakeImu`] that never reports ready, so fall
-/// detection and odometry-seeding gate off rather than judging an absent sensor.
+/// The real IMU is `imu_to_servo` at Feetech ID 200 when startup found it, otherwise
+/// [`duck_control::imui2c::ImuBus`]. When neither can be opened (or this build is off Linux)
+/// the loop falls back to a [`FakeImu`] that never reports ready, so fall detection and
+/// odometry-seeding gate off rather than judging an absent sensor.
 struct ImuIoBox(Box<dyn ImuIo>);
 
 impl ImuIo for ImuIoBox {
@@ -1023,8 +1089,11 @@ fn not_ready_imu() -> FakeImu {
     imu
 }
 
-/// Pick the IMU source for this board: MicroDuck reads ID 200 on the Dynamixel bus
-/// (same object as the servos); OpenMicroDuck opens I²C.
+/// Pick the IMU source once, from what startup already found.
+///
+/// MicroDuck reads ID 200 on the Dynamixel bus. OpenMicroDuck uses ID 200 on the Feetech
+/// bus when `imu_to_servo` answered while that bus was opening; otherwise it opens I²C.
+/// Neither arm looks again.
 fn imu_for_bus(io: &BusIo, params: &Params) -> ImuIoBox {
     #[cfg(target_os = "linux")]
     {
@@ -1036,6 +1105,13 @@ fn imu_for_bus(io: &BusIo, params: &Params) -> ImuIoBox {
                     "IMU on Dynamixel bus (original MicroDuck)"
                 );
                 ImuIoBox(Box::new(dxl.clone()))
+            }
+            BusIo::Ft(ft) if ft.imu_on_bus() => {
+                tracing::info!(
+                    id = duck_control::IMU_DXL_ID,
+                    "IMU on Feetech bus (imu_to_servo)"
+                );
+                ImuIoBox(Box::new(ft.clone()))
             }
             BusIo::Ft(_) => open_imu(&params.imu),
         }
@@ -1655,9 +1731,9 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
             }
         };
 
-        // Fuse the IMU sample into the same tick's [`Sensors`]. The IMU lives on its own I²C
-        // bus, so a failed read must degrade the tick rather than fail it: keep the last good
-        // orientation and count, logging at 1/10 — the migrate-to-I²C point.
+        // Fuse this tick's IMU sample into [`Sensors`]. The source was fixed at startup:
+        // ID 200 on the servo bus when that board answered, otherwise the I²C chip. A failed
+        // IMU read degrades the tick — keep the last orientation — rather than failing it.
         if let Some(sensors) = fresh.as_mut() {
             match safety.imu().read() {
                 Ok(imu) => {

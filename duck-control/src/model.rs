@@ -20,10 +20,9 @@ pub const JOINT_IDS: [u8; NUM_JOINTS] = [
     10, 11, 12, 13, 14, // right leg
 ];
 
-/// Servo-bus IMU id (200). Original MicroDuck (`DynamixelIo`) still reads `imu_to_dxl`
-/// at this id in the same `sync_read` as the XL330s, matching `2c61dcc`.
-/// OpenMicroDuck currently reads the chip over I²C; a later Feetech IMU node on
-/// [`crate::ftbus::FeetechIo`] will reuse this id.
+/// Servo-bus IMU id (200). Original MicroDuck (`DynamixelIo`) reads `imu_to_dxl` at this
+/// id in the same `sync_read` as the XL330s. OpenMicroDuck's [`crate::ftbus::FeetechIo`]
+/// reads `imu_to_servo` here when startup finds it, and otherwise uses the I²C chip.
 pub const IMU_DXL_ID: u8 = 200;
 
 /// Joint names, from the protocol crate — the wire indexes `joints` and `targets`

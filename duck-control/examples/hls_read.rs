@@ -10,9 +10,12 @@
 //! For the Radxa (aarch64), see `docs/robot/bringup-examples.md`.
 //!
 //! The UART is exclusive (`TIOCEXCL` on Linux): if this talks to the robot's
-//! onboard bus, stop `robotd` first. ID 200 is the old IMU-on-bus address and
-//! is not pinged. Opening here is read-only: unlike [`duck_control::ftbus::FeetechIo::open`],
-//! this does not rewrite SRAM registers or drop torque.
+//! onboard bus, stop `robotd` first. After the fifteen joints, ID 200 is pinged
+//! five times. A reply whose model is `0x4D44` is `imu_to_servo`: it is placed
+//! first in the same `sync_read` the control loop uses, and the footer shows the
+//! trunk-frame sample. Opening here is read-only: unlike
+//! [`duck_control::ftbus::FeetechIo::open`], this does not rewrite SRAM registers
+//! or drop torque.
 //!
 //! A TTY gets a 14-row × 15-column frame that repaints in place. Anything else
 //! (a pipe, a file) gets one snapshot and exits, so the escape codes never land
@@ -24,9 +27,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use duck_control::ftbus::{self, reg};
+use duck_control::ftbus::{self, IMU_MODEL_ADDR, IMU_PROBE_ATTEMPTS, IMU_TO_SERVO_MODEL, reg};
+use duck_control::imu::{IMU_BLOCK_LEN, ImuData, SflpDecoder};
 use duck_control::model::BAUD_RATE;
-use duck_control::{JOINT_IDS, JOINT_NAMES, NUM_JOINTS};
+use duck_control::{IMU_DXL_ID, JOINT_IDS, JOINT_NAMES, NUM_JOINTS};
 use rustypot::servo::feetech::sts3215::Sts3215Controller;
 
 /// Same bound as the control loop: a missing device costs a hiccup, not a stall.
@@ -40,7 +44,8 @@ const TICK_LEN: u8 = 15;
 const FRAME_PERIOD: Duration = Duration::from_millis(100);
 
 /// Fixed frame height so cursor-up always lands on the first row.
-const ROWS: usize = 14;
+/// Thirteen joint rows, one IMU row, one footer.
+const ROWS: usize = 15;
 
 /// Per-servo column width, not counting the space between columns.
 const COL: usize = 6;
@@ -135,10 +140,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if n_alive == 0 {
-        return Err(
-            "no duck servo answered (IDs 10-14 / 20-24 / 30-34; 200 is not on this bus)".into(),
-        );
+        return Err("no duck servo answered (IDs 10-14 / 20-24 / 30-34)".into());
     }
+    let imu_on_bus = probe_bus_imu(&mut controller);
 
     let tty = io::stdout().is_terminal();
     if tty {
@@ -151,10 +155,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut hz = 0.0;
     let mut last = Instant::now();
     let mut samples: [Option<Sample>; NUM_JOINTS] = [const { None }; NUM_JOINTS];
+    let mut imu = SflpDecoder::default();
+    let mut imu_sample = ImuData::default();
 
     while RUNNING.load(Ordering::Relaxed) {
         let t0 = Instant::now();
-        match read_tick(&mut controller, &alive, &mut samples) {
+        match read_tick(
+            &mut controller,
+            &alive,
+            &mut samples,
+            imu_on_bus,
+            &mut imu,
+            &mut imu_sample,
+        ) {
             Ok(()) => {
                 let dt = last.elapsed().as_secs_f64();
                 if dt > 0.0 {
@@ -170,7 +183,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let lines = render(&port, &samples, n_alive, hz, misses);
+        let lines = render(
+            &port,
+            &samples,
+            n_alive,
+            hz,
+            misses,
+            imu_on_bus,
+            &imu_sample,
+            imu.ready(),
+        );
         if tty {
             paint(&lines, first)?;
             first = false;
@@ -194,16 +216,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Unicast ping of ID 200, up to [`IMU_PROBE_ATTEMPTS`] times. The first reply whose
+/// model is [`IMU_TO_SERVO_MODEL`] is the bus IMU. A miss leaves the joint table alone.
+fn probe_bus_imu(controller: &mut Sts3215Controller) -> bool {
+    for attempt in 1..=IMU_PROBE_ATTEMPTS {
+        let answered = match controller.ping(IMU_DXL_ID) {
+            Ok(alive) => alive,
+            Err(e) => {
+                eprintln!("ping {IMU_DXL_ID} attempt {attempt}: {e}");
+                false
+            }
+        };
+        if !answered {
+            continue;
+        }
+        match controller.read_raw_data(IMU_DXL_ID, IMU_MODEL_ADDR, 2) {
+            Ok(bytes) if bytes.len() == 2 => {
+                let model = u16::from_le_bytes([bytes[0], bytes[1]]);
+                if model == IMU_TO_SERVO_MODEL {
+                    eprintln!(
+                        "imu_to_servo id {IMU_DXL_ID} model {model:#06x} (attempt {attempt})"
+                    );
+                    return true;
+                }
+                eprintln!(
+                    "id {IMU_DXL_ID} answered model {model:#06x}, not an imu_to_servo ({IMU_TO_SERVO_MODEL:#06x})"
+                );
+                return false;
+            }
+            Ok(bytes) => eprintln!(
+                "id {IMU_DXL_ID} model read was {} bytes (attempt {attempt})",
+                bytes.len()
+            ),
+            Err(e) => eprintln!("id {IMU_DXL_ID} model read attempt {attempt}: {e}"),
+        }
+    }
+    eprintln!("no imu_to_servo at id {IMU_DXL_ID} after {IMU_PROBE_ATTEMPTS} pings");
+    false
+}
+
 fn read_tick(
     controller: &mut Sts3215Controller,
     alive: &[bool; NUM_JOINTS],
     samples: &mut [Option<Sample>; NUM_JOINTS],
+    imu_on_bus: bool,
+    imu: &mut SflpDecoder,
+    imu_sample: &mut ImuData,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ids: Vec<u8> = JOINT_IDS
-        .iter()
-        .zip(alive.iter())
-        .filter_map(|(&id, &ok)| ok.then_some(id))
-        .collect();
+    let mut ids = Vec::with_capacity(NUM_JOINTS + usize::from(imu_on_bus));
+    if imu_on_bus {
+        ids.push(IMU_DXL_ID);
+    }
+    ids.extend(
+        JOINT_IDS
+            .iter()
+            .zip(alive.iter())
+            .filter_map(|(&id, &ok)| ok.then_some(id)),
+    );
     let blocks = controller
         .sync_read_raw_data(&ids, TICK_ADDR, TICK_LEN)
         .map_err(|e| format!("sync_read: {e}"))?;
@@ -216,16 +285,35 @@ fn read_tick(
         .into());
     }
 
+    let joint_blocks = if imu_on_bus {
+        *imu_sample = decode_imu_block(&blocks[0], imu)?;
+        &blocks[1..]
+    } else {
+        &blocks[..]
+    };
+
     let mut b = 0usize;
     for (i, &ok) in alive.iter().enumerate() {
         if !ok {
             samples[i] = None;
             continue;
         }
-        samples[i] = Some(decode_block(&blocks[b])?);
+        samples[i] = Some(decode_block(&joint_blocks[b])?);
         b += 1;
     }
     Ok(())
+}
+
+fn decode_imu_block(
+    block: &[u8],
+    imu: &mut SflpDecoder,
+) -> Result<ImuData, Box<dyn std::error::Error>> {
+    if block.len() < IMU_BLOCK_LEN {
+        return Err(format!("short imu block: {} bytes", block.len()).into());
+    }
+    let mut raw = [0u8; IMU_BLOCK_LEN];
+    raw.copy_from_slice(&block[..IMU_BLOCK_LEN]);
+    Ok(imu.decode(&raw))
 }
 
 fn decode_block(block: &[u8]) -> Result<Sample, Box<dyn std::error::Error>> {
@@ -263,6 +351,9 @@ fn render(
     n_alive: usize,
     hz: f64,
     misses: u64,
+    imu_on_bus: bool,
+    imu: &ImuData,
+    imu_ready: bool,
 ) -> [String; ROWS] {
     let names = row_cells("name", cells_in_col_order(|i| pad(SHORT_NAMES[i])));
     let ids = row_cells("id", cells_in_col_order(|i| pad(&JOINT_IDS[i].to_string())));
@@ -287,15 +378,50 @@ fn render(
     });
     let async_flag = metric(samples, "async", |s| pad(&s.async_flag.to_string()));
 
+    let imu_note = if imu_on_bus {
+        "IMU id 200"
+    } else {
+        "no bus IMU"
+    };
     let footer = format!(
-        "{hz:5.1} Hz  {n_alive}/{n} alive  {misses} miss  {port}  ID 200 skipped  Ctrl-C quit",
+        "{hz:5.1} Hz  {n_alive}/{n} alive  {misses} miss  {port}  {imu_note}  Ctrl-C quit",
         n = NUM_JOINTS,
     );
 
     [
-        names, ids, pos_deg, pos_rad, rpm, load, volt, curr, temp, moving, goal, status,
-        async_flag, footer,
+        names,
+        ids,
+        pos_deg,
+        pos_rad,
+        rpm,
+        load,
+        volt,
+        curr,
+        temp,
+        moving,
+        goal,
+        status,
+        async_flag,
+        imu_row(imu_on_bus, imu, imu_ready),
+        footer,
     ]
+}
+
+fn imu_row(imu_on_bus: bool, imu: &ImuData, ready: bool) -> String {
+    if !imu_on_bus {
+        return format!(
+            "{:<LABEL$}no id {IMU_DXL_ID} after {IMU_PROBE_ATTEMPTS} pings",
+            "imu"
+        );
+    }
+    let [gx, gy, gz] = imu.gyro.map(|v| v * 180.0 / PI);
+    let [px, py, pz] = imu.gravity;
+    let [qw, qx, qy, qz] = imu.quat;
+    format!(
+        "{:<LABEL$}id {IMU_DXL_ID}  g {gx:+6.2} {gy:+6.2} {gz:+6.2} dps  \
+         grav {px:+.3} {py:+.3} {pz:+.3}  q {qw:+.3} {qx:+.3} {qy:+.3} {qz:+.3}  ready {ready}",
+        "imu"
+    )
 }
 
 fn metric(
@@ -381,6 +507,7 @@ Linux / the robot:
   sudo systemctl stop robotd
   cargo run -p duck-control --example hls_read -- /dev/ttyACM0
 
-Reads every duck servo ID (10-14, 20-24, 30-34). ID 200 is the retired IMU
-and is skipped. Does not enable torque or write registers.
+Reads every duck servo ID (10-14, 20-24, 30-34). Then pings ID 200 five times.
+Model 0x4D44 is imu_to_servo and is read in the same sync_read, shown on the
+imu row in the trunk frame. Does not enable torque or write registers.
 ";

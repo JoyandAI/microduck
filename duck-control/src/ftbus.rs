@@ -1,4 +1,4 @@
-//! The Feetech bus driver (FT-HLS protocol): HD1910 servos today, a bus IMU later.
+//! The Feetech bus driver (FT-HLS protocol): HD1910 servos, and `imu_to_servo` when it is present.
 //!
 //! The `HD1910` speaks the vendor's `FT-HLS` framing, a Dynamixel-v1-style layout:
 //! `FF FF ID LEN INST PARAMS CHK` with `CHK = ~(ID + LEN + INST + PARAMS) & 0xFF` and
@@ -18,11 +18,12 @@
 //! documented in place and must be backfilled on hardware before shipping.
 //!
 //! **This type is Feetech-only.** [`crate::bus::DynamixelIo`] is the XL330 path and is not
-//! extended here. Today [`FeetechIo`] talks to the fifteen joints; [`crate::model::IMU_DXL_ID`]
-//! (200) is reserved for a later Feetech IMU node on this same bus — the same shape the
-//! original MicroDuck used on Dynamixel. Until that node exists, [`RobotIo::read`] leaves
-//! `Sensors::imu` at its default and the caller fills it from I²C [`crate::io::ImuIo`] on
-//! the same tick.
+//! extended here. [`FeetechIo`] talks to the fifteen joints. At startup it pings
+//! [`crate::model::IMU_DXL_ID`] (200) five times. An answer whose model number is `0x4D44`
+//! is `imu_to_servo`: that id goes first in the tick `sync_read`, and the first 12 bytes of
+//! its 15-byte block are the SFLP sample [`crate::imu::SflpDecoder`] already decodes. The
+//! choice is fixed for the life of this object. If ID 200 never answers, the tick read stays
+//! the fifteen joints and the caller fills [`Sensors::imu`] from I²C [`crate::io::ImuIo`].
 
 use std::f64::consts::PI;
 use std::io::{Read, Write};
@@ -33,10 +34,11 @@ use std::time::{Duration, Instant};
 use rustypot::servo::feetech::sts3215::Sts3215Controller;
 use serialport::SerialPort;
 
+use crate::bus::{STALE_RUN_WARN, StaleImuTracker};
 use crate::hardware::HD1910_FIRMWARE;
-use crate::imu::ImuData;
-use crate::io::{IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
-use crate::model::{BAUD_RATE, JOINT_IDS, NUM_JOINTS};
+use crate::imu::{IMU_BLOCK_LEN, ImuData, SflpDecoder};
+use crate::io::{ImuIo, ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
+use crate::model::{BAUD_RATE, IMU_DXL_ID, JOINT_IDS, NUM_JOINTS};
 
 /// HLS register addresses (DEC), from the vendor memory table. The HLS's *named* register
 /// table differs from rustypot's STS3215 at 34/35/36, so these are the single source of
@@ -110,6 +112,14 @@ const READ_TIMEOUT: Duration = Duration::from_millis(30);
 /// keeps this tick. Only a scan that cannot assemble every joint arms [`RxFlushPort`] to
 /// discard what is left before the next instruction.
 const READ_ATTEMPTS: usize = 2;
+
+/// Startup pings of ID 200. One ping can miss the board's reply; five separates "not on
+/// this bus" from "the byte didn't land". After that the source does not change.
+pub const IMU_PROBE_ATTEMPTS: usize = 5;
+
+/// `imu_to_servo` model number, little-endian at address 3. Not an HD1910.
+pub const IMU_TO_SERVO_MODEL: u16 = 0x4D44;
+pub const IMU_MODEL_ADDR: u8 = 3;
 
 /// How long a silent input means the late replies from a failed read have finished.
 ///
@@ -463,21 +473,52 @@ fn hls_checksum(body: &[u8]) -> u8 {
     !body.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte))
 }
 
+/// Pull joint replies back out of a stream rustypot has already given up on.
+///
+/// See [`resync_status_blocks`]. This is the joints-only scan: an `imu_to_servo` frame,
+/// if one is even on the wire, is not part of a tick that did not ask for it.
+#[cfg(test)]
+fn resync_tick_blocks(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
+    resync_status_blocks(buf, &JOINT_IDS)
+}
+
+/// Tick `sync_read` ids. ID 200 is first when `imu_to_servo` was found at startup, which
+/// is the slot the board answers without waiting for the servos ahead of it.
+fn tick_read_ids(imu_on_bus: bool) -> Vec<u8> {
+    let mut ids = Vec::with_capacity(NUM_JOINTS + usize::from(imu_on_bus));
+    if imu_on_bus {
+        ids.push(IMU_DXL_ID);
+    }
+    ids.extend_from_slice(&JOINT_IDS);
+    ids
+}
+
+/// The SFLP sample inside a 15-byte tick block. Bytes 12..15 are a counter and status
+/// flags; counting them would hide a frozen orientation behind a changing tail.
+fn imu_sample_prefix(block: &[u8]) -> Option<[u8; IMU_BLOCK_LEN]> {
+    if block.len() < IMU_BLOCK_LEN {
+        return None;
+    }
+    let mut raw = [0u8; IMU_BLOCK_LEN];
+    raw.copy_from_slice(&block[..IMU_BLOCK_LEN]);
+    Some(raw)
+}
+
 /// Pull tick-read replies back out of a stream rustypot has already given up on.
 ///
-/// A candidate starts at `FF FF`, names one of [`JOINT_IDS`], and has [`TICK_STATUS_LEN`].
-/// The checksum is what makes that boundary real: a mismatch, or an id that is not a joint,
-/// advances one byte and the scan continues, so one lost byte does not discard the frames
-/// after it. Bytes before the first real header are skipped. Returns register blocks in
-/// [`JOINT_IDS`] order when each joint appears once; a duplicate id means two transactions
+/// A candidate starts at `FF FF`, names one of `ids`, and has [`TICK_STATUS_LEN`].
+/// The checksum is what makes that boundary real: a mismatch, or an id that is not in
+/// `ids`, advances one byte and the scan continues, so one lost byte does not discard the
+/// frames after it. Bytes before the first real header are skipped. Returns register
+/// blocks in `ids` order when each id appears once; a duplicate id means two transactions
 /// got mixed, and that is not a tick we can trust.
-fn resync_tick_blocks(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let mut found = vec![None; NUM_JOINTS];
+fn resync_status_blocks(buf: &[u8], ids: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut found = vec![None; ids.len()];
     let mut i = 0;
     while i + TICK_STATUS_FRAME <= buf.len() {
         let head = &buf[i..];
-        let id_ok = JOINT_IDS.iter().position(|&id| id == head[2]);
-        if head[0] != 0xFF || head[1] != 0xFF || head[3] != TICK_STATUS_LEN || id_ok.is_none() {
+        let slot = ids.iter().position(|&id| id == head[2]);
+        if head[0] != 0xFF || head[1] != 0xFF || head[3] != TICK_STATUS_LEN || slot.is_none() {
             i += 1;
             continue;
         }
@@ -486,11 +527,11 @@ fn resync_tick_blocks(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
             i += 1;
             continue;
         }
-        let joint = id_ok.expect("id was just found in JOINT_IDS");
-        if found[joint].is_some() {
+        let slot = slot.expect("id was just found");
+        if found[slot].is_some() {
             return None;
         }
-        found[joint] = Some(frame[5..5 + TICK_READ_LEN as usize].to_vec());
+        found[slot] = Some(frame[5..5 + TICK_READ_LEN as usize].to_vec());
         i += TICK_STATUS_FRAME;
     }
     found.into_iter().collect()
@@ -736,12 +777,30 @@ pub struct FeetechIo {
     /// Second handle on the same tty, used only after rustypot has returned, to read
     /// the reply bytes it left behind and rescan them.
     tail: Box<dyn SerialPort>,
-    /// Servo ids in [`crate::model::JOINT_IDS`] order — the order blocks come back in.
+    /// Joint ids in [`JOINT_IDS`] order. Writes and the position-only read use this list,
+    /// so `imu_to_servo` is never commanded.
     ids: Vec<u8>,
+    /// Tick `sync_read` ids. [`IMU_DXL_ID`] first when [`Self::imu_on_bus`].
+    tick_ids: Vec<u8>,
+    /// Set once in [`Self::open`]. Does not flip if the board appears or disappears later.
+    imu_on_bus: bool,
+    imu: SflpDecoder,
+    stale_imu: StaleImuTracker,
+    /// Last decoded sample. [`RobotIo::read`] fills this; [`ImuIo::read`] returns it.
+    last_imu: ImuData,
     /// Supply voltage per joint captured in the last tick's block. Zero until a read happens.
     last_volts: [f64; NUM_JOINTS],
     /// Case temperature per joint from the last tick's block.
     last_temps_c: [f64; NUM_JOINTS],
+}
+
+/// What one startup probe of ID 200 found. A model other than [`IMU_TO_SERVO_MODEL`] is
+/// retried: a shifted frame can look like a number, and five tries are what separate that
+/// from a device that is genuinely something else.
+enum BusImuProbe {
+    Found,
+    Other { model: u16 },
+    Miss,
 }
 
 impl FeetechIo {
@@ -779,19 +838,30 @@ impl FeetechIo {
             capture,
             tail,
             ids: JOINT_IDS.to_vec(),
+            tick_ids: tick_read_ids(false),
+            imu_on_bus: false,
+            imu: SflpDecoder::default(),
+            stale_imu: StaleImuTracker::default(),
+            last_imu: ImuData::default(),
             last_volts: [0.0; NUM_JOINTS],
             last_temps_c: [0.0; NUM_JOINTS],
         };
         io.ping_all()?;
+        io.imu_on_bus = io.probe_bus_imu();
+        io.tick_ids = tick_read_ids(io.imu_on_bus);
         io.apply_startup()?;
         Ok(io)
+    }
+
+    /// Whether startup found `imu_to_servo` at ID 200. Fixed for this object's life.
+    pub fn imu_on_bus(&self) -> bool {
+        self.imu_on_bus
     }
 
     /// Confirm every servo is present. One missing servo means a `sync_read` below would fail
     /// the whole transaction anyway, so it is better to say so at open.
     ///
-    /// Only [`JOINT_IDS`]. [`crate::model::IMU_DXL_ID`] (200) is reserved for a later
-    /// Feetech IMU node and is not pinged yet.
+    /// Only [`JOINT_IDS`]. ID 200 is probed afterwards, and a miss there is not a failed open.
     fn ping_all(&mut self) -> Result<()> {
         for &id in &JOINT_IDS {
             let alive = self
@@ -803,6 +873,85 @@ impl FeetechIo {
             }
         }
         Ok(())
+    }
+
+    /// Ping ID 200 up to [`IMU_PROBE_ATTEMPTS`] times. The first reply whose model is
+    /// [`IMU_TO_SERVO_MODEL`] locks the bus IMU in; anything else leaves it off.
+    ///
+    /// Unicast, not broadcast. A broadcast ping is answered by every servo at once, and the
+    /// bytes collide. A failed attempt arms a receive discard so a late reply is not the
+    /// next ping's status packet.
+    fn probe_bus_imu(&mut self) -> bool {
+        let mut other_model = None;
+        for attempt in 1..=IMU_PROBE_ATTEMPTS {
+            match self.classify_imu_probe() {
+                BusImuProbe::Found => {
+                    tracing::info!(
+                        id = IMU_DXL_ID,
+                        attempt,
+                        model = format!("{IMU_TO_SERVO_MODEL:#06x}"),
+                        "imu_to_servo answered on the Feetech bus"
+                    );
+                    return true;
+                }
+                BusImuProbe::Other { model } => {
+                    other_model = Some(model);
+                    tracing::debug!(
+                        attempt,
+                        model = format!("{model:#06x}"),
+                        "id 200 answered with an unexpected model"
+                    );
+                }
+                BusImuProbe::Miss => {
+                    tracing::debug!(attempt, "id 200 did not answer");
+                }
+            }
+            self.discard_rx.store(true, Ordering::Release);
+        }
+        if let Some(model) = other_model {
+            tracing::warn!(
+                id = IMU_DXL_ID,
+                model = format!("{model:#06x}"),
+                expected = format!("{IMU_TO_SERVO_MODEL:#06x}"),
+                "id 200 is not an imu_to_servo; IMU stays on I2C"
+            );
+        } else {
+            tracing::info!(
+                id = IMU_DXL_ID,
+                attempts = IMU_PROBE_ATTEMPTS,
+                "no imu_to_servo at id 200; IMU stays on I2C"
+            );
+        }
+        false
+    }
+
+    fn classify_imu_probe(&mut self) -> BusImuProbe {
+        match self.controller.ping(IMU_DXL_ID) {
+            Ok(true) => {}
+            Ok(false) => return BusImuProbe::Miss,
+            Err(e) => {
+                tracing::debug!(error = %e, "ping id 200 failed");
+                return BusImuProbe::Miss;
+            }
+        }
+        match self.read_register(IMU_DXL_ID, IMU_MODEL_ADDR, 2) {
+            Ok(bytes) if bytes.len() == 2 => {
+                let model = u16::from_le_bytes([bytes[0], bytes[1]]);
+                if model == IMU_TO_SERVO_MODEL {
+                    BusImuProbe::Found
+                } else {
+                    BusImuProbe::Other { model }
+                }
+            }
+            Ok(bytes) => {
+                tracing::debug!(got = bytes.len(), "short model read from id 200");
+                BusImuProbe::Miss
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "model read from id 200 failed");
+                BusImuProbe::Miss
+            }
+        }
     }
 
     /// Write the operational registers this session needs. EEPROM persistence (angle limits,
@@ -925,7 +1074,7 @@ impl FeetechIo {
             .map_err(|e| IoError::Bus(format!("write reg {addr} on {id}: {e}")))
     }
 
-    /// One `sync_read` attempt: broadcast, collect fifteen replies, decode them.
+    /// One `sync_read` attempt: broadcast, collect one reply per [`Self::tick_ids`] entry, decode them.
     ///
     /// Split out of [`RobotIo::read`] so the retry around it is visible as a retry, and so a
     /// failed attempt cannot be mistaken for the whole tick's work. rustypot stops at the
@@ -933,9 +1082,9 @@ impl FeetechIo {
     /// scanned for `FF FF` / [`TICK_STATUS_LEN`] before this attempt is declared failed.
     fn read_once(&mut self) -> Result<Sensors> {
         self.capture.start();
-        let result = self
-            .controller
-            .sync_read_raw_data(&self.ids, TICK_READ_ADDR, TICK_READ_LEN);
+        let result =
+            self.controller
+                .sync_read_raw_data(&self.tick_ids, TICK_READ_ADDR, TICK_READ_LEN);
         self.capture.stop();
         match result {
             Ok(blocks) => self.decode_tick_blocks(&blocks),
@@ -946,26 +1095,27 @@ impl FeetechIo {
         }
     }
 
-    /// Rescan a failed `sync_read` and keep the tick when every joint's frame is in there.
+    /// Rescan a failed `sync_read` and keep the tick when every expected frame is in there.
     fn recover_tick(&mut self) -> Result<Sensors> {
         let mut buf = self.capture.take();
         append_until_quiet(&mut *self.tail, &mut buf);
-        let blocks = resync_tick_blocks(&buf)
+        let blocks = resync_status_blocks(&buf, &self.tick_ids)
             .ok_or_else(|| IoError::Bus("hls servo sync_read: resync found no full tick".into()))?;
         self.decode_tick_blocks(&blocks)
     }
 
     fn decode_tick_blocks(&mut self, blocks: &[Vec<u8>]) -> Result<Sensors> {
-        if blocks.len() != NUM_JOINTS {
+        let imu_at = usize::from(self.imu_on_bus);
+        if blocks.len() != NUM_JOINTS + imu_at {
             return Err(IoError::ShortRead {
                 what: "hls sync_read blocks",
-                expected: NUM_JOINTS,
+                expected: NUM_JOINTS + imu_at,
                 got: blocks.len(),
             });
         }
 
         let mut sensors = Sensors::default();
-        for (joint, block) in blocks.iter().enumerate() {
+        for (joint, block) in blocks[imu_at..].iter().enumerate() {
             if block.len() != TICK_READ_LEN as usize {
                 return Err(IoError::ShortRead {
                     what: "hls motor block",
@@ -981,9 +1131,35 @@ impl FeetechIo {
             self.last_temps_c[joint] = fb.temp_c;
         }
 
-        // The IMU no longer rides this bus; the caller fuses the separate ImuIo sample.
-        sensors.imu = ImuData::default();
+        if self.imu_on_bus {
+            // Joints decoded first: a bad position must not count as an IMU sample.
+            sensors.imu = self.ingest_imu_block(&blocks[0])?;
+        }
         Ok(sensors)
+    }
+
+    /// First 12 bytes of the 15-byte block at address 56. The tail is the board's counter
+    /// and status; [`SflpDecoder`] does not look at them.
+    fn ingest_imu_block(&mut self, block: &[u8]) -> Result<ImuData> {
+        if block.len() != TICK_READ_LEN as usize {
+            return Err(IoError::ShortRead {
+                what: "imu_to_servo block",
+                expected: TICK_READ_LEN as usize,
+                got: block.len(),
+            });
+        }
+        let raw = imu_sample_prefix(block).expect("length checked");
+        let run = self.stale_imu.observe(&raw);
+        if run == STALE_RUN_WARN || (run > STALE_RUN_WARN && run.is_multiple_of(500)) {
+            tracing::warn!(
+                consecutive = run,
+                total = self.stale_imu.stale().total,
+                "imu board has returned the same sample {run} reads running — orientation is frozen"
+            );
+        }
+        let imu = self.imu.decode(&raw);
+        self.last_imu = imu;
+        Ok(imu)
     }
 }
 
@@ -1069,6 +1245,25 @@ impl RobotIo for FeetechIo {
             volts,
             temps_c: self.last_temps_c,
         })
+    }
+}
+
+/// The sample [`RobotIo::read`] already took. A second transaction would put ID 200 in a
+/// slot the board is not waiting for.
+impl ImuIo for FeetechIo {
+    fn read(&mut self) -> Result<ImuData> {
+        if !self.imu_on_bus {
+            return Err(IoError::Bus("imu_to_servo was not found at startup".into()));
+        }
+        Ok(self.last_imu)
+    }
+
+    fn ready(&self) -> bool {
+        self.imu_on_bus && self.imu.ready()
+    }
+
+    fn stale(&self) -> ImuStale {
+        self.stale_imu.stale()
     }
 }
 
@@ -1436,6 +1631,60 @@ mod tests {
         let mut buf = all_tick_frames();
         buf.extend(tick_frame(JOINT_IDS[0], 0xAB));
         assert!(resync_tick_blocks(&buf).is_none());
+    }
+
+    /// Startup asks ID 200 five times, and a hit puts that id ahead of the joints.
+    #[test]
+    fn bus_imu_is_probed_five_times_and_read_first() {
+        assert_eq!(IMU_PROBE_ATTEMPTS, 5);
+        assert_eq!(IMU_TO_SERVO_MODEL, 0x4D44);
+        assert_eq!(tick_read_ids(false), JOINT_IDS.to_vec());
+        let ids = tick_read_ids(true);
+        assert_eq!(ids[0], IMU_DXL_ID);
+        assert_eq!(&ids[1..], JOINT_IDS.as_slice());
+        assert!(!JOINT_IDS.contains(&IMU_DXL_ID));
+    }
+
+    /// With the board on the bus, a recovered tick is the IMU block and then every joint.
+    /// Without it, the same IMU frame is not a joint and does not spoil the fifteen.
+    #[test]
+    fn resync_keeps_the_bus_imu_ahead_of_the_joints() {
+        let mut buf = tick_frame(IMU_DXL_ID, 0xC8);
+        buf.extend(all_tick_frames());
+
+        let with_imu = resync_status_blocks(&buf, &tick_read_ids(true)).unwrap();
+        assert_eq!(with_imu.len(), NUM_JOINTS + 1);
+        assert_eq!(with_imu[0][0], 0xC8);
+        assert_eq!(with_imu[1][0], 1);
+        assert_eq!(with_imu[NUM_JOINTS][0], NUM_JOINTS as u8);
+
+        let joints_only = resync_tick_blocks(&buf).unwrap();
+        assert_eq!(joints_only.len(), NUM_JOINTS);
+        assert_eq!(joints_only[0][0], 1);
+
+        assert!(resync_status_blocks(&all_tick_frames(), &tick_read_ids(true)).is_none());
+    }
+
+    /// Address 56 is 15 bytes so the board shares a sync_read with an HD1910. The sample
+    /// the decoder sees is the first 12; the counter and status in the tail are not.
+    #[test]
+    fn the_sync_read_tail_is_not_part_of_the_imu_sample() {
+        let mut block = [0u8; TICK_READ_LEN as usize];
+        block[6..8].copy_from_slice(&0x3000u16.to_le_bytes());
+        block[12] = 0xAB;
+        block[13] = 0x0F;
+        let raw = imu_sample_prefix(&block).unwrap();
+        assert_eq!(raw.len(), IMU_BLOCK_LEN);
+        assert_eq!(&raw[6..8], &0x3000u16.to_le_bytes());
+
+        let mut from_prefix = SflpDecoder::default();
+        let mut from_twelve = SflpDecoder::default();
+        let mut only_twelve = [0u8; IMU_BLOCK_LEN];
+        only_twelve[6..8].copy_from_slice(&0x3000u16.to_le_bytes());
+        assert_eq!(
+            from_prefix.decode(&raw).quat,
+            from_twelve.decode(&only_twelve).quat
+        );
     }
 
     /// Bytes already buffered are dropped, bytes still arriving are read off, then the

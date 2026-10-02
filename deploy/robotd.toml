@@ -31,8 +31,10 @@ port = "/dev/ttyS2"
 driver = "hd1910"
 
 [imu]
-# OpenMicroDuck only: the IMU on its own I²C bus. Production wiring is i2c4 (pins 27/28,
-# on-board pull-ups), aliased /dev/i2c-imu by the udev rule, at 0x6A.
+# OpenMicroDuck fallback: used only when startup does not find imu_to_servo (Feetech ID 200,
+# model 0x4D44) after five pings. That choice is fixed until the next start. Production
+# wiring for this chip is i2c4 (pins 27/28, on-board pull-ups), aliased /dev/i2c-imu by the
+# udev rule, at 0x6A.
 # If that path cannot be opened or WHO_AM_I is not 0x70, robotd scans /dev/i2c-* the same
 # way imu_probe does — some boards answer on /dev/i2c-5. Do not point this at i2c6: 0x6A
 # there is a different device.

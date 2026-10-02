@@ -174,10 +174,10 @@ impl<T: RobotIo, U: ImuIo> Safety<T, U> {
 
     /// The IMU half of the composition point.
     ///
-    /// `robotd` calls [`RobotIo::read`] for the servo half and then this, on the same tick,
-    /// to fill [`Sensors::imu`] — the two buses are independent, so only the caller can say
-    /// "one sample of both". A failed [`ImuIo::read`] degrades the tick (the caller keeps its
-    /// last sample) rather than failing it.
+    /// `robotd` calls [`RobotIo::read`] and then this, on the same tick, to fill
+    /// [`Sensors::imu`]. When the IMU is I²C the two reads are independent, so a failed
+    /// [`ImuIo::read`] degrades the tick (the caller keeps its last sample). When the IMU
+    /// rides the servo bus, this returns the sample that read already fetched.
     ///
     /// Exposing the IMU itself does not break safety's write-handle invariant: the IMU never
     /// commands a motor, and the only `RobotIo` in the crate still lives here.

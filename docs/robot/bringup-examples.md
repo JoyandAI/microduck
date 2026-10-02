@@ -1,8 +1,9 @@
 # Bench examples — cross-compile and copy to the board
 
-`imu_probe`, `hls_read` and `hls_control` are `duck-control` examples. They talk to
-the IMU or the servo UART **without** going through `robotd`. They are not a daemon
-release: do not use [`dev-push.md`](dev-push.md) / `scripts/dev-push.sh` for them.
+`imu_probe`, `hls_read`, `imu_servo_read` and `hls_control` are `duck-control`
+examples. They talk to the IMU or the servo UART **without** going through `robotd`.
+They are not a daemon release: do not use [`dev-push.md`](dev-push.md) /
+`scripts/dev-push.sh` for them.
 
 There is no `hls_write`. Sweeping / writing HD1910s is `hls_control`.
 
@@ -39,7 +40,7 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/aarch64-linux-gnu-
 cd /mnt/e/dev/microduck
 
 cargo build --target aarch64-unknown-linux-gnu -p duck-control \
-  --example imu_probe --example hls_read --example hls_control
+  --example imu_probe --example hls_read --example imu_servo_read --example hls_control
 ```
 
 One example only:
@@ -53,6 +54,7 @@ cargo build --target aarch64-unknown-linux-gnu -p duck-control --example hls_con
 ```text
 target/aarch64-unknown-linux-gnu/debug/examples/imu_probe
 target/aarch64-unknown-linux-gnu/debug/examples/hls_read
+target/aarch64-unknown-linux-gnu/debug/examples/imu_servo_read
 target/aarch64-unknown-linux-gnu/debug/examples/hls_control
 ```
 
@@ -65,7 +67,7 @@ Same artifacts, repo-default toolchain:
 
 ```bash
 cargo zigbuild --target aarch64-unknown-linux-gnu.2.31 -p duck-control \
-  --example imu_probe --example hls_read --example hls_control
+  --example imu_probe --example hls_read --example imu_servo_read --example hls_control
 ```
 
 ## Copy onto the Radxa
@@ -81,20 +83,26 @@ relative to the repo:
 BOARD=radxa@radxa-zero3
 EX=target/aarch64-unknown-linux-gnu/debug/examples
 
-scp $EX/imu_probe $EX/hls_read $EX/hls_control $BOARD:~/
-ssh $BOARD 'sudo systemctl stop robotd; chmod +x ~/imu_probe ~/hls_read ~/hls_control'
+scp $EX/imu_probe $EX/hls_read $EX/imu_servo_read $EX/hls_control $BOARD:~/
+ssh $BOARD 'sudo systemctl stop robotd; chmod +x ~/imu_probe ~/hls_read ~/imu_servo_read ~/hls_control'
 ```
 
 On the board:
 
 ```bash
-# IMU (OpenMicroDuck). Alias first; some boards answer on i2c-5.
+# I²C IMU. Alias first; some boards answer on i2c-5.
 ./imu_probe /dev/i2c-imu 0x6A
 # ./imu_probe /dev/i2c-5 0x6A
 # ./imu_probe --hz 50
 
-# HD1910 bus — read-only status
+# imu_to_servo on the Feetech bus (ID 200, five pings, model 0x4D44).
+./imu_probe /dev/ttyS2 --hz 50
+
+# HD1910 bus — joint table, plus the bus IMU row when ID 200 answers.
 ./hls_read /dev/ttyS2
+
+# Every device on the bus: servo lines and the IMU line (accel included).
+./imu_servo_read /dev/ttyS2
 
 # HD1910 bus — sweep / write. Joints not in the sweep hold 0°, not the pose they were in.
 ./hls_control --port /dev/ttyS2 --mode speed

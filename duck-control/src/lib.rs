@@ -19,11 +19,11 @@ pub mod obs;
 pub mod policy;
 pub mod safety;
 
+pub use hardware::{HD1910_BAM_M1, HD1910_FIRMWARE, Hd1910BamM1, Hd1910Firmware};
 pub use imu::ImuData;
 pub use io::{
     FakeImu, FakeIo, ImuIo, ImuStale, IoError, JointTargets, RobotIo, Sensors, SlowSensors,
 };
-pub use hardware::{HD1910_BAM_M1, HD1910_FIRMWARE, Hd1910BamM1, Hd1910Firmware};
 pub use model::{
     BATTERY_EMPTY_V, BATTERY_FULL_V, DEFAULT_POSITION, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES,
     NUM_JOINTS, battery_percent,
