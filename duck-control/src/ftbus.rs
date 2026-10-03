@@ -473,6 +473,50 @@ fn hls_checksum(body: &[u8]) -> u8 {
     !body.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte))
 }
 
+/// `FF FF ID LEN=2 INST=0x0B CHK`. No parameters means "current position is the midpoint".
+fn calibrate_mid_packet(id: u8) -> [u8; 6] {
+    let body = [id, 2, 0x0B];
+    [0xFF, 0xFF, id, 2, 0x0B, hls_checksum(&body)]
+}
+
+/// A status frame with error 0, after skipping the half-duplex echo of `echo`.
+fn calibrate_status_ok(buf: &[u8], id: u8, echo: &[u8]) -> bool {
+    buf.windows(6).any(|frame| {
+        frame != echo
+            && frame[0] == 0xFF
+            && frame[1] == 0xFF
+            && frame[2] == id
+            && frame[3] == 2
+            && frame[4] == 0
+            && hls_checksum(&frame[2..5]) == frame[5]
+    })
+}
+
+fn read_calibrate_status(port: &mut dyn SerialPort, id: u8, echo: &[u8]) -> bool {
+    let saved = port.timeout();
+    if port.set_timeout(READ_TIMEOUT).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 32];
+    let start = Instant::now();
+    let mut ok = false;
+    while start.elapsed() < Duration::from_millis(80) {
+        match port.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if calibrate_status_ok(&buf, id, echo) {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+    }
+    let _ = port.set_timeout(saved);
+    ok
+}
+
 /// Pull joint replies back out of a stream rustypot has already given up on.
 ///
 /// See [`resync_status_blocks`]. This is the joints-only scan: an `imu_to_servo` frame,
@@ -803,12 +847,44 @@ enum BusImuProbe {
     Miss,
 }
 
+/// One servo, as a bench tool reads it. Degrees use the same count map as the control loop.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BenchSample {
+    pub id: u8,
+    pub position: u16,
+    pub degrees: Option<f64>,
+    pub volts: f64,
+    pub temperature_c: u8,
+    pub load_percent: f64,
+    pub kp: u8,
+    pub kd: u8,
+    pub torque: bool,
+}
+
 impl FeetechIo {
+    /// Open the port and nothing else: no ping of all fifteen, no EEPROM rewrite.
+    ///
+    /// [`Self::open`] is what the control loop uses. This is for a bench page that talks to
+    /// one servo while `robotd` is stopped — calling [`Self::open`] would refuse a missing
+    /// joint and rewrite mode on every id it did find.
+    pub fn open_bench(port: &str) -> Result<Self> {
+        Self::attach(port)
+    }
+
     /// Open the bus and apply the per-boot startup register writes.
     ///
     /// Verifies every servo answers, then writes the SRAM/operational registers and leaves
     /// torque off — nothing enables torque just because a process started.
     pub fn open(port: &str) -> Result<Self> {
+        let mut io = Self::attach(port)?;
+        io.ping_all()?;
+        io.imu_on_bus = io.probe_bus_imu();
+        io.tick_ids = tick_read_ids(io.imu_on_bus);
+        io.apply_startup()?;
+        Ok(io)
+    }
+
+    fn attach(port: &str) -> Result<Self> {
         let serial = serialport::new(port, BAUD_RATE)
             .timeout(READ_TIMEOUT)
             .open()
@@ -832,7 +908,7 @@ impl FeetechIo {
             .with_protocol_v1()
             .with_serial_port(serial);
 
-        let mut io = Self {
+        Ok(Self {
             controller,
             discard_rx,
             capture,
@@ -845,12 +921,133 @@ impl FeetechIo {
             last_imu: ImuData::default(),
             last_volts: [0.0; NUM_JOINTS],
             last_temps_c: [0.0; NUM_JOINTS],
-        };
-        io.ping_all()?;
-        io.imu_on_bus = io.probe_bus_imu();
-        io.tick_ids = tick_read_ids(io.imu_on_bus);
-        io.apply_startup()?;
-        Ok(io)
+        })
+    }
+
+    /// Which of `ids` answer a ping. A miss discards a late reply so it cannot shift the next one.
+    pub fn bench_scan(&mut self, ids: &[u8]) -> Vec<u8> {
+        let mut online = Vec::new();
+        for &id in ids {
+            match self.controller.ping(id) {
+                Ok(true) => online.push(id),
+                _ => self.discard_rx.store(true, Ordering::Release),
+            }
+        }
+        online
+    }
+
+    /// Position, supply, temperature, load and the position-loop gains of one servo.
+    pub fn bench_read(&mut self, id: u8) -> Result<BenchSample> {
+        let pos = self.read_u16(id, reg::PRESENT_POSITION)?;
+        let volts = voltage_to_volts(self.read_u8(id, reg::PRESENT_VOLTAGE)?);
+        let temperature_c = self.read_u8(id, reg::PRESENT_TEMPERATURE)?;
+        let load = self.read_u16(id, reg::PRESENT_LOAD)?;
+        Ok(BenchSample {
+            id,
+            position: pos,
+            degrees: position_to_rad(pos).map(|r| r.to_degrees()),
+            volts,
+            temperature_c,
+            load_percent: load_percent(load),
+            kp: self.read_u8(id, reg::KP)?,
+            kd: self.read_u8(id, reg::KD)?,
+            torque: self.read_u8(id, reg::TORQUE_ENABLE)? != 0,
+        })
+    }
+
+    /// Torque on, then one `WritePosEx` to `counts` (0–4095). Speed is capped so a bench
+    /// command is a move, not a slam: 800 steps/s, accel 20, torque cap 50%.
+    pub fn bench_goto(&mut self, id: u8, counts: u16) -> Result<()> {
+        if counts > MAX_POSITION_COUNT {
+            return Err(IoError::Bus(format!(
+                "position {counts} is outside 0–{MAX_POSITION_COUNT}"
+            )));
+        }
+        self.write_register(id, reg::TORQUE_ENABLE, &[1])?;
+        let block = encode_write_pos_ex(counts, 800, 20, 500);
+        self.controller
+            .sync_write_raw_data(&[id], reg::ACCEL, &[block.to_vec()])
+            .map_err(|e| IoError::Bus(format!("WritePosEx on {id}: {e}")))
+    }
+
+    /// Position-loop P and D (registers 50 and 51). SRAM, so the lock stays shut.
+    pub fn bench_gains(&mut self, id: u8, kp: u8, kd: u8) -> Result<()> {
+        if kp > 254 {
+            return Err(IoError::Bus(format!("kp {kp} is above 254")));
+        }
+        self.write_register(id, reg::KP, &[kp])?;
+        self.write_register(id, reg::KD, &[kd])?;
+        Ok(())
+    }
+
+    /// Torque on or off for one servo. Off is how a joint is freed before it is picked up.
+    pub fn bench_torque(&mut self, id: u8, on: bool) -> Result<()> {
+        self.write_register(id, reg::TORQUE_ENABLE, &[u8::from(on)])
+    }
+
+    /// Change one servo's ID. EEPROM: unlock, write, lock the new id.
+    ///
+    /// Only one servo of `id` may be on the bus. `200` is the IMU node and is refused.
+    pub fn bench_set_id(&mut self, id: u8, new_id: u8) -> Result<()> {
+        if new_id == 0 || new_id == IMU_DXL_ID {
+            return Err(IoError::Bus(format!(
+                "id {new_id} is reserved (1–253, not {IMU_DXL_ID})"
+            )));
+        }
+        self.write_register(id, reg::TORQUE_ENABLE, &[0])?;
+        self.write_register(id, reg::LOCK, &[0])?;
+        self.write_register(id, reg::ID, &[new_id])?;
+        self.write_register(new_id, reg::LOCK, &[1])?;
+        Ok(())
+    }
+
+    /// Present-position counts of one servo. A miss is that servo, not the whole bus.
+    pub fn bench_position(&mut self, id: u8) -> Result<u16> {
+        self.read_u16(id, reg::PRESENT_POSITION)
+    }
+
+    /// Feetech position-calibrate `0x0B` with no parameter: the position the horn is at
+    /// becomes the midpoint (2048), which this runtime treats as 0 rad.
+    ///
+    /// Torque is cut first. Leaving it on would make the servo chase the old goal after
+    /// the origin moves. The write is permanent; call it only when the joint is already
+    /// at its mechanical zero.
+    pub fn bench_set_mid(&mut self, id: u8) -> Result<u16> {
+        self.write_register(id, reg::TORQUE_ENABLE, &[0])?;
+        let packet = calibrate_mid_packet(id);
+        let _ = self.tail.clear(serialport::ClearBuffer::Input);
+        self.tail
+            .write_all(&packet)
+            .map_err(|e| IoError::Bus(format!("calibrate {id}: {e}")))?;
+        self.tail
+            .flush()
+            .map_err(|e| IoError::Bus(format!("calibrate {id}: {e}")))?;
+        if !read_calibrate_status(&mut *self.tail, id, &packet) {
+            return Err(IoError::Bus(format!(
+                "servo {id} did not accept position calibrate"
+            )));
+        }
+        self.read_u16(id, reg::PRESENT_POSITION)
+    }
+
+    fn read_u8(&mut self, id: u8, addr: u8) -> Result<u8> {
+        let bytes = self.read_register(id, addr, 1)?;
+        bytes
+            .first()
+            .copied()
+            .ok_or_else(|| IoError::Bus(format!("empty read of reg {addr} on {id}")))
+    }
+
+    fn read_u16(&mut self, id: u8, addr: u8) -> Result<u16> {
+        let bytes = self.read_register(id, addr, 2)?;
+        if bytes.len() != 2 {
+            return Err(IoError::ShortRead {
+                what: "register",
+                expected: 2,
+                got: bytes.len(),
+            });
+        }
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     /// Whether startup found `imu_to_servo` at ID 200. Fixed for this object's life.
@@ -1995,5 +2192,26 @@ mod tests {
             self.inflight.drain(..n);
             Ok(n)
         }
+    }
+
+    #[test]
+    fn calibrate_mid_packet_is_instruction_0x0b() {
+        let packet = calibrate_mid_packet(20);
+        assert_eq!(&packet[..5], &[0xFF, 0xFF, 20, 2, 0x0B]);
+        assert_eq!(packet[5], hls_checksum(&[20, 2, 0x0B]));
+    }
+
+    #[test]
+    fn calibrate_status_ignores_the_echo_and_a_fault() {
+        let echo = calibrate_mid_packet(20);
+        let mut ok = vec![0xFF, 0xFF, 20, 2, 0, hls_checksum(&[20, 2, 0])];
+        assert!(!calibrate_status_ok(&echo, 20, &echo));
+        assert!(calibrate_status_ok(&ok, 20, &echo));
+        let mut both = echo.to_vec();
+        both.extend_from_slice(&ok);
+        assert!(calibrate_status_ok(&both, 20, &echo));
+        ok[4] = 1;
+        ok[5] = hls_checksum(&[20, 2, 1]);
+        assert!(!calibrate_status_ok(&ok, 20, &echo));
     }
 }

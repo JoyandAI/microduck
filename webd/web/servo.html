@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMicroDuck</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+<header>
+  <div><small>单颗舵机</small><h1>OpenMicroDuck</h1></div>
+  <nav>
+    <a href="/">控制</a>
+    <a href="/calibrate">标定</a>
+    <a href="/servo" aria-current="page">舵机</a>
+  </nav>
+  <span class="grow"></span>
+  <span class="pill" id="link">未连接</span>
+</header>
+<p class="warn">这一页直接写舵机总线，和 robotd 不能同时开着串口。先在机器人上执行 <code>sudo systemctl stop robotd</code>，用完再 <code>sudo systemctl start robotd</code>。改 ID 时总线上只留一颗舵机。关节角度和身体姿态在行走时看「控制」页。</p>
+<p class="msg" id="message">选择串口后连接。</p>
+
+<section>
+  <h2>串口</h2>
+  <div class="row">
+    <label>端口 <input id="port" value="/dev/ttyS2" spellcheck="false" size="18"></label>
+    <button class="primary" id="connect">连接</button>
+    <button id="disconnect">断开</button>
+    <button id="scan">扫描</button>
+  </div>
+  <p class="hint" id="online">还没扫描。</p>
+</section>
+
+<section>
+  <h2>这一颗</h2>
+  <div class="row">
+    <label>舵机
+      <select id="id"></select>
+    </label>
+    <button id="read">读取</button>
+    <button id="torque-on">上力矩</button>
+    <button id="torque-off">卸力矩</button>
+  </div>
+  <div class="metrics" id="sample">
+    <article><small>位置</small><strong id="pos">—</strong></article>
+    <article><small>角度</small><strong id="deg">—</strong></article>
+    <article><small>电压</small><strong id="volt">—</strong></article>
+    <article><small>温度</small><strong id="temp">—</strong></article>
+    <article><small>负载</small><strong id="load">—</strong></article>
+    <article><small>KP / KD</small><strong id="gains-now">—</strong></article>
+    <article><small>力矩</small><strong id="torque">—</strong></article>
+  </div>
+</section>
+
+<section>
+  <h2>走到位置</h2>
+  <div class="servo-row">
+    <span>原始位置</span>
+    <input id="goto" type="number" min="0" max="4095" value="2048">
+    <button id="go">写入</button>
+  </div>
+  <p class="hint">2048 大约是 0°。写入时会打开这颗的力矩，速度大约 800 步/秒，力矩上限 50%。装在腿上时先扶住。</p>
+</section>
+
+<section>
+  <h2>位置环增益</h2>
+  <div class="servo-row">
+    <span>KP / KD</span>
+    <span class="row">
+      <input id="kp" type="number" min="0" max="254" value="32">
+      <input id="kd" type="number" min="0" max="254" value="40">
+    </span>
+    <button id="set-gains">写入</button>
+  </div>
+  <p class="hint">HD1910 出厂位置环是 KP 32、KD 40。这两个寄存器在掉电后不一定还在，要长期改需要再写 EEPROM。</p>
+</section>
+
+<section>
+  <h2>修改 ID</h2>
+  <div class="servo-row">
+    <span>新 ID</span>
+    <input id="new-id" type="number" min="1" max="253" value="20">
+    <button class="danger" id="set-id">写入</button>
+  </div>
+  <p class="hint">写的是 EEPROM。总线上只能有当前这一个 ID。200 留给总线上的 IMU，不能用。标准 ID：左腿 20–24，头颈嘴 30–34，右腿 10–14。</p>
+</section>
+</main>
+<script src="/servo.js"></script>

@@ -209,6 +209,20 @@ sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && 
 or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp and refuses
 `init`/`enable`/skills until it is stood up.
 
+### Web console (`webd`)
+
+Bluetooth is not required. On the robot:
+
+```
+cargo run -p webd -- --host 0.0.0.0 --port 8090
+```
+
+Open `http://<robot>:8090`. **控制** stands the robot up, enables walking, and sends the same intents as the gamepad: velocity, roulade, sit, kicks, ground pick. Joint angles and trunk tilt come from `robotd`'s state stream, the same one `robotctl monitor` draws. Closing the page zeroes velocity; it does not cut torque.
+
+**舵机** writes the bus directly, so stop the daemon first (`sudo systemctl stop robotd`) and start it again when you are done. One servo at a time for an ID change.
+
+**标定** (`/calibrate`) uses that same bus. Each joint has a slider. **设 0 位** sends Feetech `0x0B`, which makes the horn's current position the encoder midpoint 2048 (0 rad) and is stored in the servo. Pose the joint at its mechanical zero first. **运行到默认位置** commands the standing pose (`DEFAULT_POSITION`). Leaving the page cuts torque.
+
 ### Gamepad (`configd`)
 
 ```

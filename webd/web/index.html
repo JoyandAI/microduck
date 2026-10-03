@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMicroDuck</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+<header>
+  <div><small>局域网控制</small><h1>OpenMicroDuck</h1></div>
+  <nav>
+    <a href="/" aria-current="page">控制</a>
+    <a href="/calibrate">标定</a>
+    <a href="/servo">舵机</a>
+  </nav>
+  <span class="grow"></span>
+  <span class="pill" id="link">正在连接…</span>
+</header>
+<p class="msg" id="message">正在连接 robotd…</p>
+
+<section>
+  <h2>动作</h2>
+  <div class="row">
+    <button class="primary" id="init">起立</button>
+    <button class="primary" id="enable">开始行走</button>
+    <button id="hold">回到站姿</button>
+    <button id="stop">速度归零</button>
+    <button class="danger" id="relax">卸力</button>
+  </div>
+  <p class="hint">起立会给所有关节上力矩，并在大约两秒内走到站姿，先放在支架上或扶好。开始行走之后，下面的摇杆才让它走。卸力会关掉力矩，没人扶的话会倒下。</p>
+</section>
+
+<section>
+  <h2>行走</h2>
+  <div class="joysticks">
+    <div>
+      <div class="joy" id="joy-move"><div class="knob" id="knob-move"></div></div>
+      <p class="joy-value">前进 <span id="vx">0.00</span> · 侧移 <span id="vy">0.00</span></p>
+    </div>
+    <div>
+      <div class="joy" id="joy-turn"><div class="knob" id="knob-turn"></div></div>
+      <p class="joy-value">转向 <span id="wz">0.00</span></p>
+    </div>
+  </div>
+  <p class="hint">松开摇杆回到零。键盘 <kbd>W</kbd><kbd>S</kbd> 前进，<kbd>A</kbd><kbd>D</kbd> 侧移，<kbd>Q</kbd><kbd>E</kbd> 转向，空格速度归零。满杆大约 0.3 m/s、1.5 rad/s。页面关掉或切到后台后，速度指令会停。</p>
+</section>
+
+<section>
+  <h2>技能</h2>
+  <div class="row">
+    <button data-skill="roulade">翻滚</button>
+    <button data-skill="sit_toggle">坐下 / 站起</button>
+    <button data-skill="kick_left">左踢</button>
+    <button data-skill="kick_right">右踢</button>
+    <button data-skill="ground_pick">捡起</button>
+  </div>
+  <p class="hint">这些和手柄上的动作是同一条指令。需要先「开始行走」。按住「翻滚」会连着翻。</p>
+</section>
+
+<section>
+  <h2>头和嘴</h2>
+  <label class="slider">颈俯仰<input id="neck" type="range" min="-1" max="1" step="0.02" value="0"><span id="neck-v">0.00</span></label>
+  <label class="slider">头俯仰<input id="head-pitch" type="range" min="-1" max="1" step="0.02" value="0"><span id="hp-v">0.00</span></label>
+  <label class="slider">头偏航<input id="head-yaw" type="range" min="-1" max="1" step="0.02" value="0"><span id="hy-v">0.00</span></label>
+  <label class="slider">头滚转<input id="head-roll" type="range" min="-1" max="1" step="0.02" value="0"><span id="hr-v">0.00</span></label>
+  <label class="slider">嘴<input id="mouth" type="range" min="0" max="1" step="0.02" value="0"><span id="mouth-v">0.00</span></label>
+  <p class="hint">头的四个数是弧度，大约 ±1。嘴 0 是闭上，1 是张开。</p>
+</section>
+
+<section>
+  <h2>姿态与状态</h2>
+  <div class="layout">
+    <div>
+      <div class="stage" id="stage" title="躯干俯仰和滚转">
+        <div class="horizon" id="horizon"></div>
+        <div class="body" id="body"><div class="beak"></div></div>
+      </div>
+      <p class="joy-value" id="tilt">倾角 —</p>
+    </div>
+    <div class="metrics" id="metrics">
+      <article><small>策略</small><strong id="policy">—</strong></article>
+      <article><small>安全</small><strong id="safety">—</strong></article>
+      <article><small>重力</small><strong id="gravity">—</strong></article>
+      <article><small>循环</small><strong id="loop">—</strong></article>
+      <article><small>电池</small><strong id="battery">—</strong></article>
+      <article><small>电机</small><strong id="motors">—</strong></article>
+      <article><small>指令</small><strong id="applied">—</strong></article>
+      <article><small>限制</small><strong id="limits">—</strong></article>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>关节</h2>
+  <table>
+    <thead><tr><th>关节</th><th>ID</th><th>实际</th><th>目标</th><th>偏差</th></tr></thead>
+    <tbody id="joints"></tbody>
+  </table>
+  <p class="hint">角度来自 robotd 的状态流，和 <code>robotctl monitor</code> 是同一份数。偏差条满格大约是 11°。</p>
+</section>
+</main>
+<script src="/app.js"></script>

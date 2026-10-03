@@ -161,7 +161,7 @@ mod tests {
             "the console did not answer 200: {}",
             answer.lines().next().unwrap_or("nothing at all")
         );
-        assert!(answer.contains("duck console"), "that was not the page");
+        assert!(answer.contains("OpenMicroDuck"), "that was not the page");
         assert!(
             !answer.contains(PORT_TOKEN),
             "the page went out over the wire with its port token still in it"

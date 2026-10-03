@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMicroDuck</title>
+<link rel="stylesheet" href="/style.css">
+<main>
+<header>
+  <div><small>零点标定</small><h1>OpenMicroDuck</h1></div>
+  <nav>
+    <a href="/">控制</a>
+    <a href="/calibrate" aria-current="page">标定</a>
+    <a href="/servo">舵机</a>
+  </nav>
+  <span class="grow"></span>
+  <span class="pill" id="link">未连接</span>
+</header>
+<p class="warn">这一页直接写舵机总线。先执行 <code>sudo systemctl stop robotd</code>，用完再启动。设 0 位会把当前位置写成编码器中位 2048，并保存在舵机里。先把关节摆到机械零位再按。</p>
+<p class="msg" id="message">连接串口后开始。开始标定会把增益临时降到 KP 3、KD 0，十五路先走到 2048。</p>
+
+<section>
+  <h2>串口</h2>
+  <div class="row">
+    <label>端口 <input id="port" value="/dev/ttyS2" spellcheck="false" size="18"></label>
+    <button class="primary" id="connect">连接</button>
+    <button id="disconnect">断开</button>
+  </div>
+</section>
+
+<section>
+  <h2>步骤</h2>
+  <div class="row">
+    <button class="primary" id="start">开始标定</button>
+    <button id="home-all">运行到默认位置</button>
+    <button id="exit">退出</button>
+  </div>
+  <p class="hint">拖动滑条只改这一路，范围是编码器 0–4095。摆到机械零位后按「设 0 位」。绿色表示这次打开页面后已经设过。退出或离开页面会卸力矩，并把增益恢复成 KP 32、KD 40。已经写入舵机的 0 位不会被清掉。「运行到默认位置」走到站姿，0 位设好之后这个姿势才准。</p>
+</section>
+
+<section>
+  <h2>关节</h2>
+  <div id="joints" class="cal-list"></div>
+</section>
+</main>
+<script src="/calibrate.js"></script>
