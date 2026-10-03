@@ -101,7 +101,7 @@ On the board:
 # HD1910 bus — joint table, plus the bus IMU row when ID 200 answers.
 ./hls_read /dev/ttyS2
 
-# Every device on the bus: servo lines and the IMU line (accel included).
+# IMU unicast (addr 56, 86 bytes); servos one sync_read (addr 56, 15 bytes).
 ./imu_servo_read /dev/ttyS2
 
 # HD1910 bus — sweep / write. Joints not in the sweep hold 0°, not the pose they were in.

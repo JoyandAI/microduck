@@ -1,12 +1,24 @@
 //! Every Feetech device on one bus: HD1910 feedback and `imu_to_servo`.
 //!
-//! Same job as `E:\dev\imu_to_servo\src\Tools\imu_servo_read.py`. A broadcast
-//! PING is confirmed with a unicast PING, because on a full duck bus the
+//! Discovery is the same as `E:\dev\imu_to_servo\src\Tools\imu_servo_read.py`: a
+//! broadcast PING confirmed with a unicast PING, because on a full duck bus the
 //! broadcast replies overlap. Known joint IDs are then pinged too, and ID 200
 //! is tried five times so a late `imu_to_servo` is not missed. The IMU is the
-//! device whose model number is `0x4D44`; its address 56 is gyro and quaternion,
-//! and acceleration is the six bytes at address 136. Servos are the 15-byte
-//! block at address 56. Voltage is byte 6 of that block, 0.1 V per count.
+//! device whose model number is `0x4D44`.
+//!
+//! Each sample is two transactions. The IMU is a unicast read of address 56 for
+//! 86 bytes (gyro, quaternion, and the accelerometer at 136). The servos are
+//! one `sync_read` — instruction `0x82`, address 56, 15 bytes — and the IMU id
+//! is not in that list. Servo voltage is byte 6 of the servo block, 0.1 V per
+//! count.
+//!
+//! Checked on `duck-57ed`, 2026-10-03: this split comes back clean. `robotd`'s
+//! tick is a different transaction, one `sync_read` of the 15-byte block with
+//! ID 200 first and then the servos, and that one fails its checksum from the
+//! first tick (`docs/robot/ttl_bus_communication.md`). Shorting R33 on the HAT
+//! did not clear it. Whether the combined read is a bug still open, or just how
+//! this bus has to be talked to, is not settled. This example keeps the split
+//! that was verified.
 //!
 //! Read-only. Stop `robotd` before opening the robot's UART.
 //!
@@ -25,11 +37,12 @@ use duck_control::ftbus::{
 };
 use duck_control::model::BAUD_RATE;
 use duck_control::{IMU_DXL_ID, JOINT_IDS};
+use rustypot::servo::feetech::sts3215::Sts3215Controller;
 use serialport::SerialPort;
 
 const SERVO_ADDR: u8 = 56;
 const SERVO_LEN: u8 = 15;
-/// Address 56 through the 6-byte accelerometer at 136.
+/// Address 56 through the 6-byte accelerometer at 136. Unicast, IMU only.
 const IMU_LEN: u8 = 86;
 const ACCEL_OFFSET: usize = 80;
 const GYRO_DPS_PER_LSB: f64 = 17.5e-3;
@@ -80,21 +93,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for &id in &ids {
         kinds.push(is_imu(&mut *port, id));
     }
-    let names = ids
-        .iter()
-        .zip(kinds.iter())
-        .map(|(id, imu)| {
-            if *imu {
-                format!("{id} IMU")
-            } else {
-                id.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!("{} {} 8N1  {names}", args.port, args.baud);
+    let imus = imu_ids(&ids, &kinds);
+    let servos = servo_ids(&ids, &kinds);
+    let imu_list = if imus.is_empty() {
+        "none".to_string()
+    } else {
+        imus.iter()
+            .map(|id| format!("{id} IMU"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let servo_list = if servos.is_empty() {
+        "none".to_string()
+    } else {
+        servos
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!("{} {} 8N1  imu: {imu_list}  servos: {servo_list}", args.port, args.baud);
     println!(
-        "pos=counts  spd=rpm (clockwise negative)  cur=mA  tq=load%  volt=V  g=dps a=g  Ctrl-C quit"
+        "imu unicast addr={SERVO_ADDR} len={IMU_LEN}   \
+         servos sync_read addr={SERVO_ADDR} len={SERVO_LEN}  \
+         pos=counts  spd=rpm (clockwise negative)  cur=mA  tq=load%  volt=V  g=dps a=g  Ctrl-C quit"
     );
 
     let tty = io::stdout().is_terminal();
@@ -110,25 +132,79 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.count
     };
 
+    port.set_timeout(READ_DEADLINE)
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    let mut controller = Sts3215Controller::new()
+        .with_protocol_v1()
+        .with_serial_port(port);
+    let mut imu_ok = 0u64;
+    let mut imu_fail = 0u64;
+    let mut ok = 0u64;
+    let mut fail = 0u64;
+
     while RUNNING.load(Ordering::Relaxed) && (limit == 0 || shown < limit) {
         let started = Instant::now();
-        let mut lines = Vec::with_capacity(ids.len());
-        for (&id, &imu) in ids.iter().zip(kinds.iter()) {
-            let text = if imu {
-                match read_mem(&mut *port, id, SERVO_ADDR, IMU_LEN) {
-                    Ok(block) => format!("id={id:<3} IMU {}", decode_imu(&block)),
-                    Err(e) => e,
+        let mut lines = Vec::with_capacity(imus.len() + servos.len() + 1);
+        for &id in &imus {
+            match controller.read_raw_data(id, SERVO_ADDR, IMU_LEN) {
+                Ok(block) => {
+                    imu_ok += 1;
+                    lines.push(format!("id={id:<3} IMU {}", decode_imu(&block)));
                 }
-            } else {
-                match read_mem(&mut *port, id, SERVO_ADDR, SERVO_LEN) {
-                    Ok(block) => format!("id={id:<3} {}", decode_servo(&block)),
-                    Err(e) => e,
+                Err(e) => {
+                    imu_fail += 1;
+                    lines.push(format!("id={id:<3} IMU {e}"));
                 }
-            };
-            lines.push(text);
+            }
         }
+        let mut sync_error = None;
+        if servos.is_empty() {
+            // Nothing to put on the wire. The footer says so.
+        } else {
+            match controller.sync_read_raw_data(&servos, SERVO_ADDR, SERVO_LEN) {
+                Ok(blocks) if blocks.len() == servos.len() => {
+                    ok += 1;
+                    for (&id, block) in servos.iter().zip(blocks.iter()) {
+                        lines.push(format!("id={id:<3} {}", decode_servo(block)));
+                    }
+                }
+                Ok(blocks) => {
+                    fail += 1;
+                    for &id in &servos {
+                        lines.push(format!("id={id:<3} —"));
+                    }
+                    sync_error = Some(format!(
+                        "expected {} blocks, got {}",
+                        servos.len(),
+                        blocks.len()
+                    ));
+                }
+                Err(e) => {
+                    fail += 1;
+                    for &id in &servos {
+                        lines.push(format!("id={id:<3} —"));
+                    }
+                    sync_error = Some(e.to_string());
+                }
+            }
+        }
+        let sync_status = if servos.is_empty() {
+            "sync_read (no servos)".to_string()
+        } else if let Some(detail) = &sync_error {
+            format!("sync_read addr={SERVO_ADDR} len={SERVO_LEN}  ok={ok} fail={fail}  {detail}")
+        } else {
+            format!("sync_read addr={SERVO_ADDR} len={SERVO_LEN}  ok={ok} fail={fail}")
+        };
+        lines.push(format!(
+            "imu unicast ok={imu_ok} fail={imu_fail}  {sync_status}"
+        ));
         paint(&lines, tty, shown == 0)?;
         shown += 1;
+        if !tty {
+            if let Some(detail) = sync_error {
+                return Err(format!("sync_read: {detail}").into());
+            }
+        }
         if let Some(rest) = period.checked_sub(started.elapsed()) {
             thread::sleep(rest);
         }
@@ -334,6 +410,25 @@ fn checksum(body: &[u8]) -> u8 {
     !body.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte))
 }
 
+fn imu_ids(ids: &[u8], kinds: &[bool]) -> Vec<u8> {
+    ids.iter()
+        .zip(kinds.iter())
+        .filter_map(|(&id, &imu)| imu.then_some(id))
+        .collect()
+}
+
+/// Servo ids only, in discovery order.
+///
+/// The IMU stays on its own unicast read. Putting ID 200 in this `sync_read`
+/// is the control loop's tick, and that transaction is the one whose checksum
+/// fails on the board. See the module comment.
+fn servo_ids(ids: &[u8], kinds: &[bool]) -> Vec<u8> {
+    ids.iter()
+        .zip(kinds.iter())
+        .filter_map(|(&id, &imu)| (!imu).then_some(id))
+        .collect()
+}
+
 fn signed_mag(raw: u16, bit: u32) -> (i32, u16) {
     let magnitude = raw & ((1u16 << bit) - 1);
     let sign = if raw & (1u16 << bit) == 0 { 1 } else { -1 };
@@ -484,7 +579,10 @@ Usage:
 --baud defaults to 1000000. --hz defaults to 10. --count 0 refreshes until Ctrl-C
 on a terminal, and prints one snapshot when stdout is not a terminal.
 ID 200 is pinged five times. Model 0x4D44 is the IMU; anything else is a servo.
-Does not enable torque or write registers. Stop robotd before using the robot UART.
+The IMU is a unicast read (address 56, 86 bytes, including accel). Servos are
+one sync_read of address 56, 15 bytes, and the IMU is not in that list. A failed
+sync_read exits non-zero when stdout is not a terminal. Does not enable torque
+or write registers. Stop robotd before using the robot UART.
 
 Windows:
   cargo run -p duck-control --example imu_servo_read -- --port COM13
@@ -555,6 +653,15 @@ mod tests {
         let text = decode_imu(&block);
         assert!(text.contains("q ---"), "{text}");
         assert!(text.contains("g "), "{text}");
+        assert!(text.contains("a "), "{text}");
+    }
+
+    #[test]
+    fn sync_read_omits_the_imu() {
+        let ids = [10u8, 11, 200, 12];
+        let kinds = [false, false, true, false];
+        assert_eq!(imu_ids(&ids, &kinds), vec![200]);
+        assert_eq!(servo_ids(&ids, &kinds), vec![10, 11, 12]);
     }
 
     #[test]
