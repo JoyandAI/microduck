@@ -782,6 +782,10 @@ Sideloading, factory install, or rescuing a board whose `updaterd` is too old to
 that fixes being too old. See [`install-dev.md`](install-dev.md) — it is `updaterd install --from`,
 and the `--force` variant has conditions worth reading before you use it.
 
+A zip you built on this machine is a different path: [`pack-zip.md`](pack-zip.md).
+`sudo sh scripts/install-zip.sh daemon-<version>.zip` replaces
+`releases/<version>/` and does not check a signature.
+
 ### Logs
 
 ```

@@ -18,6 +18,7 @@ without hardware, get a dev board, push a branch, release — with pointers to t
 | [`duckctl.md`](robot/duckctl.md) | Every `duckctl` command — the robot from a laptop, over Bluetooth. |
 | [`install-dev.md`](robot/install-dev.md) | Setting up a board for development, from nothing. |
 | [`install-by-hand.md`](robot/install-by-hand.md) | The same install as separate commands, for testing one step at a time. |
+| [`pack-zip.md`](robot/pack-zip.md) | Pack a hand-install zip and replace `releases/<version>/` on a board. |
 
 ## `design/` — you are changing the daemon
 

@@ -166,3 +166,10 @@ Then the gamepad — [`pair-a-gamepad.md`](pair-a-gamepad.md):
 ```bash
 sudo robotctl pad pair
 ```
+
+## Replacing the release from a zip
+
+A board that already has a release store, and a binary you built yourself: pack
+`dist/daemon-<version>.zip` and install it over
+`/opt/robot/daemon/releases/<version>/`. The steps, and why the programs have to
+land in `bin/`, are in [`pack-zip.md`](pack-zip.md).
