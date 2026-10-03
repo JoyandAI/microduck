@@ -7,15 +7,16 @@
 #
 # Writes dist/daemon-<version>.zip. Unzipping it gives the release tree
 # (`bin/`, `systemd/`, `hooks/`, …) that `/opt/robot/daemon/releases/<version>/`
-# is. Install that zip with scripts/install-zip.sh. See docs/robot/pack-zip.md.
+# is. Install that zip with install-zip.sh. See docs/robot/pack-zip.md.
 #
 # The file list is the release workflow's (`_build-release.yml`), plus `webd`.
 # `bin/`, `hooks/` and `scripts/` are mode 0755 inside the zip; everything else
 # is 0644. A zip made by Windows Explorer does not keep those bits, and a board
 # then fails `ExecStart` with 203/EXEC.
 #
-# This is the package you copy onto a board. The signed update a robot downloads
-# is still built by `cargo xtask package`.
+# The package you copy onto a board. The signed update a robot downloads
+# is still built by `cargo xtask package`. Install with install-zip.sh;
+# the usage line follows however that script is invoked.
 
 set -eu
 
@@ -172,10 +173,20 @@ with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         info.date_time = (1980, 1, 1, 0, 0, 0)
         info.compress_type = zipfile.ZIP_DEFLATED
         with path.open("rb") as handle:
-            archive.writestr(info, handle.read())
+            data = handle.read()
+        # Windows checkouts store hooks/scripts as CRLF. dash on the board then
+        # fails `set -eu` with `Illegal option -`.
+        if rel.startswith(("hooks/", "scripts/")):
+            data = data.replace(b"\r\n", b"\n").replace(b"\r", b"")
+        archive.writestr(info, data)
 PY
 
 echo "packed $zip_path"
 echo "  version $version"
 echo "  revision $REVISION"
-echo "install: sudo sh scripts/install-zip.sh $zip_path"
+here=$(dirname "$0")
+case "$here" in
+    ''|.) installer=install-zip.sh ;;
+    *) installer="$here/install-zip.sh" ;;
+esac
+echo "install: sudo sh $installer $zip_path"

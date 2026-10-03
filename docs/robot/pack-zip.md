@@ -38,12 +38,16 @@ present. Without it every file lands as `0644`, and the unit exits `203/EXEC`
 is there. Pack the zip with this script. A zip made by dragging the directory
 onto an archive tool on Windows drops those bits.
 
+`hooks/` and `scripts/` are stored with Unix newlines. A Windows checkout of
+those files is CRLF, and the board's `/bin/sh` (dash) then fails at `set -eu`
+with `Illegal option -`.
+
 ## Install
 
 Copy the zip and the installer to the board, then:
 
 ```bash
-sudo sh install-zip.sh daemon-0.13.0.zip
+sudo sh install-zip.sh daemon-0.13.1.zip
 ```
 
 From the clone, with the zip still on this machine, the same script is

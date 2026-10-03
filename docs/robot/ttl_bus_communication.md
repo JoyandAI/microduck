@@ -1,6 +1,6 @@
 # TTL 总线：上电读舵机的 CRC 错误
 
-OpenMicroDuck 的舵机和 `imu_to_servo` 走 elec_RPI_Robot_HAT 的 TTL 单线，1 Mbps，半双工。帧格式、rustypot 怎么把校验失败打出来、以及驱动里已经做的重对齐，见 [servo_communication.md](servo_communication.md)。这一页记的是：一上电、还没给舵机出力矩，`robotd` 把 IMU 和舵机收在同一笔 `sync_read` 里就很容易校验失败。R33 仍是 150 Ω 时会这样；把 R33 短接之后，同一笔还是失败。把 IMU 改成单播、舵机单独做 `sync_read` 之后，工具侧能读干净。控制环要不要改、还是这条总线本来就得分开读，还没有定。
+OpenMicroDuck 的舵机和 `imu_to_servo` 走 elec_RPI_Robot_HAT 的 TTL 单线，1 Mbps，半双工。帧格式、rustypot 怎么把校验失败打出来、以及驱动里已经做的重对齐，见 [servo_communication.md](servo_communication.md)。这一页记的是：一上电、还没给舵机出力矩，把 IMU 和舵机收在同一笔 `sync_read` 里就很容易校验失败。R33 仍是 150 Ω 时会这样；把 R33 短接之后，同一笔还是失败。把 IMU 改成单播、舵机单独做 `sync_read` 之后，工具侧能读干净。`robotd` 的飞特路径现在按这个拆法读。合在一笔里为什么会坏，仍然没有定论。
 
 电路说明来自 `elec_RPI_Robot_HAT_design.md` 第 6 节、第 6.1 节（原理图位号 `PCB01186`，生产文件 `ASE01187-C1`）。两份日志都在同目录：[robotd_with_crc_error.log](robotd_with_crc_error.log) 是短接前，[robotd_with_crc_error_after_shortR33](robotd_with_crc_error_after_shortR33) 是短接后。
 
@@ -84,9 +84,9 @@ attempt 1 到 30 之间 58 行，30 到 60、60 到 90 各 60 行，仍是每秒
 
 同一天、同一台 `duck-57ed`，用 `imu_servo_read` 把两笔拆开再读：IMU 单播地址 56、86 字节（陀螺、四元数、地址 136 的加速度）；舵机单独一次 `sync_read`，地址 56、15 字节，名单里没有 ID 200。这一拍能读干净。
 
-`robotd` 的每拍仍是一笔 `sync_read`：ID 200 排在最前，和舵机收同一块 15 字节。上面两份日志里从第一拍起就校验失败的，就是这一笔。短接 R33 没有把它变成能读的。
+上面两份日志里从第一拍起就校验失败的，是当时 `robotd` 的那一笔：ID 200 排在最前，和舵机收同一块 15 字节。短接 R33 没有把那一笔变成能读的。
 
-所以现在有两个并列的事实。合在一笔里读，启动时校验失败，原因还没找到，这可以仍是一个未解决的问题。分开读在这块板上能过，也可以就是这条总线该有的接法，控制环以后若要改，改的是「不要把 IMU 放进舵机那笔 `sync_read`」。文档停在这里，不把分开读写成控制环已经修好。
+`FeetechIo` 现在按拆开的方式读。每拍先 `sync_read` 十五个舵机（地址 56、15 字节），再对 ID 200 发一条单播读，长度同样是 15 字节，解码只用前 12 字节。IMU 这一条失败时，这一拍的舵机数据还在，姿态沿用上一次。合在一笔 `sync_read` 里为什么校验失败，可以仍是未解决的问题，也可以就是这条总线的接法；控制环不再用那一笔。
 
 ## R33 为什么会被怀疑
 

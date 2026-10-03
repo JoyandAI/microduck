@@ -219,6 +219,8 @@ cargo run -p webd -- --host 0.0.0.0 --port 8090
 
 Open `http://<robot>:8090`. **控制** stands the robot up, enables walking, and sends the same intents as the gamepad: velocity, roulade, sit, kicks, ground pick. Joint angles and trunk tilt come from `robotd`'s state stream, the same one `robotctl monitor` draws. Closing the page zeroes velocity; it does not cut torque.
 
+**日志** (`/logs`) shows stdout and stderr for `robotd`, `padd`, `webd`, `mediad`, `btd`, `configd`, `updaterd` and `tofd`. systemd units come from `journalctl`; a `webd` started from a terminal shows its own tracing without the journal. The user running webd must be able to read the system journal (`systemd-journal` group, or start webd with `sudo`), or the page will be empty except for webd itself.
+
 **舵机** writes the bus directly, so stop the daemon first (`sudo systemctl stop robotd`) and start it again when you are done. One servo at a time for an ID change.
 
 **标定** (`/calibrate`) uses that same bus. Each joint has a slider. **设 0 位** sends Feetech `0x0B`, which makes the horn's current position the encoder midpoint 2048 (0 rad) and is stored in the servo. Pose the joint at its mechanical zero first. **运行到默认位置** commands the standing pose (`DEFAULT_POSITION`). Leaving the page cuts torque.
@@ -783,8 +785,9 @@ that fixes being too old. See [`install-dev.md`](install-dev.md) — it is `upda
 and the `--force` variant has conditions worth reading before you use it.
 
 A zip you built on this machine is a different path: [`pack-zip.md`](pack-zip.md).
-`sudo sh scripts/install-zip.sh daemon-<version>.zip` replaces
-`releases/<version>/` and does not check a signature.
+On the board, `sudo sh install-zip.sh daemon-<version>.zip` (or the same script
+from the clone as `scripts/install-zip.sh`) replaces `releases/<version>/` and
+does not check a signature.
 
 ### Logs
 

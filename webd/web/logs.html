@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMicroDuck</title>
+<link rel="stylesheet" href="/style.css">
+<main class="logs-page">
+<header>
+  <div><small>进程日志</small><h1>OpenMicroDuck</h1></div>
+  <nav>
+    <a href="/">控制</a>
+    <a href="/calibrate">标定</a>
+    <a href="/servo">舵机</a>
+    <a href="/logs" aria-current="page">日志</a>
+  </nav>
+  <span class="grow"></span>
+  <span class="pill" id="link">未跟随</span>
+</header>
+<p class="msg" id="message">systemd 把各 *d 的 stdout / stderr 收进 journal。选一个进程，或看全部。</p>
+
+<section>
+  <h2>进程</h2>
+  <div class="row" id="daemons"></div>
+  <p class="hint">robotd、padd、mediad、btd、configd、updaterd、tofd 走 journalctl。webd 若从终端启动，本页直接显示它自己的 tracing（stderr），不必经过 journal。</p>
+</section>
+
+<section>
+  <h2>过滤</h2>
+  <div class="row">
+    <label>流<select id="stream">
+      <option value="all">stdout + stderr</option>
+      <option value="stdout">stdout</option>
+      <option value="stderr">stderr</option>
+    </select></label>
+    <label>条数<select id="lines">
+      <option>100</option>
+      <option selected>300</option>
+      <option>800</option>
+      <option>2000</option>
+    </select></label>
+    <label>包含<input id="filter" type="search" placeholder="过滤文字"></label>
+    <button class="primary" id="reload">刷新</button>
+    <button id="follow">跟随</button>
+    <button id="pause">暂停</button>
+    <button id="clear">清空</button>
+  </div>
+  <p class="hint">stdout 是 journal 里 PRIORITY 5–7（println 这类）；stderr 是 0–4。Rust tracing 默认写 stderr，所以 robotd 的 WARN / ERROR 在 stderr。robotd 总线校验那行 <code>read crc</code> 在 stdout。</p>
+</section>
+
+<section class="log-wrap">
+  <pre class="log" id="log"></pre>
+</section>
+</main>
+<script src="/logs.js"></script>

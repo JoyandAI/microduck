@@ -925,8 +925,8 @@ impl ImuIo for SharedDxl {
 
 /// OpenMicroDuck's servo bus, shared when `imu_to_servo` is the IMU.
 ///
-/// The tick `sync_read` already fetched ID 200. [`ImuIo::read`] returns that sample,
-/// so both halves have to be this same object — a second owner of the tty cannot exist.
+/// [`RobotIo::read`] is the fifteen-servo `sync_read`. [`ImuIo::read`] is the unicast
+/// read of ID 200 on that same object — a second owner of the tty cannot exist.
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct SharedFt(Rc<RefCell<duck_control::ftbus::FeetechIo>>);

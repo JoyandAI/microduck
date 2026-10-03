@@ -20,10 +20,14 @@
 //! **This type is Feetech-only.** [`crate::bus::DynamixelIo`] is the XL330 path and is not
 //! extended here. [`FeetechIo`] talks to the fifteen joints. At startup it pings
 //! [`crate::model::IMU_DXL_ID`] (200) five times. An answer whose model number is `0x4D44`
-//! is `imu_to_servo`: that id goes first in the tick `sync_read`, and the first 12 bytes of
-//! its 15-byte block are the SFLP sample [`crate::imu::SflpDecoder`] already decodes. The
-//! choice is fixed for the life of this object. If ID 200 never answers, the tick read stays
-//! the fifteen joints and the caller fills [`Sensors::imu`] from I²C [`crate::io::ImuIo`].
+//! is `imu_to_servo`. The tick then does two transactions: one `sync_read` of the fifteen
+//! servos (address 56, 15 bytes), and a unicast read of the same block on ID 200. The
+//! first 12 bytes of that block are the SFLP sample [`crate::imu::SflpDecoder`] already
+//! decodes. Putting ID 200 inside the servo `sync_read` checksum-fails on this bus from
+//! the first tick; the split is what `imu_servo_read` verified on `duck-57ed`
+//! (2026-10-03). See `docs/robot/ttl_bus_communication.md`. The choice is fixed for the
+//! life of this object. If ID 200 never answers, the tick read stays the fifteen joints
+//! and the caller fills [`Sensors::imu`] from I²C [`crate::io::ImuIo`].
 
 use std::f64::consts::PI;
 use std::io::{Read, Write};
@@ -526,15 +530,11 @@ fn resync_tick_blocks(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
     resync_status_blocks(buf, &JOINT_IDS)
 }
 
-/// Tick `sync_read` ids. ID 200 is first when `imu_to_servo` was found at startup, which
-/// is the slot the board answers without waiting for the servos ahead of it.
-fn tick_read_ids(imu_on_bus: bool) -> Vec<u8> {
-    let mut ids = Vec::with_capacity(NUM_JOINTS + usize::from(imu_on_bus));
-    if imu_on_bus {
-        ids.push(IMU_DXL_ID);
-    }
-    ids.extend_from_slice(&JOINT_IDS);
-    ids
+/// Tick `sync_read` ids: the fifteen joints. ID 200 is a unicast read, not a member of
+/// this list. See the module comment.
+#[cfg(test)]
+fn tick_read_ids() -> Vec<u8> {
+    JOINT_IDS.to_vec()
 }
 
 /// The SFLP sample inside a 15-byte tick block. Bytes 12..15 are a counter and status
@@ -821,11 +821,9 @@ pub struct FeetechIo {
     /// Second handle on the same tty, used only after rustypot has returned, to read
     /// the reply bytes it left behind and rescan them.
     tail: Box<dyn SerialPort>,
-    /// Joint ids in [`JOINT_IDS`] order. Writes and the position-only read use this list,
-    /// so `imu_to_servo` is never commanded.
+    /// Joint ids in [`JOINT_IDS`] order. The tick `sync_read`, writes, and the
+    /// position-only read use this list, so `imu_to_servo` is never in those transactions.
     ids: Vec<u8>,
-    /// Tick `sync_read` ids. [`IMU_DXL_ID`] first when [`Self::imu_on_bus`].
-    tick_ids: Vec<u8>,
     /// Set once in [`Self::open`]. Does not flip if the board appears or disappears later.
     imu_on_bus: bool,
     imu: SflpDecoder,
@@ -879,7 +877,6 @@ impl FeetechIo {
         let mut io = Self::attach(port)?;
         io.ping_all()?;
         io.imu_on_bus = io.probe_bus_imu();
-        io.tick_ids = tick_read_ids(io.imu_on_bus);
         io.apply_startup()?;
         Ok(io)
     }
@@ -914,7 +911,6 @@ impl FeetechIo {
             capture,
             tail,
             ids: JOINT_IDS.to_vec(),
-            tick_ids: tick_read_ids(false),
             imu_on_bus: false,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
@@ -1271,17 +1267,17 @@ impl FeetechIo {
             .map_err(|e| IoError::Bus(format!("write reg {addr} on {id}: {e}")))
     }
 
-    /// One `sync_read` attempt: broadcast, collect one reply per [`Self::tick_ids`] entry, decode them.
+    /// One `sync_read` of the fifteen servos, then decode them.
     ///
-    /// Split out of [`RobotIo::read`] so the retry around it is visible as a retry, and so a
-    /// failed attempt cannot be mistaken for the whole tick's work. rustypot stops at the
-    /// first bad frame; the bytes it already read, plus whatever is still in the tty, are
-    /// scanned for `FF FF` / [`TICK_STATUS_LEN`] before this attempt is declared failed.
+    /// ID 200 is not in this transaction. [`ImuIo::read`] fetches it with a unicast read
+    /// of the same address and length. rustypot stops at the first bad frame; the bytes
+    /// it already read, plus whatever is still in the tty, are scanned for `FF FF` /
+    /// [`TICK_STATUS_LEN`] before this attempt is declared failed.
     fn read_once(&mut self) -> Result<Sensors> {
         self.capture.start();
         let result =
             self.controller
-                .sync_read_raw_data(&self.tick_ids, TICK_READ_ADDR, TICK_READ_LEN);
+                .sync_read_raw_data(&self.ids, TICK_READ_ADDR, TICK_READ_LEN);
         self.capture.stop();
         match result {
             Ok(blocks) => self.decode_tick_blocks(&blocks),
@@ -1292,27 +1288,26 @@ impl FeetechIo {
         }
     }
 
-    /// Rescan a failed `sync_read` and keep the tick when every expected frame is in there.
+    /// Rescan a failed `sync_read` and keep the tick when every joint frame is in there.
     fn recover_tick(&mut self) -> Result<Sensors> {
         let mut buf = self.capture.take();
         append_until_quiet(&mut *self.tail, &mut buf);
-        let blocks = resync_status_blocks(&buf, &self.tick_ids)
+        let blocks = resync_status_blocks(&buf, &self.ids)
             .ok_or_else(|| IoError::Bus("hls servo sync_read: resync found no full tick".into()))?;
         self.decode_tick_blocks(&blocks)
     }
 
     fn decode_tick_blocks(&mut self, blocks: &[Vec<u8>]) -> Result<Sensors> {
-        let imu_at = usize::from(self.imu_on_bus);
-        if blocks.len() != NUM_JOINTS + imu_at {
+        if blocks.len() != NUM_JOINTS {
             return Err(IoError::ShortRead {
                 what: "hls sync_read blocks",
-                expected: NUM_JOINTS + imu_at,
+                expected: NUM_JOINTS,
                 got: blocks.len(),
             });
         }
 
         let mut sensors = Sensors::default();
-        for (joint, block) in blocks[imu_at..].iter().enumerate() {
+        for (joint, block) in blocks.iter().enumerate() {
             if block.len() != TICK_READ_LEN as usize {
                 return Err(IoError::ShortRead {
                     what: "hls motor block",
@@ -1326,11 +1321,6 @@ impl FeetechIo {
             sensors.currents_ma[joint] = fb.current_ma;
             self.last_volts[joint] = fb.volts;
             self.last_temps_c[joint] = fb.temp_c;
-        }
-
-        if self.imu_on_bus {
-            // Joints decoded first: a bad position must not count as an IMU sample.
-            sensors.imu = self.ingest_imu_block(&blocks[0])?;
         }
         Ok(sensors)
     }
@@ -1445,14 +1435,20 @@ impl RobotIo for FeetechIo {
     }
 }
 
-/// The sample [`RobotIo::read`] already took. A second transaction would put ID 200 in a
-/// slot the board is not waiting for.
+/// The IMU sample, fetched by its own unicast read. A checksum failure here must not
+/// fail the servo tick — the caller keeps the previous orientation.
 impl ImuIo for FeetechIo {
     fn read(&mut self) -> Result<ImuData> {
         if !self.imu_on_bus {
             return Err(IoError::Bus("imu_to_servo was not found at startup".into()));
         }
-        Ok(self.last_imu)
+        match self.read_register(IMU_DXL_ID, TICK_READ_ADDR, TICK_READ_LEN) {
+            Ok(block) => self.ingest_imu_block(&block),
+            Err(e) => {
+                self.discard_rx.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
     }
 
     fn ready(&self) -> bool {
@@ -1830,42 +1826,34 @@ mod tests {
         assert!(resync_tick_blocks(&buf).is_none());
     }
 
-    /// Startup asks ID 200 five times, and a hit puts that id ahead of the joints.
+    /// Startup asks ID 200 five times. A hit does not put that id on the servo `sync_read`.
     #[test]
-    fn bus_imu_is_probed_five_times_and_read_first() {
+    fn bus_imu_is_probed_five_times_and_left_off_the_servo_sync_read() {
         assert_eq!(IMU_PROBE_ATTEMPTS, 5);
         assert_eq!(IMU_TO_SERVO_MODEL, 0x4D44);
-        assert_eq!(tick_read_ids(false), JOINT_IDS.to_vec());
-        let ids = tick_read_ids(true);
-        assert_eq!(ids[0], IMU_DXL_ID);
-        assert_eq!(&ids[1..], JOINT_IDS.as_slice());
+        assert_eq!(tick_read_ids(), JOINT_IDS.to_vec());
         assert!(!JOINT_IDS.contains(&IMU_DXL_ID));
     }
 
-    /// With the board on the bus, a recovered tick is the IMU block and then every joint.
-    /// Without it, the same IMU frame is not a joint and does not spoil the fifteen.
+    /// A recovered tick is the fifteen joints. An IMU frame sitting in the same buffer
+    /// is not one of them, and a buffer of only those joints is a full tick.
     #[test]
-    fn resync_keeps_the_bus_imu_ahead_of_the_joints() {
+    fn resync_ignores_an_imu_frame_on_a_joint_tick() {
         let mut buf = tick_frame(IMU_DXL_ID, 0xC8);
         buf.extend(all_tick_frames());
 
-        let with_imu = resync_status_blocks(&buf, &tick_read_ids(true)).unwrap();
-        assert_eq!(with_imu.len(), NUM_JOINTS + 1);
-        assert_eq!(with_imu[0][0], 0xC8);
-        assert_eq!(with_imu[1][0], 1);
-        assert_eq!(with_imu[NUM_JOINTS][0], NUM_JOINTS as u8);
+        let joints = resync_tick_blocks(&buf).unwrap();
+        assert_eq!(joints.len(), NUM_JOINTS);
+        assert_eq!(joints[0][0], 1);
+        assert_eq!(joints[NUM_JOINTS - 1][0], NUM_JOINTS as u8);
 
-        let joints_only = resync_tick_blocks(&buf).unwrap();
-        assert_eq!(joints_only.len(), NUM_JOINTS);
-        assert_eq!(joints_only[0][0], 1);
-
-        assert!(resync_status_blocks(&all_tick_frames(), &tick_read_ids(true)).is_none());
+        assert!(resync_tick_blocks(&all_tick_frames()).is_some());
     }
 
-    /// Address 56 is 15 bytes so the board shares a sync_read with an HD1910. The sample
-    /// the decoder sees is the first 12; the counter and status in the tail are not.
+    /// The unicast IMU read is the same 15-byte block the servos use. The sample the
+    /// decoder sees is the first 12; the counter and status in the tail are not.
     #[test]
-    fn the_sync_read_tail_is_not_part_of_the_imu_sample() {
+    fn the_read_tail_is_not_part_of_the_imu_sample() {
         let mut block = [0u8; TICK_READ_LEN as usize];
         block[6..8].copy_from_slice(&0x3000u16.to_le_bytes());
         block[12] = 0xAB;

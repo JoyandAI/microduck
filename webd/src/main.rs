@@ -6,8 +6,8 @@
 //!   Stand, walk, roulade and the joint/attitude view all go through that. The browser
 //!   never opens the bus, so it cannot race the control loop.
 //! - **舵机** opens the bus itself, and only while `robotd` is stopped. One writer.
-//! - **标定** uses that same bus: a slider per joint, `0x0B` to make the current
-//!   position the midpoint, and a move to the standing pose.
+//! - **日志** reads each `*d` unit's stdout/stderr from journald, and this
+//!   process's own tracing when webd was started from a terminal.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -24,7 +24,6 @@ use clap::Parser;
 use duck_control::ftbus::FeetechIo;
 use duck_control::{JOINT_IDS, JOINT_NAMES};
 use duck_ipc_proto as proto;
-#[cfg(unix)]
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -34,10 +33,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 const INDEX: &str = include_str!("../web/index.html");
 const SERVO: &str = include_str!("../web/servo.html");
 const CALIBRATE: &str = include_str!("../web/calibrate.html");
+const LOGS: &str = include_str!("../web/logs.html");
 const CSS: &str = include_str!("../web/style.css");
 const APP_JS: &str = include_str!("../web/app.js");
 const SERVO_JS: &str = include_str!("../web/servo.js");
 const CALIBRATE_JS: &str = include_str!("../web/calibrate.js");
+const LOGS_JS: &str = include_str!("../web/logs.js");
 
 /// Soft position-loop gains while a joint is being posed by hand. SRAM only.
 const CAL_KP: u8 = 3;
@@ -81,19 +82,24 @@ struct Args {
     servo_port: String,
 }
 
+mod logs;
+
 struct App {
     robot_socket: PathBuf,
     servo_port: String,
     bus: Mutex<Option<FeetechIo>>,
+    capture: logs::Capture,
 }
 
 #[tokio::main]
 async fn main() {
+    let capture = logs::Capture::new();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "webd=info".into()),
         )
+        .with_writer(capture.clone())
         .init();
 
     let args = Args::parse();
@@ -101,6 +107,7 @@ async fn main() {
         robot_socket: args.robot_socket,
         servo_port: args.servo_port,
         bus: Mutex::new(None),
+        capture,
     });
     let address: SocketAddr = match format!("{}:{}", args.host, args.port).parse() {
         Ok(a) => a,
@@ -128,12 +135,17 @@ fn router(app: Arc<App>) -> Router {
         .route("/", get(index))
         .route("/servo", get(servo_page))
         .route("/calibrate", get(calibrate_page))
+        .route("/logs", get(logs_page))
         .route("/style.css", get(css))
         .route("/app.js", get(app_js))
         .route("/servo.js", get(servo_js))
         .route("/calibrate.js", get(calibrate_js))
+        .route("/logs.js", get(logs_js))
         .route("/ws", get(ws))
+        .route("/ws/logs", get(ws_logs))
         .route("/api/meta", get(meta))
+        .route("/api/logs", get(api_logs))
+        .route("/api/logs/daemons", get(api_daemons))
         .route("/api/servo/connect", post(servo_connect))
         .route("/api/servo/disconnect", post(servo_disconnect))
         .route("/api/servo/scan", get(servo_scan))
@@ -159,6 +171,9 @@ async fn servo_page() -> impl IntoResponse {
 async fn calibrate_page() -> impl IntoResponse {
     page(CALIBRATE, "text/html; charset=utf-8")
 }
+async fn logs_page() -> impl IntoResponse {
+    page(LOGS, "text/html; charset=utf-8")
+}
 async fn css() -> impl IntoResponse {
     page(CSS, "text/css; charset=utf-8")
 }
@@ -170,6 +185,9 @@ async fn servo_js() -> impl IntoResponse {
 }
 async fn calibrate_js() -> impl IntoResponse {
     page(CALIBRATE_JS, "text/javascript; charset=utf-8")
+}
+async fn logs_js() -> impl IntoResponse {
+    page(LOGS_JS, "text/javascript; charset=utf-8")
 }
 
 fn page(body: &'static str, content_type: &'static str) -> impl IntoResponse {
@@ -208,6 +226,200 @@ async fn meta(State(app): State<Arc<App>>) -> Json<Value> {
 async fn ws(State(app): State<Arc<App>>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
     let path = app.robot_socket.clone();
     upgrade.on_upgrade(move |socket| bridge(socket, path))
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    unit: Option<String>,
+    stream: Option<String>,
+    lines: Option<u32>,
+}
+
+fn log_params(q: &LogQuery) -> Result<(String, &'static str, usize), Api> {
+    let unit = q.unit.clone().unwrap_or_else(|| "robotd".into());
+    if !logs::allowed(&unit) {
+        return Err(err(StatusCode::BAD_REQUEST, "不是已知的 *d 进程"));
+    }
+    Ok((
+        unit,
+        logs::stream_name(q.stream.as_deref()),
+        logs::clamp_lines(q.lines),
+    ))
+}
+
+async fn api_daemons() -> Json<Value> {
+    Json(json!({ "daemons": logs::daemon_status().await }))
+}
+
+async fn api_logs(State(app): State<Arc<App>>, Query(q): Query<LogQuery>) -> Api {
+    let (unit, stream, n) = match log_params(&q) {
+        Ok(v) => v,
+        Err(api) => return api,
+    };
+    let fetched = logs::fetch(&unit, stream, n, &app.capture).await;
+    ok(json!({
+        "ok": true,
+        "unit": unit,
+        "stream": stream,
+        "lines": fetched.lines.iter().map(logs::as_json).collect::<Vec<_>>(),
+        "hint": fetched.hint,
+    }))
+}
+
+async fn ws_logs(
+    State(app): State<Arc<App>>,
+    Query(q): Query<LogQuery>,
+    upgrade: WebSocketUpgrade,
+) -> impl IntoResponse {
+    match log_params(&q) {
+        Err(api) => api.into_response(),
+        Ok((unit, stream, n)) => {
+            let capture = app.capture.clone();
+            upgrade
+                .on_upgrade(move |socket| follow_logs(socket, capture, unit, stream, n))
+                .into_response()
+        }
+    }
+}
+
+async fn follow_logs(
+    mut socket: WebSocket,
+    capture: logs::Capture,
+    unit: String,
+    stream: &'static str,
+    n: usize,
+) {
+    let fetched = logs::fetch(&unit, stream, n, &capture).await;
+    let payload = json!({
+        "lines": fetched.lines.iter().map(logs::as_json).collect::<Vec<_>>(),
+        "hint": fetched.hint,
+    });
+    if socket
+        .send(Message::Text(payload.to_string().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    #[cfg(unix)]
+    follow_unix(socket, capture, unit, stream).await;
+    #[cfg(not(unix))]
+    follow_capture(socket, capture, unit, stream).await;
+}
+
+async fn follow_capture(
+    socket: WebSocket,
+    capture: logs::Capture,
+    unit: String,
+    stream: &'static str,
+) {
+    if unit != "webd" && unit != "all" {
+        return;
+    }
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let mut rx = capture.subscribe();
+    loop {
+        tokio::select! {
+            msg = ws_rx.next() => {
+                if msg.is_none() { break; }
+            }
+            cap = rx.recv() => {
+                match cap {
+                    Ok(line) if logs::keep_stream(stream, line.priority) => {
+                        if ws_tx.send(Message::Text(logs::as_json(&line).to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn follow_unix(
+    socket: WebSocket,
+    capture: logs::Capture,
+    unit: String,
+    stream: &'static str,
+) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let mut rx = if unit == "webd" || unit == "all" {
+        Some(capture.subscribe())
+    } else {
+        None
+    };
+    let mut child = logs::follow_command(&unit, stream).spawn().ok();
+    let mut journal_lines = match child.as_mut().and_then(|c| c.stdout.take()) {
+        Some(out) => Some(BufReader::new(out).lines()),
+        None => None,
+    };
+    if child.is_none() {
+        let note = json!({
+            "hint": "无法启动 journalctl 跟随。若正在看 webd，本进程的输出仍会推送。"
+        });
+        if ws_tx
+            .send(Message::Text(note.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    loop {
+        tokio::select! {
+            msg = ws_rx.next() => {
+                if msg.is_none() { break; }
+            }
+            journal = next_journal_line(&mut journal_lines) => {
+                if let Some(raw) = journal
+                    && let Some(parsed) = logs::parse_journal_line(&raw)
+                    && logs::keep_stream(stream, parsed.priority)
+                    && ws_tx.send(Message::Text(logs::as_json(&parsed).to_string().into())).await.is_err()
+                {
+                    break;
+                }
+            }
+            cap = async {
+                match rx.as_mut() {
+                    Some(r) => r.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match cap {
+                    Ok(line) if logs::keep_stream(stream, line.priority) => {
+                        if ws_tx.send(Message::Text(logs::as_json(&line).to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => rx = None,
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
+    if let Some(mut c) = child {
+        let _ = c.kill().await;
+    }
+}
+
+#[cfg(unix)]
+async fn next_journal_line(
+    lines: &mut Option<tokio::io::Lines<BufReader<tokio::process::ChildStdout>>>,
+) -> Option<String> {
+    loop {
+        match lines.as_mut() {
+            Some(src) => match src.next_line().await {
+                Ok(Some(line)) => return Some(line),
+                _ => *lines = None,
+            },
+            None => std::future::pending::<()>().await,
+        }
+    }
 }
 
 async fn bridge(socket: WebSocket, path: PathBuf) {
@@ -623,6 +835,9 @@ mod tests {
         assert!(INDEX.contains("<title>OpenMicroDuck</title>"));
         assert!(SERVO.contains("<title>OpenMicroDuck</title>"));
         assert!(CALIBRATE.contains("<title>OpenMicroDuck</title>"));
+        assert!(LOGS.contains("<title>OpenMicroDuck</title>"));
+        assert!(LOGS_JS.contains("/ws/logs"));
+        assert!(INDEX.contains("href=\"/logs\""));
         assert!(CALIBRATE.contains("设 0 位"));
         assert!(CALIBRATE.contains("运行到默认位置"));
         assert_eq!(LABELS.len(), JOINT_NAMES.len());

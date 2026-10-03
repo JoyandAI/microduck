@@ -11,9 +11,10 @@
 //!
 //! The UART is exclusive (`TIOCEXCL` on Linux): if this talks to the robot's
 //! onboard bus, stop `robotd` first. After the fifteen joints, ID 200 is pinged
-//! five times. A reply whose model is `0x4D44` is `imu_to_servo`: it is placed
-//! first in the same `sync_read` the control loop uses, and the footer shows the
-//! trunk-frame sample. Opening here is read-only: unlike
+//! five times. A reply whose model is `0x4D44` is `imu_to_servo`: this example still
+//! places it first in one `sync_read` with the joints. The control loop does not —
+//! `FeetechIo` reads the fifteen servos with `sync_read` and ID 200 with a unicast
+//! read. Opening here is read-only: unlike
 //! [`duck_control::ftbus::FeetechIo::open`], this does not rewrite SRAM registers
 //! or drop torque.
 //!

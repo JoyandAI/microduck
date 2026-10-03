@@ -128,3 +128,17 @@ input[type="range"] { width: 100%; }
   border-radius: 10px; padding: .7rem .85rem; margin: 0;
 }
 kbd { font: inherit; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 .3rem; }
+.logs-page { max-width: 1200px; }
+.log-wrap { padding: 0; overflow: hidden; }
+.log {
+  margin: 0; height: min(70vh, 640px); overflow: auto; padding: .7rem .85rem;
+  font: 12px/1.45 ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+  background: #101820; color: #d7e4f0; border-radius: 12px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.log-line { display: block; }
+.log-meta { color: #7f96ab; }
+.log-line.err .log-msg { color: #ff8d7a; }
+.log-line.warn .log-msg { color: #e6c07b; }
+.log-line.info .log-msg { color: #d7e4f0; }
+label { display: inline-flex; gap: .35rem; align-items: center; color: var(--muted); font-size: 13px; }

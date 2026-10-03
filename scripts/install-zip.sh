@@ -2,7 +2,7 @@
 #
 # Install a hand-built daemon zip into the release store.
 #
-#   sudo sh scripts/install-zip.sh daemon-0.13.0.zip
+#   sudo sh install-zip.sh daemon-<version>.zip
 #
 # Replaces /opt/robot/daemon/releases/<version>/, points current at it, and runs
 # the release's hooks/postinstall (units, sysusers, then enable --now). The
@@ -16,14 +16,22 @@
 
 set -eu
 
+# $0 is this file as typed (`scripts/install-zip.sh`, `./install-zip.sh`,
+# an absolute path). Do not hardcode scripts/ — a copy next to the zip is
+# invoked without that prefix.
+self=$0
+case "$self" in
+    ''|-|sh|bash|dash|*/sh|*/bash|*/dash) self=install-zip.sh ;;
+esac
+
 ZIP=${1:-}
 if [ -z "$ZIP" ] || [ "$ZIP" = "-h" ] || [ "$ZIP" = "--help" ]; then
-    echo "usage: sudo sh scripts/install-zip.sh daemon-<version>.zip" >&2
+    echo "usage: sudo sh $self daemon-<version>.zip" >&2
     exit 1
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "error: run as root: sudo sh scripts/install-zip.sh $ZIP" >&2
+    echo "error: run as root: sudo sh $self $ZIP" >&2
     exit 1
 fi
 
@@ -98,6 +106,19 @@ if [ ! -x "$dest/bin/robotd" ]; then
 fi
 
 ln -sfn "releases/${version}" "${INSTALL_DIR}/current"
+
+# Windows-packed trees often leave CR on shell scripts. dash reads `set -eu\r`
+# as an unknown option and stops the hook.
+for dir in "$dest/hooks" "$dest/scripts"; do
+    [ -d "$dir" ] || continue
+    for f in "$dir"/*; do
+        [ -f "$f" ] || continue
+        tmp=$(mktemp)
+        tr -d '\r' < "$f" > "$tmp"
+        cat "$tmp" > "$f"
+        rm -f "$tmp"
+    done
+done
 
 if [ -f "$dest/hooks/postinstall" ]; then
     echo "running hooks/postinstall"

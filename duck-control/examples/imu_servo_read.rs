@@ -13,12 +13,13 @@
 //! count.
 //!
 //! Checked on `duck-57ed`, 2026-10-03: this split comes back clean. `robotd`'s
-//! tick is a different transaction, one `sync_read` of the 15-byte block with
-//! ID 200 first and then the servos, and that one fails its checksum from the
-//! first tick (`docs/robot/ttl_bus_communication.md`). Shorting R33 on the HAT
-//! did not clear it. Whether the combined read is a bug still open, or just how
-//! this bus has to be talked to, is not settled. This example keeps the split
-//! that was verified.
+//! Feetech tick is the same split on the 15-byte block: one `sync_read` of the
+//! fifteen servos, then a unicast read of ID 200. The combined `sync_read` (ID
+//! 200 first, then the servos) fails its checksum from the first tick
+//! (`docs/robot/ttl_bus_communication.md`). Shorting R33 on the HAT did not
+//! clear it. Whether that combined read is a bug still open, or just how this
+//! bus has to be talked to, is not settled. This example keeps the split that
+//! was verified, including the longer 86-byte IMU window.
 //!
 //! Read-only. Stop `robotd` before opening the robot's UART.
 //!

@@ -4,11 +4,11 @@
 //! plain data, which is what makes the loop testable without a robot.
 //!
 //! [`Sensors`] still carries joints *and* IMU. Original MicroDuck fetches both in one
-//! Dynamixel `sync_read` (ID 200, then the XL330s). OpenMicroDuck does the same when
-//! startup found `imu_to_servo` at Feetech ID 200; otherwise [`RobotIo::read`] leaves
+//! Dynamixel `sync_read` (ID 200, then the XL330s). OpenMicroDuck's Feetech tick reads
+//! the fifteen HD1910s in one `sync_read` and, when startup found `imu_to_servo`, reads
+//! ID 200 with its own unicast instruction. Otherwise [`RobotIo::read`] leaves
 //! [`Sensors::imu`] at its default and the caller fills it from the I²C [`ImuIo`].
-//! Either way [`ImuIo::read`] is the composition point, and a bus IMU returns the sample
-//! the servo read already fetched.
+//! Either way [`ImuIo::read`] is the composition point.
 
 use crate::imu::ImuData;
 use crate::model::NUM_JOINTS;
@@ -113,11 +113,12 @@ pub struct ImuStale {
 }
 
 pub trait RobotIo {
-    /// One transaction: the servos, and the IMU when it shares their bus.
+    /// One transaction: the servos.
     ///
-    /// MicroDuck (`DynamixelIo`) always includes ID 200. OpenMicroDuck (`FeetechIo`)
-    /// includes ID 200 only when startup found `imu_to_servo` there; otherwise `imu`
-    /// stays [`ImuData::default`] and the caller fills it from the I²C [`ImuIo`].
+    /// MicroDuck (`DynamixelIo`) also includes ID 200 in that `sync_read`. OpenMicroDuck
+    /// (`FeetechIo`) does not: the fifteen HD1910s are the `sync_read`, and ID 200 is a
+    /// later unicast read when startup found `imu_to_servo`. Otherwise `imu` stays
+    /// [`ImuData::default`] and the caller fills it from the I²C [`ImuIo`].
     /// [`Sensors::imu`] is what the composition point publishes.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
@@ -155,9 +156,10 @@ pub trait RobotIo {
 /// The composition point in `robotd` calls [`RobotIo::read`] and [`ImuIo::read`] each tick,
 /// then merges the two into one [`Sensors`]. An I²C IMU is a separate bus, so a failed
 /// [`ImuIo::read`] degrades the tick (the caller keeps its last sample) instead of failing
-/// it. A servo-bus IMU — MicroDuck's [`crate::bus::DynamixelIo`], or [`crate::ftbus::FeetechIo`]
-/// after startup found `imu_to_servo` — returns the ID-200 sample already fetched in the
-/// combined `sync_read`.
+/// it. A servo-bus IMU on MicroDuck ([`crate::bus::DynamixelIo`]) returns the ID-200
+/// sample already fetched in the combined `sync_read`. On OpenMicroDuck
+/// ([`crate::ftbus::FeetechIo`]) the same call is the unicast read of ID 200; a failure
+/// degrades the tick the same way an I²C miss does.
 pub trait ImuIo {
     /// Read one IMU sample (50 Hz, called on the same tick as the servo read).
     ///
