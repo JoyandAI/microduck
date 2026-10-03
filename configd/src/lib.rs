@@ -24,6 +24,7 @@
 //! typed JSON from a peer-credentialled local socket. See `systemd/configd.service` for the
 //! sandbox that goes with it.
 
+pub mod beacon;
 #[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod identity;

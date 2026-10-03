@@ -100,14 +100,16 @@ Status: draft · Date: 2026-10-03
 
 没有全局 IPv4 时不发。发了 `0.0.0.0` 对局域网没有用，没有地址这件事广告已经在说。
 
-有地址时每秒一个数据报，发到该地址所在子网的广播地址：
+有地址时每秒一个数据报，发到该地址所在子网的广播地址，目的端口 **47090**：
 
 ```text
 MDK1\n
 {"v":1,"name":"duck-c51b","serial":"<soc serial>","api":16,"ip4":"192.168.1.42"}
 ```
 
-`MDK1\n` 是魔数，后面是一行 JSON。整个数据报保持在一个以太网帧里。`v` 只增加、不改旧字段的含义。`api` 是 `API_VERSION`，用来在列表上提示版本不一致。
+`MDK1\n` 是魔数，后面是一行 JSON。整个数据报保持在一个以太网帧里。`v` 只增加、不改旧字段的含义。`api` 是 `API_VERSION`，用来在列表上提示版本不一致。没有序列号时 `serial` 为 `null`。
+
+`configd.service` 的 `RestrictAddressFamilies` 要包含 `AF_INET`，否则这个数据报在沙箱里发不出去。`AF_NETLINK` 仍然不给：配网还是走 NetworkManager 的 D-Bus。
 
 信标不是 API。上面没有密码、没有 PIN、没有控制方法。端口不放进去：信令固定是 **8443**，和「不把端口塞进 31 字节广告」是同一条约束。非默认端口只存在于开发启动参数里，由调用方另行指定。
 
@@ -168,12 +170,11 @@ App 在 `control` 通道上使用已经放行的只读方法，外加下面要�
 | `update.rollback` / `update.select` | 回到这台机器上已经跑过的模型版本，同样只限 reload 型                                           |
 
 
-`mediad` 今天拒绝全部 `update.apply`，理由是安装会重启 `mediad`、进度会话会消失。这个理由对 **daemon** 组件成立，对 reload 型的模型组件不成立。放行时按组件的 `on_apply` 区分：daemon 的 apply、rollback、select 继续拒绝，仍从蓝牙做。模型组件在 `deploy/updater.toml` 里登记之前，`check` 不应为了它们报失败——文件里已经写了为什么空着。
+`mediad` 按 `updater.toml` 里的 `on_apply` 区分：`reload` 的 apply、rollback、select 放行，daemon 的继续拒绝，仍从蓝牙做。读不到这份文件，或者组件不是 `reload`，就拒绝。模型组件在 `deploy/updater.toml` 里登记之前，`check` 不应为了它们报失败——文件里已经写了为什么空着。
 
-还有两个前提，现在都没有：
+`robotd` 收到 `SIGHUP` 后在控制环外面重新加载当前配置指向的权重，加载完再换上。换的过程里上一套继续开车。加载失败则留着上一套，并把 `robot.health` 报成策略不可用，好让引擎回滚。模式在加载期间变了，这次结果丢掉。
 
-- `robotd` 还没有处理 reload 信号。`updater-design.md` 写了 SIGHUP 后重新映射权重；进程里还没有这条路径。在它落地之前，App 可以列出版本，不提供「更新模型」按钮。
-- 模型组件的源（清单、签名、地址）要在第一次真正发布那个包的改动里写进 `updater.toml`，而不是先抄 example。
+模型组件的源（清单、签名、地址）要在第一次真正发布那个包的改动里写进 `updater.toml`，而不是先抄 example。在那之前 App 可以列出版本，更新按钮没有可点的组件。
 
 整包 daemon 更新会换掉当时打进去的 `policies/`，也会重启 `mediad`。那是粗路径，进度走蓝牙上的 `update.subscribe`。App 里「更新动作」和「更新系统」是两件事。
 
@@ -182,8 +183,8 @@ App 在 `control` 通道上使用已经放行的只读方法，外加下面要�
 ## 6. 实施顺序
 
 1. **App 先走已有的两段。** 蓝牙读地址或配网，然后连 `:8443`，用第 4 节的调用开车和看视频。服务端这一步没有新协议。
-2. `configd` **的 UDP 信标。** 第 3.2 节。发现失败时仍能退回广告。
-3. **模型组件 +** `robotd` **reload。** 两者齐了，再把 `mediad` 的放行从「所有 apply」改成「daemon 的 apply」。
+2. **`configd` 的 UDP 信标。** 第 3.2 节。已落地。发现失败时仍能退回广告。
+3. **`robotd` 的 SIGHUP reload，以及 `mediad` 只放行 reload 型组件。** 已落地。模型组件本身仍等第一个真实的包。
 
 
 

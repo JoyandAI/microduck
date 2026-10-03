@@ -377,6 +377,9 @@ struct RobotState {
     imu_stale_run: AtomicU64,
     imu_ready: AtomicBool,
     shutdown: AtomicBool,
+    /// Set by SIGHUP. The control loop reloads the policy files and swaps them in between
+    /// ticks, so a model update does not restart this process. `docs/design/app-connect.md` §5.
+    reload_policy: AtomicBool,
     /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
     state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
     /// What `btd` should be advertising, published when it changes.
@@ -386,8 +389,9 @@ struct RobotState {
     /// that has fallen behind on beacons wants the newest one, not a backlog of beats that have
     /// already passed.
     chorale_tx: tokio::sync::broadcast::Sender<proto::ChoraleAdvertise>,
-    /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
-    /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
+    /// Why the policy is not loaded, if it is not. Set at startup and again when a SIGHUP
+    /// reload fails. The loop keeps running and holds the previous bundle, so a broken
+    /// file is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
     /// Which policy files this process is running, as file names. `None` when the policy is
     /// disabled.
@@ -462,6 +466,7 @@ impl RobotState {
             imu_stale_run: AtomicU64::new(0),
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            reload_policy: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
@@ -703,6 +708,30 @@ async fn main() -> ExitCode {
             tracing::error!(error = %e, "cannot power off");
         }
     });
+
+    // `updaterd` signals SIGHUP when a model component's `on_apply` is reload. The flag is
+    // polled by the control loop, which loads the new files off the tick.
+    #[cfg(unix)]
+    {
+        let flag = Arc::clone(&state);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut hangup = match signal(SignalKind::hangup()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    tracing::warn!(error = %error, "cannot listen for SIGHUP; policy reload is unavailable");
+                    return;
+                }
+            };
+            loop {
+                if hangup.recv().await.is_none() {
+                    break;
+                }
+                flag.reload_policy.store(true, Ordering::Relaxed);
+                tracing::warn!("SIGHUP: reloading the policy bundle");
+            }
+        });
+    }
 
     let control = match spawn_control_thread(
         &args,
@@ -1422,6 +1451,45 @@ async fn adopt_startup_pose<T: RobotIo, U: ImuIo>(
 /// A policy that was *not wanted* is healthy; one that was wanted and could not be loaded is not.
 /// Collapsing those two would either make a bench robot look broken or let a release with an
 /// unusable bundle pass the health gate.
+/// Load the networks named by `policy_cfg`. Does not touch [`RobotState`]: startup and a
+/// SIGHUP reload both call this, and the reload runs off the control thread.
+fn assemble(policy_cfg: &params::ResolvedPolicy) -> Result<Controller, String> {
+    let tuning = Tuning {
+        action_scale: policy_cfg.action_scale,
+        standing_action_scale: policy_cfg.standing_action_scale,
+        standing_gain_ratio: policy_cfg.standing_gain_ratio,
+        gain: policy_cfg.gain,
+        head_lowpass: policy_cfg.head_lowpass,
+        legs_lowpass: policy_cfg.legs_lowpass,
+    };
+    let skills = SkillTuning {
+        ground_pick_period: policy_cfg.ground_pick_period,
+        ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
+        ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
+        kick_duration: policy_cfg.kick_duration,
+        roulade_duration: policy_cfg.roulade_duration,
+        roulade_action_scale: policy_cfg.roulade_action_scale,
+        roulade_gain_ratio: policy_cfg.roulade_gain_ratio,
+    };
+    let paths = PolicyPaths {
+        walk: policy_cfg.walk.clone(),
+        stand: policy_cfg.stand.clone(),
+        sitstand: policy_cfg.sitstand.clone(),
+        ground_pick: policy_cfg.ground_pick.clone(),
+        kick_left: policy_cfg.kick_left.clone(),
+        kick_right: policy_cfg.kick_right.clone(),
+        roulade: policy_cfg.roulade.clone(),
+    };
+    let mut policy = Policy::load(&paths, DEFAULT_STANDING_THRESHOLD).map_err(|e| e.to_string())?;
+    // Roller mode has no standing network — command magnitude stops selecting it. Nothing
+    // else reserves it: limp-fall hands back by *letting* the standing network be selected,
+    // which is what stands the robot up.
+    if policy_cfg.mode == Mode::Roller {
+        policy.set_standing_disabled(true);
+    }
+    Ok(Controller::new(policy, tuning, skills))
+}
+
 fn build_controller(
     policy_cfg: &params::ResolvedPolicy,
     limp_fall: bool,
@@ -1431,59 +1499,25 @@ fn build_controller(
         tracing::warn!("policy disabled; holding the startup pose");
         return None;
     }
-    {
-        let tuning = Tuning {
-            action_scale: policy_cfg.action_scale,
-            standing_action_scale: policy_cfg.standing_action_scale,
-            standing_gain_ratio: policy_cfg.standing_gain_ratio,
-            gain: policy_cfg.gain,
-            head_lowpass: policy_cfg.head_lowpass,
-            legs_lowpass: policy_cfg.legs_lowpass,
-        };
-        let skills = SkillTuning {
-            ground_pick_period: policy_cfg.ground_pick_period,
-            ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
-            ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
-            kick_duration: policy_cfg.kick_duration,
-            roulade_duration: policy_cfg.roulade_duration,
-            roulade_action_scale: policy_cfg.roulade_action_scale,
-            roulade_gain_ratio: policy_cfg.roulade_gain_ratio,
-        };
-        let paths = PolicyPaths {
-            walk: policy_cfg.walk.clone(),
-            stand: policy_cfg.stand.clone(),
-            sitstand: policy_cfg.sitstand.clone(),
-            ground_pick: policy_cfg.ground_pick.clone(),
-            kick_left: policy_cfg.kick_left.clone(),
-            kick_right: policy_cfg.kick_right.clone(),
-            roulade: policy_cfg.roulade.clone(),
-        };
-        match Policy::load(&paths, DEFAULT_STANDING_THRESHOLD) {
-            Ok(mut policy) => {
-                // Roller mode has no standing network — command magnitude stops selecting
-                // it. Nothing else reserves it: limp-fall hands back by *letting* the
-                // standing network be selected, which is what stands the robot up.
-                if policy_cfg.mode == Mode::Roller {
-                    policy.set_standing_disabled(true);
-                }
-                tracing::warn!(
-                    mode = policy_cfg.mode.as_str(),
-                    walk = %policy_cfg.walk.display(),
-                    stand = ?policy_cfg.stand.as_ref().map(|p| p.display().to_string()),
-                    sitstand = ?policy_cfg.sitstand.as_ref().map(|p| p.display().to_string()),
-                    ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
-                    kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
-                    roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
-                    limp_fall,
-                    "policy loaded"
-                );
-                Some(Controller::new(policy, tuning, skills))
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "policy unavailable; holding the pose");
-                state.policy_error.store(Some(Arc::new(e.to_string())));
-                None
-            }
+    match assemble(policy_cfg) {
+        Ok(controller) => {
+            tracing::warn!(
+                mode = policy_cfg.mode.as_str(),
+                walk = %policy_cfg.walk.display(),
+                stand = ?policy_cfg.stand.as_ref().map(|p| p.display().to_string()),
+                sitstand = ?policy_cfg.sitstand.as_ref().map(|p| p.display().to_string()),
+                ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
+                kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
+                roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
+                limp_fall,
+                "policy loaded"
+            );
+            Some(controller)
+        }
+        Err(reason) => {
+            tracing::error!(error = %reason, "policy unavailable; holding the pose");
+            state.policy_error.store(Some(Arc::new(reason)));
+            None
         }
     }
 }
@@ -1710,9 +1744,56 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
         voice.play("greet", false);
     }
 
+    // A SIGHUP reload in flight. The load itself is `spawn_blocking`: reading and warming an
+    // ONNX bundle takes long enough to blow the tick, and the previous controller keeps
+    // driving until the new one is ready.
+    let mut reloading: Option<(
+        tokio::task::JoinHandle<Result<Controller, String>>,
+        params::Mode,
+        std::path::PathBuf,
+    )> = None;
+
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
+
+        if let Some((handle, _, _)) = reloading.as_mut()
+            && handle.is_finished()
+        {
+            let (handle, mode, walk) = reloading.take().expect("checked above");
+            if policy_cfg.mode != mode || policy_cfg.walk != walk {
+                tracing::warn!("discarding a policy reload started before the mode changed");
+            } else {
+                match handle.await {
+                    Ok(Ok(next)) => {
+                        controller = Some(next);
+                        state.policy_error.store(None);
+                        tracing::warn!("policy reloaded");
+                    }
+                    Ok(Err(reason)) => {
+                        tracing::error!(
+                            error = %reason,
+                            "policy reload failed; holding the previous bundle"
+                        );
+                        state.policy_error.store(Some(Arc::new(reason)));
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "policy reload task failed");
+                    }
+                }
+            }
+        }
+        if reloading.is_none() && state.reload_policy.swap(false, Ordering::Relaxed) {
+            if policy_cfg.enabled {
+                let cfg = policy_cfg.clone();
+                let mode = cfg.mode;
+                let walk = cfg.walk.clone();
+                tracing::warn!(walk = %walk.display(), "reloading policy");
+                reloading = Some((tokio::task::spawn_blocking(move || assemble(&cfg)), mode, walk));
+            } else {
+                tracing::warn!("SIGHUP with the policy disabled; nothing to reload");
+            }
+        }
 
         let mut fresh = match safety.read() {
             Ok(sensors) => {

@@ -34,7 +34,12 @@ duck-detect = { path = "../duck-detect" }
 # tracing middleware are all weight for routes that do not exist.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
+# Reads `on_apply` out of updater.toml so a model reload can travel this session and a daemon
+# restart cannot. The updater crate itself stays off this binary: it pulls http, tar and zstd,
+# and the recovery path's reason for keeping those out applies to not inflating mediad either.
+toml = "1.1.3"
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

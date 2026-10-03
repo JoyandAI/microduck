@@ -245,6 +245,15 @@ async fn main() -> ExitCode {
         },
     });
 
+    // The phone's LAN discovery beacon. Dropped with this task on shutdown; a send failure
+    // stays inside it and does not take the socket this process exists to serve.
+    {
+        let net = Arc::clone(&service.net);
+        let serial = service.serial.clone();
+        let named = Arc::clone(&service);
+        tokio::spawn(configd::beacon::run(net, move || named.store.name(), serial));
+    }
+
     tokio::select! {
         result = serve(service, args.socket) => match result {
             Ok(()) => ExitCode::SUCCESS,

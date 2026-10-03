@@ -66,8 +66,9 @@ RestartSec=2s
 #   - ProtectSystem=strict makes the whole filesystem read-only except ReadWritePaths.
 #   - The state dir is the ONLY writable path: it holds the robot's name and must survive an
 #     update and a rollback, which is why it is under /var/lib and not in a release directory.
-#   - AF_NETLINK is absent: configd asks NetworkManager over D-Bus (a unix socket) and never
-#     touches an interface itself.
+#   - AF_INET is the LAN discovery beacon (docs/design/app-connect.md §3.2): one UDP
+#     broadcast a second, to the subnet of the address NetworkManager already reported.
+#     AF_NETLINK stays absent: configd still does not configure an interface itself.
 #   - CAP_SYS_BOOT is NOT granted, because logind performs the reboot; configd only asks. A
 #     capability here would let it call reboot(2) directly, which is precisely the unclean
 #     shutdown this service exists to avoid.
@@ -81,7 +82,7 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

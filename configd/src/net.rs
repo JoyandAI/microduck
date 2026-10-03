@@ -9,8 +9,20 @@
 //! laptop with no hardware, no network and no D-Bus, and the logic worth testing is the
 //! dispatch and authorisation around this, not NM itself.
 
+use std::net::Ipv4Addr;
+
 use async_trait::async_trait;
 use duck_ipc_proto as proto;
+
+/// An IPv4 address on the wifi interface, with the prefix NetworkManager reported.
+///
+/// The beacon turns this into a subnet broadcast. The prefix stays here rather than being
+/// guessed, because a `/24` assumption is wrong the first time a board is on a `/22`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanAddress {
+    pub address: Ipv4Addr,
+    pub prefix: u8,
+}
 
 /// What went wrong, in terms a caller can act on.
 pub type NetResult<T> = Result<T, String>;
@@ -18,6 +30,11 @@ pub type NetResult<T> = Result<T, String>;
 #[async_trait]
 pub trait Net: Send + Sync {
     async fn status(&self) -> NetResult<proto::NetStatusResult>;
+    /// The wifi interface's IPv4, if it has one a phone on that subnet could send to.
+    ///
+    /// `Ok(None)` when there is no address. An error is a backend that could not be asked,
+    /// which the beacon logs and retries.
+    async fn lan(&self) -> NetResult<Option<LanAddress>>;
     async fn scan(&self) -> NetResult<proto::NetScanResult>;
     /// Join `ssid`, storing it so NM reconnects by itself next time.
     async fn connect(&self, ssid: &str, psk: Option<&str>) -> NetResult<proto::ConnectResult>;
@@ -69,6 +86,10 @@ impl Net for UnavailableNet {
             mac: self.mac.clone(),
             iface: self.iface.clone(),
         })
+    }
+
+    async fn lan(&self) -> NetResult<Option<LanAddress>> {
+        Ok(None)
     }
 
     /// Empty rather than an error, for the same reason: a phone shows "no networks found", which is
@@ -176,6 +197,14 @@ impl Net for FakeNet {
                 iface: Some("wlan0".into()),
             },
         })
+    }
+
+    async fn lan(&self) -> NetResult<Option<LanAddress>> {
+        let state = self.inner.lock().await;
+        Ok(state.connected.as_ref().map(|_| LanAddress {
+            address: Ipv4Addr::new(192, 168, 50, 63),
+            prefix: 24,
+        }))
     }
 
     async fn scan(&self) -> NetResult<proto::NetScanResult> {

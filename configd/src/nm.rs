@@ -10,6 +10,7 @@
 //! intent until it runs on the board.
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -17,7 +18,8 @@ use duck_ipc_proto as proto;
 use futures::StreamExt;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use crate::net::{Net, NetResult};
+use crate::beacon;
+use crate::net::{LanAddress, Net, NetResult};
 
 /// Values from NetworkManager's own `nm-dbus-interface.h`, read from upstream rather than
 /// remembered. These are the numbers that make "you typed the password wrong" reportable, which
@@ -244,8 +246,36 @@ impl NetworkManager {
             .and_then(|entry| entry.get("address").cloned())
             .and_then(|value| String::try_from(value).ok())
     }
+}
 
-    /// Which stored profile, if any, is for this SSID.
+fn lan_candidates(addresses: &[HashMap<String, OwnedValue>]) -> Vec<(Ipv4Addr, u8)> {
+    let mut pairs = Vec::new();
+    for entry in addresses {
+        let Some(raw) = entry.get("address") else {
+            continue;
+        };
+        let Ok(text) = String::try_from(raw.clone()) else {
+            continue;
+        };
+        let Ok(address) = text.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let Some(prefix) = entry.get("prefix").and_then(prefix_u8) else {
+            continue;
+        };
+        pairs.push((address, prefix));
+    }
+    pairs
+}
+
+fn prefix_u8(value: &OwnedValue) -> Option<u8> {
+    u32::try_from(value.clone())
+        .ok()
+        .and_then(|n| u8::try_from(n).ok())
+        .or_else(|| u8::try_from(value.clone()).ok())
+}
+
+impl NetworkManager {
     /// Every saved profile for `ssid` — plural, deliberately.
     ///
     /// NetworkManager permits duplicate connection ids, so "the profile for this SSID" is not a
@@ -458,6 +488,36 @@ impl Net for NetworkManager {
             mac: wireless.hw_address().await.ok(),
             iface: device.interface().await.ok(),
         })
+    }
+
+    async fn lan(&self) -> NetResult<Option<LanAddress>> {
+        let Some(path) = self.wifi_device().await? else {
+            return Ok(None);
+        };
+        let device = DeviceProxy::builder(&self.bus)
+            .path(&path)
+            .map_err(bus_err)?
+            .build()
+            .await
+            .map_err(bus_err)?;
+        let Ok(config_path) = device.ip4_config().await else {
+            return Ok(None);
+        };
+        if config_path.as_str() == "/" {
+            return Ok(None);
+        }
+        let Ok(config) = Ip4ConfigProxy::builder(&self.bus)
+            .path(&config_path)
+            .map_err(bus_err)?
+            .build()
+            .await
+        else {
+            return Ok(None);
+        };
+        let Ok(addresses) = config.address_data().await else {
+            return Ok(None);
+        };
+        Ok(beacon::select(&lan_candidates(&addresses)))
     }
 
     async fn scan(&self) -> NetResult<proto::NetScanResult> {

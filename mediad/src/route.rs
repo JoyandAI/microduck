@@ -21,9 +21,10 @@
 //!
 //! 1. **It authorises a different transport.** The pairing PIN. A peer that can rewrite it can
 //!    lock a phone out of BLE, which is the recovery path.
-//! 2. **It would drop the session it was asked over.** The update mutations, and reconfiguring
-//!    wifi. §8 covers what update needs before it can be permitted; it is a deferral rather than
-//!    a rule.
+//! 2. **It would drop the session it was asked over.** A daemon update restarts `mediad`, and
+//!    reconfiguring wifi moves the robot off this network. A model component whose `on_apply`
+//!    is `reload` does neither, so that one is permitted — `docs/design/app-connect.md` §5.
+//!    Daemon apply stays deferred, for the reason in `remote-webrtc.md` §8.
 //! 3. **It is not a client's question.** `updaterd`'s internal queries to `robotd`.
 //!
 //! ## What it does *not* decide
@@ -33,7 +34,10 @@
 //! service on both sides. This file is about which calls exist over the transport, not about who
 //! is holding it.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use duck_ipc_proto as proto;
+use serde::Deserialize;
 
 /// Where a call arriving over a WebRTC datachannel goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +53,10 @@ pub enum Route {
 /// Read the `false` arms as the boundary. Each is a decision that a peer holding a session does
 /// not get to do this, and each says which of the three kinds of reason it is.
 fn permits(call: &proto::Call) -> bool {
+    permits_against(call, None)
+}
+
+fn permits_against(call: &proto::Call, override_models: Option<&BTreeSet<String>>) -> bool {
     use proto::Call::*;
     match call {
         // The version handshake. Must be reachable or no client can establish anything.
@@ -139,14 +147,16 @@ fn permits(call: &proto::Call) -> bool {
         // unroutable to BLE itself.
         SystemPairingPin | SystemSetPairingPin(_) => false,
 
-        // ── refused: it would drop the session it was asked over ─────────────
+        // ── an update that does not drop this session ────────────────────────
         //
-        // Applying, rolling back or selecting a release restarts `mediad`, which drops the session
-        // the client is watching progress on. **A deferral, not a rule** — a phone updating a
-        // robot over WebRTC is wanted, and `remote-webrtc.md` §8 lists the two things it needs: a
-        // client that reconnects and re-subscribes, and `RobotRemoteSessionActive` learning to
-        // tell a bystander session from the one that requested the update.
-        Apply(_) | Rollback(_) | Select(_) => false,
+        // A daemon apply restarts `mediad` and the progress the client is watching disappears
+        // with it. That one stays refused; `remote-webrtc.md` §8 is what it still needs.
+        // A model component reloads `robotd` in place, so the session survives and the phone
+        // can watch `update.subscribe` on this channel. The distinction is `on_apply` in
+        // updater.toml, not the component's name.
+        Apply(params) => model_allowed(override_models, params.component.as_str()),
+        Rollback(params) => model_allowed(override_models, params.component.as_str()),
+        Select(params) => model_allowed(override_models, params.component.as_str()),
 
         // Reconfiguring wifi moves the robot to another network and takes this session with it.
         // And unlike the update case there is nothing to defer *to*: provisioning is what BLE
@@ -190,6 +200,67 @@ fn permits(call: &proto::Call) -> bool {
     }
 }
 
+/// Components whose `on_apply` is `reload`. Read from the board's updater config when a peer
+/// asks to apply, roll back or select — not on every `robot.move`.
+fn model_allowed(override_models: Option<&BTreeSet<String>>, id: &str) -> bool {
+    match override_models {
+        Some(names) => names.contains(id),
+        None => installed_models().contains(id),
+    }
+}
+
+fn installed_models() -> BTreeSet<String> {
+    const PATH: &str = "/etc/robot/updater.toml";
+    match std::fs::read_to_string(PATH) {
+        Ok(text) => match reload_components(&text) {
+            Ok(names) => names,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "updater.toml did not parse; refusing model updates over WebRTC"
+                );
+                BTreeSet::new()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(error) => {
+            tracing::warn!(error = %error, path = PATH, "cannot read updater.toml");
+            BTreeSet::new()
+        }
+    }
+}
+
+/// Names in `text` whose `on_apply.action` is `reload`.
+fn reload_components(text: &str) -> Result<BTreeSet<String>, String> {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        component: BTreeMap<String, Component>,
+    }
+    #[derive(Deserialize)]
+    struct Component {
+        on_apply: Action,
+    }
+    #[derive(Deserialize)]
+    #[serde(tag = "action", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum Action {
+        None,
+        Restart {
+            #[serde(default)]
+            units: Vec<String>,
+        },
+        Reload { unit: String, signal: String },
+    }
+    let file: File = toml::from_str(text).map_err(|error| error.to_string())?;
+    Ok(file
+        .component
+        .into_iter()
+        .filter(|(_, component)| matches!(component.on_apply, Action::Reload { .. }))
+        .map(|(name, _)| name)
+        .collect())
+}
+
 /// Where this call goes, or that it is refused.
 pub fn route_for(call: &proto::Call) -> Route {
     if !permits(call) {
@@ -214,6 +285,8 @@ pub fn refusal(call: &proto::Call) -> proto::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     /// Everything permitted must be deliverable, for the reason `btd`'s twin of this test exists:
@@ -312,6 +385,63 @@ mod tests {
                 seen.contains(service),
                 "no permitted call reaches {service}; seen {seen:?}"
             );
+        }
+    }
+
+    /// A reload swaps weights in `robotd` and leaves this session up. A restart of `mediad`
+    /// does not, so the daemon component stays off this transport.
+    #[test]
+    fn only_a_reload_component_may_be_updated_over_webrtc() {
+        let text = r#"
+            [component.daemon]
+            on_apply = { action = "restart", units = ["robotd", "mediad"] }
+
+            [component.model-walk]
+            on_apply = { action = "reload", unit = "robotd", signal = "SIGHUP" }
+        "#;
+        let models = reload_components(text).expect("the sample is the shape updater.toml has");
+        assert!(models.contains("model-walk"));
+        assert!(!models.contains("daemon"));
+
+        let apply = |component: &str| {
+            proto::Call::Apply(proto::ApplyParams {
+                component: proto::ComponentId::new(component),
+                target: proto::Target::Latest,
+                options: proto::ApplyOptions {
+                    dry_run: false,
+                    interrupt_sessions: false,
+                    from_dir: None,
+                },
+            })
+        };
+        assert!(
+            matches!(
+                route_against(&apply("model-walk"), Some(&models)),
+                Route::To(..)
+            ),
+            "a model reload is what the phone asks for on this session"
+        );
+        assert_eq!(
+            route_against(&apply("daemon"), Some(&models)),
+            Route::Refused,
+            "a daemon apply restarts mediad and drops the session"
+        );
+        let rollback = proto::Call::Rollback(proto::ComponentParams {
+            component: proto::ComponentId::new("model-walk"),
+        });
+        assert!(matches!(
+            route_against(&rollback, Some(&models)),
+            Route::To(..)
+        ));
+    }
+
+    fn route_against(call: &proto::Call, models: Option<&BTreeSet<String>>) -> Route {
+        if !permits_against(call, models) {
+            return Route::Refused;
+        }
+        match call.destination() {
+            Some((service, lane)) => Route::To(service, lane),
+            None => Route::Refused,
         }
     }
 }
