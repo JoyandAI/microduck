@@ -28,7 +28,7 @@ ExecStart=/opt/robot/daemon/current/bin/robotd --socket /run/robotd.sock
 # Parameters come from /etc/robot/robotd.toml, which is robotd's default path and is not
 # named here on purpose: the file is optional, and a missing one means built-in defaults
 # rather than a daemon that refuses to start. Naming it with --params would make it
-# mandatory. See deploy/robotd.toml.
+# mandatory. A first install seeds this file from deploy/robotd_openmd.toml.
 
 # --unhealthy and --busy are deliberately absent. They exist to exercise the updater's
 # rollback path on a bench robot and are added by hand for that, never shipped: a robot

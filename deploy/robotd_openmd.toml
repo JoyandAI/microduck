@@ -1,15 +1,15 @@
-# robotd — OpenMicroDuck (HD1910) bench / SpacemiT K1 runtime.
+# robotd — OpenMicroDuck (HD1910) default config.
 #
-# Not the fleet template (`deploy/robotd.toml`). Copy over `/etc/robot/robotd.toml` on a
-# board that speaks FT-HLS on `/dev/ttyACM0` with the IMU on `/dev/i2c-4`. Policy paths
-# below are machine-local; point them at this board's models before restarting.
+# install.sh copies this file to `/etc/robot/robotd.toml` when that path does not
+# already exist. robotd reads it with no `--params` flag. The fleet example that
+# matches built-in defaults stays at `deploy/robotd.toml`.
 #
-# Installed to /etc/robot/robotd.toml. Read once at startup, not watched: changing
-# anything here needs `systemctl restart robotd`. Live reload is deferred
+# Read once at startup, not watched: changing anything here needs
+# `systemctl restart robotd`. Live reload is deferred
 # (docs/design/robotd-design.md §4.2).
 #
-# It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
-# per-robot configuration rather than a shipped default, so it must survive an update
+# It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: once
+# copied to /etc/robot it is per-robot configuration, so it must survive an update
 # *and* a rollback (docs/design/architecture.md §3). The installer never overwrites it.
 
 [platform]
@@ -25,7 +25,7 @@ variant = "open_microduck"
 # Serial port the servos share. /dev/ttyS2 is the Radxa Zero 3W's wiring; a board wired
 # differently can also be overridden per-invocation with `robotd --port`, which is the dev
 # escape hatch rather than the thing to edit here.
-port = "/dev/ttyACM0"
+port = "/dev/ttyS2"
 # Which driver the serial port speaks. Keep this in step with [platform].variant
 # (hd1910 for open_microduck, xl330 for microduck). robotd opens the variant's driver.
 driver = "hd1910"
@@ -121,13 +121,13 @@ action_scale = 0.7
 # trained low-pass. Only the standing network stays out: the prototype loads it in roller
 # mode and then never runs it, standing transitions being skipped on wheels.
 mode = "walk"
-walk = "/home/joyandai/duck_models/20260927_m6-walk.onnx"
+walk = ".../current/policies/20260927_m6-walk.onnx"
 stand = "none"
-sitstand = "none" # /home/joyandai/duck_models/20260927_083712_m6-standup.onnx
-ground_pick = "/home/joyandai/duck_models/xgoduck_pick.onnx"
+sitstand = "none" # .../current/policies/20260927_083712_m6-standup.onnx
+ground_pick = ".../current/policies/xgoduck_pick.onnx"
 kick_left = "none"
-kick_right = "/home/joyandai/duck_models/20260930_m6-kick-right.onnx"
-roulade = "/home/joyandai/duck_models/20260930_m6-roulade.onnx"
+kick_right = ".../current/policies/20260930_m6-kick-right.onnx"
+roulade = ".../current/policies/20260930_m6-roulade.onnx"
 
 # Policy files. Unset means the mode's default inside the release directory, so an ordinary
 # update carries the policies alongside the binaries that were trained against them. Point
@@ -160,10 +160,10 @@ roulade = "/home/joyandai/duck_models/20260930_m6-roulade.onnx"
 # standing_action_scale = 1.0
 # Standing runs softer, at this fraction of `gain`. The prototype's --standing-kp-ratio.
 # standing_gain_ratio = 0.8
-# Position P gain while running. Unset follows [platform].variant: 32 OpenMicroDuck
+# Position P gain while running. Unset follows [platform].variant: 5 OpenMicroDuck
 # (HD1910 BAM Kp), 200 MicroDuck (XL330). This board is softer than the BAM default
 # while the bus and policies settle.
-gain = 4
+gain = 5
 
 # First-order low-pass on the head and leg joint targets, as a blend factor in (0, 1].
 # 1.0 is pass-through (off). Unset resolves per mode: 0.5 / 0.7 walking — the values the

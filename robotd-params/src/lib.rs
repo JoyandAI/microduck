@@ -1367,6 +1367,14 @@ mod tests {
         assert_eq!(media.bitrate_resolved(), 2_000_000);
     }
 
+    /// The file `install.sh` seeds onto a board that has no config yet. It is allowed to
+    /// differ from the built-in defaults; it is not allowed to fail to parse.
+    #[test]
+    fn the_openmd_install_config_parses() {
+        let shipped = include_str!("../../deploy/robotd_openmd.toml");
+        toml::from_str::<Params>(shipped).expect("deploy/robotd_openmd.toml must parse");
+    }
+
     /// The shipped example must agree with the built-in defaults, or the file documents a
     /// robot that does not exist — and an operator reading it would draw wrong conclusions
     /// about what their board is actually doing.

@@ -792,7 +792,7 @@ ln -sfn releases/under-test /opt/robot/daemon/current
 mkdir -p /etc/robot
 sed "s|\"ORG/duck-daemon\"|\"pollen-robotics/microduck\"|" \
     /bin/deploy/updater.toml > /etc/robot/updater.toml
-cp /bin/deploy/robotd.toml /etc/robot/robotd.toml
+cp /bin/deploy/robotd_openmd.toml /etc/robot/robotd.toml
 
 # ── install.sh, the provisioning path ──
 #

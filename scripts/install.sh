@@ -301,7 +301,7 @@ install_config() {
     if [ -f "${CONFIG_DIR}/robotd.toml" ]; then
         warn "keeping the existing ${CONFIG_DIR}/robotd.toml"
     else
-        fetch "${config_raw}/deploy/robotd.toml" "${CONFIG_DIR}/robotd.toml"
+        fetch "${config_raw}/deploy/robotd_openmd.toml" "${CONFIG_DIR}/robotd.toml"
         chmod 644 "${CONFIG_DIR}/robotd.toml"
     fi
 }
