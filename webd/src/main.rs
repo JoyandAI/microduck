@@ -40,9 +40,10 @@ const SERVO_JS: &str = include_str!("../web/servo.js");
 const CALIBRATE_JS: &str = include_str!("../web/calibrate.js");
 const LOGS_JS: &str = include_str!("../web/logs.js");
 
-/// Soft position-loop gains while a joint is being posed by hand. SRAM only.
-const CAL_KP: u8 = 3;
-const CAL_KD: u8 = 0;
+/// Stiff position-loop gains while calibrating, so each horn holds a definite
+/// encoder count. Same HD1910 factory numbers restored on exit. SRAM only.
+const CAL_KP: u8 = 32;
+const CAL_KD: u8 = 40;
 /// HD1910 factory position-loop gains, restored when calibration exits.
 const RUN_KP: u8 = 32;
 const RUN_KD: u8 = 40;

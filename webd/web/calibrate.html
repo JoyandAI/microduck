@@ -17,7 +17,7 @@
   <span class="pill" id="link">未连接</span>
 </header>
 <p class="warn">这一页直接写舵机总线。先执行 <code>sudo systemctl stop robotd</code>，用完再启动。设 0 位会把当前位置写成编码器中位 2048，并保存在舵机里。先把关节摆到机械零位再按。</p>
-<p class="msg" id="message">连接串口后开始。开始标定会把增益临时降到 KP 3、KD 0，十五路先走到 2048。</p>
+<p class="msg" id="message">连接串口后开始。开始标定会把增益设为 KP=32、KD=40，15 路先走到 2048。标定时需要硬的关节，才能定准位置。</p>
 
 <section>
   <h2>串口</h2>

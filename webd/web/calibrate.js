@@ -107,7 +107,7 @@ async function boot() {
       await api("/api/cal/enter", {});
       active = true;
       joints.forEach((_, index) => showCount(index, 2048));
-      say("标定已开始：KP 3、KD 0，目标 2048。摆到机械零位后设 0 位。", "ok");
+      say("标定已开始：KP=32、KD=40，目标 2048。摆到机械零位后设 0 位。", "ok");
     } catch (e) { say(e.message, "bad"); }
   };
   $("home-all").onclick = async () => {
