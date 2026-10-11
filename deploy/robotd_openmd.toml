@@ -121,13 +121,13 @@ action_scale = 0.7
 # trained low-pass. Only the standing network stays out: the prototype loads it in roller
 # mode and then never runs it, standing transitions being skipped on wheels.
 mode = "walk"
-walk = "/opt/robot/policies/current/20260927_m6-walk.onnx"
+walk = "/opt/robot/policies/current/20261008_020101_openmd-velstand-flat-backlash.onnx"
 stand = "none"
 sitstand = "none" # /opt/robot/policies/current/20260927_083712_m6-standup.onnx
-ground_pick = "/opt/robot/policies/current/xgoduck_pick.onnx"
+ground_pick = "/opt/robot/policies/current/20261008_122028_openmd-ground-pick.onnx"
 kick_left = "none"
-kick_right = "/opt/robot/policies/current/20260930_m6-kick-right.onnx"
-roulade = "/opt/robot/policies/current/20260930_m6-roulade.onnx"
+kick_right = "/opt/robot/policies/current/20261008_161025_openmd-ball-kick-right.onnx"
+roulade = "/opt/robot/policies/current/20261008_021404_openmd-m6-roulade.onnx"
 
 # Policy files. Unset means the mode's default inside the release directory, so an ordinary
 # update carries the policies alongside the binaries that were trained against them. Point
