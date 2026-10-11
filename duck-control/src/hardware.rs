@@ -34,7 +34,11 @@ pub const HD1910_BAM_M1: Hd1910BamM1 = Hd1910BamM1 {
     friction_viscous: 0.008,
 };
 
-/// Firmware values the HD1910 BAM model was identified against, and what `FeetechIo` writes.
+/// Firmware values the HD1910 BAM model was identified against.
+///
+/// `FeetechIo` still writes mode, the voltage window and the protection current from here.
+/// The position-loop gains the control loop runs are [`HD1910_RUNTIME_KP`] /
+/// [`HD1910_RUNTIME_KD`], not this snapshot.
 ///
 /// True-hardware readback (FT-SCS, firmware 3.46): mode 4, Kp/Kd/Ki = 32/40/0, protection
 /// current 500 LSB = 3.25 A, voltage window 4.0–8.4 V. The robot's pack is 2S **7.4 V**.
@@ -75,6 +79,18 @@ pub const HD1910_FIRMWARE: Hd1910Firmware = Hd1910Firmware {
 /// not the runtime pack.
 pub const HD1910_VIN: f64 = 7.4;
 
+/// Position-loop P written to SRAM register 50 while a policy runs.
+///
+/// Not [`HD1910_FIRMWARE::kp`]: that 32 is the BAM identification snapshot. This is the
+/// value `robotd` asks `FeetechIo::set_gain` to write. Register 50 is RAM; a power cycle
+/// drops it.
+pub const HD1910_RUNTIME_KP: u8 = 6;
+
+/// Position-loop D written to SRAM register 51 alongside every `set_gain`.
+///
+/// Not [`HD1910_FIRMWARE::kd`] (the BAM snapshot, 40). Register 51 is RAM.
+pub const HD1910_RUNTIME_KD: u8 = 20;
+
 /// Milliamps per current LSB, from the Feetech memory table.
 pub const HD1910_MA_PER_CURRENT_LSB: f64 = 6.5;
 
@@ -110,5 +126,14 @@ mod tests {
         assert_eq!(HD1910_FIRMWARE.max_voltage_lsb, 84);
         assert_eq!(HD1910_FIRMWARE.min_voltage_lsb, 40);
         assert_eq!(HD1910_VIN, 7.4);
+    }
+
+    /// The control loop's SRAM gains are not the BAM identification snapshot.
+    #[test]
+    fn runtime_gains_are_the_policy_pair_not_the_bam_snapshot() {
+        assert_eq!(HD1910_RUNTIME_KP, 6);
+        assert_eq!(HD1910_RUNTIME_KD, 20);
+        assert_ne!(HD1910_RUNTIME_KP, HD1910_FIRMWARE.kp);
+        assert_ne!(HD1910_RUNTIME_KD, HD1910_FIRMWARE.kd);
     }
 }

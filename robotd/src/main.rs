@@ -791,9 +791,9 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
     }
     // Before the ramp, not after: position_p_gain is a RAM register that survives this
     // process, so whatever was written last is what the robot stands up with. A previous fall
-    // leaves `gain_limp` (50) there, and `init` would then take the robot to its home pose at
-    // a third of the intended stiffness — soft enough to be a fall risk in the one command
-    // whose whole job is establishing a known state.
+    // leaves `gain_limp` there (50 on an XL330), and `init` would then take the robot to its
+    // home pose at that leftover stiffness — a fall risk in the one command whose whole job
+    // is establishing a known state.
     //
     // `robotd`'s control loop sets its own gain on the first tick, so this only governs the
     // ramp and the window before the daemon starts — which is exactly the window where the
@@ -2439,7 +2439,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                     limp_fall
                         .pose_target(tick_start, limp_fall_pose)
                         .unwrap_or(DEFAULT_POSITION),
-                    params.safety.limp_fall_pose_gain,
+                    params.limp_fall_pose_gain(),
                     true,
                     "limp_pose",
                 ),
@@ -3660,6 +3660,20 @@ mod tests {
             .result_as()
             .unwrap();
         assert!(init.accepted, "nor may init refuse for gravity");
+    }
+
+    /// Walking, limp and the pose ramp share one SRAM KP (`HD1910_RUNTIME_KP`). Standing
+    /// still multiplies by `standing_gain_ratio`; the built-in ratio stays 0.8, and
+    /// `deploy/robotd_openmd.toml` is what sets it to 1.
+    #[test]
+    fn open_microduck_policy_gains_are_the_sram_pair() {
+        use duck_control::HD1910_RUNTIME_KP;
+        let params = Params::default();
+        let policy = params.resolved_policy();
+        assert_eq!(policy.gain, HD1910_RUNTIME_KP as u16);
+        assert_eq!(policy.standing_gain_ratio, 0.8);
+        assert_eq!(params.gain_limp(), HD1910_RUNTIME_KP as u16);
+        assert_eq!(params.limp_fall_pose_gain(), HD1910_RUNTIME_KP as u16);
     }
 
     fn state() -> RobotState {

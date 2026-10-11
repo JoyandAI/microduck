@@ -177,7 +177,7 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "policy.gain",
         Kind::OptionalInteger,
-        "Servo position P gain while running; unset = 32 OpenMicroDuck / 200 MicroDuck",
+        "Servo position P gain while running; unset = 6 OpenMicroDuck / 200 MicroDuck",
     ),
     entry(
         "policy.head_lowpass",
@@ -249,7 +249,7 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "safety.gain_limp",
         Kind::OptionalInteger,
-        "The gain limp-fall yields at; unset = 8 OpenMicroDuck / 50 MicroDuck",
+        "The gain limp-fall yields at; unset = 6 OpenMicroDuck / 50 MicroDuck",
     ),
     feature(
         "safety.battery_empty_shutdown",
@@ -303,8 +303,8 @@ pub const REGISTRY: &[Entry] = &[
     ),
     entry(
         "safety.limp_fall_pose_gain",
-        Kind::Integer,
-        "Gain for that ramp — softened standing, not limp",
+        Kind::OptionalInteger,
+        "Gain for the pose ramp; unset = 6 OpenMicroDuck / 160 MicroDuck",
     ),
     // ── [detect] ─────────────────────────────────────────────────────────────
     feature(

@@ -158,12 +158,13 @@ roulade = "/opt/robot/policies/current/20260930_m6-roulade.onnx"
 
 # The standing policy is trained to be applied whole.
 # standing_action_scale = 1.0
-# Standing runs softer, at this fraction of `gain`. The prototype's --standing-kp-ratio.
-# standing_gain_ratio = 0.8
-# Position P gain while running. Unset follows [platform].variant: 5 OpenMicroDuck
-# (HD1910 BAM Kp), 200 MicroDuck (XL330). This board is softer than the BAM default
-# while the bus and policies settle.
-gain = 5
+# Standing fraction of `gain`. The built-in default is 0.8. This board stands at the
+# same SRAM KP as walking.
+standing_gain_ratio = 1.0
+# Position P gain while running. Unset is 6: SRAM register 50, dropped on power-off.
+# KD is not a key — every gain write also sets SRAM register 51 to 20. The BAM snapshot
+# Kp/Kd 32/40 is not what the loop runs. Leave this commented so the variant default applies.
+# gain = 6
 
 # First-order low-pass on the head and leg joint targets, as a blend factor in (0, 1].
 # 1.0 is pass-through (off). Unset resolves per mode: 0.5 / 0.7 walking — the values the
@@ -218,9 +219,9 @@ battery_empty_shutdown = false
 # what answers it — this one only ever zeroes the velocity.
 # deadman_ms = 500
 
-# The gain limp-fall yields at — low enough to give way rather than fight the floor.
-# Unset follows [platform].variant: 8 OpenMicroDuck, 50 MicroDuck.
-# gain_limp = 8
+# The gain limp-fall yields at. Unset is 6 on this variant — the same SRAM KP as walking,
+# not a separate soft value and not the XL330 50.
+# gain_limp = 6
 
 # Land soft, then stand up from a still robot instead of a thrashing one.
 #
@@ -270,16 +271,16 @@ battery_empty_shutdown = false
 # different times to finish — or at `limp_fall_max_ms` whatever the gyro says, so a robot
 # held in someone's hands does not stay limp forever.
 #
-# The pose ramp then travels the joints back to standing. Its gain is not the limp gain:
-# they have to actually move across the floor. 160 is the softened standing gain. 0.6 s was
-# settled on at the robot: a full second is mostly dead time before the stand-up, since the
-# joints travel unloaded rather than lifting the robot, and 0.3 also worked — this keeps
-# some margin over it.
+# The pose ramp then travels the joints back to standing. Unset is 6 on this variant,
+# the same SRAM KP as walking. 160 is the XL330 softened standing gain and must not be
+# written to an HD1910. 0.6 s was settled on at the robot: a full second is mostly dead
+# time before the stand-up, since the joints travel unloaded rather than lifting the
+# robot, and 0.3 also worked — this keeps some margin over it.
 # limp_fall_still_rate = 1.0
 # limp_fall_still_ms = 200
 # limp_fall_max_ms = 1500
 # limp_fall_pose_ms = 600
-# limp_fall_pose_gain = 160
+# limp_fall_pose_gain = 6
 
 # Sit down gracefully and power the machine off when the battery EMA reaches the empty
 # floor (6.6 V — the same value the battery percentage maps to 0%). The EMA moves over

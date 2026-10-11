@@ -531,10 +531,13 @@ pub struct PolicyParams {
     /// (the prototype's alpha default), 0.8 roller.
     pub action_scale: Option<f64>,
     pub standing_action_scale: f64,
-    /// Standing runs softer, at this fraction of `gain`.
+    /// Standing runs softer, at this fraction of `gain`. The prototype's
+    /// `--standing-kp-ratio`. `deploy/robotd_openmd.toml` sets it to 1 so this board
+    /// stands at the same SRAM KP as walking.
     pub standing_gain_ratio: f64,
-    /// Position P gain while running. Unset resolves per [`Variant`]: 32 OpenMicroDuck
-    /// (HD1910 BAM Kp), 200 MicroDuck (XL330 prototype).
+    /// Position P gain while running. Unset resolves per [`Variant`]: 6 OpenMicroDuck
+    /// (HD1910 SRAM register 50; the BAM snapshot Kp=32 is not what the loop writes),
+    /// 200 MicroDuck (XL330 prototype).
     pub gain: Option<u16>,
     /// First-order low-pass on the head joint targets, `1.0` = pass-through. Default 0.5
     /// in both modes — the value the alpha policies are *trained* with, so it must match
@@ -694,8 +697,9 @@ pub struct SafetyParams {
     pub fall_debounce_ms: u64,
     /// Intent age past which the velocity is zeroed. Stop, not limp.
     pub deadman_ms: u64,
-    /// The gain limp-fall yields at — low enough to give way rather than fight the floor.
-    /// Unset resolves per [`Variant`]: 8 OpenMicroDuck, 50 MicroDuck.
+    /// The gain limp-fall yields at.
+    /// Unset resolves per [`Variant`]: 6 OpenMicroDuck (same SRAM KP as walking),
+    /// 50 MicroDuck.
     pub gain_limp: Option<u16>,
     /// Sit down and power the machine off when the battery EMA reaches the empty floor
     /// (6.6 V — `duck_control::model::BATTERY_EMPTY_V`). The EMA moves over ~10 s, so a
@@ -738,9 +742,9 @@ pub struct SafetyParams {
     /// than lifting anything, so a full second was mostly dead time before the stand-up;
     /// 0.6 keeps some margin over the 0.3 that also worked.
     pub limp_fall_pose_ms: u64,
-    /// Gain for that ramp. The joints have to actually travel across the floor, so it is
-    /// not the limp gain; it is the softened standing gain rather than the walking one.
-    pub limp_fall_pose_gain: u16,
+    /// Gain for that ramp. Unset resolves per [`Variant`]: 6 OpenMicroDuck (same SRAM KP
+    /// as walking — not the XL330 softened standing gain), 160 MicroDuck.
+    pub limp_fall_pose_gain: Option<u16>,
 }
 
 impl Default for PolicyParams {
@@ -792,7 +796,7 @@ impl Default for SafetyParams {
             limp_fall_still_ms: 200,
             limp_fall_max_ms: 1500,
             limp_fall_pose_ms: 600,
-            limp_fall_pose_gain: 160,
+            limp_fall_pose_gain: None,
         }
     }
 }
@@ -844,20 +848,31 @@ impl Variant {
         matches!(self, Variant::MicroDuck)
     }
 
-    /// Default position P gain written to the servos. HD1910 BAM identified Kp=32;
+    /// Default position P gain written to SRAM register 50. OpenMicroDuck is 6
+    /// (`duck_control::HD1910_RUNTIME_KP`); the BAM snapshot Kp=32 is not this number.
     /// XL330 prototype used 200.
     pub fn running_gain(self) -> u16 {
         match self {
-            Variant::OpenMicroDuck => 32,
+            Variant::OpenMicroDuck => 6,
             Variant::MicroDuck => 200,
         }
     }
 
-    /// Limp-fall P gain. Same 1/4 ratio as the XL330 50/200 pair.
+    /// Limp-fall P gain. OpenMicroDuck uses the same SRAM KP as walking. MicroDuck keeps
+    /// the XL330 50/200 pair.
     pub fn gain_limp(self) -> u16 {
         match self {
-            Variant::OpenMicroDuck => 8,
+            Variant::OpenMicroDuck => 6,
             Variant::MicroDuck => 50,
+        }
+    }
+
+    /// P gain for the ramp back to standing after a limp landing. OpenMicroDuck uses the
+    /// same SRAM KP as walking. MicroDuck keeps 160, the XL330 softened standing gain.
+    pub fn pose_gain(self) -> u16 {
+        match self {
+            Variant::OpenMicroDuck => 6,
+            Variant::MicroDuck => 160,
         }
     }
 
@@ -1165,6 +1180,12 @@ impl Params {
             .unwrap_or(self.platform.variant.gain_limp())
     }
 
+    pub fn limp_fall_pose_gain(&self) -> u16 {
+        self.safety
+            .limp_fall_pose_gain
+            .unwrap_or(self.platform.variant.pose_gain())
+    }
+
     pub fn period(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(1.0 / self.control.hz as f64)
     }
@@ -1372,7 +1393,17 @@ mod tests {
     #[test]
     fn the_openmd_install_config_parses() {
         let shipped = include_str!("../../deploy/robotd_openmd.toml");
-        toml::from_str::<Params>(shipped).expect("deploy/robotd_openmd.toml must parse");
+        let params: Params =
+            toml::from_str(shipped).expect("deploy/robotd_openmd.toml must parse");
+        let policy = params.resolved_policy();
+        assert_eq!(policy.gain, 6);
+        assert_eq!(policy.standing_gain_ratio, 1.0);
+        assert_eq!(
+            (policy.gain as f64 * policy.standing_gain_ratio).round() as u16,
+            6
+        );
+        assert_eq!(params.gain_limp(), 6);
+        assert_eq!(params.limp_fall_pose_gain(), 6);
     }
 
     /// The shipped example must agree with the built-in defaults, or the file documents a
@@ -1430,7 +1461,7 @@ mod tests {
         assert_eq!(p.action_scale, 0.9);
         assert_eq!(p.standing_action_scale, 1.0);
         assert_eq!(p.standing_gain_ratio, 0.8, "--standing-kp-ratio");
-        assert_eq!(p.gain, 32, "HD1910 BAM Kp");
+        assert_eq!(p.gain, 6, "HD1910 SRAM KP");
         assert_eq!(
             p.head_lowpass,
             Some(0.5),
@@ -1529,7 +1560,7 @@ mod tests {
             "the rebased roller line keeps the trained filters"
         );
         assert_eq!(p.legs_lowpass, Some(0.7));
-        assert_eq!(p.gain, 32, "variant default, not the drive mode");
+        assert_eq!(p.gain, 6, "variant default, not the drive mode");
     }
 
     #[test]
@@ -1540,8 +1571,10 @@ mod tests {
         assert!(p.platform.variant.imu_on_bus());
         let r = p.resolved_policy();
         assert_eq!(r.gain, 200);
+        assert_eq!(r.standing_gain_ratio, 0.8, "XL330 prototype --standing-kp-ratio");
         assert_eq!(r.nominal_voltage, 7.4);
         assert_eq!(p.gain_limp(), 50);
+        assert_eq!(p.limp_fall_pose_gain(), 160);
     }
 
     #[test]
@@ -1554,8 +1587,10 @@ mod tests {
             assert_eq!(parsed.platform.variant, variant);
         }
         assert_eq!(Params::default().platform.variant, Variant::OpenMicroDuck);
-        assert_eq!(Params::default().gain(), 32);
-        assert_eq!(Params::default().gain_limp(), 8);
+        assert_eq!(Params::default().gain(), 6);
+        assert_eq!(Params::default().gain_limp(), 6);
+        assert_eq!(Params::default().limp_fall_pose_gain(), 6);
+        assert_eq!(Params::default().resolved_policy().standing_gain_ratio, 0.8);
     }
 
     /// `"none"` disables an optional slot outright — the prototype's `--sitstand-policy None`

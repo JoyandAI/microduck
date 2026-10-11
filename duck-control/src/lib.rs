@@ -19,7 +19,10 @@ pub mod obs;
 pub mod policy;
 pub mod safety;
 
-pub use hardware::{HD1910_BAM_M1, HD1910_FIRMWARE, Hd1910BamM1, Hd1910Firmware};
+pub use hardware::{
+    HD1910_BAM_M1, HD1910_FIRMWARE, HD1910_RUNTIME_KD, HD1910_RUNTIME_KP, Hd1910BamM1,
+    Hd1910Firmware,
+};
 pub use imu::ImuData;
 pub use io::{
     FakeImu, FakeIo, ImuIo, ImuStale, IoError, JointTargets, RobotIo, Sensors, SlowSensors,

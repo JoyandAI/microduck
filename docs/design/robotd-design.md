@@ -882,13 +882,14 @@ not a new release.
 One line selects the servo protocol, where the IMU is read, and the BAM-aligned runtime
 numbers (P gain, limp gain, nominal voltage). `bus.driver` should match but is **not** what
 `robotd` opens — the variant is. Unset `policy.gain` / `policy.nominal_voltage` /
-`safety.gain_limp` resolve from the variant; **leave them commented** unless this board
-genuinely needs a different number, or a MicroDuck will stand up at HD1910 kP 32.
+`safety.gain_limp` and `safety.limp_fall_pose_gain` resolve from the variant; **leave
+them commented** unless this board genuinely needs a different number, or a MicroDuck
+will stand up at HD1910 kP 6.
 
-| toml | meaning | `bus.driver` | IMU | running kP | limp kP | `vin` |
-|---|---|---|---|---|---|---|
-| `variant = "open_microduck"` | this development tree (default) | `hd1910` | `[imu]` I²C | 32 | 8 | 7.4 V |
-| `variant = "microduck"` | original, matching `2c61dcc` | `xl330` | bus ID 200; `[imu]` ignored | 200 | 50 | 7.4 V |
+| toml | meaning | `bus.driver` | IMU | running / standing / limp / pose kP | `vin` |
+|---|---|---|---|---|---|
+| `variant = "open_microduck"` | this development tree (default) | `hd1910` | `[imu]` I²C | 6 (SRAM; KD 20). Standing is `gain × standing_gain_ratio` (built-in 0.8; the OpenMicroDuck install file sets 1) | 7.4 V |
+| `variant = "microduck"` | original, matching `2c61dcc` | `xl330` | bus ID 200; `[imu]` ignored | 200, standing 160, limp 50, pose 160 | 7.4 V |
 
 **Deploy: leave the board as OpenMicroDuck** (the template's default). No edit.
 

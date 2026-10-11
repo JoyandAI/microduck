@@ -39,7 +39,7 @@ use rustypot::servo::feetech::sts3215::Sts3215Controller;
 use serialport::SerialPort;
 
 use crate::bus::{STALE_RUN_WARN, StaleImuTracker};
-use crate::hardware::HD1910_FIRMWARE;
+use crate::hardware::{HD1910_FIRMWARE, HD1910_RUNTIME_KD};
 use crate::imu::{IMU_BLOCK_LEN, ImuData, SflpDecoder};
 use crate::io::{ImuIo, ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{BAUD_RATE, IMU_DXL_ID, JOINT_IDS, NUM_JOINTS};
@@ -1400,13 +1400,12 @@ impl RobotIo for FeetechIo {
     }
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {
-        // `kp` is the raw register value for reg 50 (0..254). Kd/Ki are the BAM-identified
-        // firmware values (40/0): position-mode Ki is inert, and the HD1910 factory D is 40
-        // not 32. See `crate::hardware::HD1910_FIRMWARE`.
-        const KD: u8 = HD1910_FIRMWARE.kd;
+        // Registers 50/51/52 are SRAM. Power-off restores the servo's EEPROM; this write
+        // does not touch it. KD is the policy runtime value (20), not the BAM snapshot
+        // `HD1910_FIRMWARE.kd` (40). Position-mode Ki is inert.
+        const KD: u8 = HD1910_RUNTIME_KD;
         const KI: u8 = HD1910_FIRMWARE.ki;
-        // Register 50 is 0..=254. BAM identified Kp=32; clamp so a leftover 1023 from an
-        // XL330 config cannot wrap.
+        // Register 50 is 0..=254. Clamp so a leftover 1023 from an XL330 config cannot wrap.
         let kp_byte = kp.min(254) as u8;
         for &id in &JOINT_IDS {
             self.write_register(id, reg::KP, &[kp_byte])?;
