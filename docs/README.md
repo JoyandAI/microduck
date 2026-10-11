@@ -12,6 +12,7 @@ without hardware, get a dev board, push a branch, release — with pointers to t
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command, and the web console on port 8090. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
+| [`disable-sleep.md`](robot/disable-sleep.md) | Stop a Zero 3W from suspending when idle. 0.2 A at 7.5 V is that sleep, not power-off. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
 | [`bringup-examples.md`](robot/bringup-examples.md) | Cross-compile `imu_probe` / `hls_read` / `imu_servo_read` / `hls_control` and copy them onto the Radxa. |
 | [`dev-push.md`](robot/dev-push.md) | Build on your machine and install on the board over ssh, with no CI run. |
