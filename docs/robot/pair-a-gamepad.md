@@ -76,6 +76,54 @@ The xpadneo driver then loads, a `/dev/input/event*` node appears, and the light
 a BlueZ quirk on reconnects to a pad the board already knows; a fresh pair from a board that never
 saw the pad does not hit it.
 
+If the node appears and then vanishes, and the light never leaves the fast flash, the pad's own
+firmware is too old. Disconnecting does not fix that — see
+[Xbox firmware below 5.12](#xbox-firmware-below-512).
+
+## Xbox firmware below 5.12
+
+Tested on an original Xbox Wireless Controller, on duck-57ed, kernel `6.1.84-10-rk2410-nocsf`.
+`pad pair` printed `padd is driving from it now` while the Xbox button kept flashing quickly.
+BlueZ was connected, and `padd` had the pad, for a moment. The kernel then removed the controller
+and created it again a second later. `padd` logged `pad gone` and then `pad connected` on that
+cycle. Opening `/dev/input/event5` in the gap returns `No such device`.
+
+`xpadneo` names the cause. Firmware **5.09** is BLE version `0x0509`, which is below the driver's
+stable line of **5.12** (`0x0512`):
+
+```text
+xpadneo 0005:045E:0B13.0003: BLE firmware version 5.09, please upgrade for better stability
+```
+
+`bluetoothctl info` shows the same number at the end of the modalias, `usb:v045Ep0B13d0509`.
+`0B13` is the BLE Xbox product. On this controller that address was `0C:35:26:C1:BC:69`. An older
+classic bond for the same pad is a different address (`A0:5A:5F:61:45:88`, product `02E0`).
+Forgetting the classic address leaves the BLE bond in place.
+
+Read the version the driver just saw:
+
+```bash
+sudo dmesg -T | grep "BLE firmware version"
+```
+
+Upgrade the controller, not the board. Connect it to a Windows PC with a USB cable and update it
+in the **Xbox Accessories** app, or update it from an Xbox console. It needs **5.12 or newer**.
+The 5.09 unit on duck-57ed held the link after that update: the light stopped flashing quickly.
+
+Then drop the old bond and pair again while the light is flashing quickly:
+
+```bash
+sudo robotctl pad forget 0C:35:26:C1:BC:69
+```
+
+```bash
+sudo robotctl pad pair
+```
+
+Do not run `bluetoothctl scan` while the pad is connected, and do not hold `cat` open on its
+`event` node to watch it. On this radio a scan drops the link. The `event` index also moves each
+time the controller is removed and created again.
+
 ## Check it
 
 ```bash
