@@ -1,2 +1,3 @@
 hooks/** text eol=lf
 scripts/*.sh text eol=lf
+deploy/hid-xpadneo-dkms/** text eol=lf

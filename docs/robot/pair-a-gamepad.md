@@ -3,6 +3,24 @@
 Once per pad. After this, `padd.service` drives whatever pad is connected, from boot — nothing to
 start, and nothing that dies with your ssh session.
 
+## Xbox BLE controller driver
+
+Xbox Series X|S controllers use Bluetooth Low Energy (BLE). On Linux, they require the `xpadneo`
+driver, which is installed by `scripts/setup-board.sh`. If you are pairing an Xbox controller on a
+board that was not provisioned with the current `setup-board.sh`, install it first:
+
+```bash
+sudo sh scripts/setup-xpadneo.sh
+```
+
+Without `xpadneo`, the BLE connection succeeds but no input device is created — `bluetoothctl` shows
+`Connected: yes` and there is no new `/dev/input/event*` node, so `padd` has nothing to drive. A
+reboot after installing `xpadneo` loads the module, and the pad then pairs and drives normally.
+
+`/dev/input/js*` is a separate, older interface. The Zero 3W kernel
+`6.1.84-10-rk2410-nocsf` is built with `CONFIG_INPUT_JOYDEV` off, so a working pad still has no
+`js0` until [`joydev` is built](#the-js0-node). `padd` does not need that node.
+
 ## Put the pad in pairing mode
 
 On an **Xbox** controller this is two presses, and the second is the one that goes wrong:
@@ -43,6 +61,21 @@ robot prefers one in pairing mode; both stay paired afterwards and `padd` drives
 The cost is that re-running with nothing new in pairing mode waits out the whole search window
 before reporting the pad you already have — `--timeout 5` if you are only repairing trust.
 
+**If the light keeps flashing after pairing.** On an Xbox pad, `pad pair` completes the BLE bond
+but the HID connection may not follow — `bluetoothctl info` shows `Connected: yes` yet no
+`/dev/input/event*` node stays up, and the pad's light keeps flashing quickly. Reconnect the
+Bluetooth link by hand:
+
+```bash
+sudo bluetoothctl disconnect <pad-address>
+sudo bluetoothctl connect <pad-address>
+```
+
+The xpadneo driver then loads, a `/dev/input/event*` node appears, and the light goes solid or off.
+`/dev/input/js0` appears only when `joydev` is loaded — see [the js0 node](#the-js0-node). This is
+a BlueZ quirk on reconnects to a pad the board already knows; a fresh pair from a board that never
+saw the pad does not hit it.
+
 ## Check it
 
 ```bash
@@ -60,6 +93,110 @@ working robot ignoring you.
 `paired but NOT trusted` is the state worth knowing. It works now and does not reconnect after a
 reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`
 to fix it.
+
+## The js0 node
+
+Tested on a 飞智沙漠狐 (Flydigi Dune Fox), kernel `6.1.84-10-rk2410-nocsf`. In Xbox mode that pad
+does not advertise itself as Dune Fox. BlueZ and the input subsystem both name it
+`Xbox Wireless Controller`.
+
+On that run the one gamepad device was:
+
+```text
+/dev/input/js0    Xbox Wireless Controller    event5
+```
+
+That line is not the output of one command. It is the name and the handler list from a single
+record in `/proc/bus/input/devices`:
+
+```text
+N: Name="Xbox Wireless Controller"
+H: Handlers=event5 dmcfreq js0
+```
+
+`N:` is the name the pad reported. `H:` lists every interface bound to that same input device:
+`event5` is the evdev node `padd` reads, and `js0` is the legacy joystick node. `dmcfreq` is the
+SoC's frequency governor hooked onto input events. It is not a gamepad device, and nothing should
+open it as one.
+
+Read it on the board:
+
+```bash
+awk 'BEGIN{RS=""; FS="\n"} /js0/{print}' /proc/bus/input/devices
+```
+
+```bash
+cat /sys/class/input/js0/device/name
+```
+
+```bash
+ls /sys/class/input/js0/device/
+```
+
+`cat` prints `Xbox Wireless Controller`. `ls` shows `event5` and `js0` side by side, which is what
+ties the two nodes to one pad. The event index is assigned per connection, so a later connect may
+be `event6` or anything else. Look at the `Handlers` line for `js0` rather than assuming `event5`.
+
+`padd` drives from the `event*` node through evdev. The robot already responds with no `js*` file
+at all. `js0` is there for programs that open the old joystick API, such as `jstest`.
+
+**This kernel does not ship `joydev`.** `/boot/config-6.1.84-10-rk2410-nocsf` has
+`# CONFIG_INPUT_JOYDEV is not set`, so `modprobe joydev` fails with `Module joydev not found` and
+pairing never creates `/dev/input/js*`. `CONFIG_INPUT_JOYSTICK=y` only means the joystick event
+types exist; it does not create the `js*` nodes.
+
+### Build and load joydev
+
+Build the mainline `joydev` driver that matches this kernel's upstream version, `6.1.84`. The
+`-10-rk2410-nocsf` suffix is Radxa's package revision. The C file comes from the `v6.1.84` tag,
+not from that package. The board needs `gcc`, `make`, and the headers package
+`linux-headers-6.1.84-10-rk2410-nocsf`, which provides
+`/lib/modules/6.1.84-10-rk2410-nocsf/build`.
+
+On the board:
+
+```bash
+mkdir -p /tmp/joydev-build
+cd /tmp/joydev-build
+curl -fsSL -o joydev.c \
+  'https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/input/joydev.c?h=v6.1.84'
+```
+
+```bash
+cat > Makefile << 'EOF'
+obj-m += joydev.o
+
+all:
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(CURDIR) modules
+EOF
+make -j"$(nproc)"
+```
+
+`make` warns that the kernel was built by `aarch64-linux-gnu-gcc (Debian 12.2.0-14)` and the board
+compiler is `gcc (Debian 12.2.0-14+deb12u1)`. Same GCC 12.2.0, different Debian revision. The
+module still loads. If the board cannot reach `git.kernel.org`, download that `joydev.c` elsewhere
+and copy it into `/tmp/joydev-build/` before `make`.
+
+Install it for the running kernel and load it. The pad can stay connected; `joydev` attaches to
+the existing device and `js0` shows up without another pair.
+
+```bash
+sudo install -D -m 644 joydev.ko "/lib/modules/$(uname -r)/updates/joydev.ko"
+sudo depmod -a
+sudo modprobe joydev
+echo joydev | sudo tee /etc/modules-load.d/joydev.conf
+sudo udevadm trigger --subsystem-match=input --action=change
+ls -l /dev/input/js0
+```
+
+`/etc/modules-load.d/joydev.conf` is what loads it on the next boot. Right after `modprobe` the
+node can be `crw------- root root`, because it was created before udev ran.
+`/lib/udev/rules.d/50-udev-default.rules` sets `KERNEL=="js[0-9]*"` to `MODE="0664"`. The trigger
+applies that, and the node becomes `crw-rw-r--+ root input`.
+
+A newer kernel package needs this repeated: new headers, a `joydev.c` from the matching upstream
+version, and a rebuild. This does not touch the radio. Do not `systemctl restart bluetooth`, and
+do not power the adapter off, as part of loading `joydev`.
 
 ## Forget one
 

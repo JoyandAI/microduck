@@ -1122,6 +1122,117 @@ EOF
     fi
 }
 
+# Xbox Series controllers speak HID-over-GATT. hid-generic binds that device and
+# then drops it — bluetoothd reports "unlikely error" reading the report
+# descriptor, a new input node appears every few hundred milliseconds, and padd
+# sees the pad for one tick. hid-xpadneo is the driver that holds the link.
+# The modprobe aliases and udev rebind are what setup-xpadneo.sh installs; without
+# them the module is built and hid-generic still owns the pad.
+configure_xpadneo() {
+    say "gamepad: hid-xpadneo for Xbox BLE controllers"
+
+    missing=""
+    for pkg in dkms gcc make; do
+        dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+    done
+    if [ -n "$missing" ]; then
+        say "installing:$missing"
+        apt-get update -qq || true
+        # shellcheck disable=SC2086
+        apt-get install -y -qq $missing \
+            || { warn "apt failed — an Xbox pad will connect and not drive"; return 0; }
+    fi
+
+    if [ -z "${vendor_ver:-}" ]; then
+        vendor_ver=$(find /lib/modules -maxdepth 1 -name '*-vendor-rk35xx' 2>/dev/null | sort -V | tail -1 | xargs -r basename)
+    fi
+    if [ -z "${vendor_ver:-}" ]; then
+        warn "no vendor kernel under /lib/modules — Xbox controller driver not installed"
+        return 0
+    fi
+
+    mod_name="hid-xpadneo"
+    mod_files="dkms.conf src/Makefile
+        src/xpadneo/compat.h src/xpadneo/consumer.c src/xpadneo/core.c
+        src/xpadneo/debug.c src/xpadneo/device.c src/xpadneo/events.c
+        src/xpadneo/helpers.h src/xpadneo/keyboard.c src/xpadneo/mappings.c
+        src/xpadneo/mouse.c src/xpadneo/power.c src/xpadneo/quirks.c
+        src/xpadneo/rumble.c src/xpadneo/synthetic.c src/xpadneo/xpadneo.h"
+
+    dkms_tmp=$(mktemp -d)
+    dkms_ok=1
+    for f in $mod_files; do
+        mkdir -p "$dkms_tmp/$(dirname "$f")"
+        fetch_repo_file "deploy/hid-xpadneo-dkms/$f" "$dkms_tmp/$f" || { dkms_ok=0; break; }
+    done
+    if [ "$dkms_ok" != 1 ]; then
+        warn "could not fetch the hid-xpadneo DKMS sources — an Xbox pad will connect and not drive"
+        rm -rf "$dkms_tmp"
+        return 0
+    fi
+
+    # Windows checkouts keep a CR on this line; without stripping it the version is empty.
+    dkms_ver=$(sed -n 's/^PACKAGE_VERSION="\([^"]*\)".*/\1/p' "$dkms_tmp/dkms.conf" | tr -d '\r')
+    dkms_src="/usr/src/${mod_name}-${dkms_ver}"
+    deploy_needed=0
+    for f in $mod_files; do
+        cmp -s "$dkms_tmp/$f" "$dkms_src/$f" || deploy_needed=1
+    done
+    if [ "$deploy_needed" = 1 ]; then
+        say "deploying $mod_name DKMS sources to $dkms_src"
+        dkms remove "${mod_name}/$dkms_ver" --all >/dev/null 2>&1 || true
+        for f in $mod_files; do
+            mkdir -p "$dkms_src/$(dirname "$f")"
+            cp "$dkms_tmp/$f" "$dkms_src/$f"
+        done
+    fi
+    if dkms status "${mod_name}/$dkms_ver" 2>/dev/null | grep "$vendor_ver" | grep -q installed; then
+        say "$mod_name DKMS module already installed"
+    else
+        if [ -d "/usr/src/linux-headers-$vendor_ver" ] \
+            && [ ! -x "/usr/src/linux-headers-$vendor_ver/scripts/mod/modpost" ]; then
+            say "rebuilding the vendor headers' host tools (modpost)"
+            dpkg-reconfigure linux-headers-vendor-rk35xx >/dev/null 2>&1 || true
+        fi
+        say "building the $mod_name driver via DKMS (takes a minute)"
+        if dkms install "${mod_name}/$dkms_ver" -k "$vendor_ver"; then
+            say "$mod_name DKMS module installed for $vendor_ver"
+            needs_reboot=1
+        else
+            warn "DKMS build failed for $mod_name — an Xbox pad will connect and not drive"
+            warn "see /var/lib/dkms/${mod_name}/$dkms_ver/build/make.log"
+        fi
+    fi
+    rm -rf "$dkms_tmp"
+
+    conf_tmp=$(mktemp)
+    if fetch_repo_file "deploy/hid-xpadneo-dkms/etc-modprobe.d/xpadneo.conf" "$conf_tmp"; then
+        if [ ! -f /etc/modprobe.d/xpadneo.conf ] \
+            || ! cmp -s "$conf_tmp" /etc/modprobe.d/xpadneo.conf; then
+            say "installing /etc/modprobe.d/xpadneo.conf"
+            install -m 644 "$conf_tmp" /etc/modprobe.d/xpadneo.conf
+            needs_reboot=1
+        fi
+    else
+        warn "could not fetch the xpadneo modprobe config"
+    fi
+    rm -f "$conf_tmp"
+
+    for rule in 60-xpadneo.rules 70-xpadneo-disable-hidraw.rules; do
+        rule_tmp=$(mktemp)
+        if fetch_repo_file "deploy/hid-xpadneo-dkms/etc-udev-rules.d/$rule" "$rule_tmp"; then
+            if [ ! -f "/etc/udev/rules.d/$rule" ] \
+                || ! cmp -s "$rule_tmp" "/etc/udev/rules.d/$rule"; then
+                say "installing /etc/udev/rules.d/$rule"
+                install -m 644 "$rule_tmp" "/etc/udev/rules.d/$rule"
+            fi
+        else
+            warn "could not fetch $rule"
+        fi
+        rm -f "$rule_tmp"
+    done
+}
+
 main() {
     check_environment
     persist_self
@@ -1130,6 +1241,7 @@ main() {
     free_motor_port
     configure_bluetooth
     configure_audio
+    configure_xpadneo
     configure_tof
     # After configure_audio, which is what installs the vendor kernel: the camera's MIPI-CSI
     # capture driver lives only on that branch, and its overlay directory is the one to mirror
