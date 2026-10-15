@@ -15,9 +15,12 @@
 [platform]
 # Which robot this board is. One line selects the servo protocol, where the IMU is read,
 # and the BAM-aligned runtime numbers (P gain, limp gain, nominal voltage).
-#   open_microduck  — Feetech HD1910 + I²C IMU (this development tree; default)
+#   open_microduck  — Feetech HD1910 + IMU on the servo bus (Feetech ID 200,
+#                     its own read, not inside the servos' sync_read). An I²C
+#                     IMU is still used when that node is absent. Default.
 #   microduck       — original: Dynamixel XL330 + IMU on the servo bus (ID 200),
-#                     matching 2c61dcc and earlier
+#                     in the same sync_read as the XL330s, matching 2c61dcc
+#                     and earlier
 # Changing this needs `systemctl restart robotd`.
 variant = "open_microduck"
 
@@ -31,8 +34,9 @@ port = "/dev/ttyS2"
 driver = "hd1910"
 
 [imu]
-# OpenMicroDuck fallback: used only when startup does not find imu_to_servo (Feetech ID 200,
-# model 0x4D44) after five pings. That choice is fixed until the next start. Production
+# I²C IMU. OpenMicroDuck uses it only when startup does not find imu_to_servo
+# (Feetech ID 200, model 0x4D44) on the servo bus after five pings. That choice is
+# fixed until the next start. Production
 # wiring for this chip is i2c4 (pins 27/28, on-board pull-ups), aliased /dev/i2c-imu by the
 # udev rule, at 0x6A.
 # If that path cannot be opened or WHO_AM_I is not 0x70, robotd scans /dev/i2c-* the same
