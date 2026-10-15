@@ -116,6 +116,19 @@ async function boot() {
       say("十五路正在走到站姿默认位置。", "ok");
     } catch (e) { say(e.message, "bad"); }
   };
+  $("save-home").onclick = async () => {
+    if (!confirm("把当前十五路位置写成默认站姿？这一步写进 robotd.toml 的 policy.home。策略的观测零点也会跟着变，保存后要重新启动 robotd。")) return;
+    try {
+      const data = await api("/api/cal/home", {});
+      (data.home || []).forEach((count, index) => {
+        if (!joints[index]) return;
+        joints[index].home = count;
+        const button = document.querySelector('[data-home="' + index + '"]');
+        if (button) button.textContent = "到默认 " + count;
+      });
+      say("已写入 " + data.path + "。重新启动 robotd 后，站姿和策略零点都会用这组角度。", "ok");
+    } catch (e) { say(e.message, "bad"); }
+  };
   $("exit").onclick = () => exitCal();
 }
 

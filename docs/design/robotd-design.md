@@ -626,7 +626,10 @@ Two of those tables are load-bearing beyond their own crate. `JOINT_NAMES` comes
 orders cannot be allowed to drift — a `const` assertion makes "cannot" true. And
 `DEFAULT_POSITION` must match `HOME_FRAME` in the training env: a policy observes joint
 positions *relative* to the home pose, so a discrepancy here is a constant offset on 14
-observation slots.
+observation slots. `policy.home` in `robotd.toml` overrides that const. The file is
+fifteen **degrees** in `JOINT_NAMES` order; parsing converts them to radians once.
+Unset keeps the const. The web calibrate page can write the key from the pose on the
+bench; `robotd` still reads the file once, at startup.
 
 ## 3. The API
 

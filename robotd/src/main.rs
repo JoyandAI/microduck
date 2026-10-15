@@ -44,7 +44,7 @@ use duck_control::io::{ImuIo, RobotIo};
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
 use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyPaths};
 use duck_control::safety::{Safety, SafetyConfig};
-use duck_control::{DEFAULT_POSITION, FakeImu, FakeIo, ImuData, NUM_JOINTS};
+use duck_control::{FakeImu, FakeIo, ImuData, NUM_JOINTS};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -190,7 +190,12 @@ impl LimpFall {
     /// purpose: that ramp is bring-up from limp at the policy gain over a fixed two
     /// seconds, this one is a landed robot being put back into shape, and both its
     /// duration and its gain are tunable because both depend on how the robot lands.
-    fn pose_target(&self, now: Instant, over: Duration) -> Option<[f64; NUM_JOINTS]> {
+    fn pose_target(
+        &self,
+        now: Instant,
+        over: Duration,
+        home: &[f64; NUM_JOINTS],
+    ) -> Option<[f64; NUM_JOINTS]> {
         let LimpFall::Posing { from, since } = self else {
             return None;
         };
@@ -200,7 +205,7 @@ impl LimpFall {
         }
         let mut target = [0.0; NUM_JOINTS];
         for (i, slot) in target.iter_mut().enumerate() {
-            *slot = from[i] + (DEFAULT_POSITION[i] - from[i]) * t;
+            *slot = from[i] + (home[i] - from[i]) * t;
         }
         Some(target)
     }
@@ -802,7 +807,11 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
         tracing::error!(error = %e, gain = params.gain(), "cannot set the position gain");
         return ExitCode::FAILURE;
     }
-    if let Err(e) = io.interpolate_to(&DEFAULT_POSITION, duration, Duration::from_millis(20)) {
+    if let Err(e) = io.interpolate_to(
+        &duck_control::standing_pose(params.policy.home.as_deref()),
+        duration,
+        Duration::from_millis(20),
+    ) {
         tracing::error!(error = %e, "interpolation to the home pose failed");
         return ExitCode::FAILURE;
     }
@@ -850,8 +859,9 @@ fn spawn_control_thread(
 
             if fake {
                 tracing::warn!("--fake: no bus, no robot");
+                let home = duck_control::standing_pose(params.policy.home.as_deref());
                 runtime.block_on(control_loop(
-                    FakeIo::at(DEFAULT_POSITION),
+                    FakeIo::at(home),
                     FakeImu::new(),
                     state,
                     intents,
@@ -1370,7 +1380,7 @@ impl Bringup {
     ///
     /// Linear, like `DynamixelIo::interpolate_to` which `robotd init` uses — same shape, except this
     /// one is computed per tick instead of blocking the thread, because here the loop is running.
-    fn homing_target(&self, now: Instant) -> Option<[f64; NUM_JOINTS]> {
+    fn homing_target(&self, now: Instant, home: &[f64; NUM_JOINTS]) -> Option<[f64; NUM_JOINTS]> {
         let Bringup::Homing { from, since } = self else {
             return None;
         };
@@ -1380,7 +1390,7 @@ impl Bringup {
         }
         let mut target = [0.0; NUM_JOINTS];
         for (i, slot) in target.iter_mut().enumerate() {
-            *slot = from[i] + (DEFAULT_POSITION[i] - from[i]) * t;
+            *slot = from[i] + (home[i] - from[i]) * t;
         }
         Some(target)
     }
@@ -1453,7 +1463,10 @@ async fn adopt_startup_pose<T: RobotIo, U: ImuIo>(
 /// unusable bundle pass the health gate.
 /// Load the networks named by `policy_cfg`. Does not touch [`RobotState`]: startup and a
 /// SIGHUP reload both call this, and the reload runs off the control thread.
-fn assemble(policy_cfg: &params::ResolvedPolicy) -> Result<Controller, String> {
+fn assemble(
+    policy_cfg: &params::ResolvedPolicy,
+    home: [f64; NUM_JOINTS],
+) -> Result<Controller, String> {
     let tuning = Tuning {
         action_scale: policy_cfg.action_scale,
         standing_action_scale: policy_cfg.standing_action_scale,
@@ -1487,19 +1500,20 @@ fn assemble(policy_cfg: &params::ResolvedPolicy) -> Result<Controller, String> {
     if policy_cfg.mode == Mode::Roller {
         policy.set_standing_disabled(true);
     }
-    Ok(Controller::new(policy, tuning, skills))
+    Ok(Controller::new(policy, tuning, skills, home))
 }
 
 fn build_controller(
     policy_cfg: &params::ResolvedPolicy,
     limp_fall: bool,
     state: &RobotState,
+    home: [f64; NUM_JOINTS],
 ) -> Option<Controller> {
     if !policy_cfg.enabled {
         tracing::warn!("policy disabled; holding the startup pose");
         return None;
     }
-    match assemble(policy_cfg) {
+    match assemble(policy_cfg, home) {
         Ok(controller) => {
             tracing::warn!(
                 mode = policy_cfg.mode.as_str(),
@@ -1534,6 +1548,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
     // `mut` because a mode switch replaces it: the resolved policy *is* the mode, once the
     // per-mode defaults have been applied.
     let mut policy_cfg = params.resolved_policy();
+    let home = duck_control::standing_pose(params.policy.home.as_deref());
     let mut safety = Safety::new(
         io,
         imu,
@@ -1557,7 +1572,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
     const LEG_JOINTS: [usize; 10] = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14];
     let leg_deviation = LEG_JOINTS
         .iter()
-        .map(|&j| (hold[j] - DEFAULT_POSITION[j]).abs())
+        .map(|&j| (hold[j] - home[j]).abs())
         .sum::<f64>()
         / LEG_JOINTS.len() as f64;
     let mut seated_boot = leg_deviation > SEATED_BOOT_RAD;
@@ -1569,7 +1584,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
     }
 
     // Loaded once here and again on a mode switch — see `build_controller`.
-    let mut controller = build_controller(&policy_cfg, params.safety.limp_fall, &state);
+    let mut controller = build_controller(&policy_cfg, params.safety.limp_fall, &state, home);
 
     tracing::warn!(
         joints = NUM_JOINTS,
@@ -1789,7 +1804,11 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                 let mode = cfg.mode;
                 let walk = cfg.walk.clone();
                 tracing::warn!(walk = %walk.display(), "reloading policy");
-                reloading = Some((tokio::task::spawn_blocking(move || assemble(&cfg)), mode, walk));
+                reloading = Some((
+                    tokio::task::spawn_blocking(move || assemble(&cfg, home)),
+                    mode,
+                    walk,
+                ));
             } else {
                 tracing::warn!("SIGHUP with the policy disabled; nothing to reload");
             }
@@ -2207,7 +2226,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                         tracing::warn!("posed — handing back to the standing policy");
                         limp_fall = LimpFall::Idle;
                         falling.reset();
-                        hold = DEFAULT_POSITION;
+                        hold = home;
                         // Hand back to the policy, and let it choose. The twist has been
                         // held at zero through the whole sequence, so with nobody driving
                         // the standing network is what command magnitude selects — which
@@ -2309,7 +2328,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
 
         // The ramp finishing is what makes the policy eligible to drive.
         if let Bringup::Homing { .. } = bringup
-            && bringup.homing_target(tick_start).is_none()
+            && bringup.homing_target(tick_start, &home).is_none()
         {
             // Home, and a switch waiting: load the other mode's bundle here, where the robot is
             // standing still at a known pose with torque on. `Policy::load` validates and warms
@@ -2320,7 +2339,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                 policy_params.mode = target;
                 let cfg = policy_params.resolved_for(params.platform.variant);
                 state.policy_error.store(None);
-                controller = build_controller(&cfg, params.safety.limp_fall, &state);
+                controller = build_controller(&cfg, params.safety.limp_fall, &state, home);
                 // Published together with the mode, and only after the load: a client that reads
                 // `robot.mode` and gets the new one must not then be told the old mode's networks.
                 state.policies.store(Arc::new(PolicyNames::of(&cfg)));
@@ -2334,7 +2353,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
             }
             tracing::warn!("at the home pose; the policy has the robot");
             bringup = Bringup::Ready;
-            hold = DEFAULT_POSITION;
+            hold = home;
         }
         state
             .homed
@@ -2388,7 +2407,7 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                 // ("policy DISABLED - returning to default pose"). Commanded directly, no
                 // ramp: the servos do the travel at their own speed, and the robot is
                 // standing at home when Start next hands it to the policy.
-                hold = DEFAULT_POSITION;
+                hold = home;
             } else {
                 // Any other stop — IMU cooling, a blind bus, the armed fall gate — freezes
                 // where the robot *is*, from the last sample that arrived. Captured once,
@@ -2437,8 +2456,8 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
                     // machine above clears `Posing` on the same tick, so this is the one
                     // frame where the two can disagree.
                     limp_fall
-                        .pose_target(tick_start, limp_fall_pose)
-                        .unwrap_or(DEFAULT_POSITION),
+                        .pose_target(tick_start, limp_fall_pose, &home)
+                        .unwrap_or(home),
                     params.limp_fall_pose_gain(),
                     true,
                     "limp_pose",
@@ -2463,9 +2482,9 @@ async fn control_loop<T: RobotIo, U: ImuIo>(
             }
             // Ramping to the home pose. `moving` is true, because it is: the joints are travelling,
             // and `safeToRestart` must not say yes in the middle of it.
-            _ if bringup.homing_target(tick_start).is_some() => (
+            _ if bringup.homing_target(tick_start, &home).is_some() => (
                 bringup
-                    .homing_target(tick_start)
+                    .homing_target(tick_start, &home)
                     .expect("just checked it is Some"),
                 policy_cfg.gain,
                 true,
@@ -3533,6 +3552,7 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use duck_control::DEFAULT_POSITION;
 
     /// The limp-fall pose ramp: starts where the robot landed, ends at the standing pose,
     /// and reports itself finished rather than pinning at the end — the state machine reads
@@ -3547,11 +3567,13 @@ mod tests {
             since,
         };
 
-        let start = posing.pose_target(since, over).expect("t = 0");
+        let start = posing
+            .pose_target(since, over, &DEFAULT_POSITION)
+            .expect("t = 0");
         assert_eq!(start, landed, "the ramp starts from where the robot landed");
 
         let half = posing
-            .pose_target(since + over / 2, over)
+            .pose_target(since + over / 2, over, &DEFAULT_POSITION)
             .expect("mid-ramp");
         for (i, value) in half.iter().enumerate() {
             let expected = landed[i] + (DEFAULT_POSITION[i] - landed[i]) * 0.5;
@@ -3559,7 +3581,9 @@ mod tests {
         }
 
         assert!(
-            posing.pose_target(since + over, over).is_none(),
+            posing
+                .pose_target(since + over, over, &DEFAULT_POSITION)
+                .is_none(),
             "a finished ramp is None, not the endpoint held forever"
         );
     }
@@ -3570,13 +3594,13 @@ mod tests {
     fn only_the_posing_phase_ramps() {
         let over = Duration::from_secs(1);
         let now = Instant::now();
-        assert!(LimpFall::Idle.pose_target(now, over).is_none());
+        assert!(LimpFall::Idle.pose_target(now, over, &DEFAULT_POSITION).is_none());
         assert!(
             LimpFall::Limp {
                 since: now,
                 landing: Landing::default(),
             }
-            .pose_target(now, over)
+            .pose_target(now, over, &DEFAULT_POSITION)
             .is_none()
         );
     }
@@ -5234,12 +5258,14 @@ mod tests {
         };
 
         // At the start it commands where the robot already is: no step, no lurch.
-        let first = bringup.homing_target(since).expect("ramping");
+        let first = bringup
+            .homing_target(since, &DEFAULT_POSITION)
+            .expect("ramping");
         assert_eq!(first, resting);
 
         // Halfway is halfway, per joint.
         let mid = bringup
-            .homing_target(since + HOME_RAMP / 2)
+            .homing_target(since + HOME_RAMP / 2, &DEFAULT_POSITION)
             .expect("still ramping");
         assert!(
             (mid[0] - (resting[0] + DEFAULT_POSITION[0]) / 2.0).abs() < 1e-6,
@@ -5249,15 +5275,15 @@ mod tests {
 
         // And it ends — `None` is what promotes the state to `Ready`, so a ramp that never
         // finished would leave the policy permanently locked out.
-        assert!(bringup.homing_target(since + HOME_RAMP).is_none());
+        assert!(bringup.homing_target(since + HOME_RAMP, &DEFAULT_POSITION).is_none());
         assert!(
             bringup
-                .homing_target(since + HOME_RAMP + Duration::from_secs(1))
+                .homing_target(since + HOME_RAMP + Duration::from_secs(1), &DEFAULT_POSITION)
                 .is_none()
         );
 
         // Neither other state ramps anything.
-        assert!(Bringup::Limp.homing_target(since).is_none());
-        assert!(Bringup::Ready.homing_target(since).is_none());
+        assert!(Bringup::Limp.homing_target(since, &DEFAULT_POSITION).is_none());
+        assert!(Bringup::Ready.homing_target(since, &DEFAULT_POSITION).is_none());
     }
 }

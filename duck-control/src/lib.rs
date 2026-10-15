@@ -29,6 +29,6 @@ pub use io::{
 };
 pub use model::{
     BATTERY_EMPTY_V, BATTERY_FULL_V, DEFAULT_POSITION, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES,
-    NUM_JOINTS, battery_percent,
+    NUM_JOINTS, battery_percent, standing_pose,
 };
 pub use obs::{ACTION_LEN, Command, OBS_LEN, Observation};

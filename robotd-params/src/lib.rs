@@ -512,6 +512,15 @@ pub struct PolicyParams {
     /// `walk` (default) or `roller`. Changes which policies load *and* the tuning defaults
     /// below — every unset field resolves per mode, so a roller robot needs one line.
     pub mode: Mode,
+    /// Standing pose in radians, [`duck_ipc_proto::JOINT_NAMES`] order, fifteen values.
+    ///
+    /// The file writes **degrees**. [`home_from_degrees`] converts once while parsing, so
+    /// everything after `Params` — the control loop, the observation zero — stays in radians.
+    /// Unset keeps `duck_control::DEFAULT_POSITION`. Policies observe joint angles relative
+    /// to this pose, so it is the training `HOME_FRAME` as well as the pose `init` and the
+    /// web console move to. The calibrate page can write it. Read once at startup.
+    #[serde(default, deserialize_with = "home_from_degrees")]
+    pub home: Option<Vec<f64>>,
     /// Policy paths. Absent means the mode's default inside the release directory, so a
     /// normal update ships them; point one elsewhere to try a build without cutting a
     /// release. The literal `"none"` disables a slot outright — the prototype's convention.
@@ -752,6 +761,7 @@ impl Default for PolicyParams {
         Self {
             enabled: true,
             mode: Mode::Walk,
+            home: None,
             walk: None,
             stand: None,
             sitstand: None,
@@ -1068,6 +1078,10 @@ pub enum ParamsError {
         min: u32,
         max: u32,
     },
+    #[error(
+        "{path}: policy.home must be 15 finite joint angles in degrees (one turn, ±180, JOINT_NAMES order), {reason}"
+    )]
+    Home { path: String, reason: String },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -1156,6 +1170,9 @@ impl Params {
                 max: BITRATE_MAX,
             });
         }
+        if let Some(home) = &self.policy.home {
+            validate_home(path, home)?;
+        }
         Ok(())
     }
 
@@ -1189,6 +1206,42 @@ impl Params {
     pub fn period(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(1.0 / self.control.hz as f64)
     }
+}
+
+/// `policy.home` arrives as degrees. Keep radians in the struct; the control loop never
+/// sees the file's unit.
+fn home_from_degrees<'de, D>(deserializer: D) -> Result<Option<Vec<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(degrees) = Option::<Vec<f64>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        degrees
+            .into_iter()
+            .map(|degrees| degrees.to_radians())
+            .collect(),
+    ))
+}
+
+/// `policy.home` after [`home_from_degrees`]: fifteen finite radians, one per joint,
+/// inside a single servo turn. The file's limit is ±180°.
+fn validate_home(path: &Path, home: &[f64]) -> Result<(), ParamsError> {
+    if home.len() != 15 {
+        return Err(ParamsError::Home {
+            path: path.display().to_string(),
+            reason: format!("got {} values", home.len()),
+        });
+    }
+    let limit = std::f64::consts::PI + 1e-3;
+    if home.iter().any(|angle| !angle.is_finite() || angle.abs() > limit) {
+        return Err(ParamsError::Home {
+            path: path.display().to_string(),
+            reason: "an angle is not finite or is outside ±180°".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Re-parse a file that `deny_unknown_fields` rejected, dropping the keys this build has no
@@ -1386,6 +1439,34 @@ mod tests {
         assert_eq!(media.quality.size(), (1280, 720));
         assert_eq!(media.quality.fps(), 30);
         assert_eq!(media.bitrate_resolved(), 2_000_000);
+    }
+
+    /// `policy.home` is degrees in the file and radians after parsing. The wrong length,
+    /// or an angle outside ±180°, must be refused before the daemon starts.
+    #[test]
+    fn home_is_fifteen_degrees_converted_to_radians() {
+        assert!(Params::default().policy.home.is_none());
+        let ok: Params = toml::from_str(
+            "[policy]\nhome = [0.0, -5.0, -26.2, 0.0, 26.0, 20.0, 20.0, 0.0, 0.0, 0.0, 0.0, 5.0, 26.2, 0.0, -26.0]\n",
+        )
+        .expect("fifteen angles");
+        assert!(ok.validate(Path::new("probe.toml")).is_ok());
+        let neck = ok.policy.home.expect("set")[5];
+        assert!(
+            (neck - 20.0_f64.to_radians()).abs() < 1e-12,
+            "20° in the file is radians in the struct, got {neck}"
+        );
+        let short: Params = toml::from_str("[policy]\nhome = [0.0, 20.0]\n").expect("parses");
+        let err = short.validate(Path::new("probe.toml")).expect_err("length");
+        assert!(err.to_string().contains("15"), "{err}");
+        let wide = format!(
+            "[policy]\nhome = [{}]\n",
+            std::iter::repeat_n("181.0", 15)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let wide: Params = toml::from_str(&wide).expect("parses");
+        assert!(wide.validate(Path::new("probe.toml")).is_err());
     }
 
     /// The file `install.sh` seeds onto a board that has no config yet. It is allowed to

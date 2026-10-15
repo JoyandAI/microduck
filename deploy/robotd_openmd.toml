@@ -148,6 +148,29 @@ roulade = "/opt/robot/policies/current/20261008_021404_openmd-m6-roulade.onnx"
 # kick_right  = ".../current/policies/ball_kick_right.onnx"
 # roulade     = ".../current/policies/roulade.onnx"          X-button forward roll
 
+# Standing pose, degrees, fifteen joints in JOINT_NAMES order. Unset keeps the built-in
+# pose (knees at 0, neck and head pitch at 20). Parsed into radians once at load. A policy
+# observes joint angles relative to this pose, so it is the training HOME_FRAME as well as
+# where `init` and the web console move. The calibrate page can save the pose the robot is
+# holding. robotd reads this file once at startup.
+# home = [
+#     0.0,   # 20 left_hip_yaw
+#    -5.0,   # 21 left_hip_roll
+#   -26.2,   # 22 left_hip_pitch
+#     0.0,   # 23 left_knee
+#    26.0,   # 24 left_ankle
+#    20.0,   # 30 neck_pitch
+#    20.0,   # 31 head_pitch
+#     0.0,   # 32 head_yaw
+#     0.0,   # 33 head_roll
+#     0.0,   # 34 mouth
+#     0.0,   # 10 right_hip_yaw
+#     5.0,   # 11 right_hip_roll
+#    26.2,   # 12 right_hip_pitch
+#     0.0,   # 13 right_knee
+#   -26.0,   # 14 right_ankle
+# ]
+
 # Requires ONNX Runtime on the board. It is dlopened, not linked, so a missing library is
 # a startup failure rather than a build one — robotd reports it through robot.health and
 # holds its pose. scripts/install.sh installs it; ORT_DYLIB_PATH overrides where to look.

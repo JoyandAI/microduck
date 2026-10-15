@@ -41,6 +41,9 @@ pub enum Kind {
     OptionalPath,
     /// A list of whole numbers, edited as comma-separated text ("4, 5, 9").
     IntegerList,
+    /// A list of fractional numbers of exactly this length, or absent. Edited as
+    /// comma-separated text. `unset` clears it.
+    OptionalFloatList(u8),
 }
 
 /// One key of `robotd.toml`.
@@ -135,6 +138,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(&["walk", "roller"]),
         "Legs or the roller: picks policies and tuning. Held DPad-Up switches it live; this is \
          the mode a reboot comes back in",
+    ),
+    entry(
+        "policy.home",
+        Kind::OptionalFloatList(15),
+        "Standing pose, degrees, 15 joints in JOINT_NAMES order; unset = built-in DEFAULT_POSITION",
     ),
     entry(
         "policy.walk",
@@ -534,6 +542,10 @@ mod tests {
                     format!("[{section}]\n{key} = \"probe\"\n")
                 }
                 Kind::IntegerList => format!("[{section}]\n{key} = [1, 2]\n"),
+                Kind::OptionalFloatList(len) => {
+                    let numbers = std::iter::repeat_n("0.0", len as usize).collect::<Vec<_>>();
+                    format!("[{section}]\n{key} = [{}]\n", numbers.join(", "))
+                }
             };
             let parsed: Result<Params, _> = toml::from_str(&probe);
             assert!(

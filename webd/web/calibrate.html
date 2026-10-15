@@ -33,9 +33,10 @@
   <div class="row">
     <button class="primary" id="start">开始标定</button>
     <button id="home-all">运行到默认位置</button>
+    <button id="save-home">保存为默认站姿</button>
     <button id="exit">退出</button>
   </div>
-  <p class="hint">拖动滑条只改这一路，范围是编码器 0–4095。摆到机械零位后按「设 0 位」。绿色表示这次打开页面后已经设过。退出或离开页面会卸力矩，并把增益恢复成 KP 32、KD 40。已经写入舵机的 0 位不会被清掉。「运行到默认位置」走到站姿，0 位设好之后这个姿势才准。</p>
+  <p class="hint">拖动滑条只改这一路，范围是编码器 0–4095。摆到机械零位后按「设 0 位」。绿色表示这次打开页面后已经设过。退出或离开页面会卸力矩，并把增益恢复成 KP 32、KD 40。已经写入舵机的 0 位不会被清掉。「运行到默认位置」走到 <code>robotd.toml</code> 里的 <code>policy.home</code>，没写过就用程序里的站姿。0 位设好之后这个姿势才准。「保存为默认站姿」把当前十五路角度按度写进同一份配置。策略看到的关节角是相对这组站姿的，所以保存之后要重新启动 robotd，控制环才会用新的零点。这一页马上就用新的。</p>
 </section>
 
 <section>

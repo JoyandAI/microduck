@@ -4943,9 +4943,11 @@ dependencies = [
  "duck-control",
  "duck-ipc-proto",
  "futures-util",
+ "robotd-params",
  "serde",
  "serde_json",
  "tokio",
+ "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
  "tracing-subscriber",
 ]

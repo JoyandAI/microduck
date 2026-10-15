@@ -81,6 +81,10 @@ struct Args {
     /// Default serial port shown on the servo page.
     #[arg(long, default_value = "/dev/ttyS2")]
     servo_port: String,
+    /// `robotd.toml`. The calibrate page reads and writes `policy.home` here.
+    /// A missing file means the built-in standing pose.
+    #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+    config: PathBuf,
 }
 
 mod logs;
@@ -88,6 +92,7 @@ mod logs;
 struct App {
     robot_socket: PathBuf,
     servo_port: String,
+    config: PathBuf,
     bus: Mutex<Option<FeetechIo>>,
     capture: logs::Capture,
 }
@@ -107,6 +112,7 @@ async fn main() {
     let app = Arc::new(App {
         robot_socket: args.robot_socket,
         servo_port: args.servo_port,
+        config: args.config,
         bus: Mutex::new(None),
         capture,
     });
@@ -160,6 +166,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/cal/exit", post(cal_exit))
         .route("/api/cal/zero", post(cal_zero))
         .route("/api/cal/default", post(cal_default))
+        .route("/api/cal/home", post(cal_save_home))
         .with_state(app)
 }
 
@@ -202,6 +209,7 @@ fn page(body: &'static str, content_type: &'static str) -> impl IntoResponse {
 }
 
 async fn meta(State(app): State<Arc<App>>) -> Json<Value> {
+    let homes = home_counts(&app.config);
     let joints: Vec<Value> = JOINT_NAMES
         .iter()
         .zip(JOINT_IDS)
@@ -213,7 +221,7 @@ async fn meta(State(app): State<Arc<App>>) -> Json<Value> {
                 "name": name,
                 "id": id,
                 "label": label,
-                "home": home_counts()[index],
+                "home": homes[index],
             })
         })
         .collect();
@@ -654,12 +662,60 @@ where
     }
 }
 
-fn home_counts() -> [u16; 15] {
+fn home_counts(config: &std::path::Path) -> [u16; 15] {
+    let pose = match robotd_params::Params::load(config, false) {
+        Ok(params) => duck_control::standing_pose(params.policy.home.as_deref()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %config.display(),
+                "standing pose unreadable; using the built-in"
+            );
+            duck_control::DEFAULT_POSITION
+        }
+    };
     let mut counts = [0u16; 15];
-    for (i, rad) in duck_control::DEFAULT_POSITION.iter().enumerate() {
+    for (i, rad) in pose.iter().enumerate() {
         counts[i] = duck_control::ftbus::rad_to_position_count(*rad);
     }
     counts
+}
+
+/// Write `policy.home` in degrees and leave every other key and comment alone.
+///
+/// `pose` is radians, the same unit as the control loop. The file stores degrees;
+/// `robotd-params` converts back on the next load.
+fn write_home(path: &std::path::Path, pose: &[f64; 15]) -> Result<(), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("读不到配置：{error}")),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|error| format!("配置不是合法的 toml：{error}"))?;
+    let mut array = toml_edit::Array::new();
+    for angle in pose {
+        array.push(angle.to_degrees());
+    }
+    doc["policy"]["home"] = toml_edit::Item::Value(array.into());
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| format!("建不了配置目录：{error}"))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string()).map_err(|error| format!("写不了配置：{error}"))?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|err| format!("替换不了配置：{err}"))?;
+            std::fs::rename(&tmp, path).map_err(|err| format!("替换不了配置：{err}"))?;
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("替换不了配置：{error}"));
+        }
+    }
+    Ok(())
 }
 
 fn joint_slot(id: u8) -> Option<usize> {
@@ -776,7 +832,7 @@ struct CalDefault {
 }
 
 async fn cal_default(State(app): State<Arc<App>>, Json(body): Json<CalDefault>) -> Api {
-    let homes = home_counts();
+    let homes = home_counts(&app.config);
     let targets: Vec<(u8, u16)> = match body.id {
         Some(id) => match joint_slot(id) {
             Some(index) => vec![(id, homes[index])],
@@ -802,6 +858,41 @@ fn each_joint_targets(io: &mut FeetechIo, targets: &[(u8, u16)]) -> Result<(), S
     } else {
         Err(errors.join("；"))
     }
+}
+
+async fn cal_save_home(State(app): State<Arc<App>>) -> Api {
+    let counts = match with_bus(app.clone(), |io| {
+        let mut counts = [0u16; 15];
+        for (index, &id) in JOINT_IDS.iter().enumerate() {
+            counts[index] = io
+                .bench_position(id)
+                .map_err(|error| format!("ID {id}：{error}"))?;
+        }
+        Ok(counts)
+    })
+    .await
+    {
+        Ok(counts) => counts,
+        Err(api) => return api,
+    };
+    let mut pose = [0.0; 15];
+    for (index, count) in counts.iter().enumerate() {
+        let Some(radians) = duck_control::ftbus::position_to_rad(*count) else {
+            return err(
+                StatusCode::BAD_REQUEST,
+                format!("{} 的编码器 {count} 不是单圈位置", LABELS[index]),
+            );
+        };
+        pose[index] = radians;
+    }
+    if let Err(error) = write_home(&app.config, &pose) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    ok(json!({
+        "ok": true,
+        "path": app.config.display().to_string(),
+        "home": home_counts(&app.config),
+    }))
 }
 
 async fn shutdown() {
@@ -841,10 +932,36 @@ mod tests {
         assert!(INDEX.contains("href=\"/logs\""));
         assert!(CALIBRATE.contains("设 0 位"));
         assert!(CALIBRATE.contains("运行到默认位置"));
+        assert!(CALIBRATE.contains("保存为默认站姿"));
         assert_eq!(LABELS.len(), JOINT_NAMES.len());
         assert_eq!(JOINT_IDS.len(), JOINT_NAMES.len());
-        let homes = home_counts();
+        let homes = home_counts(std::path::Path::new("/no/such/microduck-robotd.toml"));
         assert_eq!(homes[0], 2048, "a 0 rad joint is the encoder midpoint");
         assert_eq!(homes.len(), 15);
+    }
+
+    #[test]
+    fn saving_the_standing_pose_round_trips() {
+        let dir = std::env::temp_dir().join(format!("microduck-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("robotd.toml");
+        std::fs::write(&path, "[policy]\nenabled = true\n# keep me\n").unwrap();
+        let mut pose = duck_control::DEFAULT_POSITION;
+        pose[5] = 0.2;
+        write_home(&path, &pose).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"), "comments survive the edit");
+        let raw: toml_edit::DocumentMut = text.parse().unwrap();
+        let stored = raw["policy"]["home"][5].as_float().unwrap();
+        assert!(
+            (stored - 0.2_f64.to_degrees()).abs() < 1e-6,
+            "the file stores degrees, got {stored}"
+        );
+        let loaded = robotd_params::Params::load(&path, true).unwrap();
+        let got = duck_control::standing_pose(loaded.policy.home.as_deref());
+        assert!((got[5] - 0.2).abs() < 1e-9);
+        assert!((got[0] - pose[0]).abs() < 1e-9);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

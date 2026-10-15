@@ -69,6 +69,25 @@ pub const DEFAULT_POSITION: [f64; NUM_JOINTS] = [
     -0.4530, // right_ankle
 ];
 
+/// The standing pose the rest of the stack actually uses.
+///
+/// `configured` is `policy.home` after parsing: fifteen radians in [`JOINT_NAMES`]
+/// order. The file itself is degrees; `robotd-params` converts on load. Absent, the
+/// wrong length, or a non-finite value keeps [`DEFAULT_POSITION`].
+/// Policies observe joint angles relative to this pose, so the override is the training
+/// `HOME_FRAME` as well as the pose the robot stands at.
+pub fn standing_pose(configured: Option<&[f64]>) -> [f64; NUM_JOINTS] {
+    let Some(configured) = configured else {
+        return DEFAULT_POSITION;
+    };
+    if configured.len() != NUM_JOINTS || configured.iter().any(|angle| !angle.is_finite()) {
+        return DEFAULT_POSITION;
+    }
+    let mut pose = [0.0; NUM_JOINTS];
+    pose.copy_from_slice(configured);
+    pose
+}
+
 /// Mouth travel, radians: closed and fully open. The alpha reuses the v1.6 range,
 /// −5°..+30°, from `microduck_runtime`'s `variant.rs`.
 ///
@@ -239,5 +258,17 @@ mod tests {
                 "{left} ({l}) and {right} ({r}) should be equal and opposite"
             );
         }
+    }
+
+    /// An override replaces the built-in pose. A short or non-finite list does not.
+    #[test]
+    fn standing_pose_keeps_the_built_in_unless_fifteen_angles_are_set() {
+        assert_eq!(standing_pose(None), DEFAULT_POSITION);
+        let mut custom = DEFAULT_POSITION.to_vec();
+        custom[5] = 0.2;
+        assert_eq!(standing_pose(Some(&custom))[5], 0.2);
+        assert_eq!(standing_pose(Some(&[0.0, 1.0])), DEFAULT_POSITION);
+        custom[6] = f64::NAN;
+        assert_eq!(standing_pose(Some(&custom)), DEFAULT_POSITION);
     }
 }

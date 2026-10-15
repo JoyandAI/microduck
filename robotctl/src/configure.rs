@@ -228,7 +228,11 @@ impl Model {
         let input = input.trim();
         let optional = matches!(
             entry.kind,
-            Kind::TriBool | Kind::OptionalFloat | Kind::OptionalInteger | Kind::OptionalPath
+            Kind::TriBool
+                | Kind::OptionalFloat
+                | Kind::OptionalInteger
+                | Kind::OptionalPath
+                | Kind::OptionalFloatList(_)
         );
         if input == self.default_for(entry.key)
             || (optional && (input == "unset" || input.is_empty()))
@@ -271,6 +275,29 @@ impl Model {
                 }
                 if array.is_empty() {
                     return Err("an empty list — give comma-separated numbers".to_owned());
+                }
+                array.into()
+            }
+            Kind::OptionalFloatList(len) => {
+                let mut array = toml_edit::Array::new();
+                for word in input.split(',') {
+                    let word = word.trim();
+                    if word.is_empty() {
+                        continue;
+                    }
+                    let number: f64 = word
+                        .parse()
+                        .map_err(|_| format!("{word:?} is not a number"))?;
+                    if !number.is_finite() {
+                        return Err(format!("{word:?} is not a finite number"));
+                    }
+                    array.push(number);
+                }
+                if array.len() != len as usize {
+                    return Err(format!(
+                        "need {len} numbers, got {} — comma-separated degrees, one per joint",
+                        array.len()
+                    ));
                 }
                 array.into()
             }

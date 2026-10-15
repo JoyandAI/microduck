@@ -8,6 +8,8 @@ description = "LAN web console for OpenMicroDuck — drive robotd, and bench one
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 duck-control = { path = "../duck-control" }
+robotd-params = { path = "../robotd-params" }
+toml_edit = "0.23"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 clap = { workspace = true, features = ["derive"] }
 futures-util = "0.3"

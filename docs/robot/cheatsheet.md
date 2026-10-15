@@ -223,7 +223,7 @@ Open `http://<robot>:8090`. **控制** stands the robot up, enables walking, and
 
 **舵机** writes the bus directly, so stop the daemon first (`sudo systemctl stop robotd`) and start it again when you are done. One servo at a time for an ID change.
 
-**标定** (`/calibrate`) uses that same bus. Each joint has a slider. **设 0 位** sends Feetech `0x0B`, which makes the horn's current position the encoder midpoint 2048 (0 rad) and is stored in the servo. Pose the joint at its mechanical zero first. **运行到默认位置** commands the standing pose (`DEFAULT_POSITION`). Leaving the page cuts torque.
+**标定** (`/calibrate`) uses that same bus. Each joint has a slider. **设 0 位** sends Feetech `0x0B`, which makes the horn's current position the encoder midpoint 2048 (0 rad) and is stored in the servo. Pose the joint at its mechanical zero first. **运行到默认位置** commands the standing pose: `policy.home` in `robotd.toml` when that key is set (degrees; converted to radians at load), otherwise the built-in `DEFAULT_POSITION`. **保存为默认站姿** writes the pose the joints are holding into that key, in degrees. Restart `robotd` afterwards — it reads the file once at startup, and policies observe joint angles relative to this pose. Leaving the page cuts torque.
 
 ### Gamepad (`configd`)
 

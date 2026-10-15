@@ -32,7 +32,7 @@
 //! after a sit→stand cycle until the next walk. Here scale and gain are recomputed from
 //! the active state every tick — same values on every path that matters, no leftovers.
 
-use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
+use duck_control::model::{NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError};
 
@@ -164,10 +164,18 @@ pub struct Controller {
     /// end of a roll, positive means chain another.
     roulade_chain: f64,
     sit: Sit,
+    /// Standing pose. Observations are joint angles relative to it, and action offsets are
+    /// added to it. `policy.home` when set, otherwise the built-in standing pose.
+    home: [f64; NUM_JOINTS],
 }
 
 impl Controller {
-    pub fn new(policy: Policy, tuning: Tuning, skills: SkillTuning) -> Self {
+    pub fn new(
+        policy: Policy,
+        tuning: Tuning,
+        skills: SkillTuning,
+        home: [f64; NUM_JOINTS],
+    ) -> Self {
         Self {
             policy,
             tuning,
@@ -179,6 +187,7 @@ impl Controller {
             roulade: None,
             roulade_chain: 0.0,
             sit: Sit::Up,
+            home,
         }
     }
 
@@ -387,7 +396,7 @@ impl Controller {
             &sensors.imu,
             &sensors.positions,
             &sensors.velocities,
-            &DEFAULT_POSITION,
+            &self.home,
             &self.last_action,
             &effective,
         );
@@ -432,7 +441,7 @@ impl Controller {
         let offsets = Observation::scatter_action(&action);
         let mut targets = [0.0; NUM_JOINTS];
         for joint in 0..NUM_JOINTS {
-            targets[joint] = DEFAULT_POSITION[joint] + scale * offsets[joint];
+            targets[joint] = self.home[joint] + scale * offsets[joint];
         }
 
         if let Some(previous) = self.previous {
